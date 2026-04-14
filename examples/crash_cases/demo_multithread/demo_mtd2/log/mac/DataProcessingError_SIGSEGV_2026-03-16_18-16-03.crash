@@ -1,0 +1,28 @@
+=== 数据处理错误报告 ===
+时间: 2026-03-16_18-16-03
+平台: mac
+错误类型: DataProcessingError_SIGSEGV
+进程ID: 45917
+错误地址: 0x100acf644
+
+=== 模块基址信息 ===
+libdatamanager.dylib基址: 0x100acc000
+libsystem_pthread.dylib基址: 0x18d175000
+libsystem_platform.dylib基址: 0x18d00f000
+主程序基址: 0xacc000
+
+=== 堆栈跟踪 ===
+#0 0x100acf644 0   libdatamanager.dylib                0x0000000100acf644 _ZN11DataManager8add_dataEim + 216
+#1 0x100ace5cc 1   libdatamanager.dylib                0x0000000100ace5cc _Z14signal_handleriP9__siginfoPv + 480
+#2 0x18d1b2de4 2   libsystem_platform.dylib            0x000000018d1b2de4 _sigtramp + 56
+#3 0x100acf5dc 3   libdatamanager.dylib                0x0000000100acf5dc _ZN11DataManager8add_dataEim + 112
+#4 0x100acfe98 4   libdatamanager.dylib                0x0000000100acfe98 _Z19process_data_threadii + 700
+#5 0x100a7faa4 5   data_processor                      0x0000000100a7faa4 _ZNSt3__18__invokeB8ne190102IPFviiEJiiEEEDTclclsr3stdE7declvalIT_EEspclsr3stdE7declvalIT0_EEEEOS3_DpOS4_ + 52
+#6 0x100a7fa24 6   data_processor                      0x0000000100a7fa24 _ZNSt3__116__thread_executeB8ne190102INS_10unique_ptrINS_15__thread_structENS_14default_deleteIS2_EEEEPFviiEJiiEJLm2ELm3EEEEvRNS_5tupleIJT_T0_DpT1_EEENS_15__tuple_indicesIJXspT2_EEEE + 64
+#7 0x100a7f2d4 7   data_processor                      0x0000000100a7f2d4 _ZNSt3__114__thread_proxyB8ne190102INS_5tupleIJNS_10unique_ptrINS_15__thread_structENS_14default_deleteIS3_EEEEPFviiEiiEEEEEPvSA_ + 84
+#8 0x18d17c2e4 8   libsystem_pthread.dylib             0x000000018d17c2e4 _pthread_start + 136
+#9 0x18d1770fc 9   libsystem_pthread.dylib             0x000000018d1770fc thread_start + 8
+
+=== 系统信息 ===
+编译时间: Mar 16 2026 18:16:02
+编译器: Apple LLVM 17.0.0 (clang-1700.0.13.5)

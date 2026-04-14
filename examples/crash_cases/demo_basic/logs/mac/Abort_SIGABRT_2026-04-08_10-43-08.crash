@@ -1,0 +1,20 @@
+=== 崩溃报告 ===
+时间: 2026-04-08_10-43-08
+平台: mac
+崩溃类型: Abort_SIGABRT
+进程ID: 83309
+崩溃地址: 0x18d143720
+
+=== 堆栈跟踪 ===
+#0 0x18d143720 0   libsystem_kernel.dylib              0x000000018d143720 __pthread_kill + 8
+#1 0x10023665c 1   libmylib.dylib                      0x000000010023665c _Z14signal_handleriP9__siginfoPv + 496
+#2 0x18d1b2de4 2   libsystem_platform.dylib            0x000000018d1b2de4 _sigtramp + 56
+#3 0x18d17bf70 3   libsystem_pthread.dylib             0x000000018d17bf70 pthread_kill + 288
+#4 0x18d088908 4   libsystem_c.dylib                   0x000000018d088908 abort + 128
+#5 0x10023733c 5   libmylib.dylib                      0x000000010023733c _Z12crash_sigbusv + 0
+#6 0x10020a030 6   crash_test                          0x000000010020a030 main + 1424
+#7 0x18cdfc274 7   dyld                                0x000000018cdfc274 start + 2840
+
+=== 系统信息 ===
+编译时间: Apr  8 2026 10:43:07
+编译器: Apple LLVM 17.0.0 (clang-1700.0.13.5)

@@ -1,0 +1,28 @@
+=== 多线程数据损坏崩溃报告 ===
+时间: 2025-09-10_22-52-19
+平台: mac
+崩溃类型: MultiThreadDataCorruption_SIGSEGV
+进程ID: 12495
+崩溃地址: 0x102882670
+
+=== 模块基址信息 ===
+libmylib.dylib基址: 0x10287c000
+libsystem_pthread.dylib基址: 0x19bc69000
+libsystem_platform.dylib基址: 0x19bb03000
+主程序基址: 0x287c0001？
+
+=== 堆栈跟踪 ===
+#0 0x102882670 0   libmylib.dylib                      0x0000000102882670 _ZN20ComplexDataStructure8add_nodeEim + 224
+#1 0x10288153c 1   libmylib.dylib                      0x000000010288153c _Z14signal_handleriP9__siginfoPv + 452
+#2 0x19bca6e04 2   libsystem_platform.dylib            0x000000019bca6e04 _sigtramp + 56
+#3 0x102882600 3   libmylib.dylib                      0x0000000102882600 _ZN20ComplexDataStructure8add_nodeEim + 112
+#4 0x102882ea8 4   libmylib.dylib                      0x0000000102882ea8 _Z13worker_threadii + 528
+#5 0x102831560 5   mtd_crash_test                      0x0000000102831560 _ZNSt3__18__invokeB8ne180100IPFviiEJiiEEEDTclclsr3stdE7declvalIT_EEspclsr3stdE7declvalIT0_EEEEOS3_DpOS4_ + 52
+#6 0x1028314e0 6   mtd_crash_test                      0x00000001028314e0 _ZNSt3__116__thread_executeB8ne180100INS_10unique_ptrINS_15__thread_structENS_14default_deleteIS2_EEEEPFviiEJiiEJLm2ELm3EEEEvRNS_5tupleIJT_T0_DpT1_EEENS_15__tuple_indicesIJXspT2_EEEE + 64
+#7 0x102830d90 7   mtd_crash_test                      0x0000000102830d90 _ZNSt3__114__thread_proxyB8ne180100INS_5tupleIJNS_10unique_ptrINS_15__thread_structENS_14default_deleteIS3_EEEEPFviiEiiEEEEEPvSA_ + 84
+#8 0x19bc702e4 8   libsystem_pthread.dylib             0x000000019bc702e4 _pthread_start + 136
+#9 0x19bc6b0fc 9   libsystem_pthread.dylib             0x000000019bc6b0fc thread_start + 8
+
+=== 系统信息 ===
+编译时间: Sep 10 2025 22:52:15
+编译器: Apple LLVM 16.0.0 (clang-1600.0.26.6)

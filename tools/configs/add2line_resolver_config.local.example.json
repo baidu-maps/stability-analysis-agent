@@ -1,0 +1,35 @@
+{
+  "_comment": "复制本文件为 add2line_resolver_config.local.json 并填入本机工具链路径（命中 local 后不再读取 base，非 merge），该文件已在 .gitignore 中忽略",
+  "description": "堆栈地址解析工具配置文件（本地示例，含真实路径，不入 git）",
+  "platforms": {
+    "harmonyos": {
+      "tool_paths": [
+        "/path/to/harmonyos/llvm/bin",
+        "/path/to/harmonyos/toolchain/bin"
+      ],
+      "preferred_tools": ["llvm-addr2line", "addr2line"],
+      "environment_vars": {
+        "LLVM_HOME": "/path/to/harmonyos/llvm"
+      }
+    },
+    "android": {
+      "tool_paths": [
+        "/path/to/android-ndk/toolchains/llvm/prebuilt/darwin-x86_64/bin"
+      ],
+      "preferred_tools": ["llvm-addr2line", "addr2line", "ndk-stack"],
+      "environment_vars": {
+        "ANDROID_NDK_HOME": "/path/to/android-ndk"
+      }
+    },
+    "ios": {
+      "tool_paths": [],
+      "preferred_tools": ["atos", "llvm-symbolizer"],
+      "environment_vars": {}
+    },
+    "linux": {
+      "tool_paths": [],
+      "preferred_tools": ["addr2line", "llvm-addr2line"],
+      "environment_vars": {}
+    }
+  }
+}

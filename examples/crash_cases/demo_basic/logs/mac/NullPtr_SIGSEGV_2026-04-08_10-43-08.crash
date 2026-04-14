@@ -1,0 +1,18 @@
+=== 崩溃报告 ===
+时间: 2026-04-08_10-43-08
+平台: mac
+崩溃类型: NullPtr_SIGSEGV
+进程ID: 83296
+崩溃地址: 0x100546ffc
+
+=== 堆栈跟踪 ===
+#0 0x100546ffc 0   libmylib.dylib                      0x0000000100546ffc _Z13crash_nullptrv + 56
+#1 0x10054665c 1   libmylib.dylib                      0x000000010054665c _Z14signal_handleriP9__siginfoPv + 496
+#2 0x18d1b2de4 2   libsystem_platform.dylib            0x000000018d1b2de4 _sigtramp + 56
+#3 0x100546ff0 3   libmylib.dylib                      0x0000000100546ff0 _Z13crash_nullptrv + 44
+#4 0x100519d30 4   crash_test                          0x0000000100519d30 main + 656
+#5 0x18cdfc274 5   dyld                                0x000000018cdfc274 start + 2840
+
+=== 系统信息 ===
+编译时间: Apr  8 2026 10:43:07
+编译器: Apple LLVM 17.0.0 (clang-1700.0.13.5)

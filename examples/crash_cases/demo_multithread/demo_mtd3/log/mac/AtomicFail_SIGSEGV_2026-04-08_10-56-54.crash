@@ -1,0 +1,26 @@
+=== 多线程崩溃报告 ===
+时间: 2026-04-08_10-56-54
+平台: mac
+崩溃类型: AtomicFail_SIGSEGV
+进程ID: 85093
+崩溃地址: 0x1006c7744
+
+=== 模块基址信息 ===
+libmylib.dylib基址: 0x1006c4000
+libsystem_pthread.dylib基址: 0x18d175000
+
+=== 堆栈跟踪 ===
+#0 0x1006c7744 0   libmylib.dylib                      0x00000001006c7744 _ZN14AtomicFailDemo13cas_operationEv + 196
+#1 0x1006c58c4 1   libmylib.dylib                      0x00000001006c58c4 _Z14signal_handleriP9__siginfoPv + 496
+#2 0x18d1b2de4 2   libsystem_platform.dylib            0x000000018d1b2de4 _sigtramp + 56
+#3 0x1006c772c 3   libmylib.dylib                      0x00000001006c772c _ZN14AtomicFailDemo13cas_operationEv + 172
+#4 0x1006c7a18 4   libmylib.dylib                      0x00000001006c7a18 _Z17atomic_cas_threadii + 104
+#5 0x1006887a4 5   mtd3_crash_test                     0x00000001006887a4 _ZNSt3__18__invokeB8ne190102IPFviiEJiiEEEDTclclsr3stdE7declvalIT_EEspclsr3stdE7declvalIT0_EEEEOS3_DpOS4_ + 52
+#6 0x100688724 6   mtd3_crash_test                     0x0000000100688724 _ZNSt3__116__thread_executeB8ne190102INS_10unique_ptrINS_15__thread_structENS_14default_deleteIS2_EEEEPFviiEJiiEJLm2ELm3EEEEvRNS_5tupleIJT_T0_DpT1_EEENS_15__tuple_indicesIJXspT2_EEEE + 64
+#7 0x100687fd4 7   mtd3_crash_test                     0x0000000100687fd4 _ZNSt3__114__thread_proxyB8ne190102INS_5tupleIJNS_10unique_ptrINS_15__thread_structENS_14default_deleteIS3_EEEEPFviiEiiEEEEEPvSA_ + 84
+#8 0x18d17c2e4 8   libsystem_pthread.dylib             0x000000018d17c2e4 _pthread_start + 136
+#9 0x18d1770fc 9   libsystem_pthread.dylib             0x000000018d1770fc thread_start + 8
+
+=== 系统信息 ===
+编译时间: Apr  8 2026 10:54:06
+编译器: Apple LLVM 17.0.0 (clang-1700.0.13.5)

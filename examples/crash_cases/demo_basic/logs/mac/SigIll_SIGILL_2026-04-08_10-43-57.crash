@@ -1,0 +1,20 @@
+=== 崩溃报告 ===
+时间: 2026-04-08_10-43-57
+平台: mac
+崩溃类型: SigIll_SIGILL
+进程ID: 83466
+崩溃地址: 0x18d143720
+
+=== 堆栈跟踪 ===
+#0 0x18d143720 0   libsystem_kernel.dylib              0x000000018d143720 __pthread_kill + 8
+#1 0x1020b665c 1   libmylib.dylib                      0x00000001020b665c _Z14signal_handleriP9__siginfoPv + 496
+#2 0x18d1b2de4 2   libsystem_platform.dylib            0x000000018d1b2de4 _sigtramp + 56
+#3 0x18d17bf70 3   libsystem_pthread.dylib             0x000000018d17bf70 pthread_kill + 288
+#4 0x18d050c18 4   libsystem_c.dylib                   0x000000018d050c18 raise + 32
+#5 0x1020b73a4 5   libmylib.dylib                      0x00000001020b73a4 _Z12crash_sigillv + 48
+#6 0x10208a130 6   crash_test                          0x000000010208a130 main + 1680
+#7 0x18cdfc274 7   dyld                                0x000000018cdfc274 start + 2840
+
+=== 系统信息 ===
+编译时间: Apr  8 2026 10:43:40
+编译器: Apple LLVM 17.0.0 (clang-1700.0.13.5)

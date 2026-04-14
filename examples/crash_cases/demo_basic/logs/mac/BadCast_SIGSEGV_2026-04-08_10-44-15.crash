@@ -1,0 +1,18 @@
+=== 崩溃报告 ===
+时间: 2026-04-08_10-44-15
+平台: mac
+崩溃类型: BadCast_SIGSEGV
+进程ID: 83590
+崩溃地址: 0x102647274
+
+=== 堆栈跟踪 ===
+#0 0x102647274 0   libmylib.dylib                      0x0000000102647274 _Z14crash_bad_castv + 152
+#1 0x10264665c 1   libmylib.dylib                      0x000000010264665c _Z14signal_handleriP9__siginfoPv + 496
+#2 0x18d1b2de4 2   libsystem_platform.dylib            0x000000018d1b2de4 _sigtramp + 56
+#3 0xffff800102647250 3   ???                                 0xffff800102647250 0x0 + 18446603340556300880
+#4 0x102619f30 4   crash_test                          0x0000000102619f30 main + 1168
+#5 0x18cdfc274 5   dyld                                0x000000018cdfc274 start + 2840
+
+=== 系统信息 ===
+编译时间: Apr  8 2026 10:44:15
+编译器: Apple LLVM 17.0.0 (clang-1700.0.13.5)

@@ -1,0 +1,204 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller ad-hoc spec files (generated at repo root by build_cli_mac.sh)
+MapSDKCrashAgent.spec
+StabilityAnalyzer.spec
+
+# Virtual Environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# VSCode Extension
+*.vsix
+*.js.map
+*.js
+
+# IDE / AI coding tools
+.vscode/
+.cursor/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+*.crash
+
+# Build artifacts
+*.o
+*.a
+*.dylib
+*.dll
+*.exe
+
+# Exception: demo example files needed for running demos
+!examples/**/*.dylib
+!examples/**/*.crash
+!examples/**/lib/
+!examples/**/lib/**
+!examples/**/logs/
+!examples/**/logs/**
+!examples/**/log/
+!examples/**/log/**
+!examples/**/mk/*.sh
+!examples/**/mk/CMakeLists.txt
+examples/crash_cases/**/logs/execution_log.txt
+examples/crash_cases/**/*.pkl
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.env.*
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# Vector Database
+/vector_db/
+*.db
+*.sqlite3
+
+# PyInstaller cache/config
+.pyinstaller/
+
+# CLI artifacts
+/cli_reports/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# CMake build artifacts
+CMakeFiles/
+CMakeCache.txt
+CMakeConfigureLog.yaml
+cmake_install.cmake
+
+# Crash Agent runtime cache
+.crash_agent/
+
+# AI Model cache
+.cache/
+cache/
+
+# Backups
+backups/
+
+# Configuration files with sensitive data
+config.json
+secrets.json
+*.key
+*.pem
+tools/configs/agent_config.local.json
+tools/configs/add2line_resolver_config.local.json
+test/llm/test_llm_connection_res.json
+
+.venv_compare_ts/
+
+# Local-only directories (not for open source)
+map_sdk_crash_agent/
+
+# examples/crash_cases local build/cache artifacts
+examples/crash_cases/**/.DS_Store
+examples/crash_cases/**/.crash_agent/
+examples/crash_cases/**/build/
+examples/crash_cases/**/mk/CMakeFiles/
+examples/crash_cases/**/mk/CMakeCache.txt
+examples/crash_cases/**/mk/Makefile
+examples/crash_cases/**/mk/cmake_install.cmake
+examples/crash_cases/**/mk/*_crash_test
+
+# releases/ — CLI 打包产物，通过 GitHub Releases 分发，不入 git
+releases/

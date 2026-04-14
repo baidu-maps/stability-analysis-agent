@@ -1,0 +1,26 @@
+{
+  "_comment": "复制本文件为 agent_config.local.json 并填入真实 API Key（命中 local 后不再读取 base，非 merge），该文件已在 .gitignore 中忽略",
+  "llm_config": {
+    "default_provider": "openai",
+    "providers": {
+      "baidu_qianfan": {
+        "authorization": "YOUR_BAIDU_QIANFAN_AUTHORIZATION",
+        "model": "ernie-4.0-8k"
+      },
+      "openai": {
+        "api_key": "YOUR_OPENAI_API_KEY",
+        "base_url": "",
+        "model": "gpt-4o"
+      },
+      "deepseek": {
+        "api_key": "YOUR_DEEPSEEK_API_KEY",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat"
+      },
+      "zhipu_bigmodel": {
+        "api_key": "YOUR_ZHIPU_API_KEY",
+        "model": "glm-4"
+      }
+    }
+  }
+}
