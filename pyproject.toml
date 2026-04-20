@@ -20,7 +20,8 @@ classifiers = [
     "Programming Language :: Python :: 3.10"
 ]
 dependencies = [
-    "build>=1.0.3"
+    "build>=1.0.3",
+    "openai"
 ]
 
 [project.optional-dependencies]

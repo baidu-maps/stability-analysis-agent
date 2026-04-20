@@ -12,12 +12,14 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import importlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # 支持从任意 cwd 运行
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -208,6 +210,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-format", default="markdown", choices=["markdown", "json", "text"], help="输出格式")
     p.add_argument("--output-file", default=None, help="输出文件；不指定则打印到 stdout")
     p.add_argument("--skip-ai", action="store_true", help="跳过 AI（仅执行工具链）")
+    p.add_argument(
+        "--apply-ai-fixes",
+        dest="apply_ai_fixes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否基于 AI 建议回写源码（默认开启；仅在不加 --skip-ai 且 LLM 可用时生效，使用 --no-apply-ai-fixes 关闭）",
+    )
+    p.add_argument(
+        "--backup-original-sources",
+        dest="backup_original_sources",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="应用 AI 修复前是否在 cli_reports 下备份改前源码（默认开启；代码已由 Git 管理可用 --no-backup-original-sources 关闭）",
+    )
     p.add_argument("--engine", default="direct", choices=["direct", "langchain", "langgraph"], help="执行引擎标记")
     p.add_argument(
         "--plugin-module",
@@ -298,6 +314,294 @@ def _run_vector_db_command(args: argparse.Namespace) -> Optional[int]:
     return None
 
 
+def _sanitize_report_name(name: str) -> str:
+    text = (name or "stdin").strip()
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+    return text.strip("_") or "stdin"
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _build_report_dir(args: argparse.Namespace) -> Path:
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    mode = "analysis_skip_ai" if args.skip_ai else "analysis_ai"
+    crash_name = _sanitize_report_name(Path(args.crash_log).stem if args.crash_log and args.crash_log != "-" else "stdin")
+    dirname = f"{stamp}_{mode}_{args.engine}_{crash_name}"
+    return PROJECT_ROOT / "cli_reports" / dirname
+
+
+def _write_cli_report(
+    report_dir: Path,
+    result: Dict[str, Any],
+    rendered_output: str,
+    applied_fix_result: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
+    try:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        if result.get("parse_result") is not None:
+            _write_json(report_dir / "01_crash_log_parser.json", result.get("parse_result"))
+        if result.get("resolved_stack") is not None:
+            _write_json(report_dir / "02_add2line_resolver.json", result.get("resolved_stack"))
+        if result.get("code_context") is not None:
+            _write_json(report_dir / "03_code_content_provider.json", result.get("code_context"))
+        if result.get("analysis") is not None:
+            round_dir = report_dir / "round_0"
+            round_dir.mkdir(parents=True, exist_ok=True)
+            (round_dir / "05_ai_final_tip.txt").write_text(str(result.get("analysis")), encoding="utf-8")
+        if applied_fix_result is not None:
+            _write_json(report_dir / "06_apply_ai_fixes.json", applied_fix_result)
+        (report_dir / "README_output.md").write_text(rendered_output, encoding="utf-8")
+        return report_dir
+    except Exception as exc:
+        print(f"警告: 写入 cli_reports 失败: {exc}", file=sys.stderr)
+        return None
+
+
+def _extract_candidate_nodes(code_context: Dict[str, Any]) -> List[Dict[str, Any]]:
+    graph = code_context.get("graph", {}) if isinstance(code_context, dict) else {}
+    nodes = graph.get("nodes", []) if isinstance(graph, dict) else []
+    out: List[Dict[str, Any]] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        file_path = node.get("file")
+        signature = node.get("signature")
+        snippet = node.get("snippet")
+        if not file_path or not signature or not isinstance(snippet, list) or not snippet:
+            continue
+        out.append(
+            {
+                "file": str(Path(file_path).resolve()),
+                "signature": str(signature),
+                "snippet": [str(line) for line in snippet],
+                "snippet_start_line": node.get("snippet_start_line"),
+                "snippet_end_line": node.get("snippet_end_line"),
+            }
+        )
+    return out
+
+
+def _extract_json_payload(raw_text: str) -> Dict[str, Any]:
+    text = (raw_text or "").strip()
+    if not text:
+        raise ValueError("AI 未返回结构化修改计划")
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
+    if fence_match:
+        text = fence_match.group(1)
+    else:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            text = text[start : end + 1]
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("结构化修改计划必须是 JSON 对象")
+    return payload
+
+
+def _build_fix_plan_prompt(
+    parse_result: Dict[str, Any],
+    code_context: Dict[str, Any],
+    analysis_text: str,
+    candidate_nodes: List[Dict[str, Any]],
+) -> str:
+    crash_summary = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
+    concise_nodes = [
+        {
+            "file": node["file"],
+            "function_signature": node["signature"],
+            "snippet_start_line": node.get("snippet_start_line"),
+            "snippet_end_line": node.get("snippet_end_line"),
+            "snippet": node["snippet"],
+        }
+        for node in candidate_nodes
+    ]
+    return (
+        "你是代码修复执行器。请根据崩溃上下文和现有 AI 分析，输出“可直接落盘”的最小修改计划。\n"
+        "只允许修改下面 candidate_nodes 中出现的函数；不要新建文件，不要引用不存在的文件，不要输出 Markdown。\n"
+        "若无法安全修改，请返回 edits 为空数组。\n\n"
+        "输出必须是严格 JSON，格式如下：\n"
+        "{\n"
+        '  "summary": "一句话说明修复意图",\n'
+        '  "edits": [\n'
+        "    {\n"
+        '      "file": "candidate_nodes 中的绝对路径",\n'
+        '      "function_signature": "candidate_nodes 中的函数签名",\n'
+        '      "replacement_code": "完整的替换后函数代码",\n'
+        '      "reason": "为什么修改这个函数"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "要求：\n"
+        "1. replacement_code 必须是完整函数代码，能够直接替换原函数。\n"
+        "2. 优先做最小修复，避免引入新依赖。\n"
+        "3. 不要修改无关逻辑。\n"
+        "4. 如果现有 AI 分析与 candidate_nodes 冲突，以 candidate_nodes 的真实代码为准。\n\n"
+        f"parse_result={json.dumps(parse_result, ensure_ascii=False)}\n\n"
+        f"crash_summary={json.dumps(crash_summary, ensure_ascii=False)}\n\n"
+        f"candidate_nodes={json.dumps(concise_nodes, ensure_ascii=False)}\n\n"
+        f"analysis_text={analysis_text}"
+    )
+
+
+def _is_within_code_roots(path: Path, code_roots: List[str]) -> bool:
+    for root in code_roots:
+        try:
+            path.relative_to(Path(root).resolve())
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _replace_function_block(source: str, signature: str, replacement_code: str) -> Tuple[str, Optional[str]]:
+    sig_index = source.find(signature)
+    if sig_index < 0:
+        return source, None
+    brace_start = source.find("{", sig_index)
+    if brace_start < 0:
+        return source, None
+    depth = 0
+    end_index = -1
+    for idx in range(brace_start, len(source)):
+        ch = source[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end_index = idx
+                break
+    if end_index < 0:
+        return source, None
+    old_block = source[sig_index : end_index + 1]
+    return source[:sig_index] + replacement_code + source[end_index + 1 :], old_block
+
+
+def _apply_ai_fix_plan(
+    fix_plan: Dict[str, Any],
+    candidate_nodes: List[Dict[str, Any]],
+    code_roots: List[str],
+    report_dir: Optional[Path],
+    backup_original_sources: bool,
+) -> Dict[str, Any]:
+    edits = fix_plan.get("edits", []) if isinstance(fix_plan, dict) else []
+    candidate_map = {(node["file"], node["signature"]): node for node in candidate_nodes}
+    applied: List[Dict[str, Any]] = []
+    for edit in edits:
+        if not isinstance(edit, dict):
+            continue
+        file_path = Path(str(edit.get("file", ""))).resolve()
+        signature = str(edit.get("function_signature", ""))
+        replacement_code = str(edit.get("replacement_code", "")).strip("\n")
+        reason = str(edit.get("reason", ""))
+        record: Dict[str, Any] = {
+            "file": str(file_path),
+            "function_signature": signature,
+            "reason": reason,
+            "status": "skipped",
+        }
+        node = candidate_map.get((str(file_path), signature))
+        if node is None:
+            record["error"] = "目标函数不在本次代码上下文候选列表中"
+            applied.append(record)
+            continue
+        if not _is_within_code_roots(file_path, code_roots):
+            record["error"] = "目标文件不在 code_root 范围内"
+            applied.append(record)
+            continue
+        if not file_path.exists():
+            record["error"] = "目标文件不存在"
+            applied.append(record)
+            continue
+        if not replacement_code:
+            record["error"] = "replacement_code 为空"
+            applied.append(record)
+            continue
+        original = file_path.read_text(encoding="utf-8")
+        snippet_text = "\n".join(node["snippet"])
+        new_text = original
+        old_block: Optional[str] = None
+        if snippet_text in original:
+            old_block = snippet_text
+            new_text = original.replace(snippet_text, replacement_code, 1)
+        else:
+            new_text, old_block = _replace_function_block(original, signature, replacement_code)
+        if old_block is None or new_text == original:
+            record["error"] = "未能在源码中定位待替换函数"
+            applied.append(record)
+            continue
+        file_path.write_text(new_text, encoding="utf-8")
+        if report_dir is not None and backup_original_sources:
+            backup_root = report_dir / "original_sources"
+            backup_path = backup_root / file_path.relative_to(Path(code_roots[0]).resolve())
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            if not backup_path.exists():
+                backup_path.write_text(original, encoding="utf-8")
+            record["backup_path"] = str(backup_path)
+        record["status"] = "applied"
+        record["replaced_preview"] = old_block
+        applied.append(record)
+    return {
+        "success": any(item.get("status") == "applied" for item in applied),
+        "summary": fix_plan.get("summary") if isinstance(fix_plan, dict) else "",
+        "applied": applied,
+    }
+
+
+def _maybe_apply_ai_fixes(
+    llm_adapter: Any,
+    result: Dict[str, Any],
+    code_roots: List[str],
+    report_dir: Optional[Path],
+    backup_original_sources: bool,
+) -> Optional[Dict[str, Any]]:
+    if llm_adapter is None or not code_roots:
+        return {
+            "success": False,
+            "error": "缺少 LLM 或 code_root，无法应用 AI 修复",
+            "applied": [],
+        }
+    analysis_text = str(result.get("analysis") or "").strip()
+    code_context = result.get("code_context", {}) or {}
+    parse_result = result.get("parse_result", {}) or {}
+    if not analysis_text or not isinstance(code_context, dict):
+        return {
+            "success": False,
+            "error": "缺少 analysis/code_context，无法应用 AI 修复",
+            "applied": [],
+        }
+    candidate_nodes = _extract_candidate_nodes(code_context)
+    if not candidate_nodes:
+        return {
+            "success": False,
+            "error": "代码上下文未提供可替换的函数候选",
+            "applied": [],
+        }
+    prompt = _build_fix_plan_prompt(parse_result, code_context, analysis_text, candidate_nodes)
+    try:
+        response = llm_adapter.chat(
+            [
+                {"role": "system", "content": "你输出严格 JSON，不要输出 Markdown 代码块以外的解释。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+        )
+        fix_plan = _extract_json_payload(response.content)
+        return _apply_ai_fix_plan(
+            fix_plan, candidate_nodes, code_roots, report_dir, backup_original_sources
+        )
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"生成或应用 AI 修复计划失败: {exc}",
+            "applied": [],
+        }
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -359,6 +663,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     executor = ConfigDrivenExecutor(registry, config, llm_adapter)
     result = executor.execute_skill("crash_analysis", problem)
+    report_dir = _build_report_dir(args)
+    applied_fix_result: Optional[Dict[str, Any]] = None
+
+    if args.apply_ai_fixes and result.get("status") == "success" and not args.skip_ai:
+        applied_fix_result = _maybe_apply_ai_fixes(
+            llm_adapter, result, code_roots, report_dir, args.backup_original_sources
+        )
+        result["applied_ai_fixes"] = applied_fix_result
 
     if args.output_format == "json":
         output = json.dumps(result, ensure_ascii=False, indent=2)
@@ -405,15 +717,29 @@ def main(argv: Optional[List[str]] = None) -> int:
             if result.get("analysis"):
                 lines.append("## AI 分析")
                 lines.append(str(result.get("analysis")))
+            if applied_fix_result is not None:
+                lines.append("")
+                lines.append("## AI 自动改码结果")
+                if applied_fix_result.get("success"):
+                    for item in applied_fix_result.get("applied", []):
+                        if item.get("status") == "applied":
+                            lines.append(f"- 已修改: {item.get('file')} -> {item.get('function_signature')}")
+                else:
+                    lines.append(f"- 未应用修改: {applied_fix_result.get('error', '未知原因')}")
             output = "\n".join(lines)
         else:
             output = f"# 错误\n\n{result.get('error')}"
+
+    report_dir = _write_cli_report(report_dir, result, output, applied_fix_result)
 
     if args.output_file:
         Path(args.output_file).write_text(output, encoding="utf-8")
         print(f"结果已保存到: {args.output_file}", file=sys.stderr)
     else:
         print(output)
+
+    if report_dir is not None:
+        print(f"cli_report 已保存到: {report_dir}", file=sys.stderr)
 
     return 0 if result.get("status") == "success" else 1
 

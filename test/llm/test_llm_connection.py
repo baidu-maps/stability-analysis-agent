@@ -31,27 +31,12 @@ DEFAULT_TEST_RESULT_TEMPLATE: Dict[str, Any] = {
 
 def load_agent_config() -> Dict[str, Any]:
     """加载AI Agent配置文件"""
-    config_path = tools_dir / "configs" / "agent_config.json"
+    base_path = tools_dir / "configs" / "agent_config.json"
+    local_path = tools_dir / "configs" / "agent_config.local.json"
+    config_path = local_path if local_path.exists() else base_path
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
-        # 本地私有覆盖（不入库）
-        local_path = tools_dir / "configs" / "agent_config.local.json"
-        if local_path.exists():
-            try:
-                local_cfg = json.loads(local_path.read_text(encoding="utf-8"))
-                # 递归合并（local 覆盖 base）
-                def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-                    out = dict(a)
-                    for k, v in b.items():
-                        if isinstance(out.get(k), dict) and isinstance(v, dict):
-                            out[k] = _deep_merge(out[k], v)
-                        else:
-                            out[k] = v
-                    return out
-                config = _deep_merge(config, local_cfg)
-            except Exception:
-                pass
         print(f"✅ 配置文件加载成功: {config_path}")
         return config
     except Exception as e:
@@ -211,34 +196,69 @@ def get_test_messages(config: Dict[str, Any]) -> list:
     ]
 
 def get_available_models(config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """获取可用的模型列表"""
+    """获取可用的模型列表，兼容单模型和多模型两种配置格式"""
     llm_config = config.get("llm_config", {})
     providers = llm_config.get("providers", {})
-    
+    if not isinstance(providers, dict):
+        return {}
+
     models = {}
     for provider_key, provider_info in providers.items():
+        if not isinstance(provider_info, dict):
+            continue
         provider_name = provider_info.get("name", provider_key)
         provider_models = provider_info.get("models", {})
-        
-        for model_key, model_info in provider_models.items():
-            model_id = f"{provider_key}:{model_key}"
-            models[model_id] = {
-                "provider": provider_key,
-                "model": model_key,
-                "display_name": model_info.get("display_name", model_key),
-                "config": model_info
-            }
-    
+
+        if isinstance(provider_models, dict) and provider_models:
+            for model_key, model_info in provider_models.items():
+                if not isinstance(model_info, dict):
+                    model_info = {}
+                model_id = f"{provider_key}:{model_key}"
+                models[model_id] = {
+                    "provider": provider_key,
+                    "model": model_key,
+                    "display_name": model_info.get("display_name", model_key),
+                    "config": model_info
+                }
+            continue
+
+        model_name = provider_info.get("model")
+        if not model_name:
+            continue
+        model_id = f"{provider_key}:{model_name}"
+        single_model_config = dict(provider_info)
+        single_model_config.setdefault("model", model_name)
+        models[model_id] = {
+            "provider": provider_key,
+            "model": model_name,
+            "display_name": provider_name,
+            "config": single_model_config,
+        }
+
     return models
 
 def get_default_model_id(config: Dict[str, Any], models: Dict[str, Dict[str, Any]]) -> Optional[str]:
-    """从配置获取默认模型ID（provider:model），若无则退化为第一个模型"""
+    """从配置获取默认模型ID，支持仅配置 default_provider 的场景"""
     default_provider = _get_nested(config, ["llm_config", "default_provider"])
     default_model = _get_nested(config, ["llm_config", "default_model"])
+
     if default_provider and default_model:
         candidate = f"{default_provider}:{default_model}"
         if candidate in models:
             return candidate
+
+    if default_provider:
+        provider_cfg = _get_nested(config, ["llm_config", "providers", default_provider], {})
+        if isinstance(provider_cfg, dict):
+            provider_model = provider_cfg.get("model")
+            if provider_model:
+                candidate = f"{default_provider}:{provider_model}"
+                if candidate in models:
+                    return candidate
+        for model_id, model_info in models.items():
+            if model_info.get("provider") == default_provider:
+                return model_id
+
     # 兜底：取第一个可用模型
     return next(iter(models.keys()), None)
 
