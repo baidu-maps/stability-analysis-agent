@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import getpass
 import importlib
 import json
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -86,12 +88,43 @@ def _normalize_code_roots(raw_roots: Optional[List[str]]) -> List[str]:
     return out
 
 
+def _user_config_dir() -> Path:
+    override = os.environ.get("STABILITY_AGENT_CONFIG_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return (Path.home() / ".config" / "stability-analysis-agent").resolve()
+
+
+def _runtime_output_root() -> Path:
+    """
+    Runtime output base directory.
+    Default to current working directory so pip-installed CLI writes
+    reports near where the user runs commands.
+    """
+    return Path.cwd().resolve()
+
+
 def _load_agent_config_file() -> dict:
-    config_dir = PROJECT_ROOT / "tools" / "configs"
-    local_path = config_dir / "agent_config.local.json"
-    base_path = config_dir / "agent_config.json"
-    target = local_path if local_path.exists() else base_path
-    if not target.exists():
+    file_override = os.environ.get("STABILITY_AGENT_CONFIG_FILE", "").strip()
+    if file_override:
+        target = Path(file_override).expanduser().resolve()
+        if target.exists():
+            try:
+                return json.loads(target.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
+
+    bundled_config_dir = PROJECT_ROOT / "tools" / "configs"
+    user_config_dir = _user_config_dir()
+    candidates = [
+        user_config_dir / "agent_config.local.json",
+        user_config_dir / "agent_config.json",
+        bundled_config_dir / "agent_config.local.json",
+        bundled_config_dir / "agent_config.json",
+    ]
+    target = next((p for p in candidates if p.exists()), None)
+    if target is None:
         return {}
     try:
         return json.loads(target.read_text(encoding="utf-8"))
@@ -171,6 +204,259 @@ def _build_llm_config_from_agent_config(engine: str) -> Optional[LLMConfig]:
         )
 
     return None
+
+
+def _bundled_config_dir() -> Path:
+    return PROJECT_ROOT / "tools" / "configs"
+
+
+def _user_agent_config_file() -> Path:
+    return _user_config_dir() / "agent_config.local.json"
+
+
+def _user_add2line_config_file() -> Path:
+    return _user_config_dir() / "add2line_resolver_config.local.json"
+
+
+def _ensure_user_config_templates() -> None:
+    config_dir = _user_config_dir()
+    config_dir.mkdir(parents=True, exist_ok=True)
+    template_map = {
+        "agent_config.local.example.json": _user_agent_config_file(),
+        "add2line_resolver_config.local.example.json": _user_add2line_config_file(),
+    }
+    for src_name, dest in template_map.items():
+        if dest.exists():
+            continue
+        src = _bundled_config_dir() / src_name
+        if src.exists():
+            dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def _detect_add2line_tools() -> Dict[str, Optional[str]]:
+    tools = ["atos", "addr2line", "llvm-addr2line", "llvm-symbolizer", "ndk-stack"]
+    return {tool: shutil.which(tool) for tool in tools}
+
+
+def _mask_secret(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 6:
+        return "*" * len(value)
+    return value[:3] + "*" * (len(value) - 6) + value[-3:]
+
+
+def _prompt_yes_no(question: str, default_yes: bool = True) -> bool:
+    suffix = "[Y/n]" if default_yes else "[y/N]"
+    raw = input(f"{question} {suffix} ").strip().lower()
+    if not raw:
+        return default_yes
+    return raw in {"y", "yes"}
+
+
+def _prompt_non_empty(question: str, default_value: str = "") -> str:
+    while True:
+        raw = input(f"{question}{f' (默认: {default_value})' if default_value else ''}: ").strip()
+        if raw:
+            return raw
+        if default_value:
+            return default_value
+        print("输入不能为空，请重试。")
+
+
+def _load_json_or_empty(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_json_pretty(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _config_command_path() -> int:
+    print(f"config_dir: {_user_config_dir()}")
+    for p in [_user_agent_config_file(), _user_add2line_config_file()]:
+        print(f"{p.name}: {'exists' if p.exists() else 'missing'} ({p})")
+    effective_agent = os.environ.get("STABILITY_AGENT_CONFIG_FILE", "").strip() or str(_user_agent_config_file())
+    effective_add2line = os.environ.get("STABILITY_AGENT_ADD2LINE_CONFIG_FILE", "").strip() or str(_user_add2line_config_file())
+    print(f"effective_agent_config: {effective_agent}")
+    print(f"effective_add2line_config: {effective_add2line}")
+    return 0
+
+
+def _config_command_doctor() -> int:
+    problems: List[str] = []
+    agent_cfg = _load_json_or_empty(_user_agent_config_file())
+    llm_cfg = agent_cfg.get("llm_config", {}) if isinstance(agent_cfg, dict) else {}
+    providers = llm_cfg.get("providers", {}) if isinstance(llm_cfg, dict) else {}
+    default_provider = llm_cfg.get("default_provider") if isinstance(llm_cfg, dict) else None
+    if not default_provider:
+        problems.append("LLM default_provider 未配置")
+    provider_cfg = providers.get(default_provider, {}) if isinstance(providers, dict) and default_provider else {}
+    if default_provider == "baidu_qianfan":
+        if not provider_cfg.get("authorization"):
+            problems.append("baidu_qianfan.authorization 为空")
+    elif default_provider:
+        if not provider_cfg.get("api_key"):
+            problems.append(f"{default_provider}.api_key 为空")
+    else:
+        problems.append("LLM provider 配置缺失")
+
+    tools = _detect_add2line_tools()
+    if not any(tools.values()):
+        problems.append("未检测到 atos/addr2line/llvm-addr2line/llvm-symbolizer/ndk-stack 任一工具")
+
+    print("== 配置检查结果 ==")
+    print(f"agent_config: {_user_agent_config_file()}")
+    print(f"add2line_config: {_user_add2line_config_file()}")
+    print("tools:")
+    for name, path in tools.items():
+        print(f"  - {name}: {path or 'missing'}")
+    if problems:
+        print("status: WARN")
+        for item in problems:
+            print(f"  - {item}")
+        print("建议执行: sa-agent config init")
+        return 1
+    print("status: PASS")
+    return 0
+
+
+def _update_llm_config_interactive() -> None:
+    target = _user_agent_config_file()
+    data = _load_json_or_empty(target)
+    llm_cfg = data.get("llm_config", {}) if isinstance(data, dict) else {}
+    if not isinstance(llm_cfg, dict):
+        llm_cfg = {}
+    providers = llm_cfg.get("providers", {})
+    if not isinstance(providers, dict):
+        providers = {}
+
+    provider = _prompt_non_empty("请输入 provider（示例: openai / deepseek / zhipu_bigmodel / baidu_qianfan）", "openai")
+    model_defaults = {
+        "openai": "gpt-4o",
+        "deepseek": "deepseek-chat",
+        "zhipu_bigmodel": "glm-4",
+        "baidu_qianfan": "ernie-4.0-8k",
+    }
+    provider_cfg = providers.get(provider, {})
+    if not isinstance(provider_cfg, dict):
+        provider_cfg = {}
+    if provider == "baidu_qianfan":
+        secret = getpass.getpass("请输入 authorization（输入时隐藏）: ").strip()
+        provider_cfg["authorization"] = secret
+        provider_cfg["model"] = _prompt_non_empty("请输入模型名", provider_cfg.get("model") or model_defaults.get(provider, "ernie-4.0-8k"))
+        base_url = input("请输入 base_url（可空，回车跳过）: ").strip()
+        if base_url:
+            provider_cfg["base_url"] = base_url
+    else:
+        secret = getpass.getpass("请输入 api_key（输入时隐藏）: ").strip()
+        provider_cfg["api_key"] = secret
+        provider_cfg["model"] = _prompt_non_empty("请输入模型名", provider_cfg.get("model") or model_defaults.get(provider, "gpt-4o"))
+        base_url = input("请输入 base_url（可空，回车跳过）: ").strip()
+        if base_url:
+            provider_cfg["base_url"] = base_url
+
+    providers[provider] = provider_cfg
+    llm_cfg["providers"] = providers
+    llm_cfg["default_provider"] = provider
+    data["llm_config"] = llm_cfg
+    _write_json_pretty(target, data)
+    print(f"LLM 配置已写入: {target}")
+    print(f"provider={provider}, secret={_mask_secret(secret)}")
+
+
+def _update_add2line_config_interactive() -> None:
+    target = _user_add2line_config_file()
+    data = _load_json_or_empty(target)
+    if not isinstance(data, dict):
+        data = {}
+    platforms = data.get("platforms", {})
+    if not isinstance(platforms, dict):
+        platforms = {}
+
+    os_choice = _prompt_non_empty("请输入目标平台（ios/android/linux/harmonyos）", "ios")
+    os_cfg = platforms.get(os_choice, {})
+    if not isinstance(os_cfg, dict):
+        os_cfg = {}
+    path_line = input("请输入 tool_paths（多个路径用英文逗号分隔，可空）: ").strip()
+    if path_line:
+        os_cfg["tool_paths"] = [p.strip() for p in path_line.split(",") if p.strip()]
+    pref_line = input("请输入 preferred_tools（多个工具用英文逗号分隔，可空）: ").strip()
+    if pref_line:
+        os_cfg["preferred_tools"] = [p.strip() for p in pref_line.split(",") if p.strip()]
+    env_line = input("请输入环境变量（格式 KEY=VALUE，多个用英文逗号分隔，可空）: ").strip()
+    env_vars: Dict[str, str] = {}
+    if env_line:
+        for pair in env_line.split(","):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                if k.strip():
+                    env_vars[k.strip()] = v.strip()
+    if env_vars:
+        os_cfg["environment_vars"] = env_vars
+
+    platforms[os_choice] = os_cfg
+    data["platforms"] = platforms
+    _write_json_pretty(target, data)
+    print(f"add2line 配置已写入: {target}")
+
+
+def _config_command_init() -> int:
+    _ensure_user_config_templates()
+    print(f"配置目录: {_user_config_dir()}")
+
+    if _prompt_yes_no("是否现在配置大模型？", True):
+        mode = _prompt_non_empty("请选择方式：1=手动编辑配置文件, 2=交互向导填写", "2")
+        if mode == "1":
+            print("请手动编辑以下文件并填写密钥：")
+            print(f"  {_user_agent_config_file()}")
+        else:
+            _update_llm_config_interactive()
+
+    detected_tools = _detect_add2line_tools()
+    print("自动检测 add2line 相关工具：")
+    for name, path in detected_tools.items():
+        print(f"  - {name}: {path or 'missing'}")
+    env_keys = ["ANDROID_NDK_HOME", "LLVM_HOME", "ANDROID_SDK_HOME"]
+    print("环境变量：")
+    for key in env_keys:
+        print(f"  - {key}: {os.environ.get(key) or 'missing'}")
+
+    if _prompt_yes_no("是否配置 add2line 工具路径？", not any(detected_tools.values())):
+        mode = _prompt_non_empty("请选择方式：1=手动编辑配置文件, 2=交互向导填写", "2")
+        if mode == "1":
+            print("请手动编辑以下文件并填写工具路径：")
+            print(f"  {_user_add2line_config_file()}")
+        else:
+            _update_add2line_config_interactive()
+
+    print("初始化完成。建议运行: sa-agent config doctor")
+    return 0
+
+
+def _handle_config_command(argv: List[str]) -> int:
+    parser = argparse.ArgumentParser(description="Stability Analysis Agent 配置管理")
+    sub = parser.add_subparsers(dest="config_cmd")
+    sub.add_parser("init", help="交互初始化配置")
+    sub.add_parser("path", help="显示配置路径与生效文件")
+    sub.add_parser("doctor", help="检查配置与工具可用性")
+    args = parser.parse_args(argv)
+    cmd = args.config_cmd
+    if cmd == "init":
+        return _config_command_init()
+    if cmd == "path":
+        return _config_command_path()
+    if cmd == "doctor":
+        return _config_command_doctor()
+    parser.print_help()
+    return 1
 
 
 def _register_third_party_modules(registry: ToolAndSkillRegistry, modules: List[str]) -> None:
@@ -273,7 +559,7 @@ def _run_vector_db_command(args: argparse.Namespace) -> Optional[int]:
         snapshot = analyzer.export_snapshot()
         output_path = args.export_vector_db.strip() if isinstance(args.export_vector_db, str) else ""
         if not output_path:
-            output_path = str((PROJECT_ROOT / "cli_reports" / "vector_db_snapshot.json").resolve())
+            output_path = str((_runtime_output_root() / "cli_reports" / "vector_db_snapshot.json").resolve())
         out_file = Path(output_path)
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -330,7 +616,7 @@ def _build_report_dir(args: argparse.Namespace) -> Path:
     mode = "analysis_skip_ai" if args.skip_ai else "analysis_ai"
     crash_name = _sanitize_report_name(Path(args.crash_log).stem if args.crash_log and args.crash_log != "-" else "stdin")
     dirname = f"{stamp}_{mode}_{args.engine}_{crash_name}"
-    return PROJECT_ROOT / "cli_reports" / dirname
+    return _runtime_output_root() / "cli_reports" / dirname
 
 
 def _write_cli_report(
@@ -603,7 +889,11 @@ def _maybe_apply_ai_fixes(
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(argv if argv is not None else sys.argv[1:])
+    if raw_argv and raw_argv[0] == "config":
+        return _handle_config_command(raw_argv[1:])
+
+    args = build_parser().parse_args(raw_argv)
 
     vector_cmd_exit = _run_vector_db_command(args)
     if vector_cmd_exit is not None:
@@ -655,6 +945,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             llm_config = _build_llm_config_from_agent_config(args.engine)
             if llm_config is not None:
                 config.llm = llm_config
+            else:
+                print(
+                    "错误: 未检测到可用 LLM 配置。请执行 `sa-agent config init` 或添加 `--skip-ai` 继续非 AI 分析。",
+                    file=sys.stderr,
+                )
+                return 1
         if config.llm is not None:
             try:
                 llm_adapter = LLMAdapterFactory.create(config.llm.to_dict())

@@ -4,8 +4,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "stability-analyzer"
-version = "1.0.0"
+name = "stability-analysis-agent"
+version = "1.1.0"
 description = "Stability Analysis Agent: AI-assisted crash log analysis toolchain (CLI, daemon, analyzers, agent)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -20,16 +20,30 @@ classifiers = [
     "Programming Language :: Python :: 3.10"
 ]
 dependencies = [
-    "build>=1.0.3",
-    "openai"
+    "openai",
+    "requests",
+    "langgraph",
+    "langchain",
+    "langchain-openai",
+    "numpy",
+    "sentence-transformers",
+    "chromadb",
+    "chroma-hnswlib",
+    "posthog",
+    "tree-sitter>=0.21,<0.22",
+    "tree-sitter-languages"
 ]
 
 [project.optional-dependencies]
 test = ["pytest", "mock"]
 
+[project.scripts]
+sa-agent = "cli.main:main"
+sa = "cli.main:main"
+
 [project.urls]
 Homepage = "https://github.com/baidu-maps/stability-analysis-agent"
-Changelog = "CHANGELOG.md"
+Changelog = "https://github.com/baidu-maps/stability-analysis-agent/blob/main/CHANGELOG.md"
 
 # 项目根目录平铺结构：agent/ tools/ rag/ skills/ daemon/ tool_system/ protocol/ prompts/ cli/ 均为顶级子包
 # pip install -e . 后可直接 from agent.xxx / from tools.xxx 等导入

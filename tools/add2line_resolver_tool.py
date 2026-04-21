@@ -209,6 +209,9 @@ class Add2lineResolver:
             配置字典，如果加载失败返回空字典
         """
         config_candidates: list[Path] = []
+        env_override = os.environ.get("STABILITY_AGENT_ADD2LINE_CONFIG_FILE", "").strip()
+        if env_override:
+            config_candidates.append(Path(env_override).expanduser().resolve())
         
         # 如果指定了配置文件路径，优先使用（保持兼容）
         if self.config_file:
@@ -231,20 +234,14 @@ class Add2lineResolver:
 
             # 项目配置目录（local 优先）
             config_candidates.extend([
-                Path.cwd() / local_name,
-                Path.cwd() / "configs" / local_name,
                 root / "tools" / "configs" / local_name,
                 root / "tools" / "configs" / base_name,
-                root / "configs" / local_name,
-                root / "configs" / base_name,
             ])
 
             # 用户目录（local 优先）
             config_candidates.extend([
-                home / ".stability_analyzer_agent" / local_name,
-                home / ".stability_analyzer_agent" / base_name,
-                home / ".config" / "stability_analyzer_agent" / local_name,
-                home / ".config" / "stability_analyzer_agent" / base_name,
+                home / ".config" / "stability-analysis-agent" / local_name,
+                home / ".config" / "stability-analysis-agent" / base_name,
             ])
         
         # 尝试加载配置文件（按候选顺序，先找到先用）

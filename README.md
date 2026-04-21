@@ -4,6 +4,7 @@
     <strong>An AI Agent for App Stability — from crash log to root cause in one step</strong>
   </p>
   <p align="center">
+    <a href="https://pypi.org/project/stability-analysis-agent/"><img src="https://img.shields.io/pypi/v/stability-analysis-agent.svg" alt="PyPI"></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
     <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python"></a>
     <a href="./CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
@@ -126,14 +127,40 @@ Crash Log → Parse → Symbolize → Extract Code
 - Source usage: Python 3.9+
 - (Optional) `atos` (macOS, built-in) or `addr2line` (Linux, via binutils) for symbolization
 
-### 1. Use Prebuilt CLI Binary (Recommended for End Users)
+### 1. Install via PyPI (Recommended)
+
+```bash
+# Install (for Mainland China, add -i https://pypi.tuna.tsinghua.edu.cn/simple)
+pip install stability-analysis-agent
+
+# Verify installation
+sa-agent --help
+
+# Initialize local config (interactive wizard for LLM keys, addr2line/atos paths, etc.)
+sa-agent config init
+
+# Check config completeness
+sa-agent config doctor
+```
+
+> Config files are saved in `~/.config/stability-analysis-agent/`:
+> - `agent_config.local.json` — LLM provider / API key / model
+> - `add2line_resolver_config.local.json` — addr2line / atos tool paths
+>
+> Even without config initialization, you can run the full non-AI toolchain with `--skip-ai`.
+>
+> The PyPI package includes full runtime dependencies (vector DB, tree-sitter, and LangGraph chain).
+>
+> Upgrade with: `pip install -U stability-analysis-agent`
+
+### 2. Use Prebuilt CLI Binary (No Python Required)
 
 Download the latest binary from [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases), then run:
 
 ```bash
-# Example for v1.0.0 macOS arm64 package
-unzip StabilityAnalyzer-v1.0.0-mac-arm64.zip
-cd releases/stability_analyzer_cli/v1.0.0-mac-arm64
+# Example for v1.1.0 macOS arm64 package
+unzip StabilityAnalyzer-v1.1.0-mac-arm64.zip
+cd output/cli_release/stability_analyzer_cli/v1.1.0-mac-arm64
 
 chmod +x StabilityAnalyzer
 
@@ -141,9 +168,14 @@ chmod +x StabilityAnalyzer
 xattr -d com.apple.quarantine StabilityAnalyzer
 
 ./StabilityAnalyzer --help
+
+# Optional: install a stable command name into ~/.local/bin (also ships in release zips)
+chmod +x install.sh
+./install.sh
+# then: sa-agent --help
 ```
 
-### 2. Developer Setup (from Source)
+### 3. Developer Setup (from Source)
 
 ```bash
 git clone https://github.com/baidu-maps/stability-analysis-agent.git
@@ -151,24 +183,26 @@ cd stability-analysis-agent
 pip install -e .
 ```
 
-> `pip install -e .` is intended for development workflows. A global command (for example `stability-analyzer`) is not provided yet; use `python3 cli/main.py ...` or the prebuilt binary.
+> `pip install -e .` is intended for development workflows. It also exposes the `sa-agent` command locally.
 
-### 3. Run the Built-in Demo (No API Key Needed)
+### 4. Run the Built-in Demo (No API Key Needed)
+
+After installing via PyPI (`pip install stability-analysis-agent`) or from source (`pip install -e .`), clone the repo to get the bundled demo cases, then run:
 
 ```bash
-python3 cli/main.py \
+sa-agent \
   --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
   --code-root examples/crash_cases/demo_basic/code_dir \
   --skip-ai
 ```
 
-Output is saved to `cli_reports/<timestamp>/` with structured JSON reports.
+Output is saved to `./cli_reports/<timestamp>/` (under your current working directory) with structured JSON reports.
 
-### 4. Analyze Your Own Crash Log
+### 5. Analyze Your Own Crash Log
 
 ```bash
-python3 cli/main.py \
+sa-agent \
   --crash-log <your-crash-log> \
   --library-dir <path-to-libs-and-symbols> \
   --code-root <path-to-source-code>
@@ -196,10 +230,10 @@ The daemon provides **streaming output (SSE)**, **process reuse** (no cold start
 
 ```bash
 # Start the daemon
-python3 daemon/server.py --host 127.0.0.1 --port 8765
+sa-agent --daemon-server --host 127.0.0.1 --port 8765
 
 # Analyze via daemon
-python3 cli/main.py --daemon http://127.0.0.1:8765 \
+sa-agent --daemon http://127.0.0.1:8765 \
   --crash-log <crash-log> --library-dir <lib-dir> --code-root <code-root>
 ```
 
@@ -229,41 +263,37 @@ result = executor.execute_skill("crash_analysis", {
 print(result)
 ```
 
-## LLM Configuration
+## LLM and Tool Configuration
 
-AI analysis is **optional**. To enable it, configure any OpenAI-compatible provider:
+AI analysis is **optional**. You can still run full non-AI toolchain with `--skip-ai` without any initialization.
 
-**Option A — Environment Variable:**
-
-```bash
-export OPENAI_API_KEY="your-key"
-# or
-export DEEPSEEK_API_KEY="your-key"
-```
-
-**Option B — Config File:**
+For AI analysis and add2line customization after PyPI install, use:
 
 ```bash
-cp tools/configs/agent_config.local.example.json tools/configs/agent_config.local.json
+sa-agent config init
+sa-agent config path
+sa-agent config doctor
 ```
 
-Edit `tools/configs/agent_config.local.json`:
+Default local config directory:
 
-```json
-{
-  "llm_config": {
-    "default_provider": "openai",
-    "providers": {
-      "openai": {
-        "api_key": "your-key",
-        "model": "gpt-4o"
-      }
-    }
-  }
-}
+```bash
+~/.config/stability-analysis-agent/
 ```
 
-> `*.local.json` files are gitignored — your API keys stay local.
+- `agent_config.local.json` for LLM provider/key/model
+- `add2line_resolver_config.local.json` for addr2line/atos tool paths
+
+If you choose manual editing in `config init`, edit these files directly in that directory.
+
+### Advanced: Environment overrides
+
+You can still override config file locations via environment variables:
+
+```bash
+export STABILITY_AGENT_CONFIG_FILE="/abs/path/agent_config.local.json"
+export STABILITY_AGENT_ADD2LINE_CONFIG_FILE="/abs/path/add2line_resolver_config.local.json"
+```
 
 ## Project Structure
 
@@ -294,6 +324,7 @@ stability-analysis-agent/
 | CLI Guide | [docs/cli/CLI_GUIDE.md](./docs/cli/CLI_GUIDE.md) |
 | CLI Commands Reference | [docs/cli/CLI_COMMANDS_REFERENCE.md](./docs/cli/CLI_COMMANDS_REFERENCE.md) |
 | Daemon Server Guide | [docs/cli/DAEMON_SERVER_GUIDE.md](./docs/cli/DAEMON_SERVER_GUIDE.md) |
+| PyPI Release Scripts | [docs/scripts/PYPI_RELEASE_SCRIPTS.md](./docs/scripts/PYPI_RELEASE_SCRIPTS.md) |
 | System Architecture | [docs/architecture/README.md](./docs/architecture/README.md) |
 | Architecture Diagram | [docs/architecture/ARCHITECTURE_DIAGRAM.md](./docs/architecture/ARCHITECTURE_DIAGRAM.md) |
 | Tool System Overview | [docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md](./docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md) |

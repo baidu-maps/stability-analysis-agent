@@ -4,6 +4,7 @@
     <strong>面向 App 稳定性的 AI Agent — 从崩溃日志到根因定位，一步到位</strong>
   </p>
   <p align="center">
+    <a href="https://pypi.org/project/stability-analysis-agent/"><img src="https://img.shields.io/pypi/v/stability-analysis-agent.svg" alt="PyPI"></a>
     <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
     <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python"></a>
     <a href="./CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
@@ -126,14 +127,40 @@
 - 源码使用：Python 3.9+
 - （可选）符号化工具：`atos`（macOS 自带）或 `addr2line`（Linux，来自 binutils）
 
-### 1. 使用预编译 CLI 二进制（面向终端用户，推荐）
+### 1. 通过 PyPI 安装（推荐）
+
+```bash
+# 安装（中国大陆可加 -i https://pypi.tuna.tsinghua.edu.cn/simple）
+pip install stability-analysis-agent
+
+# 查看帮助
+sa-agent --help
+
+# 初始化本地配置（交互式引导配置大模型密钥、addr2line/atos 工具路径等）
+sa-agent config init
+
+# 自检配置完整性
+sa-agent config doctor
+```
+
+> 安装后的配置文件保存在 `~/.config/stability-analysis-agent/` 目录下：
+> - `agent_config.local.json`：大模型 provider / API key / model
+> - `add2line_resolver_config.local.json`：addr2line / atos 工具路径
+>
+> 即使不初始化配置，也可以通过 `--skip-ai` 运行完整非 AI 工具链。
+>
+> PyPI 包默认包含完整运行依赖（向量数据库、tree-sitter、LangGraph 链路）。
+>
+> 升级命令：`pip install -U stability-analysis-agent`
+
+### 2. 使用预编译 CLI 二进制（无需 Python）
 
 从 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases) 下载最新二进制后执行：
 
 ```bash
-# 以 v1.0.0 macOS arm64 包为例
-unzip StabilityAnalyzer-v1.0.0-mac-arm64.zip
-cd releases/stability_analyzer_cli/v1.0.0-mac-arm64
+# 以 v1.1.0 macOS arm64 包为例
+unzip StabilityAnalyzer-v1.1.0-mac-arm64.zip
+cd output/cli_release/stability_analyzer_cli/v1.1.0-mac-arm64
 
 chmod +x StabilityAnalyzer
 
@@ -141,9 +168,14 @@ chmod +x StabilityAnalyzer
 xattr -d com.apple.quarantine StabilityAnalyzer
 
 ./StabilityAnalyzer --help
+
+# 可选：安装到 ~/.local/bin，命令名为 sa-agent（Release 压缩包内自带 install.sh）
+chmod +x install.sh
+./install.sh
+# 然后可直接: sa-agent --help
 ```
 
-### 2. 开发者源码安装
+### 3. 开发者源码安装
 
 ```bash
 git clone https://github.com/baidu-maps/stability-analysis-agent.git
@@ -151,24 +183,26 @@ cd stability-analysis-agent
 pip install -e .
 ```
 
-> `pip install -e .` 主要用于开发场景。当前尚未提供全局命令入口（例如 `stability-analyzer`）；请使用 `python3 cli/main.py ...` 或预编译二进制。
+> `pip install -e .` 主要用于开发场景，同时也会暴露本地 `sa-agent` 命令。
 
-### 3. 运行内置 Demo（无需 API Key）
+### 4. 运行内置 Demo（无需 API Key）
+
+通过 PyPI 安装（`pip install stability-analysis-agent`）或源码安装（`pip install -e .`）后，克隆仓库获取内置 Demo 样例，然后运行：
 
 ```bash
-python3 cli/main.py \
+sa-agent \
   --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
   --code-root examples/crash_cases/demo_basic/code_dir \
   --skip-ai
 ```
 
-输出保存在 `cli_reports/<timestamp>/` 目录下，包含结构化 JSON 报告。
+输出保存在当前工作目录下的 `./cli_reports/<timestamp>/`，包含结构化 JSON 报告。
 
-### 4. 分析你自己的崩溃日志
+### 5. 分析你自己的崩溃日志
 
 ```bash
-python3 cli/main.py \
+sa-agent \
   --crash-log <你的崩溃日志> \
   --library-dir <库文件和符号目录> \
   --code-root <源码根目录>
@@ -196,10 +230,10 @@ Daemon 提供**流式输出（SSE）**、**进程复用**（免冷启动）和**
 
 ```bash
 # 启动 Daemon
-python3 daemon/server.py --host 127.0.0.1 --port 8765
+sa-agent --daemon-server --host 127.0.0.1 --port 8765
 
 # 通过 Daemon 分析
-python3 cli/main.py --daemon http://127.0.0.1:8765 \
+sa-agent --daemon http://127.0.0.1:8765 \
   --crash-log <崩溃日志> --library-dir <库目录> --code-root <源码目录>
 ```
 
@@ -229,41 +263,37 @@ result = executor.execute_skill("crash_analysis", {
 print(result)
 ```
 
-## 配置 LLM
+## 配置 LLM 与符号化工具
 
-AI 分析为**可选功能**。启用方式：
+AI 分析为**可选功能**。即使不初始化配置，也可以通过 `--skip-ai` 运行完整非 AI 工具链。
 
-**方式一 — 环境变量：**
-
-```bash
-export OPENAI_API_KEY="your-key"
-# 或
-export DEEPSEEK_API_KEY="your-key"
-```
-
-**方式二 — 配置文件：**
+通过 PyPI 安装后，推荐使用以下命令配置与自检：
 
 ```bash
-cp tools/configs/agent_config.local.example.json tools/configs/agent_config.local.json
+sa-agent config init
+sa-agent config path
+sa-agent config doctor
 ```
 
-编辑 `tools/configs/agent_config.local.json`：
+默认本地配置目录：
 
-```json
-{
-  "llm_config": {
-    "default_provider": "openai",
-    "providers": {
-      "openai": {
-        "api_key": "your-key",
-        "model": "gpt-4o"
-      }
-    }
-  }
-}
+```bash
+~/.config/stability-analysis-agent/
 ```
 
-> `*.local.json` 文件已加入 gitignore，你的 API Key 不会被提交。
+- `agent_config.local.json`：配置大模型 provider/key/model
+- `add2line_resolver_config.local.json`：配置 addr2line/atos 工具路径
+
+若在 `config init` 中选择手动编辑，直接编辑以上文件即可。
+
+### 高级：环境变量覆盖
+
+可通过环境变量显式指定配置文件路径：
+
+```bash
+export STABILITY_AGENT_CONFIG_FILE="/绝对路径/agent_config.local.json"
+export STABILITY_AGENT_ADD2LINE_CONFIG_FILE="/绝对路径/add2line_resolver_config.local.json"
+```
 
 ## 项目结构
 
@@ -294,6 +324,7 @@ stability-analysis-agent/
 | CLI 使用指南 | [docs/cli/CLI_GUIDE.md](./docs/cli/CLI_GUIDE.md) |
 | CLI 参数参考 | [docs/cli/CLI_COMMANDS_REFERENCE.md](./docs/cli/CLI_COMMANDS_REFERENCE.md) |
 | Daemon 服务指南 | [docs/cli/DAEMON_SERVER_GUIDE.md](./docs/cli/DAEMON_SERVER_GUIDE.md) |
+| PyPI 发布脚本指南 | [docs/scripts/PYPI_RELEASE_SCRIPTS.md](./docs/scripts/PYPI_RELEASE_SCRIPTS.md) |
 | 系统架构 | [docs/architecture/README.md](./docs/architecture/README.md) |
 | 架构图 | [docs/architecture/ARCHITECTURE_DIAGRAM.md](./docs/architecture/ARCHITECTURE_DIAGRAM.md) |
 | Tool System 概览 | [docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md](./docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md) |

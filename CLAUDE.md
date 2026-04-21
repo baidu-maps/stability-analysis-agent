@@ -121,5 +121,5 @@ python3 cli/main.py \
 - Architecture / design: `docs/architecture/`
 - CLI usage: `docs/cli/`
 - Tool implementation: `docs/tools/`
-- Developer guides: `docs/dev/`
+- Developer guides: `docs/scripts/`
 - Do NOT create `.md` files in `test/`, `tools/`, `cli_reports/`, or repo root (except standard files like README, CHANGELOG, etc.)

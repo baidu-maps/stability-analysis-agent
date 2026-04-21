@@ -34,6 +34,8 @@ ENV/
 env.bak/
 venv.bak/
 .venv
+.venv*/
+.tmp*/
 
 # Node.js
 node_modules/
@@ -200,5 +202,5 @@ examples/crash_cases/**/mk/Makefile
 examples/crash_cases/**/mk/cmake_install.cmake
 examples/crash_cases/**/mk/*_crash_test
 
-# releases/ — CLI 打包产物，通过 GitHub Releases 分发，不入 git
-releases/
+# output/ — unified build artifacts (PyPI + CLI binary/release), not tracked
+output/

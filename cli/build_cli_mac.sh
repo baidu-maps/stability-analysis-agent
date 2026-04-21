@@ -5,16 +5,17 @@
 #   bash cli/build_cli_mac.sh              # 使用 pyproject.toml 中的版本号
 #   bash cli/build_cli_mac.sh v1.2.0       # 指定版本号（覆盖 pyproject.toml）
 #
-# 产物目录: releases/stability_analyzer_cli/<VERSION>-mac-<ARCH>/
+# 产物目录: output/cli_release/stability_analyzer_cli/<VERSION>-mac-<ARCH>/
 #   StabilityAnalyzer        — 可执行二进制（PyInstaller onefile）
+#   install.sh               — 安装到 PATH（复制自 cli/install_mac_cli.sh）
 #   configs/                 — 公共配置模板
 #   CLI_RELEASE_NOTES_<V>.md — 本次发布说明（首次需人工补充正文）
 #
 # 发布流程:
 #   1. 执行本脚本生成产物
-#   2. 压缩产物目录: zip -r StabilityAnalyzer-<VERSION>-mac.zip releases/...
+#   2. 压缩产物目录: zip -r StabilityAnalyzer-<VERSION>-mac.zip output/cli_release/...
 #   3. 在 GitHub 创建 Release / Tag，将压缩包作为 Asset 上传
-#   详见: docs/dev/CLI_RELEASE_GUIDE.md
+#   详见: docs/scripts/PYPI_RELEASE_SCRIPTS.md
 #
 set -euo pipefail
 
@@ -45,7 +46,10 @@ VERSION="${1:-$DEFAULT_VERSION}"
 
 # 目标架构：arm64 / x86_64（取运行时架构）
 ARCH="$(uname -m)"   # arm64 or x86_64
-OUT_DIR="$ROOT_DIR/releases/stability_analyzer_cli/${VERSION}-mac-${ARCH}"
+PYI_WORK_DIR="$ROOT_DIR/output/cli_binary/work"
+PYI_DIST_DIR="$ROOT_DIR/output/cli_binary/dist"
+PYI_SPEC_DIR="$ROOT_DIR/output/cli_binary/spec"
+OUT_DIR="$ROOT_DIR/output/cli_release/stability_analyzer_cli/${VERSION}-mac-${ARCH}"
 
 echo "==> repo   : $ROOT_DIR"
 echo "==> version: $VERSION"
@@ -78,7 +82,7 @@ fi
 # --------------------------------------------------------------------------- #
 # 3. 清理旧构建产物
 # --------------------------------------------------------------------------- #
-rm -rf "$ROOT_DIR/build" "$ROOT_DIR/dist" "$ROOT_DIR/${BIN_NAME}.spec"
+rm -rf "$PYI_WORK_DIR" "$PYI_DIST_DIR" "$PYI_SPEC_DIR" "$ROOT_DIR/${BIN_NAME}.spec"
 
 # --------------------------------------------------------------------------- #
 # 4. PyInstaller 打包
@@ -93,6 +97,9 @@ pyinstaller \
   --name "$BIN_NAME" \
   --onefile \
   --clean \
+  --workpath "$PYI_WORK_DIR" \
+  --distpath "$PYI_DIST_DIR" \
+  --specpath "$PYI_SPEC_DIR" \
   --hidden-import hnswlib \
   --hidden-import posthog \
   --hidden-import chromadb.telemetry.product.posthog \
@@ -125,7 +132,9 @@ pyinstaller \
 # --------------------------------------------------------------------------- #
 mkdir -p "$OUT_DIR/configs"
 
-cp "$ROOT_DIR/dist/$BIN_NAME" "$OUT_DIR/$BIN_NAME"
+cp "$PYI_DIST_DIR/$BIN_NAME" "$OUT_DIR/$BIN_NAME"
+cp "$ROOT_DIR/cli/install_mac_cli.sh" "$OUT_DIR/install.sh"
+chmod +x "$OUT_DIR/install.sh"
 
 # --------------------------------------------------------------------------- #
 # 6. macOS 代码签名（可选）
@@ -171,15 +180,19 @@ fi
 
 # --------------------------------------------------------------------------- #
 # 7. 复制配置模板
-#    仅复制公共配置，不覆盖用户已有的 *.local.json
+#    仅复制公共配置模板，不复制用户本地密钥文件 *.local.json
 # --------------------------------------------------------------------------- #
-CONFIG_SRC_DIR="$ROOT_DIR/agent"
-if [[ -f "$CONFIG_SRC_DIR/agent_config.json" ]]; then
-  cp "$CONFIG_SRC_DIR/agent_config.json" "$OUT_DIR/configs/agent_config.json"
-fi
-if [[ -f "$CONFIG_SRC_DIR/agent_config.local.example.json" ]]; then
-  cp "$CONFIG_SRC_DIR/agent_config.local.example.json" "$OUT_DIR/configs/agent_config.local.example.json"
-fi
+CONFIG_SRC_DIR="$ROOT_DIR/tools/configs"
+for cfg in \
+  "agent_config.json" \
+  "agent_config.local.example.json" \
+  "add2line_resolver_config.json" \
+  "add2line_resolver_config.local.example.json"
+do
+  if [[ -f "$CONFIG_SRC_DIR/$cfg" ]]; then
+    cp "$CONFIG_SRC_DIR/$cfg" "$OUT_DIR/configs/$cfg"
+  fi
+done
 
 # --------------------------------------------------------------------------- #
 # 8. 生成 Release Notes 模板（若对应版本文件不存在则创建）
@@ -213,6 +226,10 @@ xattr -d com.apple.quarantine StabilityAnalyzer
 
 # 运行
 ./StabilityAnalyzer --help
+
+# 可选：安装到 PATH（默认 ~/.local/bin，命令名 sa-agent）
+chmod +x install.sh
+./install.sh
 \`\`\`
 
 ## Configuration
@@ -237,11 +254,12 @@ fi
 echo ""
 echo "==> Build complete!"
 echo "    binary : $OUT_DIR/$BIN_NAME"
+echo "    install: $OUT_DIR/install.sh"
 echo "    size   : $(du -sh "$OUT_DIR/$BIN_NAME" | cut -f1)"
 echo ""
 echo "Next steps:"
 echo "  1. Edit $NOTES_FILE"
 echo "  2. zip -r StabilityAnalyzer-${VERSION}-mac-${ARCH}.zip \\"
-echo "       releases/stability_analyzer_cli/${VERSION}-mac-${ARCH}/"
+echo "       output/cli_release/stability_analyzer_cli/${VERSION}-mac-${ARCH}/"
 echo "  3. gh release create ${VERSION} StabilityAnalyzer-${VERSION}-mac-${ARCH}.zip \\"
 echo "       --title 'Stability Analysis Agent ${VERSION}' --notes-file $NOTES_FILE"
