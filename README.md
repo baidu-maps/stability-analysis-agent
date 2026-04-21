@@ -122,10 +122,28 @@ Crash Log → Parse → Symbolize → Extract Code
 
 ### Prerequisites
 
-- Python 3.9+
+- Binary usage: no Python runtime required
+- Source usage: Python 3.9+
 - (Optional) `atos` (macOS, built-in) or `addr2line` (Linux, via binutils) for symbolization
 
-### 1. Install
+### 1. Use Prebuilt CLI Binary (Recommended for End Users)
+
+Download the latest binary from [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases), then run:
+
+```bash
+# Example for v1.0.0 macOS arm64 package
+unzip StabilityAnalyzer-v1.0.0-mac-arm64.zip
+cd releases/stability_analyzer_cli/v1.0.0-mac-arm64
+
+chmod +x StabilityAnalyzer
+
+# If macOS Gatekeeper blocks launch (unsigned binary)
+xattr -d com.apple.quarantine StabilityAnalyzer
+
+./StabilityAnalyzer --help
+```
+
+### 2. Developer Setup (from Source)
 
 ```bash
 git clone https://github.com/baidu-maps/stability-analysis-agent.git
@@ -133,7 +151,9 @@ cd stability-analysis-agent
 pip install -e .
 ```
 
-### 2. Run the Built-in Demo (No API Key Needed)
+> `pip install -e .` is intended for development workflows. A global command (for example `stability-analyzer`) is not provided yet; use `python3 cli/main.py ...` or the prebuilt binary.
+
+### 3. Run the Built-in Demo (No API Key Needed)
 
 ```bash
 python3 cli/main.py \
@@ -145,7 +165,7 @@ python3 cli/main.py \
 
 Output is saved to `cli_reports/<timestamp>/` with structured JSON reports.
 
-### 3. Analyze Your Own Crash Log
+### 4. Analyze Your Own Crash Log
 
 ```bash
 python3 cli/main.py \

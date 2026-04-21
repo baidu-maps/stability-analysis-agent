@@ -122,10 +122,28 @@
 
 ### 环境要求
 
-- Python 3.9+
+- 二进制使用：无需 Python 运行时
+- 源码使用：Python 3.9+
 - （可选）符号化工具：`atos`（macOS 自带）或 `addr2line`（Linux，来自 binutils）
 
-### 1. 安装
+### 1. 使用预编译 CLI 二进制（面向终端用户，推荐）
+
+从 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases) 下载最新二进制后执行：
+
+```bash
+# 以 v1.0.0 macOS arm64 包为例
+unzip StabilityAnalyzer-v1.0.0-mac-arm64.zip
+cd releases/stability_analyzer_cli/v1.0.0-mac-arm64
+
+chmod +x StabilityAnalyzer
+
+# 若 macOS Gatekeeper 拦截启动（未签名二进制）
+xattr -d com.apple.quarantine StabilityAnalyzer
+
+./StabilityAnalyzer --help
+```
+
+### 2. 开发者源码安装
 
 ```bash
 git clone https://github.com/baidu-maps/stability-analysis-agent.git
@@ -133,7 +151,9 @@ cd stability-analysis-agent
 pip install -e .
 ```
 
-### 2. 运行内置 Demo（无需 API Key）
+> `pip install -e .` 主要用于开发场景。当前尚未提供全局命令入口（例如 `stability-analyzer`）；请使用 `python3 cli/main.py ...` 或预编译二进制。
+
+### 3. 运行内置 Demo（无需 API Key）
 
 ```bash
 python3 cli/main.py \
@@ -145,7 +165,7 @@ python3 cli/main.py \
 
 输出保存在 `cli_reports/<timestamp>/` 目录下，包含结构化 JSON 报告。
 
-### 3. 分析你自己的崩溃日志
+### 4. 分析你自己的崩溃日志
 
 ```bash
 python3 cli/main.py \
