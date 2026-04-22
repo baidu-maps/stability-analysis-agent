@@ -54,19 +54,19 @@ def _get_ts_executor():
             return _ts_executor
         try:
             from stability_analyzer_agent.tool_system import (
-                ToolAndSkillRegistry, SystemConfig, LLMConfig,
-                ToolConfig, SkillConfig, ConfigDrivenExecutor,
-                LLMAdapterFactory, register_all_tools_and_skills,
+                ToolAndWorkflowRegistry, SystemConfig, LLMConfig,
+                ToolConfig, WorkflowConfig, ConfigDrivenExecutor,
+                LLMAdapterFactory, register_all_tools_and_workflows,
             )
-            registry = ToolAndSkillRegistry()
-            register_all_tools_and_skills(registry)
+            registry = ToolAndWorkflowRegistry()
+            register_all_tools_and_workflows(registry)
             config = SystemConfig(
                 tools=[
                     ToolConfig(name="crash_log_parser", enabled=True),
                     ToolConfig(name="add2line_resolver", enabled=True),
                     ToolConfig(name="code_content_provider", enabled=True),
                 ],
-                skills=[SkillConfig(name="crash_analysis", enabled=True)],
+                workflows=[WorkflowConfig(name="crash_analysis", enabled=True)],
             )
             llm_adapter = None
             api_key = os.environ.get("WENXIN_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -402,7 +402,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # --- tool-system 直连端点（ConfigDrivenExecutor）---
-        if self.path in ("/tool-system/tools", "/tool-system/skills"):
+        if self.path in ("/tool-system/tools", "/tool-system/workflows"):
             try:
                 executor = _get_ts_executor()
                 active = executor.list_active()
@@ -520,7 +520,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = _read_json_body(self)
                 executor = _get_ts_executor()
-                result = executor.execute_skill("crash_analysis", {
+                result = executor.execute_workflow("crash_analysis", {
                     "crash_log": body.get("crash_log", ""),
                     "library_dir": body.get("library_dir"),
                     "code_roots": body.get("code_roots", []),
@@ -549,7 +549,7 @@ def main() -> int:
 
     print(f"daemon listening on http://{args.host}:{args.port} (protocol={PROTOCOL_VERSION})")
     print(f"  Run API:         POST /runs  GET /runs/<id>  GET /runs/<id>/events  POST /runs/<id>/cancel")
-    print(f"  Tool System API: POST /tool-system/analyze  GET /tool-system/tools  GET /tool-system/skills")
+    print(f"  Tool System API: POST /tool-system/analyze  GET /tool-system/tools  GET /tool-system/workflows")
     httpd.serve_forever()
     return 0
 

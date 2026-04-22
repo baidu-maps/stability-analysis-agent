@@ -45,10 +45,10 @@ sa = "cli.main:main"
 Homepage = "https://github.com/baidu-maps/stability-analysis-agent"
 Changelog = "https://github.com/baidu-maps/stability-analysis-agent/blob/main/CHANGELOG.md"
 
-# 项目根目录平铺结构：agent/ tools/ rag/ skills/ daemon/ tool_system/ protocol/ prompts/ cli/ 均为顶级子包
+# 项目根目录平铺结构：agent/ tools/ rag/ workflows/ daemon/ tool_system/ protocol/ prompts/ cli/ 均为顶级子包
 # pip install -e . 后可直接 from agent.xxx / from tools.xxx 等导入
 [tool.hatch.build.targets.wheel]
-packages = ["agent", "tools", "rag", "skills", "daemon", "tool_system", "protocol", "prompts", "cli"]
+packages = ["agent", "tools", "rag", "workflows", "daemon", "tool_system", "protocol", "prompts", "cli"]
 output-dir = "output/dist"
 
 [tool.hatch.build.targets.sdist]

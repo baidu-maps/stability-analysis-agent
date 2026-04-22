@@ -33,7 +33,7 @@ This Agent solves all three:
 | **Log parsing** | Sees raw text, high noise | Structured parser extracts signal, threads, key frames; classifies crash / ANR / OOM / freeze |
 | **Knowledge accumulation** | Stateless, starts from zero | RAG: rule table + vector DB, patterns improve over time |
 | **Workflow** | Single-prompt, one-shot | Multi-step Agent with conditional multi-turn reasoning |
-| **Extensibility** | Prompt-only | Tool + Skill plugin system, config-driven |
+| **Extensibility** | Prompt-only | Tool + Workflow plugin system, config-driven |
 
 ### Agent Engine
 
@@ -58,7 +58,7 @@ Select via `--engine direct|langchain|langgraph`. All modes share the same tool 
 | **Structured Log Parsing** | Auto-detects iOS / Android / macOS / Linux / Windows; classifies crash, ANR, OOM, freeze; extracts signal, threads, key frames |
 | **Source Code Context** | Extracts code snippets around crash points |
 | **RAG Knowledge Base** | Rule table (fast path) + vector retrieval (ChromaDB) with feedback loop |
-| **Tool + Skill System** | Pluggable architecture — register custom tools and skills via config or decorators |
+| **Tool + Workflow System** | Pluggable architecture — register custom tools and workflows via config or decorators |
 | **Multiple Interfaces** | CLI, HTTP Daemon (streaming / SSE), Python API |
 
 ## Architecture
@@ -72,7 +72,7 @@ Select via `--engine direct|langchain|langgraph`. All modes share the same tool 
                        └──────────────┼──────────────┘
                                       │
                             ┌─────────▼─────────┐
-                            │   Tool + Skill    │
+                            │   Tool + Workflow │
                             │   (tool_system)   │
                             └─────────┬─────────┘
                                       │
@@ -242,19 +242,19 @@ sa-agent --daemon http://127.0.0.1:8765 \
 
 ```python
 from tool_system import (
-    ToolAndSkillRegistry, SystemConfig, SkillConfig,
-    ConfigDrivenExecutor, register_all_tools_and_skills
+    ToolAndWorkflowRegistry, SystemConfig, WorkflowConfig,
+    ConfigDrivenExecutor, register_all_tools_and_workflows
 )
 
-registry = ToolAndSkillRegistry()
-register_all_tools_and_skills(registry)
+registry = ToolAndWorkflowRegistry()
+register_all_tools_and_workflows(registry)
 
 config = SystemConfig(
-    skills=[SkillConfig(name="crash_analysis", enabled=True)]
+    workflows=[WorkflowConfig(name="crash_analysis", enabled=True)]
 )
 executor = ConfigDrivenExecutor(registry, config, llm_adapter=None)
 
-result = executor.execute_skill("crash_analysis", {
+result = executor.execute_workflow("crash_analysis", {
     "crash_log": open("crash.crash").read(),
     "library_dir": "./lib",
     "code_root": "./code"
@@ -303,8 +303,8 @@ stability-analysis-agent/
 ├── daemon/             # HTTP daemon (streaming, SSE)
 ├── tools/              # Tool implementations (parser, resolver, code provider)
 │   └── configs/        # Configuration templates
-├── tool_system/        # Tool + Skill registration & dispatch framework
-├── skills/             # Skill definitions (crash analysis)
+├── tool_system/        # Tool + Workflow registration & dispatch framework
+├── workflows/          # Workflow definitions (crash analysis)
 ├── rag/                # RAG: rule store + vector index (ChromaDB) + metadata
 ├── prompts/            # Prompt templates for LLM analysis
 ├── protocol/           # Unified request/response protocol
@@ -328,7 +328,7 @@ stability-analysis-agent/
 | Architecture Diagram | [docs/architecture/ARCHITECTURE_DIAGRAM.md](./docs/architecture/ARCHITECTURE_DIAGRAM.md) |
 | Tool System Overview | [docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md](./docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md) |
 | Tool Extension Guide | [docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md](./docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md) |
-| Skill System | [docs/skills/SKILLS.md](./docs/skills/SKILLS.md) |
+| Workflow System | [docs/workflows/WORKFLOWS.md](./docs/workflows/WORKFLOWS.md) |
 | RAG Vector Database | [docs/rag/README.md](./docs/rag/README.md) |
 | Crash Demos | [docs/crash_demos/README.md](./docs/crash_demos/README.md) |
 

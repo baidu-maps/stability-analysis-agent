@@ -5,8 +5,8 @@
 ## 扩展方式
 
 1. **新增 Tool** - 添加新的基础能力
-2. **新增 Skill** - 添加新的问题解决方案
-3. **替换内置** - 覆盖已有的 Tool/Skill 实现
+2. **新增 Workflow** - 添加新的问题解决方案
+3. **替换内置** - 覆盖已有的 Tool/Workflow 实现
 4. **自定义 LLM** - 添加新的 LLM 适配器
 
 ## 示例：新增自定义 Tool
@@ -32,25 +32,25 @@ class MyCustomTool(BaseTool):
         return {"output": f"处理: {input_data.get('input')}"}
 ```
 
-## 示例：新增自定义 Skill
+## 示例：新增自定义 Workflow
 
 ```python
-from tools.core.tool_system import BaseSkill, SkillDefinition, register_skill, Priority, SkillContext
+from tools.core.tool_system import BaseWorkflow, WorkflowDefinition, register_workflow, Priority, WorkflowContext
 
-@register_skill(priority=Priority.CUSTOM)
-class MyCustomSkill(BaseSkill):
-    """自定义技能"""
+@register_workflow(priority=Priority.CUSTOM)
+class MyCustomWorkflow(BaseWorkflow):
+    """自定义工作流"""
 
     @property
-    def definition(self) -> SkillDefinition:
-        return SkillDefinition(
-            name="my_custom_skill",
-            description="自定义技能描述",
+    def definition(self) -> WorkflowDefinition:
+        return WorkflowDefinition(
+            name="my_custom_workflow",
+            description="自定义工作流描述",
             problem_type="custom_problem",
             required_tools=["crash_log_parser"]
         )
 
-    def solve(self, problem, context: SkillContext):
+    def solve(self, problem, context: WorkflowContext):
         # 调用工具
         result = context.execute_tool("crash_log_parser", {
             "log_content": problem["crash_log"]
@@ -88,5 +88,5 @@ registry.register(
 
 ## 相关文档
 
-- [doc/skills/EXTENSION.md](../skills/EXTENSION.md) - Skill 扩展指南
-- [doc/skills/IMPLEMENTATION.md](../skills/IMPLEMENTATION.md) - 内置实现
+- [doc/workflows/EXTENSION.md](../workflows/EXTENSION.md) - Workflow 扩展指南
+- [doc/workflows/IMPLEMENTATION.md](../workflows/IMPLEMENTATION.md) - 内置实现

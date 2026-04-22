@@ -4,7 +4,7 @@
 统一 CLI 入口（Tool System only）。
 
 设计目标：
-- 仅使用 Tool/Skill 注册机制执行分析；
+- 仅使用 Tool/Workflow 注册机制执行分析；
 - 支持第三方通过模块扩展注册表；
 - 作为唯一命令行入口。
 """
@@ -29,14 +29,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tool_system import (  # type: ignore
-    ToolAndSkillRegistry,
+    ToolAndWorkflowRegistry,
     SystemConfig,
     LLMConfig,
     ToolConfig,
-    SkillConfig,
+    WorkflowConfig,
     ConfigDrivenExecutor,
     LLMAdapterFactory,
-    register_all_tools_and_skills,
+    register_all_tools_and_workflows,
 )
 
 try:
@@ -459,7 +459,7 @@ def _handle_config_command(argv: List[str]) -> int:
     return 1
 
 
-def _register_third_party_modules(registry: ToolAndSkillRegistry, modules: List[str]) -> None:
+def _register_third_party_modules(registry: ToolAndWorkflowRegistry, modules: List[str]) -> None:
     for mod_name in modules:
         m = (mod_name or "").strip()
         if not m:
@@ -920,8 +920,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "rule_confidence_threshold": args.rule_confidence_threshold,
     }
 
-    registry = ToolAndSkillRegistry()
-    register_all_tools_and_skills(registry)
+    registry = ToolAndWorkflowRegistry()
+    register_all_tools_and_workflows(registry)
 
     env_modules = [m.strip() for m in os.environ.get("STABILITY_AGENT_PLUGIN_MODULES", "").split(",") if m.strip()]
     cli_modules = args.plugin_modules or []
@@ -936,7 +936,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ToolConfig(name="add2line_resolver", enabled=True),
                 ToolConfig(name="code_content_provider", enabled=True),
             ],
-            skills=[SkillConfig(name="crash_analysis", enabled=True)],
+            workflows=[WorkflowConfig(name="crash_analysis", enabled=True)],
         )
 
     llm_adapter = None
@@ -958,7 +958,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"警告: LLM 适配器初始化失败，将继续执行工具链。错误: {exc}", file=sys.stderr)
 
     executor = ConfigDrivenExecutor(registry, config, llm_adapter)
-    result = executor.execute_skill("crash_analysis", problem)
+    result = executor.execute_workflow("crash_analysis", problem)
     report_dir = _build_report_dir(args)
     applied_fix_result: Optional[Dict[str, Any]] = None
 

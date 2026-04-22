@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-内置技能实现 - 将现有的分析能力封装为 Skill
-（迁移自 tool_system/skill_builtins.py，仅修改 import 路径）
+内置工作流实现 - 将现有的分析能力封装为 Workflow
 """
 
 import logging
 import json
 from typing import Any, Dict, List, Optional
 
-from tool_system import BaseSkill, SkillDefinition, SkillContext, Priority, register_skill
-from tool_system.registry import ToolAndSkillRegistry
+from tool_system import BaseWorkflow, WorkflowDefinition, WorkflowContext, Priority, register_workflow
+from tool_system.registry import ToolAndWorkflowRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +34,15 @@ except ImportError as e:
     RAG_AVAILABLE = False
 
 
-# ==================== Base Crash Analysis Skill ====================
+# ==================== Base Crash Analysis Workflow ====================
 
-class BaseCrashAnalysisSkill(BaseSkill):
-    """崩溃分析技能基类"""
+class BaseCrashAnalysisWorkflow(BaseWorkflow):
+    """崩溃分析工作流基类"""
 
     def __init__(self):
         self.platform = "unknown"
 
-    def solve(self, problem: Dict[str, Any], context: SkillContext) -> Dict[str, Any]:
+    def solve(self, problem: Dict[str, Any], context: WorkflowContext) -> Dict[str, Any]:
         """
         标准的崩溃分析流程：
         1. 解析 crash log
@@ -107,7 +106,7 @@ class BaseCrashAnalysisSkill(BaseSkill):
                 return {
                     "status": "success",
                     "platform": self.platform,
-                    "skill": self.definition.name,
+                    "workflow": self.definition.name,
                     "parse_result": parse_result,
                     "resolved_stack": resolved,
                     "code_context": code_context,
@@ -133,7 +132,7 @@ class BaseCrashAnalysisSkill(BaseSkill):
             return {
                 "status": "success",
                 "platform": self.platform,
-                "skill": self.definition.name,
+                "workflow": self.definition.name,
                 "parse_result": parse_result,
                 "resolved_stack": resolved,
                 "code_context": code_context,
@@ -155,7 +154,7 @@ class BaseCrashAnalysisSkill(BaseSkill):
             return {
                 "status": "error",
                 "error": str(e),
-                "skill": self.definition.name
+                "workflow": self.definition.name
             }
 
     def _build_analysis_prompt(self, parse_result: Dict, resolved: Dict, code_context: Dict, memory_context: str = "") -> str:
@@ -291,18 +290,18 @@ class BaseCrashAnalysisSkill(BaseSkill):
         return "\n\n".join(parts).strip()
 
 
-# ==================== iOS Crash Analysis Skill ====================
+# ==================== iOS Crash Analysis Workflow ====================
 
-class iOSCrashAnalyzeSkill(BaseCrashAnalysisSkill):
-    """iOS 崩溃分析技能"""
+class iOSCrashAnalyzeWorkflow(BaseCrashAnalysisWorkflow):
+    """iOS 崩溃分析工作流"""
 
     def __init__(self):
         super().__init__()
         self.platform = "ios"
 
     @property
-    def definition(self) -> SkillDefinition:
-        return SkillDefinition(
+    def definition(self) -> WorkflowDefinition:
+        return WorkflowDefinition(
             name="ios_crash_analyze",
             description="分析 iOS 平台崩溃日志，定位 Objective-C/Swift 代码问题",
             problem_type="ios_crash",
@@ -315,18 +314,18 @@ class iOSCrashAnalyzeSkill(BaseCrashAnalysisSkill):
         )
 
 
-# ==================== Android Crash Analysis Skill ====================
+# ==================== Android Crash Analysis Workflow ====================
 
-class AndroidCrashAnalyzeSkill(BaseCrashAnalysisSkill):
-    """Android 崩溃分析技能"""
+class AndroidCrashAnalyzeWorkflow(BaseCrashAnalysisWorkflow):
+    """Android 崩溃分析工作流"""
 
     def __init__(self):
         super().__init__()
         self.platform = "android"
 
     @property
-    def definition(self) -> SkillDefinition:
-        return SkillDefinition(
+    def definition(self) -> WorkflowDefinition:
+        return WorkflowDefinition(
             name="android_crash_analyze",
             description="分析 Android 平台崩溃日志，定位 Java/Kotlin/C++ 代码问题",
             problem_type="android_crash",
@@ -339,20 +338,20 @@ class AndroidCrashAnalyzeSkill(BaseCrashAnalysisSkill):
         )
 
 
-# ==================== Generic Crash Analysis Skill ====================
+# ==================== Generic Crash Analysis Workflow ====================
 
-class GenericCrashAnalyzeSkill(BaseCrashAnalysisSkill):
-    """通用崩溃分析技能（自动检测平台）"""
+class GenericCrashAnalyzeWorkflow(BaseCrashAnalysisWorkflow):
+    """通用崩溃分析工作流（自动检测平台）"""
 
     def __init__(self):
         super().__init__()
         self.platform = "auto"
 
     @property
-    def definition(self) -> SkillDefinition:
-        return SkillDefinition(
+    def definition(self) -> WorkflowDefinition:
+        return WorkflowDefinition(
             name="crash_analysis",
-            description="通用崩溃分析技能，自动检测平台并分析",
+            description="通用崩溃分析工作流，自动检测平台并分析",
             problem_type="crash_analysis",
             required_tools=["crash_log_parser", "add2line_resolver", "code_content_provider"],
             version="1.0.0",
@@ -362,16 +361,16 @@ class GenericCrashAnalyzeSkill(BaseCrashAnalysisSkill):
             }
         )
 
-    def solve(self, problem: Dict[str, Any], context: SkillContext) -> Dict[str, Any]:
+    def solve(self, problem: Dict[str, Any], context: WorkflowContext) -> Dict[str, Any]:
         # 自动检测平台
         crash_log = problem.get("crash_log", "")
 
         # 简单的平台检测
         if "iOS" in crash_log or "Swift" in crash_log or "SIGSEGV" in crash_log:
-            ios_skill = iOSCrashAnalyzeSkill()
-            return ios_skill.solve(problem, context)
+            ios_workflow = iOSCrashAnalyzeWorkflow()
+            return ios_workflow.solve(problem, context)
         elif "Android" in crash_log or "java.lang" in crash_log or "Native crash" in crash_log:
-            android_skill = AndroidCrashAnalyzeSkill()
-            return android_skill.solve(problem, context)
+            android_workflow = AndroidCrashAnalyzeWorkflow()
+            return android_workflow.solve(problem, context)
         else:
             return super().solve(problem, context)

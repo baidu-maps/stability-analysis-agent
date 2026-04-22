@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Skill 接口定义 - 问题类型解决方案
+Workflow 接口定义 - 问题类型解决方案
 """
 
 from __future__ import annotations
@@ -16,13 +16,13 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from .tool import ToolDefinition
     from .llm_adapter import BaseLLMAdapter, LLMResponse
-    from .registry import ToolAndSkillRegistry
+    from .registry import ToolAndWorkflowRegistry
 
 
 @dataclass
-class SkillDefinition:
-    """技能定义"""
-    name: str                          # 技能唯一标识
+class WorkflowDefinition:
+    """工作流定义"""
+    name: str                          # 工作流唯一标识
     description: str                   # 描述（供用户理解用途）
     problem_type: str                  # 问题类型: ios_crash/android_anr/memory_leak/crash_analysis
     required_tools: List[str]          # 需要的工具列表
@@ -30,23 +30,23 @@ class SkillDefinition:
     metadata: Dict[str, Any] = field(default_factory=dict)  # 额外元信息
 
 
-class BaseSkill(ABC):
-    """技能基类 - 问题类型解决方案"""
+class BaseWorkflow(ABC):
+    """工作流基类 - 问题类型解决方案"""
 
     @property
     @abstractmethod
-    def definition(self) -> SkillDefinition:
-        """技能定义"""
+    def definition(self) -> WorkflowDefinition:
+        """工作流定义"""
         pass
 
     @abstractmethod
-    def solve(self, problem: Dict[str, Any], context: "SkillContext") -> Dict[str, Any]:
+    def solve(self, problem: Dict[str, Any], context: "WorkflowContext") -> Dict[str, Any]:
         """
         解决问题
 
         Args:
             problem: 问题描述（crash log, error info 等）
-            context: 技能执行上下文
+            context: 工作流执行上下文
 
         Returns:
             解决方案结果
@@ -75,10 +75,10 @@ class BaseSkill(ABC):
         return f"<{self.__class__.__name__} name={self.definition.name}>"
 
 
-class SkillContext:
+class WorkflowContext:
     """
-    技能执行上下文
-    提供了 Skill 执行过程中需要的能力：LLM 调用、工具执行、配置等
+    工作流执行上下文
+    提供了 Workflow 执行过程中需要的能力：LLM 调用、工具执行、配置等
     """
 
     def __init__(self,

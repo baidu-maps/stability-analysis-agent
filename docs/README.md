@@ -8,7 +8,7 @@
 docs/
 ├── architecture/          # 架构设计
 ├── cli/                   # CLI 使用指南
-├── skills/                # Skill 系统
+├── workflows/                # Workflow 系统
 ├── rag/                   # RAG 向量库
 ├── tools/                 # 工具链
 └── crash_demos/           # 崩溃示例
@@ -33,11 +33,11 @@ docs/
 | [cli/CLI_COMMANDS_REFERENCE.md](./cli/CLI_COMMANDS_REFERENCE.md) | 参数参考 |
 | [cli/DAEMON_SERVER_GUIDE.md](./cli/DAEMON_SERVER_GUIDE.md) | Daemon 指南 |
 
-### Skill
+### Workflow
 
 | 文档 | 说明 |
 |------|------|
-| [skills/SKILLS.md](./skills/SKILLS.md) | Skill 系统完整文档 |
+| [workflows/WORKFLOWS.md](./workflows/WORKFLOWS.md) | Workflow 系统完整文档 |
 
 ### 工具链
 

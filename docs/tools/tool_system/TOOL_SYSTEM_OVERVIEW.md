@@ -2,10 +2,10 @@
 
 ## 概述
 
-Tool System 是 Stability Analysis Agent 的核心架构，采用 **Tool + Skill** 双层设计：
+Tool System 是 Stability Analysis Agent 的核心架构，采用 **Tool + Workflow** 双层设计：
 
 - **Tool（工具）** - 基础单元能力
-- **Skill（技能）** - 问题类型解决方案
+- **Workflow（工作流）** - 问题类型解决方案
 
 ## 核心组件
 
@@ -30,22 +30,22 @@ class MyTool(BaseTool):
         return {"result": "..."}
 ```
 
-### 2. Skill 接口
+### 2. Workflow 接口
 
 ```python
-from tools.core.tool_system import BaseSkill, SkillDefinition, SkillContext
+from tools.core.tool_system import BaseWorkflow, WorkflowDefinition, WorkflowContext
 
-class MySkill(BaseSkill):
+class MyWorkflow(BaseWorkflow):
     @property
-    def definition(self) -> SkillDefinition:
-        return SkillDefinition(
-            name="my_skill",
-            description="我的技能",
+    def definition(self) -> WorkflowDefinition:
+        return WorkflowDefinition(
+            name="my_workflow",
+            description="我的工作流",
             problem_type="my_problem",
             required_tools=["tool1", "tool2"]
         )
 
-    def solve(self, problem, context: SkillContext):
+    def solve(self, problem, context: WorkflowContext):
         # 调用工具
         result = context.execute_tool("tool1", {"input": "..."})
 
@@ -60,10 +60,10 @@ class MySkill(BaseSkill):
 
 ```python
 from tools.core.tool_system import (
-    ToolAndSkillRegistry,
+    ToolAndWorkflowRegistry,
     Priority,
     register_tool,
-    register_skill
+    register_workflow
 )
 
 # 使用装饰器注册
@@ -71,8 +71,8 @@ from tools.core.tool_system import (
 class MyTool(BaseTool):
     ...
 
-@register_skill(priority=Priority.CUSTOM)
-class MySkill(BaseSkill):
+@register_workflow(priority=Priority.CUSTOM)
+class MyWorkflow(BaseWorkflow):
     ...
 ```
 
@@ -82,16 +82,16 @@ class MySkill(BaseSkill):
 from tools.core.tool_system import (
     ConfigDrivenExecutor,
     SystemConfig,
-    register_all_tools_and_skills
+    register_all_tools_and_workflows
 )
 
-registry = ToolAndSkillRegistry()
-register_all_tools_and_skills(registry)
+registry = ToolAndWorkflowRegistry()
+register_all_tools_and_workflows(registry)
 
 config = SystemConfig(...)
 executor = ConfigDrivenExecutor(registry, config, llm_adapter)
 
-result = executor.execute_skill("skill_name", {"problem": "..."})
+result = executor.execute_workflow("workflow_name", {"problem": "..."})
 ```
 
 ## 内置 Tool
@@ -102,9 +102,9 @@ result = executor.execute_skill("skill_name", {"problem": "..."})
 | `add2line_resolver` | resolver | 符号化堆栈地址 |
 | `code_content_provider` | provider | 提取代码上下文 |
 
-## 内置 Skill
+## 内置 Workflow
 
-| Skill 名称 | 问题类型 | 说明 |
+| Workflow 名称 | 问题类型 | 说明 |
 |-----------|---------|------|
 | `ios_crash_analyze` | iOS 崩溃 | iOS 平台崩溃分析 |
 | `android_crash_analyze` | Android 崩溃 | Android 平台崩溃分析 |
@@ -129,8 +129,8 @@ result = executor.execute_skill("skill_name", {"problem": "..."})
   "tools": [
     {"name": "crash_log_parser", "enabled": true, "implementation": "MyCustomParser"}
   ],
-  "skills": [
-    {"name": "crash_analysis", "enabled": true, "implementation": "MyCustomSkill"}
+  "workflows": [
+    {"name": "crash_analysis", "enabled": true, "implementation": "MyCustomWorkflow"}
   ],
   "llm": {
     "engine": "direct",

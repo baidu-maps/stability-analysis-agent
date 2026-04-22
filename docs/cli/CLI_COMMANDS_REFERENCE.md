@@ -20,13 +20,13 @@ python3 cli/main.py [参数...]
 | `--crash-log PATH` | 分析时**必填**（向量库子命令除外） | 崩溃日志文件路径；`-` 表示从 **stdin** 读取。 |
 | `--library-dir DIR` | 建议填写 | 符号库目录，供 `add2line_resolver`（如 `atos` / `addr2line`）解析堆栈。 |
 | `--code-root DIR` | 建议填写 | 代码根目录；可**多次**指定，在多根目录下查找源码。 |
-| `--config PATH` | 否 | `SystemConfig` JSON 文件；不指定时使用内置默认工具链 + `crash_analysis` 技能。 |
+| `--config PATH` | 否 | `SystemConfig` JSON 文件；不指定时使用内置默认工具链 + `crash_analysis` 工作流。 |
 | `--skip-ai` | 否 | 跳过 LLM，仅跑工具链（解析 + 符号化 + 代码上下文等）。 |
 | `--engine {direct,langchain,langgraph}` | 否 | 传给 `LLMConfig` 的引擎标记，默认 `direct`。 |
 | `--output-format {markdown,json,text}` | 否 | 终端打印/写入 `--output-file` 的格式，默认 `markdown`。 |
 | `--output-file PATH` | 否 | 将上述格式结果写入文件；不指定则打印到 **stdout**。 |
 
-### 1.2 传给技能的问题上下文（内部字段）
+### 1.2 传给工作流的问题上下文（内部字段）
 
 以下参数会进入 `crash_analysis` 的 `problem` 字典，供 RAG 相关逻辑使用：
 

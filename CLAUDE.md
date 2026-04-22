@@ -103,7 +103,7 @@ python3 cli/main.py \
 - `cli/main.py` - CLI entry point
 - `daemon/server.py` - HTTP daemon with streaming support
 - `tool_system/` - Tool registration and dispatch
-- `skills/` - Skill definitions
+- `workflows/` - Workflow definitions
 - `prompts/` - Prompt templates
 - `examples/` - Demo crash cases (mac / ios / multithread)
 - `test/` - Test suite

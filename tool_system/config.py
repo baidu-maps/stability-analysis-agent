@@ -25,8 +25,8 @@ class ToolConfig:
 
 
 @dataclass
-class SkillConfig:
-    """技能配置"""
+class WorkflowConfig:
+    """工作流配置"""
     name: str
     enabled: bool = True
     implementation: Optional[str] = None
@@ -68,7 +68,7 @@ class LLMConfig:
 class SystemConfig:
     """系统配置"""
     tools: List[ToolConfig] = field(default_factory=list)
-    skills: List[SkillConfig] = field(default_factory=list)
+    workflows: List[WorkflowConfig] = field(default_factory=list)
     llm: Optional[LLMConfig] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -76,14 +76,14 @@ class SystemConfig:
     def from_dict(cls, data: Dict[str, Any]) -> "SystemConfig":
         """从字典创建"""
         tools = [ToolConfig(**t) for t in data.get("tools", [])]
-        skills = [SkillConfig(**s) for s in data.get("skills", [])]
+        workflows = [WorkflowConfig(**s) for s in data.get("workflows", [])]
 
         llm_data = data.get("llm")
         llm = LLMConfig(**llm_data) if llm_data else None
 
         return cls(
             tools=tools,
-            skills=skills,
+            workflows=workflows,
             llm=llm,
             metadata=data.get("metadata", {})
         )
@@ -102,9 +102,9 @@ class SystemConfig:
                 {"name": t.name, "enabled": t.enabled, "implementation": t.implementation, "params": t.params}
                 for t in self.tools
             ],
-            "skills": [
+            "workflows": [
                 {"name": s.name, "enabled": s.enabled, "implementation": s.implementation, "params": s.params}
-                for s in self.skills
+                for s in self.workflows
             ],
             "llm": self.llm.to_dict() if self.llm else None,
             "metadata": self.metadata
@@ -119,17 +119,17 @@ class SystemConfig:
         """获取工具配置"""
         return next((t for t in self.tools if t.name == name), None)
 
-    def get_skill_config(self, name: str) -> Optional[SkillConfig]:
-        """获取技能配置"""
-        return next((s for s in self.skills if s.name == name), None)
+    def get_workflow_config(self, name: str) -> Optional[WorkflowConfig]:
+        """获取工作流配置"""
+        return next((s for s in self.workflows if s.name == name), None)
 
     def get_enabled_tools(self) -> List[ToolConfig]:
         """获取启用的工具"""
         return [t for t in self.tools if t.enabled]
 
-    def get_enabled_skills(self) -> List[SkillConfig]:
-        """获取启用的技能"""
-        return [s for s in self.skills if s.enabled]
+    def get_enabled_workflows(self) -> List[WorkflowConfig]:
+        """获取启用的工作流"""
+        return [s for s in self.workflows if s.enabled]
 
 
 class ConfigLoader:
@@ -195,10 +195,10 @@ def create_default_config() -> SystemConfig:
             ToolConfig(name="code_content_provider", enabled=True),
             ToolConfig(name="code_context_provider", enabled=True),  # 别名
         ],
-        skills=[
-            SkillConfig(name="ios_crash_analyze", enabled=True),
-            SkillConfig(name="android_crash_analyze", enabled=True),
-            SkillConfig(name="crash_analysis", enabled=True),
+        workflows=[
+            WorkflowConfig(name="ios_crash_analyze", enabled=True),
+            WorkflowConfig(name="android_crash_analyze", enabled=True),
+            WorkflowConfig(name="crash_analysis", enabled=True),
         ],
         llm=LLMConfig(
             engine="direct",

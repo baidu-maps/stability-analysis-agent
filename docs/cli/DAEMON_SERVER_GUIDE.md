@@ -16,7 +16,7 @@ python3 daemon/server.py --host 0.0.0.0 --port 8765
 ```
 daemon listening on http://127.0.0.1:8765 (protocol=1)
   Run API:         POST /runs  GET /runs/<id>  GET /runs/<id>/events  POST /runs/<id>/cancel
-  Tool System API: POST /tool-system/analyze  GET /tool-system/tools  GET /tool-system/skills
+  Tool System API: POST /tool-system/analyze  GET /tool-system/tools  GET /tool-system/workflows
 ```
 
 ---
@@ -139,12 +139,12 @@ data: {"run_id": "...", "type": "stdout", "data": {"chunk": "..."}, "ts": 171800
 
 ### Tool System API（进程内直连模式）
 
-直接在 daemon 进程内通过 `ConfigDrivenExecutor` 调用 Tool/Skill，无需子进程，适合轻量调用。
+直接在 daemon 进程内通过 `ConfigDrivenExecutor` 调用 Tool/Workflow，无需子进程，适合轻量调用。
 
 > **延迟初始化**：首次调用任意 `/tool-system/*` 端点时才初始化 `ConfigDrivenExecutor`。
 
 #### `POST /tool-system/analyze`
-直接执行 `crash_analysis` Skill（同步）。
+直接执行 `crash_analysis` Workflow（同步）。
 
 **请求体：**
 ```json
@@ -155,7 +155,7 @@ data: {"run_id": "...", "type": "stdout", "data": {"chunk": "..."}, "ts": 171800
 }
 ```
 
-**响应：** Skill 返回的 JSON 结果。
+**响应：** Workflow 返回的 JSON 结果。
 
 ---
 
@@ -166,8 +166,8 @@ data: {"run_id": "...", "type": "stdout", "data": {"chunk": "..."}, "ts": 171800
 
 ---
 
-#### `GET /tool-system/skills`
-列出所有已注册的 Skill。
+#### `GET /tool-system/workflows`
+列出所有已注册的 Workflow。
 
 **响应：** `ConfigDrivenExecutor.list_active()` 的返回值。
 
@@ -180,7 +180,7 @@ data: {"run_id": "...", "type": "stdout", "data": {"chunk": "..."}, "ts": 171800
 | 执行方式 | 子进程（`cli/main.py`） | 进程内直连 |
 | 流式支持 | ✅ SSE 事件流 | ❌ 同步返回 |
 | 取消支持 | ✅ | ❌ |
-| 功能完整性 | 与 CLI 完全一致 | 仅 Tool/Skill 层 |
+| 功能完整性 | 与 CLI 完全一致 | 仅 Tool/Workflow 层 |
 | 适用场景 | 完整分析、长耗时任务 | 轻量调用、快速测试 |
 
 ---

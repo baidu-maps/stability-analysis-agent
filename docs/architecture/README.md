@@ -11,7 +11,7 @@
 ## 分层架构
 
 - 应用层：CLI、daemon
-- 编排层：Tool System / Skill / Executor
+- 编排层：Tool System / Workflow / Executor
 - 工具层：`crash_log_parser`、`add2line_resolver`、`code_content_provider`
 - AI 层：Direct / LangChain / LangGraph 适配器
 - 记忆层：规则 + 向量 + 元数据（RAG）
@@ -26,14 +26,14 @@
 4. （可选）RAG 检索增强
 5. 生成 AI 分析结论
 
-统一 CLI 入口为 `cli/main.py`，通过 `execute_skill("crash_analysis", problem)` 执行。
+统一 CLI 入口为 `cli/main.py`，通过 `execute_workflow("crash_analysis", problem)` 执行。
 
 ## 目录约定
 
 - `agent/`：AI Agent 实现
 - `cli/`：命令行入口
 - `daemon/`：本地 HTTP 服务
-- `skills/`：Skill 定义
+- `workflows/`：Workflow 定义
 - `tool_system/`：注册表、配置、执行器、LLM 适配器
 - `tools/`：具体工具实现
 - `rag/`：RAG 相关实现

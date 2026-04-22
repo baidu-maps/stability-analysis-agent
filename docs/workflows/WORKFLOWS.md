@@ -1,13 +1,13 @@
-# Skill 系统
+# Workflow 系统
 
-Skill（技能）是 Stability Analysis Agent 中用于解决特定问题类型的**解决方案抽象**。它封装了完整的崩溃分析流程，包括崩溃日志解析、堆栈地址符号化、代码上下文提取和 LLM 分析。
+Workflow（工作流）是 Stability Analysis Agent 中用于解决特定问题类型的**解决方案抽象**。它封装了完整的崩溃分析流程，包括崩溃日志解析、堆栈地址符号化、代码上下文提取和 LLM 分析。
 
-## 什么是 Skill？
+## 什么是 Workflow？
 
-Skill（技能）是面向特定问题类型的完整解决方案：
+Workflow（工作流）是面向特定问题类型的完整解决方案：
 
-| 维度 | Tool | Skill |
-|------|------|-------|
+| 维度 | Tool | Workflow |
+|------|------|----------|
 | **定位** | 基础单元能力 | 问题类型解决方案 |
 | **粒度** | 原子操作 | 多个 Tool 组合 |
 | **抽象级别** | 底层能力 | 面向业务场景 |
@@ -18,7 +18,7 @@ Skill（技能）是面向特定问题类型的完整解决方案：
 - `add2line_resolver` - 符号化地址
 - `code_content_provider` - 提取代码上下文
 
-### Skill 示例
+### Workflow 示例
 - `ios_crash_analyze` - iOS 崩溃分析
 - `android_crash_analyze` - Android 崩溃分析
 - `crash_analysis` - 通用崩溃分析
@@ -33,42 +33,42 @@ Skill（技能）是面向特定问题类型的完整解决方案：
                           │
 ┌─────────────────────────▼───────────────────────────────────┐
 │                    ConfigDrivenExecutor                     │
-│  - 根据配置选择 Tool/Skill 实现                              │
+│  - 根据配置选择 Tool/Workflow 实现                            │
 │  - 管理 LLM 适配器                                          │
-│  - 注入 SkillContext                                        │
+│  - 注入 WorkflowContext                                     │
 └─────────────────────────┬───────────────────────────────────┘
                           │
     ┌─────────────────────┴─────────────────────┐
     ▼                                           ▼
 ┌──────────────┐                        ┌──────────────┐
-│    Tool      │                        │    Skill     │
+│    Tool      │                        │   Workflow   │
 │  (基础能力)   │                        │ (解决方案)    │
 └──────────────┘                        └──────────────┘
 ```
 
-### BaseSkill 抽象类
+### BaseWorkflow 抽象类
 
 ```python
-from tools.core.tool_system import BaseSkill, SkillDefinition, SkillContext
+from tools.core.tool_system import BaseWorkflow, WorkflowDefinition, WorkflowContext
 
-class MySkill(BaseSkill):
+class MyWorkflow(BaseWorkflow):
     @property
-    def definition(self) -> SkillDefinition:
-        return SkillDefinition(
-            name="my_skill",
-            description="我的自定义技能",
+    def definition(self) -> WorkflowDefinition:
+        return WorkflowDefinition(
+            name="my_workflow",
+            description="我的自定义工作流",
             problem_type="my_problem_type",
             required_tools=["tool1", "tool2"]
         )
 
-    def solve(self, problem: Dict[str, Any], context: SkillContext) -> Dict[str, Any]:
+    def solve(self, problem: Dict[str, Any], context: WorkflowContext) -> Dict[str, Any]:
         # 实现分析逻辑
         pass
 ```
 
-### SkillContext 上下文
+### WorkflowContext 上下文
 
-SkillContext 提供了 Skill 执行过程中需要的能力：
+WorkflowContext 提供了 Workflow 执行过程中需要的能力：
 
 - **context.llm** - LLM 适配器（用于 AI 分析）
 - **context.tools** - 工具注册表（调用底层工具）
@@ -97,13 +97,13 @@ def solve(self, problem, context):
 用户请求
     │
     ▼
-ConfigDrivenExecutor.execute_skill("crash_analysis", problem)
+ConfigDrivenExecutor.execute_workflow("crash_analysis", problem)
     │
-    ├─ 根据配置选择 Skill 实现
+    ├─ 根据配置选择 Workflow 实现
     │
-    ├─ 创建 SkillContext (注入 LLM 适配器)
+    ├─ 创建 WorkflowContext (注入 LLM 适配器)
     │
-    ├─ 调用 Skill.solve()
+    ├─ 调用 Workflow.solve()
     │   │
     │   ├─ 调用 Tool: crash_log_parser
     │   ├─ 调用 Tool: add2line_resolver
@@ -120,13 +120,13 @@ ConfigDrivenExecutor.execute_skill("crash_analysis", problem)
 ```python
 from tools.core.tool_system import Priority
 
-# 注册自定义 Skill
+# 注册自定义 Workflow
 registry.register(
-    "my_skill",
-    MySkill(),
+    "my_workflow",
+    MyWorkflow(),
     priority=Priority.CUSTOM,  # 更高的优先级
     force_override=True,        # 强制覆盖内置
-    is_tool=False              # 这是 Skill
+    is_tool=False              # 这是 Workflow
 )
 ```
 
@@ -135,23 +135,23 @@ registry.register(
 - `Priority.EXTENSION` (200) - 扩展实现
 - `Priority.CUSTOM` (300) - 自定义实现（最高）
 
-## 内置 Skill
+## 内置 Workflow
 
-| Skill 名称 | 问题类型 | 平台 | 版本 |
-|-----------|---------|------|------|
+| Workflow 名称 | 问题类型 | 平台 | 版本 |
+|-------------|---------|------|------|
 | `ios_crash_analyze` | iOS 崩溃 | iOS | 1.0.0 |
 | `android_crash_analyze` | Android 崩溃 | Android | 1.0.0 |
 | `crash_analysis` | 通用崩溃 | 自动检测 | 1.0.0 |
 
-### iOS Crash Analyze Skill
+### iOS Crash Analyze Workflow
 
 解析 iOS 崩溃日志，提取 SIGSEGV/SIGABRT 等信号，使用 atos 符号化地址，提取 Objective-C/Swift 源代码上下文。
 
-### Android Crash Analyze Skill
+### Android Crash Analyze Workflow
 
 解析 Android 崩溃日志，提取 Java 异常/Native 崩溃，使用 addr2line/llvm-addr2line 符号化，提取 Java/Kotlin/C++ 源代码上下文。
 
-### Generic Crash Analysis Skill
+### Generic Crash Analysis Workflow
 
 自动检测崩溃日志的平台类型：
 - **iOS** - 包含 `SIGSEGV`, `SIGABRT`, `Swift` 等关键词
@@ -161,7 +161,7 @@ registry.register(
 ### 使用示例
 
 ```python
-result = executor.execute_skill("crash_analysis", {
+result = executor.execute_workflow("crash_analysis", {
     "crash_log": "...",      # 崩溃日志内容
     "library_dir": "...",     # .dylib/.so 目录
     "code_root": "...",      # 源代码目录
@@ -174,7 +174,7 @@ result = executor.execute_skill("crash_analysis", {
 {
   "status": "success",
   "platform": "ios",
-  "skill": "ios_crash_analyze",
+  "workflow": "ios_crash_analyze",
   "parse_result": { ... },
   "resolved_stack": { ... },
   "code_context": { ... },
@@ -184,29 +184,29 @@ result = executor.execute_skill("crash_analysis", {
 
 ## 扩展指南
 
-### 创建自定义 Skill
+### 创建自定义 Workflow
 
-#### 步骤 1：继承 BaseSkill
+#### 步骤 1：继承 BaseWorkflow
 
 ```python
 from tools.core.tool_system import (
-    BaseSkill,
-    SkillDefinition,
-    SkillContext
+    BaseWorkflow,
+    WorkflowDefinition,
+    WorkflowContext
 )
 
-class MyCustomSkill(BaseSkill):
+class MyCustomWorkflow(BaseWorkflow):
     @property
-    def definition(self) -> SkillDefinition:
-        return SkillDefinition(
-            name="my_custom_skill",
-            description="我的自定义技能描述",
+    def definition(self) -> WorkflowDefinition:
+        return WorkflowDefinition(
+            name="my_custom_workflow",
+            description="我的自定义工作流描述",
             problem_type="my_problem_type",
             required_tools=["tool1", "tool2"],
             version="1.0.0"
         )
 
-    def solve(self, problem: Dict[str, Any], context: SkillContext) -> Dict[str, Any]:
+    def solve(self, problem: Dict[str, Any], context: WorkflowContext) -> Dict[str, Any]:
         # 1. 获取输入
         crash_log = problem.get("crash_log", "")
 
@@ -227,27 +227,27 @@ class MyCustomSkill(BaseSkill):
         }
 ```
 
-#### 步骤 2：注册 Skill
+#### 步骤 2：注册 Workflow
 
 **方式 1：使用装饰器**
 
 ```python
-from tools.core.tool_system import register_skill, Priority
+from tools.core.tool_system import register_workflow, Priority
 
-@register_skill(priority=Priority.CUSTOM, force_override=False)
-class MyCustomSkill(BaseSkill):
+@register_workflow(priority=Priority.CUSTOM, force_override=False)
+class MyCustomWorkflow(BaseWorkflow):
     # ...
 ```
 
 **方式 2：手动注册**
 
 ```python
-from tools.core.tool_system import ToolAndSkillRegistry, Priority
+from tools.core.tool_system import ToolAndWorkflowRegistry, Priority
 
-registry = ToolAndSkillRegistry()
+registry = ToolAndWorkflowRegistry()
 registry.register(
-    "my_custom_skill",
-    MyCustomSkill(),
+    "my_custom_workflow",
+    MyCustomWorkflow(),
     priority=Priority.CUSTOM,
     force_override=False,
     is_tool=False
@@ -258,11 +258,11 @@ registry.register(
 
 ```json
 {
-  "skills": [
+  "workflows": [
     {
       "name": "crash_analysis",
       "enabled": true,
-      "implementation": "MyCustomSkill"
+      "implementation": "MyCustomWorkflow"
     }
   ]
 }
@@ -273,36 +273,36 @@ registry.register(
 ```python
 from tools.core.tool_system import (
     ConfigDrivenExecutor,
-    SystemConfig, SkillConfig,
-    register_all_tools_and_skills
+    SystemConfig, WorkflowConfig,
+    register_all_tools_and_workflows
 )
 
 # 注册所有内置 + 自定义
-registry = ToolAndSkillRegistry()
-register_all_tools_and_skills(registry)
-registry.register("my_custom_skill", MyCustomSkill(), priority=Priority.CUSTOM)
+registry = ToolAndWorkflowRegistry()
+register_all_tools_and_workflows(registry)
+registry.register("my_custom_workflow", MyCustomWorkflow(), priority=Priority.CUSTOM)
 
 # 创建配置
 config = SystemConfig(
-    skills=[SkillConfig(name="my_custom_skill", enabled=True)]
+    workflows=[WorkflowConfig(name="my_custom_workflow", enabled=True)]
 )
 
 # 执行
 executor = ConfigDrivenExecutor(registry, config)
-result = executor.execute_skill("my_custom_skill", {
+result = executor.execute_workflow("my_custom_workflow", {
     "crash_log": "..."
 })
 ```
 
-### 覆盖内置 Skill
+### 覆盖内置 Workflow
 
-如果想替换内置的 Skill，使用 `force_override=True`：
+如果想替换内置的 Workflow，使用 `force_override=True`：
 
 ```python
-class MyCustomCrashAnalysis(BaseSkill):
+class MyCustomCrashAnalysis(BaseWorkflow):
     @property
     def definition(self):
-        return SkillDefinition(
+        return WorkflowDefinition(
             name="crash_analysis",
             description="自定义崩溃分析",
             problem_type="crash_analysis",
@@ -325,11 +325,11 @@ registry.register(
 
 ```json
 {
-  "skills": [
+  "workflows": [
     {
       "name": "crash_analysis",
       "enabled": true,
-      "implementation": "MyCustomSkill",
+      "implementation": "MyCustomWorkflow",
       "params": {}
     }
   ]
@@ -340,24 +340,24 @@ registry.register(
 
 ```python
 from tools.core.tool_system import (
-    ToolAndSkillRegistry,
-    SystemConfig, SkillConfig,
+    ToolAndWorkflowRegistry,
+    SystemConfig, WorkflowConfig,
     ConfigDrivenExecutor,
-    register_all_tools_and_skills,
+    register_all_tools_and_workflows,
 )
 
 # 创建注册表
-registry = ToolAndSkillRegistry()
-register_all_tools_and_skills(registry)
+registry = ToolAndWorkflowRegistry()
+register_all_tools_and_workflows(registry)
 
 # 创建配置
 config = SystemConfig(
-    skills=[SkillConfig(name="crash_analysis", enabled=True)]
+    workflows=[WorkflowConfig(name="crash_analysis", enabled=True)]
 )
 
 # 执行分析
 executor = ConfigDrivenExecutor(registry, config, llm_adapter=None)
-result = executor.execute_skill("crash_analysis", {
+result = executor.execute_workflow("crash_analysis", {
     "crash_log": "...",
     "library_dir": "...",
     "code_root": "..."
@@ -366,7 +366,7 @@ result = executor.execute_skill("crash_analysis", {
 
 ## 扩展点
 
-1. **新增 Skill** - 创建新的问题类型解决方案
+1. **新增 Workflow** - 创建新的问题类型解决方案
 2. **替换 Tool** - 用自定义实现替换内置工具
-3. **替换 Skill** - 用自定义实现替换内置技能
+3. **替换 Workflow** - 用自定义实现替换内置工作流
 4. **自定义 LLM 适配器** - 支持新的 LLM 提供商

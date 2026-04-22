@@ -5,16 +5,16 @@ Tool System 核心模块
 """
 
 from .tool import BaseTool, ToolDefinition
-from .skill import BaseSkill, SkillDefinition, SkillContext
+from .workflow import BaseWorkflow, WorkflowDefinition, WorkflowContext
 from .registry import (
-    ToolAndSkillRegistry,
+    ToolAndWorkflowRegistry,
     Priority,
     get_registry,
     set_registry,
     register_tool,
-    register_skill
+    register_workflow
 )
-from .config import SystemConfig, ToolConfig, SkillConfig, LLMConfig, create_default_config
+from .config import SystemConfig, ToolConfig, WorkflowConfig, LLMConfig, create_default_config
 from .executor import ConfigDrivenExecutor, create_executor, create_executor_from_config_file
 from .llm.llm_adapter import (
     BaseLLMAdapter,
@@ -29,21 +29,21 @@ __all__ = [
     # Tool
     "BaseTool",
     "ToolDefinition",
-    # Skill
-    "BaseSkill",
-    "SkillDefinition",
-    "SkillContext",
+    # Workflow
+    "BaseWorkflow",
+    "WorkflowDefinition",
+    "WorkflowContext",
     # Registry
-    "ToolAndSkillRegistry",
+    "ToolAndWorkflowRegistry",
     "Priority",
     "get_registry",
     "set_registry",
     "register_tool",
-    "register_skill",
+    "register_workflow",
     # Config
     "SystemConfig",
     "ToolConfig",
-    "SkillConfig",
+    "WorkflowConfig",
     "LLMConfig",
     "create_default_config",
     # Executor
@@ -59,15 +59,15 @@ __all__ = [
     "LLMResponse",
 ]
 
-def register_all_tools_and_skills(registry=None):
-    """注册所有内置工具和技能（延迟导入避免循环依赖）。"""
+def register_all_tools_and_workflows(registry=None):
+    """注册所有内置工具和工作流（延迟导入避免循环依赖）。"""
     from tools import register_all_tools
-    from skills import register_all_skills
+    from workflows import register_all_workflows
 
     if registry is None:
         registry = get_registry()
     register_all_tools(registry)
-    register_all_skills(registry)
+    register_all_workflows(registry)
 
 # 自动注册内置
-# register_all_tools_and_skills()
+# register_all_tools_and_workflows()

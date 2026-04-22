@@ -33,7 +33,7 @@
 | **日志解析** | 看到原始文本，噪音高 | 结构化解析，提取信号类型、线程、关键帧；自动分类 Crash / ANR / OOM / Freeze |
 | **知识沉淀** | 无状态，每次从零开始 | RAG：规则表 + 向量数据库，模式持续积累 |
 | **工作流** | 单次 prompt，一轮对话 | 多步 Agent，支持条件分支和多轮推理 |
-| **可扩展性** | 只能改 prompt | Tool + Skill 插件系统，配置驱动 |
+| **可扩展性** | 只能改 prompt | Tool + Workflow 插件系统，配置驱动 |
 
 ### Agent 引擎
 
@@ -58,7 +58,7 @@
 | **结构化日志解析** | 自动识别 iOS / Android / macOS / Linux / Windows，分类 Crash、ANR、OOM、Freeze，提取信号、线程、关键帧 |
 | **源码上下文提取** | 自动提取崩溃点附近的代码片段 |
 | **RAG 知识库** | 规则表（快速路径）+ 向量检索（ChromaDB），支持反馈闭环 |
-| **Tool + Skill 系统** | 可插拔架构 — 通过配置或装饰器注册自定义工具和技能 |
+| **Tool + Workflow 系统** | 可插拔架构 — 通过配置或装饰器注册自定义工具和工作流 |
 | **多种接入方式** | CLI、HTTP Daemon（流式 / SSE）、Python API |
 
 ## 架构
@@ -72,7 +72,7 @@
                        └──────────────┼──────────────┘
                                       │
                             ┌─────────▼─────────┐
-                            │   Tool + Skill    │
+                            │   Tool + Workflow │
                             │   (tool_system)   │
                             └─────────┬─────────┘
                                       │
@@ -242,19 +242,19 @@ sa-agent --daemon http://127.0.0.1:8765 \
 
 ```python
 from tool_system import (
-    ToolAndSkillRegistry, SystemConfig, SkillConfig,
-    ConfigDrivenExecutor, register_all_tools_and_skills
+    ToolAndWorkflowRegistry, SystemConfig, WorkflowConfig,
+    ConfigDrivenExecutor, register_all_tools_and_workflows
 )
 
-registry = ToolAndSkillRegistry()
-register_all_tools_and_skills(registry)
+registry = ToolAndWorkflowRegistry()
+register_all_tools_and_workflows(registry)
 
 config = SystemConfig(
-    skills=[SkillConfig(name="crash_analysis", enabled=True)]
+    workflows=[WorkflowConfig(name="crash_analysis", enabled=True)]
 )
 executor = ConfigDrivenExecutor(registry, config, llm_adapter=None)
 
-result = executor.execute_skill("crash_analysis", {
+result = executor.execute_workflow("crash_analysis", {
     "crash_log": open("crash.crash").read(),
     "library_dir": "./lib",
     "code_root": "./code"
@@ -303,8 +303,8 @@ stability-analysis-agent/
 ├── daemon/             # HTTP Daemon（流式、SSE）
 ├── tools/              # 工具实现（解析器、符号化、代码提取）
 │   └── configs/        # 配置模板
-├── tool_system/        # Tool + Skill 注册与调度框架
-├── skills/             # Skill 定义（崩溃分析）
+├── tool_system/        # Tool + Workflow 注册与调度框架
+├── workflows/          # Workflow 定义（崩溃分析）
 ├── rag/                # RAG：规则存储 + 向量索引（ChromaDB）+ 元数据
 ├── prompts/            # LLM 分析提示词模板
 ├── protocol/           # 统一请求/响应协议
@@ -328,7 +328,7 @@ stability-analysis-agent/
 | 架构图 | [docs/architecture/ARCHITECTURE_DIAGRAM.md](./docs/architecture/ARCHITECTURE_DIAGRAM.md) |
 | Tool System 概览 | [docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md](./docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md) |
 | 工具扩展指南 | [docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md](./docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md) |
-| Skill 系统 | [docs/skills/SKILLS.md](./docs/skills/SKILLS.md) |
+| Workflow 系统 | [docs/workflows/WORKFLOWS.md](./docs/workflows/WORKFLOWS.md) |
 | RAG 向量数据库 | [docs/rag/README.md](./docs/rag/README.md) |
 | 崩溃示例 | [docs/crash_demos/README.md](./docs/crash_demos/README.md) |
 

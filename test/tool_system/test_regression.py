@@ -19,10 +19,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from stability_analyzer_agent.tool_system import (
-    ToolAndSkillRegistry,
-    SystemConfig, ToolConfig, SkillConfig,
+    ToolAndWorkflowRegistry,
+    SystemConfig, ToolConfig, WorkflowConfig,
     ConfigDrivenExecutor,
-    register_all_tools_and_skills,
+    register_all_tools_and_workflows,
 )
 
 
@@ -38,7 +38,7 @@ def analyze_crash(crash_log_path: str, library_dir: str, code_root: str, executo
         "code_roots": [code_root]
     }
 
-    result = executor.execute_skill("crash_analysis", problem)
+    result = executor.execute_workflow("crash_analysis", problem)
 
     if result.get('status') == 'success':
         parse_result = result.get('parse_result', {})
@@ -70,8 +70,8 @@ def main():
 
     print(f"📊 分析 {len(crash_logs)} 个 crash 日志\n")
 
-    registry = ToolAndSkillRegistry()
-    register_all_tools_and_skills(registry)
+    registry = ToolAndWorkflowRegistry()
+    register_all_tools_and_workflows(registry)
 
     config = SystemConfig(
         tools=[
@@ -79,7 +79,7 @@ def main():
             ToolConfig(name="add2line_resolver", enabled=True),
             ToolConfig(name="code_content_provider", enabled=True),
         ],
-        skills=[SkillConfig(name="crash_analysis", enabled=True)],
+        workflows=[WorkflowConfig(name="crash_analysis", enabled=True)],
         llm=None
     )
 

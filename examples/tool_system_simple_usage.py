@@ -7,11 +7,11 @@ Tool System 使用示例
 import os
 import json
 from stability_analyzer_agent.tool_system import (
-    ToolAndSkillRegistry,
-    SystemConfig, LLMConfig, ToolConfig, SkillConfig,
+    ToolAndWorkflowRegistry,
+    SystemConfig, LLMConfig, ToolConfig, WorkflowConfig,
     ConfigDrivenExecutor,
     DirectLLMAdapter,
-    register_all_tools_and_skills,
+    register_all_tools_and_workflows,
     Priority
 )
 
@@ -29,16 +29,16 @@ Thread 0 Crashed:
 
 
 def main():
-    # 1. 创建注册表并注册内置工具/技能
+    # 1. 创建注册表并注册内置工具/工作流
     print("=" * 50)
     print("Step 1: 创建注册表并注册内置")
     print("=" * 50)
 
-    registry = ToolAndSkillRegistry()
-    register_all_tools_and_skills(registry)
+    registry = ToolAndWorkflowRegistry()
+    register_all_tools_and_workflows(registry)
 
     print(f"已注册工具: {registry.list_all_tools()}")
-    print(f"已注册技能: {registry.list_all_skills()}")
+    print(f"已注册工作流: {registry.list_all_workflows()}")
 
     # 2. 创建配置
     print("\n" + "=" * 50)
@@ -54,9 +54,9 @@ def main():
             ToolConfig(name="add2line_resolver", enabled=True),
             ToolConfig(name="code_content_provider", enabled=True),
         ],
-        skills=[
-            SkillConfig(name="ios_crash_analyze", enabled=True),
-            SkillConfig(name="crash_analysis", enabled=True),
+        workflows=[
+            WorkflowConfig(name="ios_crash_analyze", enabled=True),
+            WorkflowConfig(name="crash_analysis", enabled=True),
         ],
         llm=LLMConfig(
             engine="direct",
@@ -89,7 +89,7 @@ def main():
     executor = ConfigDrivenExecutor(registry, config, llm_adapter)
     print(f"执行器创建成功")
     print(f"活跃工具: {executor.list_active()['tools']}")
-    print(f"活跃技能: {executor.list_active()['skills']}")
+    print(f"活跃工作流: {executor.list_active()['workflows']}")
 
     # 4. 执行工具示例
     print("\n" + "=" * 50)
@@ -105,7 +105,7 @@ def main():
     except Exception as e:
         print(f"crash_log_parser 执行失败: {e}")
 
-    # 5. 展示如何扩展自定义工具/技能
+    # 5. 展示如何扩展自定义工具/工作流
     print("\n" + "=" * 50)
     print("Step 5: 扩展示例")
     print("=" * 50)
@@ -153,7 +153,7 @@ def main():
             {"name": "crash_log_parser", "enabled": True},
             {"name": "add2line_resolver", "enabled": True},
         ],
-        "skills": [
+        "workflows": [
             {"name": "ios_crash_analyze", "enabled": True},
         ],
         "llm": {
