@@ -1,22 +1,21 @@
+<h1 align="center">Stability Analysis Agent</h1>
 <p align="center">
-  <h1 align="center">Stability Analysis Agent</h1>
-  <p align="center">
-    <strong>面向 App 稳定性的 AI Agent — 从崩溃日志到根因定位，一步到位</strong>
-  </p>
-  <p align="center">
-    <a href="https://pypi.org/project/stability-analysis-agent/"><img src="https://img.shields.io/pypi/v/stability-analysis-agent.svg" alt="PyPI"></a>
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
-    <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python"></a>
-    <a href="./CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
-  </p>
-  <p align="center">
-    <a href="./README.md">English</a> | <b>简体中文</b>
-  </p>
+  <strong>面向 App 稳定性的 AI Agent — 从崩溃日志到根因定位，一步到位</strong><br>
+  <sub>Crash · ANR · OOM · Freeze 分析 | addr2line / atos 符号化 | LangGraph AI Agent | RAG 知识库</sub>
+</p>
+<p align="center">
+  <a href="https://pypi.org/project/stability-analysis-agent/"><img src="https://img.shields.io/pypi/v/stability-analysis-agent.svg" alt="PyPI"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python"></a>
+  <a href="./CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
+</p>
+<p align="center">
+  <a href="./README.md">English</a> | <b>简体中文</b>
 </p>
 
 ---
 
-**Stability Analysis Agent** 是一个专为 **App 崩溃分析** 打造的 AI Agent。给它一份崩溃日志，它会自动完成**解析、符号化、代码提取、根因推理和修复建议生成**。
+**Stability Analysis Agent** 是一个开源的、专为 **App 稳定性分析** 打造的 AI Agent —— 覆盖**崩溃（Crash）、ANR（应用无响应）、OOM（内存溢出）、卡死（Freeze / Watchdog Kill）** 等常见稳定性问题。给它一份稳定性日志，它会自动完成**解析、符号化、代码提取、根因推理和修复建议生成**。支持 **iOS、Android、macOS、Linux、Windows**，内置 `addr2line` / `atos` 集成、LangGraph 多轮推理和 RAG 知识库（ChromaDB）。
 
 ### 为什么不直接把日志丢给 AI 编程工具？
 
@@ -24,14 +23,14 @@
 
 - **原始地址无法解析** — AI 工具无法调用 `addr2line` / `atos`，它看到的是 `0x1a2b3c` 而不是 `MyClass::process() at main.cpp:42`。
 - **日志噪音大** — 数百行系统栈帧淹没真正的关键信息，LLM 把 token 浪费在无关上下文上。
-- **没有领域记忆** — 每次对话从零开始，分析过的崩溃模式无法沉淀。
+- **没有领域记忆** — 每次对话从零开始，分析过的模式（崩溃签名、ANR 死锁堆栈、OOM 规律）无法沉淀。
 
 本 Agent 针对性地解决这三个问题：
 
 | | AI 编程工具 | Stability Analysis Agent |
 |---|---|---|
 | **地址符号化** | 无法调用原生工具 | 内置 `addr2line` / `atos` 集成 |
-| **日志解析** | 看到原始文本，噪音高 | 结构化解析，提取信号类型、线程、关键帧 |
+| **日志解析** | 看到原始文本，噪音高 | 结构化解析，提取信号类型、线程、关键帧；自动分类 Crash / ANR / OOM / Freeze |
 | **知识沉淀** | 无状态，每次从零开始 | RAG：规则表 + 向量数据库，模式持续积累 |
 | **工作流** | 单次 prompt，一轮对话 | 多步 Agent，支持条件分支和多轮推理 |
 | **可扩展性** | 只能改 prompt | Tool + Skill 插件系统，配置驱动 |
@@ -56,7 +55,7 @@
 |------|------|
 | **多步 AI Agent** | LangGraph / LangChain / Direct — 支持条件分支和多轮推理 |
 | **地址符号化** | 通过 `addr2line` / `atos` 将原始地址转换为函数名和行号 |
-| **结构化崩溃解析** | 自动识别 iOS / Android / macOS / Linux / Windows，提取信号、线程、关键帧 |
+| **结构化日志解析** | 自动识别 iOS / Android / macOS / Linux / Windows，分类 Crash、ANR、OOM、Freeze，提取信号、线程、关键帧 |
 | **源码上下文提取** | 自动提取崩溃点附近的代码片段 |
 | **RAG 知识库** | 规则表（快速路径）+ 向量检索（ChromaDB），支持反馈闭环 |
 | **Tool + Skill 系统** | 可插拔架构 — 通过配置或装饰器注册自定义工具和技能 |

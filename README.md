@@ -1,37 +1,36 @@
+<h1 align="center">Stability Analysis Agent</h1>
 <p align="center">
-  <h1 align="center">Stability Analysis Agent</h1>
-  <p align="center">
-    <strong>An AI Agent for App Stability — from crash log to root cause in one step</strong>
-  </p>
-  <p align="center">
-    <a href="https://pypi.org/project/stability-analysis-agent/"><img src="https://img.shields.io/pypi/v/stability-analysis-agent.svg" alt="PyPI"></a>
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
-    <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python"></a>
-    <a href="./CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
-  </p>
-  <p align="center">
-    <b>English</b> | <a href="./README.zh-CN.md">简体中文</a>
-  </p>
+  <strong>An AI Agent for App Stability — from crash log to root cause in one step</strong><br>
+  <sub>Crash · ANR · OOM · Freeze analysis | addr2line / atos symbolizer | LangGraph AI Agent | RAG knowledge base</sub>
+</p>
+<p align="center">
+  <a href="https://pypi.org/project/stability-analysis-agent/"><img src="https://img.shields.io/pypi/v/stability-analysis-agent.svg" alt="PyPI"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python"></a>
+  <a href="./CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
+</p>
+<p align="center">
+  <b>English</b> | <a href="./README.zh-CN.md">简体中文</a>
 </p>
 
 ---
 
-**Stability Analysis Agent** is an AI Agent purpose-built for **app crash analysis**. Feed it a crash log, and it will **parse, symbolize, extract code, reason about the root cause, and generate fix suggestions** — automatically.
+**Stability Analysis Agent** is an open-source AI Agent purpose-built for **app stability analysis** — covering **crashes, ANR (Application Not Responding), OOM (Out of Memory), freezes / watchdog kills**, and more. Feed it a stability log, and it will **parse, symbolize, extract code, reason about the root cause, and generate fix suggestions** — automatically. Supports **iOS, Android, macOS, Linux, and Windows** with built-in `addr2line` / `atos` integration, LangGraph multi-turn reasoning, and a RAG knowledge base (ChromaDB).
 
-### Why not just paste the crash log into an AI coding tool?
+### Why not just paste the log into an AI coding tool?
 
 General-purpose AI coding tools (Cursor, Copilot, Claude Code, etc.) can read a crash log, but they hit hard limits on stability analysis:
 
 - **Raw addresses are meaningless** — AI tools cannot run `addr2line` / `atos`; they see `0x1a2b3c` instead of `MyClass::process() at main.cpp:42`.
-- **Crash logs are noisy** — hundreds of system frames drown the real signal; without structured parsing, the LLM wastes tokens on irrelevant context.
-- **No domain memory** — every conversation starts from scratch; learned crash patterns are lost.
+- **Stability logs are noisy** — hundreds of system frames drown the real signal; without structured parsing, the LLM wastes tokens on irrelevant context.
+- **No domain memory** — every conversation starts from scratch; learned patterns (crash signatures, ANR deadlock traces, OOM heuristics) are lost.
 
 This Agent solves all three:
 
 | | AI Coding Tool | Stability Analysis Agent |
 |---|---|---|
 | **Address symbolization** | Cannot run native tools | Built-in `addr2line` / `atos` integration |
-| **Log parsing** | Sees raw text, high noise | Structured parser extracts signal, threads, key frames |
+| **Log parsing** | Sees raw text, high noise | Structured parser extracts signal, threads, key frames; classifies crash / ANR / OOM / freeze |
 | **Knowledge accumulation** | Stateless, starts from zero | RAG: rule table + vector DB, patterns improve over time |
 | **Workflow** | Single-prompt, one-shot | Multi-step Agent with conditional multi-turn reasoning |
 | **Extensibility** | Prompt-only | Tool + Skill plugin system, config-driven |
@@ -56,7 +55,7 @@ Select via `--engine direct|langchain|langgraph`. All modes share the same tool 
 |---------|-------------|
 | **Multi-Step AI Agent** | LangGraph / LangChain / Direct — multi-turn reasoning with conditional branching |
 | **Address Symbolization** | Resolves raw addresses to function names & line numbers via `addr2line` / `atos` |
-| **Structured Crash Parsing** | Auto-detects iOS / Android / macOS / Linux / Windows; extracts signal, threads, key frames |
+| **Structured Log Parsing** | Auto-detects iOS / Android / macOS / Linux / Windows; classifies crash, ANR, OOM, freeze; extracts signal, threads, key frames |
 | **Source Code Context** | Extracts code snippets around crash points |
 | **RAG Knowledge Base** | Rule table (fast path) + vector retrieval (ChromaDB) with feedback loop |
 | **Tool + Skill System** | Pluggable architecture — register custom tools and skills via config or decorators |

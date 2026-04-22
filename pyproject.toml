@@ -13,7 +13,7 @@ license = { text = "Apache-2.0" }
 authors = [
     { name = "liuhong_cd", email = "liuhong_cd@users.noreply.github.com" }
 ]
-keywords = ["crash", "analyzer", "agent"]
+keywords = ["crash-analysis", "crash-log", "ai-agent", "addr2line", "symbolication", "langgraph", "rag", "stability", "debugging", "root-cause-analysis"]
 classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
