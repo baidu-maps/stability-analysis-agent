@@ -611,6 +611,22 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _strip_outer_fence(text: Optional[str]) -> Optional[str]:
+    """去除模型返回最外层 markdown 围栏，保留内部代码块。"""
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s.startswith("```"):
+        return s
+    first_newline = s.find("\n")
+    if first_newline < 0:
+        return s
+    if not s.endswith("```"):
+        return s
+    inner = s[first_newline + 1 : -3].strip()
+    return inner
+
+
 def _build_report_dir(args: argparse.Namespace) -> Path:
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     mode = "analysis_skip_ai" if args.skip_ai else "analysis_ai"
@@ -624,6 +640,7 @@ def _write_cli_report(
     result: Dict[str, Any],
     rendered_output: str,
     applied_fix_result: Optional[Dict[str, Any]] = None,
+    write_readme_output: bool = True,
 ) -> Optional[Path]:
     try:
         report_dir.mkdir(parents=True, exist_ok=True)
@@ -633,13 +650,23 @@ def _write_cli_report(
             _write_json(report_dir / "02_add2line_resolver.json", result.get("resolved_stack"))
         if result.get("code_context") is not None:
             _write_json(report_dir / "03_code_content_provider.json", result.get("code_context"))
-        if result.get("analysis") is not None:
+        final_tip = result.get("final_tip")
+        if final_tip is None:
+            final_tip = result.get("analysis")
+        if final_tip is not None:
             round_dir = report_dir / "round_0"
             round_dir.mkdir(parents=True, exist_ok=True)
-            (round_dir / "05_ai_final_tip.txt").write_text(str(result.get("analysis")), encoding="utf-8")
+            (round_dir / "05_ai_final_tip.txt").write_text(str(final_tip), encoding="utf-8")
+        analysis_text = _strip_outer_fence(result.get("analysis"))
+        if analysis_text is not None:
+            round_dir = report_dir / "round_0"
+            round_dir.mkdir(parents=True, exist_ok=True)
+            (round_dir / "06_ai_res.txt").write_text(str(analysis_text), encoding="utf-8")
         if applied_fix_result is not None:
             _write_json(report_dir / "06_apply_ai_fixes.json", applied_fix_result)
-        (report_dir / "README_output.md").write_text(rendered_output, encoding="utf-8")
+        if write_readme_output:
+            final_output_text = analysis_text if analysis_text is not None else rendered_output
+            (report_dir / "final_output.md").write_text(str(final_output_text), encoding="utf-8")
         return report_dir
     except Exception as exc:
         print(f"警告: 写入 cli_reports 失败: {exc}", file=sys.stderr)
@@ -1010,6 +1037,32 @@ def main(argv: Optional[List[str]] = None) -> int:
                         f"- {frame.get('function', 'N/A')} ({frame.get('file', 'N/A')}:{frame.get('line', 'N/A')})"
                     )
                 lines.append("")
+            code_context = result.get("code_context", {}) or {}
+            crash_summary = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
+            graph = code_context.get("graph", {}) if isinstance(code_context, dict) else {}
+            if isinstance(crash_summary, dict) and isinstance(graph, dict):
+                has_loc = False
+                for frame in frames:
+                    if frame.get("file") not in (None, "", "N/A") and frame.get("line") not in (None, "", "N/A"):
+                        has_loc = True
+                        break
+                if not has_loc:
+                    node_id = crash_summary.get("node_id")
+                    node_map = {
+                        n.get("id"): n
+                        for n in (graph.get("nodes", []) if isinstance(graph.get("nodes", []), list) else [])
+                        if isinstance(n, dict) and isinstance(n.get("id"), str)
+                    }
+                    node = node_map.get(node_id) if isinstance(node_id, str) else None
+                    if node is None and isinstance(node_id, str):
+                        node = node_map.get(node_id.rstrip().rstrip("{").rstrip())
+                    if isinstance(node, dict):
+                        lines.append("## 崩溃点源码定位（回退）")
+                        lines.append(
+                            f"- {node.get('signature', 'N/A')} "
+                            f"({node.get('file', 'N/A')}:{crash_summary.get('crash_line_number', 'N/A')})"
+                        )
+                        lines.append("")
             if result.get("analysis"):
                 lines.append("## AI 分析")
                 lines.append(str(result.get("analysis")))
@@ -1026,7 +1079,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             output = f"# 错误\n\n{result.get('error')}"
 
-    report_dir = _write_cli_report(report_dir, result, output, applied_fix_result)
+    report_dir = _write_cli_report(
+        report_dir,
+        result,
+        output,
+        applied_fix_result,
+        write_readme_output=not args.skip_ai,
+    )
 
     if args.output_file:
         Path(args.output_file).write_text(output, encoding="utf-8")

@@ -70,7 +70,7 @@ LLM 密钥与默认厂商/模型来自 **`tools/configs/agent_config.json`**；�
 | 行为 | 说明 |
 |------|------|
 | 终端 / `--output-file` | 与 `--output-format` 一致，为面向阅读的摘要（markdown/json/text）。 |
-| `cli_reports/.../` | 每次分析成功后会尽量写入：`01_crash_log_parser.json`、`02_add2line_resolver.json`、`03_code_content_provider.json`、（若有 AI）`round_0/05_ai_final_tip.txt`、（若执行了改码逻辑）`06_apply_ai_fixes.json`，以及 `README_output.md`（与终端摘要一致）。 |
+| `cli_reports/.../` | 每次分析成功后会尽量写入：`01_crash_log_parser.json`、`02_add2line_resolver.json`、`03_code_content_provider.json`、`round_0/05_ai_final_tip.txt`、（AI 模式）`round_0/06_ai_res.txt`、（若执行了改码逻辑）`06_apply_ai_fixes.json`。`final_output.md` 仅在 **AI 模式**（未使用 `--skip-ai`）下生成，且内容与 `round_0/06_ai_res.txt` 保持一致（均为模型原始返回）。 |
 
 ---
 

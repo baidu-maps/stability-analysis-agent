@@ -157,9 +157,9 @@ sa-agent config doctor
 从 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases) 下载最新二进制后执行：
 
 ```bash
-# 以 v1.1.0 macOS arm64 包为例
-unzip StabilityAnalyzer-v1.1.0-mac-arm64.zip
-cd output/cli_release/stability_analyzer_cli/v1.1.0-mac-arm64
+# 以 v1.1.2 macOS arm64 包为例
+unzip StabilityAnalyzer-v1.1.2-mac-arm64.zip
+cd output/cli_release/stability_analyzer_cli/v1.1.2-mac-arm64
 
 chmod +x StabilityAnalyzer
 

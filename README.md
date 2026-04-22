@@ -157,9 +157,9 @@ sa-agent config doctor
 Download the latest binary from [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases), then run:
 
 ```bash
-# Example for v1.1.0 macOS arm64 package
-unzip StabilityAnalyzer-v1.1.0-mac-arm64.zip
-cd output/cli_release/stability_analyzer_cli/v1.1.0-mac-arm64
+# Example for v1.1.2 macOS arm64 package
+unzip StabilityAnalyzer-v1.1.2-mac-arm64.zip
+cd output/cli_release/stability_analyzer_cli/v1.1.2-mac-arm64
 
 chmod +x StabilityAnalyzer
 

@@ -59,11 +59,11 @@ bash scripts/pypi_release/publish_pypi.sh --test
 ```bash
 python3 -m venv .venv_testpypi_verify
 source .venv_testpypi_verify/bin/activate
-pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple stability-analysis-agent==1.1.0
+pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple stability-analysis-agent==1.1.2
 sa-agent --help
 ```
 
-Use the release version you just published (for example `1.1.0`) instead of hardcoding old versions.
+Use the release version you just published (for example `1.1.2`) instead of hardcoding old versions.
 
 ### 4) Basic Runtime Verification (Post Install)
 
