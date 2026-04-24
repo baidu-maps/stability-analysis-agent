@@ -12,7 +12,7 @@ Stability Analysis Agent is an AI-driven crash log analysis toolchain with a mul
 
 **Important**:
 - **Stability Analysis Agent** (open source): flat package layout, all core modules (`agent/`, `tools/`, `rag/`, `cli/`, `daemon/`, etc.) are top-level directories.
-- **Map SDK Crash Agent** (closed, enterprise-specific): sibling repo `../map-sdk-crash-agent/` — installs this package via `pip install -e .` and adds private configs/crash cases. Not part of this repo.
+- **Stability Analysis Agent** (closed, enterprise-specific): sibling repo `../stability-analysis-agent/` — installs this package via `pip install -e .` and adds private configs/crash cases. Not part of this repo.
 
 ## Common Commands
 

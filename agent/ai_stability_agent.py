@@ -1549,7 +1549,7 @@ class FullStabilityAnalyzer:
                 if not authorization:
                     raise RuntimeError(
                         "缺少千帆鉴权：请设置环境变量 BAIDU_QIANFAN_AUTHORIZATION（形如 Bearer xxx），"
-                        "或在 tools/configs/agent_config.json 中配置 llm_config.providers.baidu_qianfan.authorization"
+                        "或在 tools/configs/agent_config.local.json 中配置 llm_config.providers.baidu_qianfan.authorization"
                     )
                 if not str(authorization).startswith("Bearer "):
                     authorization = f"Bearer {authorization}"

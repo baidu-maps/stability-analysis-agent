@@ -226,22 +226,26 @@ class Add2lineResolver:
                     root / "configs" / self.config_file,
                 ])
         else:
-            # 默认配置文件位置，支持 .local.json 覆盖默认配置
-            base_name = "add2line_resolver_config.json"
+            # 默认配置文件位置：仅使用 .local.json，避免 base/local 双配置造成混淆
             local_name = "add2line_resolver_config.local.json"
             root = Path(__file__).resolve().parents[1]
             home = Path.home()
+            cwd_configs = Path.cwd().resolve() / "configs"
 
-            # 项目配置目录（local 优先）
+            # 运行目录配置：
+            # 发布产物拷贝后应优先读取同目录下 configs/
             config_candidates.extend([
-                root / "tools" / "configs" / local_name,
-                root / "tools" / "configs" / base_name,
+                cwd_configs / local_name,
             ])
 
-            # 用户目录（local 优先）
+            # 项目配置目录
+            config_candidates.extend([
+                root / "tools" / "configs" / local_name,
+            ])
+
+            # 用户目录
             config_candidates.extend([
                 home / ".config" / "stability-analysis-agent" / local_name,
-                home / ".config" / "stability-analysis-agent" / base_name,
             ])
         
         # 尝试加载配置文件（按候选顺序，先找到先用）
@@ -2730,7 +2734,7 @@ def add2line_resolver(
             }
             如果提供，将优先使用这些路径
         config_file (Optional[str]): 可选的配置文件路径，如果不提供，将尝试从默认位置读取
-            配置文件格式见 tools/configs/add2line_resolver_config.json
+            配置文件格式见 tools/configs/add2line_resolver_config.local.example.json
         max_frames (Optional[int]): 最大处理的堆栈帧数量，None 表示不限制（用于过滤噪音信息）
         quick_mode (bool): 快速模式（跳过慢速兜底策略，优先吞吐）
         

@@ -1,6 +1,6 @@
 # 参与贡献（Contributing）
 
-感谢你对 **Stability Analysis Agent** 的关注。对外开源的代码与文档以 **`stability_analyzer_agent/`** 为主；**`map_sdk_crash_agent/`** 为暂定名 **Map Sdk Crash Agent** 的闭源工作区，其贡献策略以你所在组织为准。参与前请先阅读本文，尤其是 **DCO** 与 **许可证** 部分。
+感谢你对 **Stability Analysis Agent** 的关注。参与前请先阅读本文，尤其是 **DCO** 与 **许可证** 部分。
 
 ## 许可证
 

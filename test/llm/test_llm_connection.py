@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 大模型连接测试脚本
-测试tools/configs/agent_config.json中配置的大模型是否能正常连接和使用
+测试tools/configs/agent_config.local.json中配置的大模型是否能正常连接和使用
 """
 
 import json
@@ -31,9 +31,8 @@ DEFAULT_TEST_RESULT_TEMPLATE: Dict[str, Any] = {
 
 def load_agent_config() -> Dict[str, Any]:
     """加载AI Agent配置文件"""
-    base_path = tools_dir / "configs" / "agent_config.json"
     local_path = tools_dir / "configs" / "agent_config.local.json"
-    config_path = local_path if local_path.exists() else base_path
+    config_path = local_path
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
@@ -140,7 +139,7 @@ def get_qianfan_authorization(config: Dict[str, Any]) -> Optional[str]:
     获取百度千帆 authorization。
     优先级：
     1) 环境变量 BAIDU_QIANFAN_AUTHORIZATION
-    2) 配置文件 tools/configs/agent_config.json 的 llm_config.providers.baidu_qianfan.authorization
+    2) 配置文件 tools/configs/agent_config.local.json 的 llm_config.providers.baidu_qianfan.authorization
     """
     env_auth = os.getenv("BAIDU_QIANFAN_AUTHORIZATION")
     if env_auth:
@@ -153,7 +152,7 @@ def get_zhipu_authorization(config: Dict[str, Any]) -> Optional[str]:
     获取智谱 BigModel authorization。
     优先级：
     1) 环境变量 ZHIPU_API_KEY / BIGMODEL_API_KEY
-    2) 配置文件 tools/configs/agent_config.json 的 llm_config.providers.zhipu_bigmodel.api_key
+    2) 配置文件 tools/configs/agent_config.local.json 的 llm_config.providers.zhipu_bigmodel.api_key
     """
     env_key = os.getenv("ZHIPU_API_KEY") or os.getenv("BIGMODEL_API_KEY")
     if env_key:
@@ -294,7 +293,7 @@ def test_baidu_qianfan_model(config: Dict[str, Any], model_config: Dict[str, Any
         authorization = get_qianfan_authorization(config)
         
         if not authorization:
-            error_msg = "缺少百度智能云授权信息，请设置BAIDU_QIANFAN_AUTHORIZATION环境变量或在tools/configs/agent_config.json中配置llm_config.providers.baidu_qianfan.authorization"
+            error_msg = "缺少百度智能云授权信息，请设置BAIDU_QIANFAN_AUTHORIZATION环境变量或在tools/configs/agent_config.local.json中配置llm_config.providers.baidu_qianfan.authorization"
             print(f"   ❌ {error_msg}")
             save_test_response_to_config(
                 model_id=model_id or f"baidu_qianfan:{model_name}",

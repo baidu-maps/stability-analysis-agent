@@ -6,7 +6,9 @@
 
 import logging
 import json
-from typing import Any, Dict, List, Optional
+import os
+import re
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tool_system import BaseWorkflow, WorkflowDefinition, WorkflowContext, Priority, register_workflow
 from tool_system.registry import ToolAndWorkflowRegistry
@@ -111,6 +113,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         resolved=resolved,
                         code_context=code_context,
                         memory_context=memory_context,
+                        problem=problem,
                     )
                 return {
                     "status": "success",
@@ -142,6 +145,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 resolved=resolved,
                 code_context=code_context,
                 memory_context=memory_context,
+                problem=problem,
             )
             llm_response = context.call_llm(analysis_prompt)
 
@@ -289,6 +293,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         resolved: Dict[str, Any],
         code_context: Dict[str, Any],
         memory_context: str = "",
+        problem: Optional[Dict[str, Any]] = None,
     ) -> str:
         """构建 --skip-ai 的历史兼容提示词格式。"""
         crash_summary = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
@@ -347,9 +352,18 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             for idx, frame in enumerate(resolved_frames, 1):
                 if not isinstance(frame, dict):
                     continue
-                func = frame.get("function") or frame.get("raw_address") or "N/A"
-                file_path = frame.get("file")
-                line_no = frame.get("line")
+                # add2line 通常将结果写入 resolved_* 字段，这里需要优先读取，避免误显示为 N/A
+                func = (
+                    frame.get("resolved_function")
+                    or frame.get("function")
+                    or frame.get("raw_address")
+                    or frame.get("address")
+                    or "N/A"
+                )
+                file_path = frame.get("resolved_file") or frame.get("file")
+                line_no = frame.get("resolved_line")
+                if line_no in (None, "", "None"):
+                    line_no = frame.get("line")
                 if file_path in (None, "", "None") or line_no in (None, "", "None"):
                     lines.append(f"- [第{idx}帧][源码函数] {func}")
                 else:
@@ -367,10 +381,25 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         lines.append("## 以上涉及的函数源码")
         lines.append("")
         shown_ids: List[str] = []
+        shown_signatures: Set[str] = set()
         source_ids: List[str] = []
+        # 覆盖所有调用路径节点，避免仅首路径导致函数源码不全
         if isinstance(call_paths, list) and call_paths:
-            first_path = call_paths[0] if isinstance(call_paths[0], dict) else {}
-            source_ids = [nid for nid in first_path.get("nodes", []) if isinstance(first_path.get("nodes", []), list)]
+            for path in call_paths:
+                if not isinstance(path, dict):
+                    continue
+                path_nodes = path.get("nodes", [])
+                if isinstance(path_nodes, list):
+                    source_ids.extend([nid for nid in path_nodes if isinstance(nid, str)])
+        # add2line 推断出的调用链节点也应纳入源码展示
+        call_paths_from_add2line = graph.get("call_chain_from_add2line", []) if isinstance(graph, dict) else []
+        if isinstance(call_paths_from_add2line, list):
+            for path in call_paths_from_add2line:
+                if not isinstance(path, dict):
+                    continue
+                path_nodes = path.get("nodes", [])
+                if isinstance(path_nodes, list):
+                    source_ids.extend([nid for nid in path_nodes if isinstance(nid, str)])
         if isinstance(node_id, str):
             source_ids.append(node_id)
         for nid in source_ids:
@@ -382,6 +411,9 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             if sid in shown_ids:
                 continue
             shown_ids.append(sid)
+            sig = str(node.get("signature") or "")
+            if sig:
+                shown_signatures.add(sig)
             lines.append("堆栈地址解析相关函数的代码片段:")
             lines.append(f"- 文件: {node.get('file', 'N/A')}:N/A")
             lines.append(f"- 函数: {node.get('signature', 'N/A')}")
@@ -392,6 +424,47 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             else:
                 lines.append("N/A")
             lines.append("")
+        # 对未提取到完整源码片段的堆栈函数，补充函数名，避免信息缺失
+        code_roots: List[str] = []
+        if isinstance(problem, dict):
+            prob_roots = problem.get("code_roots")
+            if isinstance(prob_roots, list):
+                code_roots.extend([str(p) for p in prob_roots if isinstance(p, str) and p.strip()])
+            prob_root = problem.get("code_root")
+            if isinstance(prob_root, str) and prob_root.strip():
+                code_roots.append(prob_root)
+        if isinstance(resolved_frames, list):
+            for frame in resolved_frames:
+                if not isinstance(frame, dict):
+                    continue
+                func = (
+                    frame.get("resolved_function")
+                    or frame.get("function")
+                    or frame.get("raw_address")
+                    or frame.get("address")
+                    or "N/A"
+                )
+                if not isinstance(func, str) or func in ("", "N/A") or func in shown_signatures:
+                    continue
+                file_path = frame.get("resolved_file") or frame.get("file") or "N/A"
+                line_no = frame.get("resolved_line")
+                if line_no in (None, "", "None"):
+                    line_no = frame.get("line")
+                if line_no in (None, "", "None"):
+                    line_no = "N/A"
+                snippet_lines = self._extract_function_snippet_from_resolved_frame(
+                    frame=frame,
+                    code_roots=code_roots,
+                )
+                lines.append("堆栈地址解析相关函数（未提取到完整源码片段）:")
+                lines.append(f"- 文件: {file_path}:{line_no}")
+                lines.append(f"- 函数: {func}")
+                lines.append("- 代码片段:")
+                if snippet_lines:
+                    lines.extend(snippet_lines)
+                else:
+                    lines.append("N/A")
+                lines.append("")
         lines.append("")
 
         lines.append("# 崩溃修复任务")
@@ -454,6 +527,123 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         lines.append("请基于以上信息，并严格遵循前文「崩溃修复任务」与「输出格式」中的要求，给出专业的崩溃分析，并提供可直接应用的修复代码。")
 
         return "\n".join(lines)
+
+    def _extract_function_snippet_from_resolved_frame(
+        self,
+        frame: Dict[str, Any],
+        code_roots: List[str],
+    ) -> List[str]:
+        """基于 resolved_file + resolved_line 兜底回源提取函数片段。"""
+        resolved_file = frame.get("resolved_file")
+        resolved_line = frame.get("resolved_line")
+        if not isinstance(resolved_file, str) or not resolved_file.strip():
+            return []
+        try:
+            line_no = int(resolved_line)
+        except (TypeError, ValueError):
+            return []
+        if line_no <= 0:
+            return []
+
+        local_file = self._resolve_source_file_path(resolved_file, code_roots)
+        if not local_file or not os.path.exists(local_file):
+            return []
+
+        try:
+            with open(local_file, "r", encoding="utf-8", errors="ignore") as f:
+                file_lines = f.read().splitlines()
+        except Exception:
+            return []
+        if not file_lines or line_no > len(file_lines):
+            return []
+
+        start, end = self._find_enclosing_function_block(file_lines, line_no)
+        if start is None or end is None:
+            return []
+        snippet = file_lines[start:end + 1]
+        if not snippet:
+            return []
+        max_lines = 180
+        if len(snippet) > max_lines:
+            snippet = snippet[:max_lines]
+            snippet.append("... [truncated] ...")
+        return snippet
+
+    def _resolve_source_file_path(self, resolved_file: str, code_roots: List[str]) -> Optional[str]:
+        if os.path.exists(resolved_file):
+            return resolved_file
+        if not code_roots:
+            return None
+        normalized = resolved_file.replace("\\", "/")
+        markers = ["engine-dev/src/", "src/"]
+        suffixes: List[str] = []
+        for marker in markers:
+            idx = normalized.find(marker)
+            if idx >= 0:
+                suffixes.append(normalized[idx + len(marker):])
+        # 回退：取尾部路径，避免映射失败
+        parts = [p for p in normalized.split("/") if p]
+        if len(parts) >= 4:
+            suffixes.append("/".join(parts[-4:]))
+        if len(parts) >= 3:
+            suffixes.append("/".join(parts[-3:]))
+
+        for root in code_roots:
+            if not isinstance(root, str) or not root.strip():
+                continue
+            base = root.rstrip("/")
+            for suffix in suffixes:
+                candidate = os.path.join(base, suffix)
+                if os.path.exists(candidate):
+                    return candidate
+        return None
+
+    def _find_enclosing_function_block(self, file_lines: List[str], line_no: int) -> Tuple[Optional[int], Optional[int]]:
+        """按行号向上回溯函数起点，再按大括号配对提取函数体。"""
+        idx = max(0, min(len(file_lines) - 1, line_no - 1))
+        control_keywords = ("if", "for", "while", "switch", "catch")
+
+        for probe in range(idx, max(-1, idx - 240), -1):
+            line = file_lines[probe].strip()
+            if not line or "{" not in line:
+                continue
+
+            header_idx: Optional[int] = None
+            for h in range(probe, max(-1, probe - 8), -1):
+                h_line = file_lines[h].strip()
+                if "(" in h_line and ")" in h_line and ";" not in h_line:
+                    header_idx = h
+                    break
+            if header_idx is None:
+                continue
+
+            header_line = file_lines[header_idx].strip()
+            if not header_line or header_line.startswith("//"):
+                continue
+            # 防止将 if/for/while 等控制流误识别为函数头
+            header_token = header_line.split("(", 1)[0].strip().split()[-1].lower() if "(" in header_line else ""
+            if header_token in control_keywords:
+                continue
+
+            sig_parts = [file_lines[h].strip() for h in range(max(0, header_idx - 2), header_idx + 1)]
+            sig_text = " ".join([s for s in sig_parts if s]).strip()
+            lowered = sig_text.lower()
+            if any(lowered.startswith(k + " ") or lowered.startswith(k + "(") for k in control_keywords):
+                continue
+            if not re.search(r"[A-Za-z_~][\w:<>~\s\*&]*\([^;]*\)", sig_text):
+                continue
+
+            brace_balance = 0
+            saw_open = False
+            for end in range(probe, len(file_lines)):
+                text = file_lines[end]
+                brace_balance += text.count("{")
+                if text.count("{") > 0:
+                    saw_open = True
+                brace_balance -= text.count("}")
+                if saw_open and brace_balance == 0 and end >= probe:
+                    return header_idx, end
+        return None, None
 
     def _collect_memory_context(
         self,

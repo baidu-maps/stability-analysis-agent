@@ -184,9 +184,7 @@ fi
 # --------------------------------------------------------------------------- #
 CONFIG_SRC_DIR="$ROOT_DIR/tools/configs"
 for cfg in \
-  "agent_config.json" \
   "agent_config.local.example.json" \
-  "add2line_resolver_config.json" \
   "add2line_resolver_config.local.example.json"
 do
   if [[ -f "$CONFIG_SRC_DIR/$cfg" ]]; then

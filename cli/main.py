@@ -116,12 +116,13 @@ def _load_agent_config_file() -> dict:
         return {}
 
     bundled_config_dir = PROJECT_ROOT / "tools" / "configs"
+    cwd_config_dir = Path.cwd().resolve() / "configs"
     user_config_dir = _user_config_dir()
     candidates = [
+        # 仅使用 local 配置，避免 base/local 双配置造成混淆
+        cwd_config_dir / "agent_config.local.json",
         user_config_dir / "agent_config.local.json",
-        user_config_dir / "agent_config.json",
         bundled_config_dir / "agent_config.local.json",
-        bundled_config_dir / "agent_config.json",
     ]
     target = next((p for p in candidates if p.exists()), None)
     if target is None:
