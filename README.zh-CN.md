@@ -135,16 +135,20 @@ pip install stability-analysis-agent
 # 查看帮助
 sa-agent --help
 
-# 初始化本地配置（交互式引导配置大模型密钥、addr2line/atos 工具路径等）
-sa-agent config init
-
-# 自检配置完整性
-sa-agent config doctor
+# 一条命令进入交互引导（自动检测配置并引导设置）
+sa-agent
 ```
+
+> 当存在最近一次分析记录时，交互菜单会出现 `5) Analyze recent log again`，可一键复跑上次崩溃日志。
+> 交互体验参考 Claude 风格 CLI：支持上下键菜单选择、分组化“更多选项”、可返回路径和关键步骤确认面板，降低首次使用门槛。
 
 > 安装后的配置文件保存在 `~/.config/stability-analysis-agent/` 目录下：
 > - `agent_config.local.json`：大模型 provider / API key / model
 > - `add2line_resolver_config.local.json`：addr2line / atos 工具路径
+>
+> provider 配置模板见 `tools/configs/agent_config.local.example.json`。  
+> 除了填写 API Key/Authorization，还必须将 `llm_config.active_provider` 设置为你当前要使用的 provider 名称（如 `openai` / `deepseek` / `zhipu_bigmodel`）。
+> 当前默认按 OpenAI Chat Completions 兼容格式请求；若某 provider 非该格式，需要新增 adapter 后再启用（仅改配置不一定可用）。
 >
 > 即使不初始化配置，也可以通过 `--skip-ai` 运行完整非 AI 工具链。
 >
@@ -157,9 +161,9 @@ sa-agent config doctor
 从 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases) 下载最新二进制后执行：
 
 ```bash
-# 以 v1.1.2 macOS arm64 包为例
-unzip StabilityAnalyzer-v1.1.2-mac-arm64.zip
-cd output/cli_release/stability_analyzer_cli/v1.1.2-mac-arm64
+# 以 v1.2.1 macOS arm64 包为例
+unzip StabilityAnalyzer-v1.2.1-mac-arm64.zip
+cd output/cli_release/stability_analyzer_cli/v1.2.1-mac-arm64
 
 chmod +x StabilityAnalyzer
 
@@ -266,12 +270,10 @@ print(result)
 
 AI 分析为**可选功能**。即使不初始化配置，也可以通过 `--skip-ai` 运行完整非 AI 工具链。
 
-通过 PyPI 安装后，推荐使用以下命令配置与自检：
+通过 PyPI 安装后，推荐直接运行：
 
 ```bash
-sa-agent config init
-sa-agent config path
-sa-agent config doctor
+sa-agent
 ```
 
 默认本地配置目录：
@@ -283,14 +285,13 @@ sa-agent config doctor
 - `agent_config.local.json`：配置大模型 provider/key/model
 - `add2line_resolver_config.local.json`：配置 addr2line/atos 工具路径
 
-若在 `config init` 中选择手动编辑，直接编辑以上文件即可。
+若你偏好手动编辑，也可直接修改以上配置文件。
 
-### 高级：环境变量覆盖
+### 高级：add2line 配置路径覆盖
 
-可通过环境变量显式指定配置文件路径：
+可通过环境变量显式指定 add2line 配置文件路径：
 
 ```bash
-export STABILITY_AGENT_CONFIG_FILE="/绝对路径/agent_config.local.json"
 export STABILITY_AGENT_ADD2LINE_CONFIG_FILE="/绝对路径/add2line_resolver_config.local.json"
 ```
 

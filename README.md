@@ -135,16 +135,20 @@ pip install stability-analysis-agent
 # Verify installation
 sa-agent --help
 
-# Initialize local config (interactive wizard for LLM keys, addr2line/atos paths, etc.)
-sa-agent config init
-
-# Check config completeness
-sa-agent config doctor
+# One command onboarding (auto-check + guided setup + analysis)
+sa-agent
 ```
+
+> When a previous analysis record exists, the interactive menu shows `5) Analyze recent log again` for one-click rerun.
+> The onboarding interaction is inspired by Claude-style CLI UX: arrow-key menus, grouped "More options", clear back actions, and post-action confirmation panels.
 
 > Config files are saved in `~/.config/stability-analysis-agent/`:
 > - `agent_config.local.json` — LLM provider / API key / model
 > - `add2line_resolver_config.local.json` — addr2line / atos tool paths
+>
+> Provider template is available at `tools/configs/agent_config.local.example.json`.  
+> Besides setting API keys/authorization, you must set `llm_config.active_provider` to the provider key you want to use (for example `openai`, `deepseek`, or `zhipu_bigmodel`).
+> AI requests currently use OpenAI Chat Completions compatible format by default; for non-compatible providers, an adapter is required (config-only changes may not be sufficient).
 >
 > Even without config initialization, you can run the full non-AI toolchain with `--skip-ai`.
 >
@@ -157,9 +161,9 @@ sa-agent config doctor
 Download the latest binary from [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases), then run:
 
 ```bash
-# Example for v1.1.2 macOS arm64 package
-unzip StabilityAnalyzer-v1.1.2-mac-arm64.zip
-cd output/cli_release/stability_analyzer_cli/v1.1.2-mac-arm64
+# Example for v1.2.1 macOS arm64 package
+unzip StabilityAnalyzer-v1.2.1-mac-arm64.zip
+cd output/cli_release/stability_analyzer_cli/v1.2.1-mac-arm64
 
 chmod +x StabilityAnalyzer
 
@@ -266,12 +270,10 @@ print(result)
 
 AI analysis is **optional**. You can still run full non-AI toolchain with `--skip-ai` without any initialization.
 
-For AI analysis and add2line customization after PyPI install, use:
+For AI analysis and add2line customization after PyPI install, run:
 
 ```bash
-sa-agent config init
-sa-agent config path
-sa-agent config doctor
+sa-agent
 ```
 
 Default local config directory:
@@ -283,14 +285,13 @@ Default local config directory:
 - `agent_config.local.json` for LLM provider/key/model
 - `add2line_resolver_config.local.json` for addr2line/atos tool paths
 
-If you choose manual editing in `config init`, edit these files directly in that directory.
+If you prefer manual editing, edit these files directly in that directory.
 
-### Advanced: Environment overrides
+### Advanced: add2line config override
 
-You can still override config file locations via environment variables:
+You can override add2line config file location via environment variable:
 
 ```bash
-export STABILITY_AGENT_CONFIG_FILE="/abs/path/agent_config.local.json"
 export STABILITY_AGENT_ADD2LINE_CONFIG_FILE="/abs/path/add2line_resolver_config.local.json"
 ```
 

@@ -36,7 +36,7 @@ cd /path/to/stability-analysis-agent
 python3 test/llm/test_llm_connection.py
 ```
 
-脚本会自动读取 `agent_config.json` 中的 `default_provider` 和 `default_model`，测试对应的模型。
+脚本会自动读取 `agent_config.local.json` 中的 `active_provider` 和 `default_model`，测试对应的模型。
 
 #### 测试指定模型
 
@@ -105,6 +105,24 @@ python3 test/llm/test_llm_connection.py --all
 
 ## ⚙️ 配置说明
 
+### 协议与 request_format
+
+脚本已支持多种协议，按 `llm_config.providers.<provider>.request_format` 选择：
+
+- `openai_chat_completions_compatible`（默认）
+  - 典型 endpoint：`.../v1/chat/completions`
+  - 常用鉴权：`Authorization: Bearer <API_KEY>`
+- `anthropic_messages_compatible`
+  - 典型 endpoint：`.../v1/messages`
+  - 常用鉴权：`x-api-key: <API_KEY>`（配置 `auth_header: x-api-key`、`auth_prefix: ""`）
+- `openai_responses_compatible`
+  - 典型 endpoint：`.../v1/responses`
+  - 请求体为 `model + input`
+- `minimax_text_chatcompletion_v2_compatible`
+  - 以 Chat Completions 兼容结构发送，适用于部分 MiniMax 兼容路由
+
+注意：`base_url` 会按配置原值使用（仅去除末尾 `/`），请填写完整 endpoint，脚本不会自动补后缀路径。
+
 ### 1. API 密钥配置
 
 #### 智谱 BigModel
@@ -155,12 +173,12 @@ export BAIDU_QIANFAN_AUTHORIZATION="Bearer your-token-here"
 
 ### 2. 默认模型配置
 
-在 `tools/configs/agent_config.json` 中配置：
+在 `tools/configs/agent_config.local.json` 中配置：
 
 ```json
 {
     "llm_config": {
-        "default_provider": "zhipu_bigmodel",
+        "active_provider": "zhipu_bigmodel",
         "default_model": "glm-4.7"
     }
 }
@@ -224,10 +242,9 @@ QIANFAN_TEST_STRICT=1 python3 test/llm/test_llm_connection.py
 
 ### 环境变量控制
 
-- `QIANFAN_TEST_STRICT=1`：严格模式，将 429 限流视为失败
-- `QIANFAN_TEST_MAX_RETRIES=3`：429 限流时的最大重试次数（默认 3）
-- `QIANFAN_TEST_RETRY_SLEEP_SECONDS=2`：重试等待时间（秒，默认 2）
-- `QIANFAN_TEST_TIMEOUT_SECONDS=30`：请求超时时间（秒，默认 30）
+- `LLM_TEST_STRICT_429=1`：严格模式，将 429 限流视为失败
+- `LLM_TEST_MAX_RETRIES=3`：429 限流时的最大重试次数（默认 3）
+- `LLM_TEST_RETRY_SLEEP_SECONDS=2`：重试等待时间（秒，默认 2）
 
 ## 📝 示例
 

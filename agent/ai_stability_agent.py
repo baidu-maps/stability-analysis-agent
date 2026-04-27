@@ -176,7 +176,7 @@ class FullStabilityAnalyzer:
         self.find_source_timeout_sec = find_source_timeout_sec
         self.code_context_timeout_sec = code_context_timeout_sec
         self.llm_config = self.config.get('llm_config', {})
-        self.default_provider = self.llm_config.get('default_provider', 'baidu_qianfan')
+        self.active_provider = self.llm_config.get('active_provider', 'baidu_qianfan')
         self.default_model = self.llm_config.get('default_model', 'ernie-4.5-turbo-128k')
         workflow_config = self.config.get("workflow_config", {}) if isinstance(self.config, dict) else {}
         self.disable_vector_db_save = bool(workflow_config.get("disable_vector_db_save", False))
@@ -216,7 +216,7 @@ class FullStabilityAnalyzer:
         # 打印配置信息
         print(f"INFO: FullStabilityAnalyzer初始化完成", file=sys.stderr)
         print(f"INFO: 配置字典: {bool(self.config)}", file=sys.stderr)
-        print(f"INFO: 默认提供商: {self.default_provider}", file=sys.stderr)
+        print(f"INFO: 默认提供商: {self.active_provider}", file=sys.stderr)
         print(f"INFO: 默认模型: {self.default_model}", file=sys.stderr)
         print(f"INFO: LangGraph模式: {'启用' if self.graph else '禁用（使用传统模式）'}", file=sys.stderr)
         print(f"INFO: 向量数据库: {'启用' if self.vector_db_analyzer else '禁用'}", file=sys.stderr)
@@ -1508,10 +1508,17 @@ class FullStabilityAnalyzer:
             model_to_use = model or self.default_model
             print(f"INFO: 使用AI模型: {model_to_use}", file=sys.stderr)
             
-            # provider 选择（默认走 config.llm_config.default_provider）
-            provider = self.default_provider
-            providers = self.config.get("llm_config", {}).get("providers", {}) or {}
-            provider_cfg = providers.get(provider, {}) if isinstance(providers, dict) else {}
+            # provider 选择（默认走 config.llm_config.active_provider）
+            provider = self.active_provider
+            llm_cfg = self.config.get("llm_config", {}) if isinstance(self.config, dict) else {}
+            providers = llm_cfg.get("providers", {}) if isinstance(llm_cfg, dict) else {}
+            provider_defaults = llm_cfg.get("provider_defaults", {}) if isinstance(llm_cfg, dict) else {}
+            if not isinstance(provider_defaults, dict):
+                provider_defaults = {}
+            provider_cfg = (
+                {**provider_defaults, **(providers.get(provider, {}) or {})}
+                if isinstance(providers, dict) else {}
+            )
             cfg_models_any = provider_cfg.get("models", {}) if isinstance(provider_cfg, dict) else {}
 
             # 处理模型名称格式：provider:model -> model
@@ -1521,44 +1528,59 @@ class FullStabilityAnalyzer:
                 actual_model = model_to_use
             print(f"INFO: 实际模型名称: {actual_model}", file=sys.stderr)
 
-            # 统一 base_url（支持传入到根路径，自动补 /chat/completions）
+            # 直接使用配置中的 base_url，不自动拼接接口路径
             base_url = provider_cfg.get("base_url") or "https://api.openai.com/v1/chat/completions"
             if str(base_url).endswith("/"):
                 base_url = str(base_url)[:-1]
-            if not str(base_url).endswith("/chat/completions"):
-                base_url = f"{base_url}/chat/completions"
 
-            # 鉴权优先级：环境变量 > 配置文件（避免在仓库中硬编码 key/token）
+            # 鉴权优先级：环境变量 > 配置文件（provider 配置驱动，兼容历史逻辑）
+            auth_type = str(provider_cfg.get("auth_type") or "").strip().lower()
+            if not auth_type:
+                auth_type = "authorization" if (provider == "baidu_qianfan" or provider_cfg.get("authorization")) else "api_key"
+            auth_header = str(provider_cfg.get("auth_header") or "Authorization").strip() or "Authorization"
+            auth_prefix = provider_cfg.get("auth_prefix")
+            if auth_prefix is None:
+                auth_prefix = "Bearer "
+            auth_prefix = str(auth_prefix)
+
+            env_key_candidates = []
+            custom_env = provider_cfg.get("api_key_env")
+            if isinstance(custom_env, list):
+                env_key_candidates.extend([str(x).strip() for x in custom_env if str(x).strip()])
+            elif isinstance(custom_env, str) and custom_env.strip():
+                env_key_candidates.extend([x.strip() for x in custom_env.split(",") if x.strip()])
+
             if provider == "zhipu_bigmodel":
-                # 智谱 BigModel：Bearer API_KEY
-                # 配置已经通过 _load_effective_agent_config() 合并了 agent_config.local.json
-                # 所以直接使用 provider_cfg 中的 api_key 即可
-                config_key = provider_cfg.get("api_key") or ""
-                # 优先级：环境变量 > 配置文件中的key（已合并local配置）
-                authorization = os.getenv("ZHIPU_API_KEY") or os.getenv("BIGMODEL_API_KEY") or (config_key if config_key.strip() else None)
-                if not authorization:
-                    raise RuntimeError(
-                        "缺少智谱鉴权：请设置环境变量 ZHIPU_API_KEY（或 BIGMODEL_API_KEY），"
-                        "或在 tools/configs/agent_config.local.json 中配置 llm_config.providers.zhipu_bigmodel.api_key"
-                    )
-                if not str(authorization).startswith("Bearer "):
-                    authorization = f"Bearer {authorization}"
+                env_key_candidates.extend(["ZHIPU_API_KEY", "BIGMODEL_API_KEY"])
+            elif provider == "baidu_qianfan":
+                env_key_candidates.append("BAIDU_QIANFAN_AUTHORIZATION")
+            elif provider == "openai":
+                env_key_candidates.append("OPENAI_API_KEY")
             else:
-                # 百度千帆：Bearer IAM token（或兼容把 token 放到 authorization）
-                authorization = os.getenv("BAIDU_QIANFAN_AUTHORIZATION") or provider_cfg.get("authorization")
+                env_key_candidates.append(f"{provider.upper()}_API_KEY")
+
+            env_secret = next((os.getenv(k) for k in env_key_candidates if os.getenv(k)), None)
+            if auth_type == "authorization":
+                config_secret = provider_cfg.get("authorization")
+            elif auth_type == "none":
+                config_secret = ""
+            else:
+                config_secret = provider_cfg.get("api_key")
+            authorization = env_secret or config_secret
+
+            if auth_type != "none":
                 if not authorization:
                     raise RuntimeError(
-                        "缺少千帆鉴权：请设置环境变量 BAIDU_QIANFAN_AUTHORIZATION（形如 Bearer xxx），"
-                        "或在 tools/configs/agent_config.local.json 中配置 llm_config.providers.baidu_qianfan.authorization"
+                        f"缺少鉴权：请设置环境变量（建议 {', '.join(env_key_candidates[:3])}）"
+                        f"或在 tools/configs/agent_config.local.json 中配置 llm_config.providers.{provider}"
                     )
-                if not str(authorization).startswith("Bearer "):
-                    authorization = f"Bearer {authorization}"
-            
+                if auth_prefix and not str(authorization).startswith(auth_prefix):
+                    authorization = f"{auth_prefix}{authorization}"
+
             # 准备请求头
-            headers = {
-                "Authorization": authorization,
-                "Content-Type": "application/json"
-            }
+            headers = {"Content-Type": "application/json"}
+            if auth_type != "none":
+                headers[auth_header] = authorization
             
             # 动态调整参数以提高性能
             prompt_length = len(prompt_content)
@@ -1612,13 +1634,8 @@ class FullStabilityAnalyzer:
             do_sample = cfg_model_any.get("do_sample")
             top_p = cfg_model_any.get("top_p")
             
-            # 准备请求数据
-            data = {
-                "model": actual_model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": """你是崩溃修复专家。任务：基于实际源代码分析崩溃并提供可直接应用的修复代码。
+            request_format = str(provider_cfg.get("request_format") or "openai_chat_completions_compatible").strip().lower()
+            system_prompt = """你是崩溃修复专家。任务：基于实际源代码分析崩溃并提供可直接应用的修复代码。
 
 关键要求：
 - 基于提供的实际源代码进行分析
@@ -1641,36 +1658,72 @@ class FullStabilityAnalyzer:
 - crash_log_parser: 解析崩溃日志，提取堆栈帧和崩溃信息
 - add2line_resolver: 解析堆栈地址，将PC地址转换为文件:行号
 - code_content_provider: 提取相关源代码上下文
-- log_filter: 过滤和提取特定日志信息"""
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt_content
-                    }
-                ],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "stream": use_streaming,
-            }
+ - log_filter: 过滤和提取特定日志信息"""
 
-            # 不同 provider 的参数兼容：千帆支持 enable_thinking；智谱 BigModel 端不保证该字段可用
-            if provider == "baidu_qianfan":
-                data["enable_thinking"] = enable_thinking
+            # 常见协议支持：
+            # 1) openai_chat_completions_compatible（默认）
+            # 2) anthropic_messages_compatible
+            # 3) openai_responses_compatible（OpenAI Responses API）
+            # 4) minimax_text_chatcompletion_v2_compatible（MiniMax 标准文本接口，结构与 chat-completions 接近）
+            if request_format == "anthropic_messages_compatible":
+                # Anthropic Messages 不复用 OpenAI 流式解析器，先固定非流式
+                use_streaming = False
+                headers.setdefault("anthropic-version", str(provider_cfg.get("anthropic_version") or "2023-06-01"))
+                data = {
+                    "model": actual_model,
+                    "system": system_prompt,
+                    "messages": [{"role": "user", "content": prompt_content}],
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                }
                 if top_p is not None:
                     data["top_p"] = top_p
-            if provider == "zhipu_bigmodel":
-                # 按智谱文档透传参数
-                if do_sample is not None:
-                    data["do_sample"] = bool(do_sample)
-                if top_p is not None:
-                    data["top_p"] = top_p
-                if thinking_obj is not None:
-                    data["thinking"] = thinking_obj
-                elif enable_thinking is not None:
-                    # 兼容旧字段 enable_thinking
-                    data["thinking"] = {"type": "enabled" if enable_thinking else "disabled"}
+            elif request_format == "openai_responses_compatible":
+                # Responses API 的 stream 事件与 chat-completions 不同，先固定非流式
+                use_streaming = False
+                data = {
+                    "model": actual_model,
+                    "input": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt_content},
+                    ],
+                    "temperature": temperature,
+                    "max_output_tokens": max_tokens,
+                }
+            else:
+                data = {
+                    "model": actual_model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": system_prompt,
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt_content
+                        }
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stream": use_streaming,
+                }
 
-            # 智谱 BigModel：流式按 config.workflow_config.streaming_response 决定
+                # 不同 provider 的参数兼容：千帆支持 enable_thinking；智谱 BigModel 端不保证该字段可用
+                if provider == "baidu_qianfan":
+                    data["enable_thinking"] = enable_thinking
+                    if top_p is not None:
+                        data["top_p"] = top_p
+                if provider == "zhipu_bigmodel":
+                    # 按智谱文档透传参数
+                    if do_sample is not None:
+                        data["do_sample"] = bool(do_sample)
+                    if top_p is not None:
+                        data["top_p"] = top_p
+                    if thinking_obj is not None:
+                        data["thinking"] = thinking_obj
+                    elif enable_thinking is not None:
+                        # 兼容旧字段 enable_thinking
+                        data["thinking"] = {"type": "enabled" if enable_thinking else "disabled"}
             
             print(f"INFO: 正在调用AI模型 {data['model']} 进行分析...", file=sys.stderr)
             print(f"INFO: 提示词长度: {len(prompt_content)} 字符", file=sys.stderr)
@@ -1708,24 +1761,50 @@ class FullStabilityAnalyzer:
             
             if response.status_code == 200:
                 result = response.json()
-                if "choices" in result and len(result["choices"]) > 0:
-                    msg = result["choices"][0].get("message", {}) or {}
-                    # 兼容智谱 BigModel：可能将主要输出放在 reasoning_content
-                    # 展示策略：优先 content；若为空再用 reasoning_content（避免把大段推理混入最终输出）
-                    content = ""
-                    if isinstance(msg, dict):
-                        final_content = (msg.get("content") or "").strip()
-                        reasoning_content = (msg.get("reasoning_content") or "").strip()
-                        content = final_content or reasoning_content
-                    print(f"INFO: AI分析完成", file=sys.stderr)
-                    
-                    if "usage" in result:
-                        usage = result["usage"]
-                        print(f"INFO: 使用统计 - 输入tokens: {usage.get('prompt_tokens', 'N/A')}, 输出tokens: {usage.get('completion_tokens', 'N/A')}, 总tokens: {usage.get('total_tokens', 'N/A')}", file=sys.stderr)
-                    
-                    return content
+                content = ""
+                if request_format == "anthropic_messages_compatible":
+                    blocks = result.get("content") if isinstance(result, dict) else None
+                    if isinstance(blocks, list):
+                        text_parts = []
+                        for blk in blocks:
+                            if isinstance(blk, dict) and blk.get("type") == "text":
+                                text_parts.append(str(blk.get("text") or ""))
+                        content = "".join(text_parts).strip()
+                elif request_format == "openai_responses_compatible":
+                    # 优先使用 output_text；兼容 output[].content[].text
+                    output_text = result.get("output_text") if isinstance(result, dict) else None
+                    if isinstance(output_text, str) and output_text.strip():
+                        content = output_text.strip()
+                    elif isinstance(result, dict):
+                        output = result.get("output")
+                        if isinstance(output, list):
+                            text_parts = []
+                            for item in output:
+                                if not isinstance(item, dict):
+                                    continue
+                                content_blocks = item.get("content")
+                                if not isinstance(content_blocks, list):
+                                    continue
+                                for blk in content_blocks:
+                                    if isinstance(blk, dict) and blk.get("type") in ("output_text", "text"):
+                                        text_parts.append(str(blk.get("text") or ""))
+                            content = "".join(text_parts).strip()
                 else:
+                    if "choices" in result and len(result["choices"]) > 0:
+                        msg = result["choices"][0].get("message", {}) or {}
+                        if isinstance(msg, dict):
+                            final_content = (msg.get("content") or "").strip()
+                            reasoning_content = (msg.get("reasoning_content") or "").strip()
+                            content = final_content or reasoning_content
+
+                if not content:
                     raise Exception(f"AI响应格式异常: {result}")
+
+                print(f"INFO: AI分析完成", file=sys.stderr)
+                if isinstance(result, dict) and "usage" in result:
+                    usage = result["usage"]
+                    print(f"INFO: 使用统计 - 输入tokens: {usage.get('prompt_tokens', 'N/A')}, 输出tokens: {usage.get('completion_tokens', 'N/A')}, 总tokens: {usage.get('total_tokens', 'N/A')}", file=sys.stderr)
+                return content
             else:
                 raise Exception(f"AI请求失败，状态码: {response.status_code}, 错误: {response.text}")
                 

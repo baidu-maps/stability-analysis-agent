@@ -1,26 +1,121 @@
 {
-  "_comment": "复制本文件为 agent_config.local.json 并填入真实 API Key（命中 local 后不再读取 base，非 merge），该文件已在 .gitignore 中忽略",
+  "_comment": "复制本文件为 agent_config.local.json 并填入真实密钥。一次只会调用一个 provider，建议只保留当前使用的 provider 节点，并将 llm_config.active_provider 设置为对应 provider 名称。",
+  "_provider_guide": {
+    "required_fields": ["model", "base_url", "auth_type"],
+    "auth_type": "api_key | authorization | none",
+    "common_optional_fields": [
+      "api_key",
+      "authorization",
+      "api_key_env",
+      "auth_header",
+      "auth_prefix",
+      "request_timeout",
+      "request_format"
+    ],
+    "request_format_enum": [
+      "openai_chat_completions_compatible",
+      "anthropic_messages_compatible",
+      "openai_responses_compatible",
+      "minimax_text_chatcompletion_v2_compatible",
+      "custom_unsupported_need_adapter"
+    ],
+    "notes": "公共配置放在 llm_config.provider_defaults；各 provider 只写差异字段。base_url 会被原样使用（仅去除末尾 /），请填写完整请求地址。",
+    "request_format_notes": {
+      "openai_chat_completions_compatible": "请求体为 model+messages，典型路径: /v1/chat/completions",
+      "anthropic_messages_compatible": "请求体为 model+messages(+system)，典型路径: /v1/messages；通常使用 x-api-key 且 auth_prefix 为空字符串",
+      "openai_responses_compatible": "请求体为 model+input，典型路径: /v1/responses",
+      "minimax_text_chatcompletion_v2_compatible": "按 OpenAI Chat Completions 兼容方式发送，通常用于 MiniMax 网关兼容路由"
+    }
+  },
   "llm_config": {
-    "default_provider": "openai",
+    "active_provider": "openai",
+    "provider_defaults": {
+      "request_format": "openai_chat_completions_compatible",
+      "auth_type": "api_key",
+      "auth_header": "Authorization",
+      "auth_prefix": "Bearer ",
+      "adapter_provider": "openai",
+      "request_timeout": 60
+    },
     "providers": {
-      "baidu_qianfan": {
-        "authorization": "YOUR_BAIDU_QIANFAN_AUTHORIZATION",
-        "model": "ernie-4.0-8k"
-      },
       "openai": {
         "api_key": "YOUR_OPENAI_API_KEY",
-        "base_url": "",
+        "api_key_env": ["OPENAI_API_KEY"],
+        "base_url": "https://api.openai.com/v1/chat/completions",
         "model": "gpt-4o"
       },
       "deepseek": {
         "api_key": "YOUR_DEEPSEEK_API_KEY",
-        "base_url": "https://api.deepseek.com",
+        "api_key_env": ["DEEPSEEK_API_KEY"],
+        "adapter_provider": "deepseek",
+        "base_url": "https://api.deepseek.com/v1/chat/completions",
         "model": "deepseek-chat"
       },
       "zhipu_bigmodel": {
         "api_key": "YOUR_ZHIPU_API_KEY",
+        "api_key_env": ["ZHIPU_API_KEY", "BIGMODEL_API_KEY"],
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
         "model": "glm-4"
+      },
+      "baidu_qianfan": {
+        "auth_type": "authorization",
+        "authorization": "YOUR_BAIDU_QIANFAN_AUTHORIZATION",
+        "api_key_env": ["BAIDU_QIANFAN_AUTHORIZATION"],
+        "adapter_provider": "baidu_qianfan",
+        "base_url": "https://qianfan.baidubce.com/v2/chat/completions",
+        "model": "ernie-4.0-8k"
+      },
+      "qwen": {
+        "api_key": "YOUR_DASHSCOPE_API_KEY",
+        "api_key_env": ["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model": "qwen-plus"
+      },
+      "kimi": {
+        "api_key": "YOUR_MOONSHOT_API_KEY",
+        "api_key_env": ["MOONSHOT_API_KEY", "KIMI_API_KEY"],
+        "base_url": "https://api.moonshot.cn/v1/chat/completions",
+        "model": "moonshot-v1-8k"
+      },
+      "minimax": {
+        "api_key": "YOUR_MINIMAX_API_KEY",
+        "api_key_env": ["MINIMAX_API_KEY"],
+        "base_url": "https://api.minimaxi.com/v1/chat/completions",
+        "model": "MiniMax-M2.5"
+      },
+      "claude": {
+        "api_key": "YOUR_ANTHROPIC_API_KEY",
+        "api_key_env": ["ANTHROPIC_API_KEY"],
+        "request_format": "anthropic_messages_compatible",
+        "auth_header": "x-api-key",
+        "auth_prefix": "",
+        "base_url": "https://api.anthropic.com/v1/messages",
+        "model": "claude-sonnet-4-20250514"
+      },
+      "xiaomi": {
+        "api_key": "YOUR_XIAOMI_API_KEY",
+        "api_key_env": ["XIAOMI_API_KEY"],
+        "request_format": "custom_unsupported_need_adapter",
+        "base_url": "https://api.mi.com/llm/v1/chat/completions",
+        "model": "mi-plus"
+      },
+      "your_new_provider": {
+        "api_key": "YOUR_PROVIDER_API_KEY",
+        "api_key_env": ["YOUR_PROVIDER_API_KEY"],
+        "request_format": "openai_chat_completions_compatible",
+        "base_url": "https://your-provider.example.com/v1/chat/completions",
+        "model": "your-model-name"
+      },
+      "your_responses_provider": {
+        "api_key": "YOUR_RESPONSES_PROVIDER_API_KEY",
+        "api_key_env": ["YOUR_RESPONSES_PROVIDER_API_KEY"],
+        "request_format": "openai_responses_compatible",
+        "base_url": "https://your-provider.example.com/v1/responses",
+        "model": "your-responses-model-name"
       }
     }
+  },
+  "workflow_config": {
+    "streaming_response": true
   }
 }

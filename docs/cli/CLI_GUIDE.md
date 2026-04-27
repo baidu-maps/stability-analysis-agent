@@ -21,6 +21,11 @@ python3 cli/main.py \
   --code-root examples/crash_cases/demo_basic/code_dir
 ```
 
+> 交互模式（直接运行 `sa-agent`）支持快捷复跑：当存在最近一次分析记录时，菜单会显示 `5) Analyze recent log again`，可一键复用上次参数重跑。
+> 菜单型选择支持上下键切换，回车确认（也兼容数字键）。
+> 交互首屏的 `2) 更多选项` 提供配置大模型、配置 addr2line 工具、执行引擎切换、命令参考（分组说明）和示例命令查看，`1) 快速开始分析` 路径保持精简。
+> 命令参考按“基础（推荐）/进阶”两屏展示，减少一次性信息密度。
+
 ### 2) 跳过 AI（推荐回归测试）
 
 ```bash
@@ -70,10 +75,85 @@ python3 cli/main.py --daemon http://127.0.0.1:8765 \
 ## 配置加载规则（LLM）
 
 - 若传入 `--config` 且其中定义了 `llm`，优先使用 `--config`
-- 否则自动读取：
-  1. `tools/configs/agent_config.local.json`（存在则独占）
-  2. `tools/configs/agent_config.json`
-- `default_provider` 支持 `openai` / `zhipu_bigmodel` / `deepseek` / `baidu_qianfan`
+- 否则固定读取：`~/.config/stability-analysis-agent/agent_config.local.json`
+- 不再从当前工作目录或仓库内配置回退，避免多来源导致行为不确定
+- `active_provider` 指向当前启用的 provider
+- `active_provider` 的值必须是 `llm_config.providers` 下的某个 key（例如 `openai` / `deepseek`）
+
+### Provider 配置与请求格式
+
+- 配置示例见：`tools/configs/agent_config.local.example.json`
+- 可将公共项放在 `llm_config.provider_defaults`（如 `auth_header`、`auth_prefix`、`request_timeout`），各 provider 仅覆盖差异字段。
+- 每个 provider 建议至少包含：
+  - `model`
+  - `base_url`
+  - `auth_type`（`api_key` / `authorization` / `none`）
+- 当前 AI 分析请求默认按 **OpenAI Chat Completions 兼容格式** 发送；`base_url` 使用配置原值（仅去除末尾 `/`），请填写完整请求地址。
+- 可通过 `request_format` 字段标记 provider 的协议类型：
+  - `openai_chat_completions_compatible`
+  - `anthropic_messages_compatible`
+  - `openai_responses_compatible`
+  - `minimax_text_chatcompletion_v2_compatible`
+  - `custom_unsupported_need_adapter`
+- `base_url` 使用配置原值（仅去除末尾 `/`），建议始终填写完整 endpoint（例如 `.../v1/chat/completions` 或 `.../v1/messages`）。
+- 若使用 Anthropic 协议网关，通常需要在 provider 中显式配置：
+  - `request_format: anthropic_messages_compatible`
+  - `auth_header: x-api-key`
+  - `auth_prefix: ""`
+  - `base_url: .../v1/messages`
+- 当 provider 非 OpenAI 兼容协议时，需要新增 adapter 后再启用（仅改配置不足以跑通）。
+
+### 多协议最小配置示例
+
+```json
+{
+  "llm_config": {
+    "active_provider": "openai",
+    "providers": {
+      "openai": {
+        "api_key": "YOUR_OPENAI_API_KEY",
+        "base_url": "https://api.openai.com/v1/chat/completions",
+        "model": "gpt-4o"
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "llm_config": {
+    "active_provider": "my_claude_gateway",
+    "providers": {
+      "my_claude_gateway": {
+        "request_format": "anthropic_messages_compatible",
+        "auth_type": "api_key",
+        "auth_header": "x-api-key",
+        "auth_prefix": "",
+        "api_key": "YOUR_ANTHROPIC_AUTH_TOKEN",
+        "base_url": "https://your-gateway.example.com/v1/messages",
+        "model": "Claude Haiku 4.5"
+      }
+    }
+  }
+}
+```
+
+```json
+{
+  "llm_config": {
+    "active_provider": "my_responses_provider",
+    "providers": {
+      "my_responses_provider": {
+        "request_format": "openai_responses_compatible",
+        "api_key": "YOUR_API_KEY",
+        "base_url": "https://your-provider.example.com/v1/responses",
+        "model": "your-responses-model"
+      }
+    }
+  }
+}
+```
 
 ## 向量数据库（RAG）命令
 
@@ -113,4 +193,5 @@ python3 cli/main.py --vector-db-gc --gc-min-confidence 0.2 --gc-rejected-thresho
 
 - [CLI_COMMANDS_REFERENCE.md](./CLI_COMMANDS_REFERENCE.md) - 完整参数参考
 - [DAEMON_SERVER_GUIDE.md](./DAEMON_SERVER_GUIDE.md) - Daemon 服务指南
+- [INTERACTIVE_CLI_DESIGN.md](./INTERACTIVE_CLI_DESIGN.md) - 交互式 CLI 设计方案
 - [rag/README.md](../rag/README.md) - RAG 向量库说明
