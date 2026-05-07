@@ -135,11 +135,12 @@ pip install stability-analysis-agent
 # 查看帮助
 sa-agent --help
 
-# 一条命令进入交互引导（自动检测配置并引导设置）
+# 一条命令进入交互引导（主菜单引导配置与分析；首屏不做阻塞式环境扫描）
 sa-agent
 ```
 
-> 当存在最近一次分析记录时，交互菜单会出现 `5) Analyze recent log again`，可一键复跑上次崩溃日志。
+> 当存在最近一次分析记录时，交互菜单会出现 `5) 再次进行上一次分析`，可一键复跑上次崩溃日志。
+> 首屏直接进入意图菜单以缩短启动等待；进入“配置大模型 / 配置 addr2line 工具”时会自动执行对应检测并给出配置引导。
 > 交互体验参考 Claude 风格 CLI：支持上下键菜单选择、分组化“更多选项”、可返回路径和关键步骤确认面板，降低首次使用门槛。
 
 > 安装后的配置文件保存在 `~/.config/stability-analysis-agent/` 目录下：
@@ -156,14 +157,18 @@ sa-agent
 >
 > 升级命令：`pip install -U stability-analysis-agent`
 
+### 以 Python 集成（可编程接口）
+
+自 **v1.2.2** 起，PyPI 包提供稳定模块 [`cli/api.py`](./cli/api.py)，例如 `execute_analysis`、`build_parser`、`collect_interactive_run_state`、`interactive_state_to_argv`、`run_from_interactive_state`、`run_cli_main` 等，便于企业包装器或自动化脚本在进程内调用与 `sa-agent` 相同的分析链路，而无需 `subprocess`。变更说明见 [`CHANGELOG.md`](./CHANGELOG.md)。
+
 ### 2. 使用预编译 CLI 二进制（无需 Python）
 
-从 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases) 下载最新二进制后执行：
+从 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases) 下载最新二进制后执行。**压缩包与目录名随版本变化，请以实际下载的 Release 文件名为准**（下面仅为示例路径）：
 
 ```bash
-# 以 v1.2.1 macOS arm64 包为例
-unzip StabilityAnalyzer-v1.2.1-mac-arm64.zip
-cd output/cli_release/stability_analyzer_cli/v1.2.1-mac-arm64
+# 示例：macOS arm64 目录结构（请按你下载的包名调整版本）
+unzip StabilityAnalyzer-v1.2.2-mac-arm64.zip
+cd output/cli_release/stability_analyzer_cli/v1.2.2-mac-arm64
 
 chmod +x StabilityAnalyzer
 
@@ -275,6 +280,8 @@ AI 分析为**可选功能**。即使不初始化配置，也可以通过 `--ski
 ```bash
 sa-agent
 ```
+
+进入后为首屏主菜单（不会自动做环境扫描）。若要自检与配置，可直接进入“配置大模型 / 配置 addr2line 工具”流程。
 
 默认本地配置目录：
 

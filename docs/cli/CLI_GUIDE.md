@@ -21,10 +21,10 @@ python3 cli/main.py \
   --code-root examples/crash_cases/demo_basic/code_dir
 ```
 
-> 交互模式（直接运行 `sa-agent`）支持快捷复跑：当存在最近一次分析记录时，菜单会显示 `5) Analyze recent log again`，可一键复用上次参数重跑。
+> 交互模式（直接运行 `sa-agent`）支持快捷复跑：当存在最近一次分析记录时，菜单会显示 `5) 再次进行上一次分析`，可一键复用上次参数重跑。
 > 菜单型选择支持上下键切换，回车确认（也兼容数字键）。
-> 交互首屏的 `2) 更多选项` 提供配置大模型、配置 addr2line 工具、执行引擎切换、命令参考（分组说明）和示例命令查看，`1) 快速开始分析` 路径保持精简。
-> 命令参考按“基础（推荐）/进阶”两屏展示，减少一次性信息密度。
+> 交互首屏不做自动环境检测；配置大模型/配置 addr2line 工具时会先做对应检测并展示结论。`2) 更多选项` 同时提供命令参考（单屏说明常用参数与子命令作用）、手动输入命令示例，以及 **高级选项（手动编辑配置文件、执行引擎切换、AI 模式开关、执行范围切换等）**，`1) 快速开始分析` 路径保持精简。
+> 参数采集完成后会直接执行，不再二次确认；执行前会提示“运行中按 `Ctrl+C` 可终止当前任务”。
 
 ### 2) 跳过 AI（推荐回归测试）
 
@@ -176,6 +176,16 @@ python3 cli/main.py --pattern-feedback pattern_xxx --feedback-type adopted --fee
 # 衰减与 GC
 python3 cli/main.py --vector-db-decay 0.01
 python3 cli/main.py --vector-db-gc --gc-min-confidence 0.2 --gc-rejected-threshold 5
+```
+
+## 任务终止与取消
+
+```bash
+# 本地 CLI 运行中：直接按 Ctrl+C
+
+# daemon Run API 任务取消
+python3 cli/main.py cancel <run_id>
+python3 cli/main.py cancel <run_id> --daemon http://127.0.0.1:8765
 ```
 
 ## 故障排查建议

@@ -7,6 +7,9 @@
 - 仅使用 Tool/Workflow 注册机制执行分析；
 - 支持第三方通过模块扩展注册表；
 - 作为唯一命令行入口。
+
+可编程调用（闭源包装器、自动化脚本）：见同包 `cli.api`，例如
+`execute_analysis`、`collect_interactive_run_state`、`interactive_state_to_argv`。
 """
 
 from __future__ import annotations
@@ -22,7 +25,10 @@ import shutil
 import subprocess
 import sys
 import termios
+import time
 import tty
+import urllib.error
+import urllib.request
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -58,24 +64,49 @@ from tool_system import (  # type: ignore
     register_all_tools_and_workflows,
 )
 
-try:
-    from rag.vector_database_integration import AIStabilityAnalyzerWithVectorDB
-    from rag.init_vector_db_data import (
-        init_rules as init_vector_rules,
-        init_patterns as init_vector_patterns,
-        init_evidence as init_vector_evidence,
-        init_strategies as init_vector_strategies,
-        init_guidance_blocks as init_vector_guidance_blocks,
-    )
-    RAG_RUNTIME_AVAILABLE = True
-except ImportError:
-    AIStabilityAnalyzerWithVectorDB = None  # type: ignore
-    init_vector_rules = None  # type: ignore
-    init_vector_patterns = None  # type: ignore
-    init_vector_evidence = None  # type: ignore
-    init_vector_strategies = None  # type: ignore
-    init_vector_guidance_blocks = None  # type: ignore
-    RAG_RUNTIME_AVAILABLE = False
+# RAG（chromadb / sentence-transformers 等）仅在向量库子命令需要时加载，避免 `sa-agent` 首屏被拖慢。
+_rag_runtime_resolved = False
+RAG_RUNTIME_AVAILABLE = False
+AIStabilityAnalyzerWithVectorDB = None  # type: ignore
+init_vector_rules = None  # type: ignore
+init_vector_patterns = None  # type: ignore
+init_vector_evidence = None  # type: ignore
+init_vector_strategies = None  # type: ignore
+init_vector_guidance_blocks = None  # type: ignore
+
+
+def _ensure_rag_runtime_loaded() -> None:
+    global _rag_runtime_resolved, RAG_RUNTIME_AVAILABLE
+    global AIStabilityAnalyzerWithVectorDB, init_vector_rules, init_vector_patterns
+    global init_vector_evidence, init_vector_strategies, init_vector_guidance_blocks
+    if _rag_runtime_resolved:
+        return
+    _rag_runtime_resolved = True
+    try:
+        from rag.vector_database_integration import AIStabilityAnalyzerWithVectorDB as _RagAnalyzer
+        from rag.init_vector_db_data import (
+            init_rules as _init_vector_rules,
+            init_patterns as _init_vector_patterns,
+            init_evidence as _init_vector_evidence,
+            init_strategies as _init_vector_strategies,
+            init_guidance_blocks as _init_vector_guidance_blocks,
+        )
+
+        AIStabilityAnalyzerWithVectorDB = _RagAnalyzer
+        init_vector_rules = _init_vector_rules
+        init_vector_patterns = _init_vector_patterns
+        init_vector_evidence = _init_vector_evidence
+        init_vector_strategies = _init_vector_strategies
+        init_vector_guidance_blocks = _init_vector_guidance_blocks
+        RAG_RUNTIME_AVAILABLE = True
+    except ImportError:
+        AIStabilityAnalyzerWithVectorDB = None
+        init_vector_rules = None
+        init_vector_patterns = None
+        init_vector_evidence = None
+        init_vector_strategies = None
+        init_vector_guidance_blocks = None
+        RAG_RUNTIME_AVAILABLE = False
 
 
 def _read_crash_log(path: str) -> str:
@@ -183,6 +214,13 @@ def _build_llm_config_from_agent_config(engine: str) -> Optional[LLMConfig]:
             adapter_provider = "deepseek"
         else:
             adapter_provider = "openai"
+
+    # Prevent duplicated "/chat/completions/chat/completions" in OpenAI-style clients.
+    if isinstance(base_url, str):
+        normalized_base_url = base_url.strip().rstrip("/")
+        if normalized_base_url.endswith("/chat/completions"):
+            normalized_base_url = normalized_base_url[: -len("/chat/completions")]
+        base_url = normalized_base_url
 
     extra: Dict[str, Any] = {}
     if adapter_provider == "deepseek":
@@ -421,6 +459,8 @@ def _prompt_select(question: str, options: List[Tuple[str, str]], default_index:
         _render(idx)
         while True:
             ch = sys.stdin.read(1)
+            if ch == "\x03":
+                raise KeyboardInterrupt
             if ch in ("\r", "\n"):
                 break
             if ch == "\x1b":
@@ -514,7 +554,7 @@ def _prompt_base_url_with_examples(provider: str, default_value: str) -> str:
         print(f"- {name}: {url}")
     print(f"当前 provider 推荐示例: {provider_examples.get(provider, suggested)}")
 
-    raw = _safe_input(f"请输入 base_url（回车使用默认） (默认: {suggested}): ").strip()
+    raw = _safe_input(f"请输入 base_url（直接回车使用默认） (默认: {suggested}): ").strip()
     if raw == "__EOF__":
         return suggested
     return raw or suggested
@@ -531,8 +571,18 @@ def _open_file_with_editor(path: Path) -> bool:
                 code = subprocess.call(cmd)
                 return code == 0
         except Exception:
-            return False
-    print("未检测到可用的 EDITOR 环境变量，请手动打开该文件。")
+            pass
+    if sys.platform == "darwin":
+        try:
+            if subprocess.call(["open", "-t", target]) == 0:
+                return True
+        except Exception:
+            pass
+        try:
+            return subprocess.call(["open", target]) == 0
+        except Exception:
+            pass
+    print("未检测到可用的 EDITOR 环境变量，且无法用系统默认方式打开。请手动打开该文件。")
     return False
 
 
@@ -697,13 +747,13 @@ def _update_llm_config_interactive() -> bool:
     for key in existing_keys + provider_candidates:
         if key not in provider_keys:
             provider_keys.append(key)
-    provider_options: List[Tuple[str, str]] = [(k, k) for k in provider_keys]
+    provider_options: List[Tuple[str, str]] = [("back", "返回")]
+    provider_options.extend([(k, k) for k in provider_keys])
     provider_options.append(("custom", "自定义输入 provider 名称"))
-    provider_options.append(("back", "返回"))
     selected_provider = _prompt_select(
         "请选择 provider",
         provider_options,
-        default_index=provider_keys.index("openai") if "openai" in provider_keys else 0,
+        default_index=(provider_keys.index("openai") + 1) if "openai" in provider_keys else 1,
     )
     if selected_provider == "back":
         return False
@@ -736,7 +786,10 @@ def _update_llm_config_interactive() -> bool:
     if provider == "baidu_qianfan":
         secret = getpass.getpass("请输入 authorization（输入时隐藏）: ").strip()
         provider_cfg["authorization"] = secret
-        provider_cfg["model"] = _prompt_non_empty("请输入模型名", provider_cfg.get("model") or model_defaults.get(provider, "ernie-4.0-8k"))
+        provider_cfg["model"] = _prompt_non_empty(
+            "请输入模型名（直接回车使用默认）",
+            provider_cfg.get("model") or model_defaults.get(provider, "ernie-4.0-8k"),
+        )
         base_url = _prompt_base_url_with_examples(
             provider,
             str(provider_cfg.get("base_url") or base_url_defaults.get(provider, "")).strip(),
@@ -745,7 +798,10 @@ def _update_llm_config_interactive() -> bool:
     else:
         secret = getpass.getpass("请输入 api_key（输入时隐藏）: ").strip()
         provider_cfg["api_key"] = secret
-        provider_cfg["model"] = _prompt_non_empty("请输入模型名", provider_cfg.get("model") or model_defaults.get(provider, "gpt-4o"))
+        provider_cfg["model"] = _prompt_non_empty(
+            "请输入模型名（直接回车使用默认）",
+            provider_cfg.get("model") or model_defaults.get(provider, "gpt-4o"),
+        )
         base_url = _prompt_base_url_with_examples(
             provider,
             str(provider_cfg.get("base_url") or base_url_defaults.get(provider, "")).strip(),
@@ -780,14 +836,14 @@ def _update_add2line_config_interactive() -> bool:
     os_choice = _prompt_select(
         "请选择目标平台",
         [
+            ("back", "返回"),
             ("ios", "ios"),
             ("android", "android"),
             ("linux", "linux"),
             ("harmonyos", "harmonyos"),
             ("custom", "自定义平台"),
-            ("back", "返回"),
         ],
-        default_index=0,
+        default_index=1,
     )
     if os_choice == "back":
         return False
@@ -798,20 +854,45 @@ def _update_add2line_config_interactive() -> bool:
     os_cfg = platforms.get(os_choice, {})
     if not isinstance(os_cfg, dict):
         os_cfg = {}
-    path_line = input("请输入 tool_paths（多个路径用英文逗号分隔，可空）: ").strip()
-    if path_line:
-        os_cfg["tool_paths"] = [p.strip() for p in path_line.split(",") if p.strip()]
-    pref_line = input("请输入 preferred_tools（多个工具用英文逗号分隔，可空）: ").strip()
-    if pref_line:
-        os_cfg["preferred_tools"] = [p.strip() for p in pref_line.split(",") if p.strip()]
-    env_line = input("请输入环境变量（格式 KEY=VALUE，多个用英文逗号分隔，可空）: ").strip()
+    # CLI 向导保持极简：优先通过环境变量配置，必要时再直接指定 bin 目录。
+    mode = _prompt_select(
+        "请选择配置方式",
+        [
+            ("back", "返回"),
+            ("env", "通过环境变量配置（推荐）"),
+            ("path", "直接指定符号化工具链 bin 目录"),
+        ],
+        default_index=1,
+    )
+    if mode == "back":
+        return False
+
     env_vars: Dict[str, str] = {}
-    if env_line:
-        for pair in env_line.split(","):
-            if "=" in pair:
-                k, v = pair.split("=", 1)
-                if k.strip():
-                    env_vars[k.strip()] = v.strip()
+    missing_env_keys: List[str] = []
+    if mode == "env":
+        while True:
+            raw_env_key = _safe_input("请输入要读取的环境变量名 KEY（必填）: ").strip()
+            if raw_env_key == "__EOF__":
+                return False
+            if not raw_env_key:
+                print("环境变量 KEY 不能为空，请重新输入。")
+                continue
+            key = raw_env_key.strip()
+            val = os.environ.get(key)
+            if val is None or str(val).strip() == "":
+                missing_env_keys.append(key)
+            else:
+                env_vars[key] = str(val)
+            break
+    else:
+        raw_bin = _safe_input("请输入符号化工具链 bin 目录（可空，输入 back 返回）: ").strip()
+        if raw_bin == "__EOF__":
+            return False
+        if raw_bin.lower() == "back":
+            return False
+        if raw_bin:
+            os_cfg["tool_paths"] = [str(Path(raw_bin).expanduser().resolve())]
+
     if env_vars:
         os_cfg["environment_vars"] = env_vars
 
@@ -823,6 +904,9 @@ def _update_add2line_config_interactive() -> bool:
         [
             f"配置文件: {target}",
             f"平台: {os_choice}",
+            f"tool_paths: {os_cfg.get('tool_paths') or []}",
+            f"environment_vars: {list((os_cfg.get('environment_vars') or {}).keys())}",
+            *( [f"未读取到的环境变量（当前环境缺失/为空）: {', '.join(missing_env_keys)}"] if missing_env_keys else [] ),
         ],
     )
     return True
@@ -835,10 +919,10 @@ def _config_command_init() -> int:
     if _prompt_yes_no("是否现在配置大模型？", True):
         mode = _prompt_select(
             "请选择大模型配置方式",
-            [("1", "手动编辑配置文件"), ("2", "交互向导填写")],
-            default_index=1,
+            [("wizard", "交互向导填写"), ("manual", "手动编辑配置文件")],
+            default_index=0,
         )
-        if mode == "1":
+        if mode == "manual":
             _configure_llm_only()
         else:
             _update_llm_config_interactive()
@@ -848,7 +932,7 @@ def _config_command_init() -> int:
     for name, path in detected_tools.items():
         print(f"  - {name}: {path or 'missing'}")
     env_keys = ["ANDROID_NDK_HOME", "LLVM_HOME", "ANDROID_SDK_HOME"]
-    print("环境变量：")
+    print("默认的环境变量：")
     for key in env_keys:
         print(f"  - {key}: {os.environ.get(key) or 'missing'}")
 
@@ -867,129 +951,373 @@ def _config_command_init() -> int:
     return 0
 
 
+def _print_llm_detection_summary(status: Dict[str, Any]) -> None:
+    print("== 大模型配置检测 ==")
+    print(f"- 配置文件: {_user_agent_config_file()}")
+    if status.get("llm_ok"):
+        print("- 状态: 已配置可用（当前密钥非占位）")
+        print(f"- 当前 provider: {status.get('active_provider') or '未知'}")
+        model_disp = status.get("model") or "（未填写 model）"
+        print(f"- 当前模型: {model_disp}")
+    else:
+        print("- 状态: 未就绪（缺少 provider、密钥或未替换占位符等）")
+        ap = status.get("active_provider")
+        if ap:
+            print(f"- active_provider: {ap}（请检查密钥等字段是否有效）")
+        else:
+            print("- active_provider: 未设置")
+    print("")
+
+
+def _check_llm_connectivity() -> None:
+    def _ack_result() -> None:
+        if _is_tty_interactive():
+            _prompt_select(
+                "联通性检测已完成，请选择",
+                [("ok", "已确定"), ("back", "返回")],
+                default_index=0,
+            )
+        else:
+            _safe_input("联通性检测已完成，按回车返回... ")
+
+    llm_cfg = _build_llm_config_from_agent_config("direct")
+    if llm_cfg is None:
+        print("❌ 当前配置未就绪：请先完成 provider / 密钥配置。")
+        _ack_result()
+        return
+    llm_cfg.timeout = 10
+    llm_cfg.max_tokens = 32
+    try:
+        adapter = LLMAdapterFactory.create(llm_cfg.to_dict())
+    except Exception as exc:
+        print(f"❌ 初始化 LLM 客户端失败: {exc}")
+        _ack_result()
+        return
+
+    print("正在检测联通性（最长约 10 秒，可按 Ctrl+C 取消）...")
+    start = time.time()
+    try:
+        resp = adapter.chat(
+            [{"role": "user", "content": "请回复：pong"}],
+            temperature=0.0,
+            max_tokens=32,
+        )
+        elapsed = time.time() - start
+        content = str(resp.content or "").strip().replace("\n", " ")
+        if len(content) > 80:
+            content = content[:80] + "..."
+        print("✅ 联通性检测通过")
+        print(f"- provider: {_doctor_status().get('active_provider') or 'unknown'}")
+        print(f"- 耗时: {elapsed:.2f}s")
+        if content:
+            print(f"- 响应片段: {content}")
+        _ack_result()
+    except KeyboardInterrupt:
+        print("\n已取消联通性检测。")
+        _ack_result()
+    except Exception as exc:
+        elapsed = time.time() - start
+        msg = str(exc)
+        lower = msg.lower()
+        reason = "请求失败"
+        if "404" in lower:
+            reason = "接口路径可能错误（404）"
+        elif "401" in lower or "403" in lower:
+            reason = "鉴权失败（401/403，检查密钥与权限）"
+        elif "timeout" in lower or "timed out" in lower:
+            reason = "请求超时（网络或网关较慢）"
+        elif "name or service not known" in lower or "nodename nor servname" in lower:
+            reason = "域名解析失败（DNS/地址配置问题）"
+        print("❌ 联通性检测失败")
+        print(f"- 原因: {reason}")
+        print(f"- 耗时: {elapsed:.2f}s")
+        print(f"- 错误: {msg}")
+        _ack_result()
+
+
 def _configure_llm_only() -> None:
     _ensure_user_config_templates()
-    mode = _prompt_select(
-        "请选择大模型配置方式",
-        [("1", "手动编辑配置文件"), ("2", "交互向导填写"), ("back", "返回")],
-        default_index=1,
-    )
-    if mode == "back":
-        return
-    if mode == "1":
-        target = _user_agent_config_file()
-        while True:
-            print("━━━━━━━━━━━━━━━━━━━━━━")
-            print("配置大模型（手动方式）")
-            print("")
-            print("请编辑以下文件并填写密钥：")
-            print("")
-            print(str(target))
-            print("")
-            print("完成后返回此窗口。")
-            print("━━━━━━━━━━━━━━━━━━━━━━")
-            action = _prompt_select(
-                "请选择操作",
+    while True:
+        status = _doctor_status()
+        _print_llm_detection_summary(status)
+
+        if status.get("llm_ok"):
+            rerun = _prompt_select(
+                "当前大模型已可用，是否需要重新设置？",
                 [
-                    ("open", "[o] 打开文件"),
-                    ("check", "[c] 我已完成，继续检测"),
-                    ("help", "[h] 查看最小必填示例"),
-                    ("back", "[b] 返回"),
+                    ("keep", "不用了，返回"),
+                    ("reconfig", "重新设置"),
+                    ("connectivity", "检测联通性（可选，可能耗时）"),
                 ],
                 default_index=0,
             )
-            if action == "back":
+            if rerun == "keep":
                 return
-            if action == "help":
-                print("最小必填：")
-                print("- llm_config.active_provider")
-                print("- llm_config.providers.<provider>.model")
-                print("- llm_config.providers.<provider>.base_url")
-                print("- llm_config.providers.<provider>.api_key 或 authorization（非占位符）")
+            if rerun == "connectivity":
+                _check_llm_connectivity()
                 print("")
                 continue
-            if action == "open":
-                ok = _open_file_with_editor(target)
-                print("已打开文件。" if ok else f"请手动打开: {target}")
+        else:
+            print("请完成大模型配置。\n")
+            pre_action = _prompt_select(
+                "请选择下一步",
+                [
+                    ("reconfig", "进入交互向导修复"),
+                    ("connectivity", "检测联通性（高级，可选）"),
+                    ("back", "返回"),
+                ],
+                default_index=0,
+            )
+            if pre_action == "back":
+                return
+            if pre_action == "connectivity":
+                _check_llm_connectivity()
                 print("")
                 continue
-            status = _doctor_status()
-            if status.get("llm_ok"):
-                print("LLM 配置检测通过。")
-                print("")
-                return
-            print("LLM 配置仍未完成，请继续编辑后再检测。")
+        print("")
+        print("—— 进入交互向导（将依次选择 provider、填写密钥等）——")
+        print("")
+        changed = _update_llm_config_interactive()
+        if changed:
+            return
+        nxt2 = _prompt_select(
+            "已取消向导或未保存修改。",
+            [
+                ("exit", "返回"),
+                ("retry", "再次进入向导"),
+            ],
+            default_index=0,
+        )
+        if nxt2 == "exit":
+            return
+
+
+def _configure_llm_manual_panel() -> None:
+    _ensure_user_config_templates()
+    target = _user_agent_config_file()
+    while True:
+        status = _doctor_status()
+        _print_llm_detection_summary(status)
+        print("━━━━━━━━━━━━━━━━━━━━━━")
+        print("配置大模型（手动方式）")
+        print("")
+        print("请编辑以下文件并填写密钥：")
+        print("")
+        print(str(target))
+        print("")
+        print("完成后返回此窗口。")
+        print("━━━━━━━━━━━━━━━━━━━━━━")
+        action = _prompt_select(
+            "请选择操作",
+            [
+                ("open", "[o] 打开文件"),
+                ("check", "[c] 我已完成，检查配置是否正确"),
+                ("help", "[h] 查看最小必填示例"),
+                ("back", "[b] 返回"),
+            ],
+            default_index=0,
+        )
+        if action == "back":
+            return
+        if action == "help":
+            print("最小必填：")
+            print("- llm_config.active_provider")
+            print("- llm_config.providers.<provider>.model")
+            print("- llm_config.providers.<provider>.base_url")
+            print("- llm_config.providers.<provider>.api_key 或 authorization（非占位符）")
             print("")
-        return
-    changed = _update_llm_config_interactive()
-    if not changed:
-        print("已返回上一层。")
+            print("— 请在下方的菜单中继续操作 —")
+            if _is_tty_interactive():
+                _safe_input("按回车显示菜单... ")
+            continue
+        if action == "open":
+            ok = _open_file_with_editor(target)
+            if ok:
+                print("已尝试用系统默认文本编辑器打开；若未看到窗口，请检查是否被其他桌面空间遮挡。")
+            else:
+                print(f"无法自动打开，请手动打开: {target}")
+            print("")
+            print("— 请在下方的菜单中继续操作 —")
+            if _is_tty_interactive():
+                _safe_input("按回车显示菜单... ")
+            continue
+        st2 = _doctor_status()
+        if st2.get("llm_ok"):
+            _show_success_panel("✅ LLM 配置检测通过", [f"provider: {st2.get('active_provider')}", f"model: {st2.get('model') or 'N/A'}"])
+            return
+        print("LLM 配置仍未完成，请继续编辑后再检查。")
+        print("")
+        print("— 请在下方的菜单中继续操作 —")
+        if _is_tty_interactive():
+            _safe_input("按回车显示菜单... ")
+
+
+def _current_platform_key() -> str:
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform.startswith("win"):
+        return "windows"
+    return "linux"
+
+
+def _platform_tool_recommendations() -> Dict[str, List[str]]:
+    return {
+        "macos": ["atos", "llvm-addr2line"],
+        "ios": ["atos", "llvm-addr2line"],
+        "android": ["llvm-addr2line", "ndk-stack"],
+        "linux": ["addr2line", "llvm-addr2line"],
+        "harmonyos": ["llvm-addr2line"],
+        "windows": ["llvm-addr2line", "addr2line"],
+    }
+
+
+def _print_add2line_detection_explainer(status: Dict[str, Any]) -> None:
+    detected = {
+        name
+        for name, meta in (status.get("tool_status") or {}).items()
+        if (meta.get("path") or "").strip()
+    }
+    recommendations = _platform_tool_recommendations()
+    platform_key = _current_platform_key()
+    platform_labels = {
+        "macos": "macOS / iOS",
+        "android": "Android",
+        "linux": "Linux",
+        "harmonyos": "HarmonyOS",
+    }
+    ordered_platforms = ["macos", "android", "linux", "harmonyos"]
+    platform_hits: Dict[str, List[str]] = {}
+    for p in ordered_platforms:
+        platform_hits[p] = [t for t in recommendations.get(p, []) if t in detected]
+
+    print("各平台可用工具：")
+    for p in ordered_platforms:
+        hits = platform_hits[p]
+        print(f"- {platform_labels[p]}: {', '.join(hits) if hits else '无可用工具'}")
+    print("")
+
+    need_config = [platform_labels[p] for p in ordered_platforms if not platform_hits[p]]
+    if need_config:
+        print(f"需要配置的平台: {', '.join(need_config)}")
+    else:
+        print("所有平台均检测到至少一个推荐工具。")
+    print("")
 
 
 def _configure_add2line_only() -> None:
     _ensure_user_config_templates()
-    detected_tools = _detect_add2line_tools()
-    print("自动检测 add2line 相关工具：")
-    for name, path in detected_tools.items():
-        print(f"  - {name}: {path or 'missing'}")
-    env_keys = ["ANDROID_NDK_HOME", "LLVM_HOME", "ANDROID_SDK_HOME"]
-    print("环境变量：")
-    for key in env_keys:
-        print(f"  - {key}: {os.environ.get(key) or 'missing'}")
-    mode = _prompt_select(
-        "请选择 add2line 配置方式",
-        [("1", "手动编辑配置文件"), ("2", "交互向导填写"), ("back", "返回")],
-        default_index=1,
-    )
-    if mode == "back":
-        return
-    if mode == "1":
-        target = _user_add2line_config_file()
-        while True:
-            print("━━━━━━━━━━━━━━━━━━━━━━")
-            print("配置 addr2line 工具（手动方式）")
-            print("")
-            print("请编辑以下文件并填写工具路径：")
-            print("")
-            print(str(target))
-            print("")
-            print("完成后返回此窗口。")
-            print("━━━━━━━━━━━━━━━━━━━━━━")
-            action = _prompt_select(
-                "请选择操作",
-                [
-                    ("open", "[o] 打开文件"),
-                    ("check", "[c] 我已完成，继续检测"),
-                    ("help", "[h] 查看关键字段"),
-                    ("back", "[b] 返回"),
-                ],
-                default_index=0,
-            )
-            if action == "back":
-                return
-            if action == "help":
-                print("关键字段：")
-                print("- platforms.<platform>.tool_paths")
-                print("- platforms.<platform>.preferred_tools")
-                print("- platforms.<platform>.environment_vars")
-                print("")
-                continue
-            if action == "open":
-                ok = _open_file_with_editor(target)
-                print("已打开文件。" if ok else f"请手动打开: {target}")
-                print("")
-                continue
-            status = _doctor_status()
-            if status.get("tool_ok"):
-                print("add2line 工具检测通过。")
-                print("")
-                return
-            print("仍未检测到可用 add2line 工具，请继续编辑后再检测。")
-            print("")
-        return
+    status = _doctor_status()
+    print("== 符号化工具检测 ==")
+    print("")
+    _print_add2line_detection_explainer(status)
+
+    recommendations = _platform_tool_recommendations()
+    detected_names = {
+        name
+        for name, meta in (status.get("tool_status") or {}).items()
+        if (meta.get("path") or "").strip()
+    }
+    current_platform = _current_platform_key()
+    current_hits = [
+        t for t in recommendations.get(current_platform, []) if t in detected_names
+    ]
+    if current_hits:
+        rerun = _prompt_select(
+            "是否需要重新设置？",
+            [
+                ("keep", "不用了，返回"),
+                ("reconfig", "重新设置"),
+            ],
+            default_index=0,
+        )
+        if rerun == "keep":
+            return
+
+    print("")
+    print("—— 进入交互向导（将选择平台并填写工具路径等）——")
+    print("")
     changed = _update_add2line_config_interactive()
-    if not changed:
-        print("已返回上一层。")
+    if changed:
+        _show_success_panel("✅ 已完成符号化工具配置", ["你可以返回上一级继续操作。"])
+        return
+    _prompt_select(
+        "已取消向导或未保存修改。",
+        [
+            ("back", "返回"),
+        ],
+        default_index=0,
+    )
+    return
+
+
+def _configure_add2line_manual_panel() -> None:
+    _ensure_user_config_templates()
+    target = _user_add2line_config_file()
+    while True:
+        status = _doctor_status()
+        print("== 符号化工具检测 ==")
+        print(f"- 配置文件: {_user_add2line_config_file()}")
+        print(f"- 状态: {'已检测到可用工具' if status.get('tool_ok') else '未检测到可用工具'}")
+        available_tools = [
+            f"{name}({meta.get('source')})"
+            for name, meta in status.get("tool_status", {}).items()
+            if (meta.get("path") or "").strip()
+        ]
+        print(f"- 已检测工具: {', '.join(available_tools) if available_tools else '无'}")
+        print("")
+
+        print("━━━━━━━━━━━━━━━━━━━━━━")
+        print("配置 addr2line 工具（手动方式）")
+        print("")
+        print("请编辑以下文件并填写工具路径：")
+        print("")
+        print(str(target))
+        print("")
+        print("完成后返回此窗口。")
+        print("━━━━━━━━━━━━━━━━━━━━━━")
+        action = _prompt_select(
+            "请选择操作",
+            [
+                ("open", "[o] 打开文件"),
+                ("check", "[c] 我已完成，检查配置是否正确"),
+                ("help", "[h] 查看关键字段"),
+                ("back", "[b] 返回"),
+            ],
+            default_index=0,
+        )
+        if action == "back":
+            return
+        if action == "help":
+            print("关键字段：")
+            print("- platforms.<platform>.tool_paths")
+            print("- platforms.<platform>.environment_vars")
+            print("")
+            print("— 请在下方的菜单中继续操作 —")
+            if _is_tty_interactive():
+                _safe_input("按回车显示菜单... ")
+            continue
+        if action == "open":
+            ok = _open_file_with_editor(target)
+            if ok:
+                print("已尝试用系统默认文本编辑器打开；若未看到窗口，请检查是否被其他桌面空间遮挡。")
+            else:
+                print(f"无法自动打开，请手动打开: {target}")
+            print("")
+            print("— 请在下方的菜单中继续操作 —")
+            if _is_tty_interactive():
+                _safe_input("按回车显示菜单... ")
+            continue
+        st2 = _doctor_status()
+        if st2.get("tool_ok"):
+            _show_success_panel("✅ 符号化工具检测通过", [f"已检测工具: {', '.join(available_tools) if available_tools else 'N/A'}"])
+            return
+        print("仍未检测到可用 add2line 工具，请继续编辑后再检查。")
+        print("")
+        print("— 请在下方的菜单中继续操作 —")
+        if _is_tty_interactive():
+            _safe_input("按回车显示菜单... ")
 
 
 def _handle_config_command(argv: List[str]) -> int:
@@ -1067,6 +1395,39 @@ def _handle_profile_command(argv: List[str]) -> int:
     return 1
 
 
+def _handle_cancel_command(argv: List[str]) -> int:
+    parser = argparse.ArgumentParser(description="取消 daemon 中正在运行的任务")
+    parser.add_argument("run_id", help="需要取消的 run_id")
+    parser.add_argument("--daemon", default="http://127.0.0.1:8765", help="daemon 地址（默认: http://127.0.0.1:8765）")
+    parser.add_argument("--timeout", type=float, default=10.0, help="请求超时时间（秒，默认 10）")
+    args = parser.parse_args(argv)
+
+    base = str(args.daemon).strip().rstrip("/")
+    run_id = str(args.run_id).strip()
+    if not run_id:
+        print("错误: run_id 不能为空", file=sys.stderr)
+        return 1
+    url = f"{base}/runs/{run_id}/cancel"
+    req = urllib.request.Request(url=url, data=b"{}", method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=max(0.1, float(args.timeout))) as resp:
+            body = resp.read().decode("utf-8", errors="ignore").strip()
+            if body:
+                print(body)
+            else:
+                print(json.dumps({"run_id": run_id, "status": "canceled"}, ensure_ascii=False))
+            return 0
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore").strip()
+        print(f"错误: 取消任务失败（HTTP {exc.code}）", file=sys.stderr)
+        if detail:
+            print(detail, file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"错误: 无法连接 daemon: {exc}", file=sys.stderr)
+        return 1
+
+
 def _register_third_party_modules(registry: ToolAndWorkflowRegistry, modules: List[str]) -> None:
     for mod_name in modules:
         m = (mod_name or "").strip()
@@ -1122,6 +1483,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="应用 AI 修复前是否在 cli_reports 下备份改前源码（默认开启；代码已由 Git 管理可用 --no-backup-original-sources 关闭）",
     )
     p.add_argument("--engine", default="direct", choices=["direct", "langchain", "langgraph"], help="执行引擎标记")
+    p.add_argument("--parse-only", action="store_true", help="仅执行解析+符号化（不提取代码上下文，不调用 AI）")
+    p.add_argument("--parse-log-only", action="store_true", help="仅解析崩溃日志（不符号化，不提取代码上下文，不调用 AI）")
     p.add_argument(
         "--plugin-module",
         action="append",
@@ -1153,6 +1516,7 @@ def _run_vector_db_command(args: argparse.Namespace) -> Optional[int]:
     if not need_vector_cmd:
         return None
 
+    _ensure_rag_runtime_loaded()
     if not RAG_RUNTIME_AVAILABLE or AIStabilityAnalyzerWithVectorDB is None:
         print("错误: RAG 运行时不可用，请安装向量数据库依赖后重试。", file=sys.stderr)
         return 1
@@ -1535,6 +1899,14 @@ def _maybe_apply_ai_fixes(
 
 def _print_execution_plan(state: Dict[str, Any]) -> None:
     print("== 执行计划 ==")
+    run_scope = str(state.get("run_scope", "full")).strip()
+    if run_scope == "parse_log_only":
+        print("- [1/1] 仅解析崩溃日志")
+        return
+    if run_scope == "parse_only":
+        print("- [1/2] 解析崩溃日志")
+        print("- [2/2] 符号化堆栈地址")
+        return
     print("- [1/4] 解析崩溃日志")
     print("- [2/4] 符号化堆栈地址")
     print("- [3/4] 提取源码上下文")
@@ -1542,6 +1914,33 @@ def _print_execution_plan(state: Dict[str, Any]) -> None:
         print("- [4/4] 跳过 AI（不调用大模型；输出工具链结果并生成可复用提示词）")
     else:
         print("- [4/4] 进行 AI 推理与修复建议")
+
+
+def _print_user_parameter_confirmation(
+    state: Dict[str, Any],
+    *,
+    library_dir_input: Optional[str] = None,
+    code_roots_input: Optional[str] = None,
+) -> None:
+    lines: List[str] = [f"- crash_log: {state['crash_log']}"]
+    library_dir = str(state.get("library_dir") or "").strip()
+    code_roots = state.get("code_roots") or []
+
+    if library_dir_input == "skip":
+        lines.append("- library_dir: skip")
+    elif library_dir:
+        lines.append(f"- library_dir: {library_dir}")
+
+    if code_roots_input == "skip":
+        lines.append("- code_roots: skip")
+    elif code_roots:
+        lines.append(f"- code_roots: {code_roots}")
+
+    if not lines:
+        return
+    print("== 参数确认 ==")
+    for line in lines:
+        print(line)
 
 
 def _doctor_status() -> Dict[str, Any]:
@@ -1564,9 +1963,11 @@ def _doctor_status() -> Dict[str, Any]:
     llm_ok = bool(active_provider and not _is_placeholder_secret(provider_cfg.get(auth_field)))
     tool_status = _detect_add2line_tool_status()
     tools = {name: (meta.get("path") or None) for name, meta in tool_status.items()}
+    model_val = str(provider_cfg.get("model") or "").strip()
     return {
         "llm_ok": llm_ok,
         "active_provider": active_provider,
+        "model": model_val or None,
         "auth_field": auth_field,
         "tool_status": tool_status,
         "tools": tools,
@@ -1582,79 +1983,119 @@ def _prompt_with_default(question: str, default_value: str = "") -> str:
     return raw
 
 
-def _collect_interactive_run_state() -> Optional[Dict[str, Any]]:
+def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
     _ensure_user_config_templates()
     session_state = _load_session_state()
     last_run = session_state.get("last_run", {}) if isinstance(session_state.get("last_run", {}), dict) else {}
     preferred_engine = str(last_run.get("engine", "direct")).strip() if isinstance(last_run, dict) else "direct"
     if preferred_engine not in {"direct", "langchain", "langgraph"}:
         preferred_engine = "direct"
+    preferred_skip_ai = False
+    preferred_run_scope = str(last_run.get("run_scope", "full")).strip() if isinstance(last_run, dict) else "full"
+    if preferred_run_scope not in {"full", "parse_only", "parse_log_only"}:
+        preferred_run_scope = "full"
 
-    status = _doctor_status()
-    print("== 环境速览 ==")
-    print(f"- LLM 配置: {'OK' if status['llm_ok'] else 'Missing'}")
-    print(f"- add2line 工具: {'OK' if status['tool_ok'] else 'Missing'}")
-    available_tools = [
-        f"{name}({meta.get('source')})"
-        for name, meta in status.get("tool_status", {}).items()
-        if (meta.get("path") or "").strip()
-    ]
-    print(f"- 已检测工具: {', '.join(available_tools) if available_tools else '无'}")
-    print("")
+    def _show_command_reference() -> None:
+        print("== 命令参考 ==")
+        print("[主流程参数]")
+        print("1) --crash-log PATH：崩溃日志路径（支持 '-' 从 stdin 读取）")
+        print("2) --library-dir DIR：符号库目录（日志未符号化时建议填写）")
+        print("3) --code-root DIR：源码目录（可重复指定多个）")
+        print("4) --config PATH：指定 SystemConfig JSON（不填则使用内置默认工具链与工作流）")
+        print("5) --skip-ai：仅跳过 LLM 推理，仍执行工具链并生成可复用提示词")
+        print("6) --engine {direct|langchain|langgraph}：选择执行引擎")
+        print("7) --parse-only：仅执行解析+符号化")
+        print("8) --parse-log-only：仅解析崩溃日志")
+        print("")
+        print("[RAG 上下文参数（进入分析 problem）]")
+        print("1) --vector-db-path PATH：向量数据库目录（默认 ./vector_db）")
+        print("2) --vector-db-max-results INT：向量检索最大返回数（默认 3）")
+        print("3) --rule-confidence-threshold FLOAT：规则高置信阈值（默认 0.85）")
+        print("")
+        print("[输出与交互]")
+        print("1) --output-format {markdown|json|text}：控制输出格式")
+        print("2) --output-file PATH：将结果写入文件（不指定则打印到终端）")
+        print("3) --interactive / --no-interactive：开启或关闭交互模式")
+        print("")
+        print("[AI 自动改码]")
+        print("1) --apply-ai-fixes / --no-apply-ai-fixes：是否自动把 AI 修复写回源码")
+        print("2) --backup-original-sources / --no-backup-original-sources：改码前是否备份源码")
+        print("")
+        print("[向量数据库运维]")
+        print("1) --init-vector-db：初始化向量库（清空后写入种子）")
+        print("2) --vector-db-stats：查看向量库统计")
+        print("3) --export-vector-db [PATH]：导出向量库快照")
+        print("4) --import-vector-db PATH：导入向量库快照（合并）")
+        print("5) --pattern-feedback + --feedback-type + --feedback-comment：记录模式反馈")
+        print("6) --vector-db-decay FLOAT：执行置信度衰减")
+        print("7) --vector-db-gc：执行模式治理（配合 gc 阈值参数）")
+        print("8) --gc-min-confidence FLOAT：GC 最低置信阈值（默认 0.2）")
+        print("9) --gc-rejected-threshold INT：GC 拒绝次数阈值（默认 5）")
+        print("")
+        print("[扩展能力]")
+        print("1) --plugin-module MODULE：加载第三方扩展模块（可重复）")
+        print("2) STABILITY_AGENT_PLUGIN_MODULES：逗号分隔注入插件模块（环境变量）")
+        print("")
+        print("[子命令]")
+        print("1) sa-agent config path|doctor|init：配置路径/检测/初始化")
+        print("2) sa-agent profile list|show|use|save|delete：管理会话 profile")
+        print("3) sa-agent run ...：显式使用参数模式执行分析")
+        print("")
+        print("[常见组合]")
+        print("1) 完整分析：--crash-log ... --library-dir ... --code-root ...")
+        print("2) 只分析不改码：加 --no-apply-ai-fixes")
+        print("3) 只跑工具链不走 LLM：加 --skip-ai")
+        print("4) 向量库统计：--vector-db-stats")
+        print("5) 向量库初始化：--init-vector-db")
+        print("")
 
-    def _print_command_guide_grouped() -> None:
-        while True:
-            guide_choice = _prompt_select(
-                "命令参考（请选择查看范围）",
-                [
-                    ("basic", "基础（推荐）"),
-                    ("advanced", "进阶"),
-                    ("back", "返回"),
-                ],
-                default_index=0,
-            )
-            if guide_choice == "back":
-                return
-            if guide_choice == "basic":
-                print("== 命令参考：基础（推荐）==")
-                print("[分析运行]")
-                print("- sa-agent：交互引导，一步步完成配置与分析")
-                print("- --crash-log PATH：分析必填，崩溃日志路径；支持 '-' 从 stdin")
-                print("- --library-dir DIR：符号库目录（未符号化日志建议填写）")
-                print("- --code-root DIR：源码目录（做源码上下文/AI分析时建议填写，可多次）")
-                print("- --skip-ai：不调用大模型；输出工具链结果并生成可复用提示词")
-                print("")
-                print("[输出控制]")
-                print("- --output-format {markdown,json,text}")
-                print("- --output-file PATH")
-                print("")
-                print("[关键配置提示]")
-                print("- LLM：active_provider + api_key/authorization（必须非占位符）")
-                print("- add2line 检测优先级：env -> path -> config")
-                print("")
-                print("完整文档：docs/cli/CLI_COMMANDS_REFERENCE.md")
-                print("命令帮助：sa-agent --help")
-                print("")
-                continue
-            print("== 命令参考：进阶 == ")
-            print("[AI 自动改码与备份]")
-            print("- --apply-ai-fixes / --no-apply-ai-fixes：是否自动回写源码")
-            print("- --backup-original-sources / --no-backup-original-sources：是否备份改前源码")
-            print("")
-            print("[向量数据库（RAG）运维（独占子流程）]")
-            print("- --init-vector-db / --vector-db-stats")
-            print("- --export-vector-db [PATH] / --import-vector-db PATH")
-            print("- --pattern-feedback + --feedback-type + --feedback-comment")
-            print("- --vector-db-decay / --vector-db-gc / --gc-min-confidence / --gc-rejected-threshold")
-            print("")
-            print("[扩展与高级入口]")
-            print("- --plugin-module MODULE（可重复）")
-            print("- STABILITY_AGENT_PLUGIN_MODULES（环境变量注入）")
-            print("- sa-agent run ... / sa-agent profile ...")
-            print("")
-            print("完整文档：docs/cli/CLI_COMMANDS_REFERENCE.md")
-            print("命令帮助：sa-agent --help")
-            print("")
+    def _pick_engine(current_engine: str) -> str:
+        engine_choice = _prompt_select(
+            "请选择执行引擎",
+            [
+                ("back", "返回"),
+                ("direct", "direct（默认，启动快，单轮调用）"),
+                ("langchain", "langchain（可编排工具链，适合增强流程）"),
+                ("langgraph", "langgraph（多轮 Agent 编排，适合复杂任务）"),
+            ],
+            default_index=(["direct", "langchain", "langgraph"].index(current_engine) + 1)
+            if current_engine in {"direct", "langchain", "langgraph"}
+            else 1,
+        )
+        if engine_choice == "back":
+            return current_engine
+        return engine_choice
+
+    def _pick_ai_mode(current_skip_ai: bool) -> bool:
+        ai_choice = _prompt_select(
+            "是否开启AI",
+            [
+                ("back", "返回"),
+                ("use_ai", "使用 AI（默认，支持一步到位自动改码）"),
+                ("skip_ai", "跳过 AI（仅跳过LLM，仍生成可复用提示词）"),
+            ],
+            default_index=2 if current_skip_ai else 1,
+        )
+        if ai_choice == "back":
+            return current_skip_ai
+        return ai_choice == "skip_ai"
+
+    def _pick_run_scope(current_scope: str) -> str:
+        scope_choice = _prompt_select(
+            "设置Agent执行流程",
+            [
+                ("back", "返回"),
+                ("full", "完整分析（解析+符号化+获取代码上下文+根据配置开启AI）"),
+                ("parse_only", "仅解析+符号化"),
+                ("parse_log_only", "仅解析日志"),
+            ],
+            default_index=(["full", "parse_only", "parse_log_only"].index(current_scope) + 1)
+            if current_scope in {"full", "parse_only", "parse_log_only"}
+            else 1,
+        )
+        if scope_choice == "back":
+            return current_scope
+        return scope_choice
 
     while True:
         recent_log = str(last_run.get("crash_log", "")).strip() if isinstance(last_run, dict) else ""
@@ -1664,7 +2105,7 @@ def _collect_interactive_run_state() -> Optional[Dict[str, Any]]:
             ("2", "更多选项"),
         ]
         if has_recent:
-            opts.append(("5", "Analyze recent log again"))
+            opts.append(("5", "再次进行上一次分析"))
         opts.append(("q", "退出"))
         choice = _prompt_select("请选择要执行的操作", opts, default_index=0).strip().lower()
         if choice == "__eof__":
@@ -1676,52 +2117,113 @@ def _collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                 sub_choice = _prompt_select(
                     "更多选项",
                     [
+                        ("back", "返回"),
                         ("cfg_llm", "配置大模型"),
                         ("cfg_add2line", "配置 addr2line 工具"),
-                        ("engine", f"调整执行引擎（当前: {preferred_engine}）"),
-                        ("command_guide", "命令参考（分组说明）"),
-                        ("example", "快速示例命令"),
-                        ("back", "返回"),
-                        ("quit", "退出"),
+                        ("advanced", "高级选项"),
+                        ("command_guide", "命令参考"),
+                        ("example", "手动输入命令示例"),
                     ],
                     default_index=0,
                 )
                 if sub_choice == "cfg_llm":
                     _configure_llm_only()
-                    status = _doctor_status()
                     print("")
                     continue
                 if sub_choice == "cfg_add2line":
                     _configure_add2line_only()
-                    status = _doctor_status()
                     print("")
                     continue
-                if sub_choice == "engine":
-                    preferred_engine = _prompt_select(
-                        "请选择执行引擎",
-                        [
-                            ("direct", "direct"),
-                            ("langchain", "langchain"),
-                            ("langgraph", "langgraph"),
-                        ],
-                        default_index=["direct", "langchain", "langgraph"].index(preferred_engine),
-                    )
-                    print(f"已设置默认引擎: {preferred_engine}")
-                    print("")
+                if sub_choice == "advanced":
+                    while True:
+                        adv = _prompt_select(
+                            "高级选项",
+                            [
+                                ("back", "返回"),
+                                ("llm_manual", "手动编辑大模型配置文件"),
+                                ("add2line_manual", "手动编辑 addr2line 配置文件"),
+                                ("engine", f"调整执行引擎（当前: {preferred_engine}）"),
+                                (
+                                    "run_scope",
+                                    f"设置Agent执行流程（当前: { {'full':'完整分析','parse_only':'仅解析+符号化','parse_log_only':'仅解析日志'}.get(preferred_run_scope, preferred_run_scope) }）",
+                                ),
+                                ("ai_mode", f"设置是否开启AI（当前: {'关闭' if preferred_skip_ai else '开启'}）"),
+                            ],
+                            default_index=0,
+                        )
+                        if adv == "back":
+                            break
+                        if adv == "llm_manual":
+                            _configure_llm_manual_panel()
+                            print("")
+                            continue
+                        if adv == "add2line_manual":
+                            _configure_add2line_manual_panel()
+                            print("")
+                            continue
+                        if adv == "engine":
+                            chosen = _pick_engine(preferred_engine)
+                            if chosen != preferred_engine:
+                                preferred_engine = chosen
+                                print(f"已设置默认引擎: {preferred_engine}")
+                            print("")
+                            continue
+                        if adv == "ai_mode":
+                            chosen_skip_ai = _pick_ai_mode(preferred_skip_ai)
+                            if chosen_skip_ai != preferred_skip_ai:
+                                preferred_skip_ai = chosen_skip_ai
+                                print(f"已设置 AI 模式: {'跳过AI' if preferred_skip_ai else '使用AI'}")
+                            print("")
+                            continue
+                        if adv == "run_scope":
+                            chosen_scope = _pick_run_scope(preferred_run_scope)
+                            if chosen_scope != preferred_run_scope:
+                                preferred_run_scope = chosen_scope
+                                print(
+                                    f"已设置Agent执行流程: { {'full':'完整分析','parse_only':'仅解析+符号化','parse_log_only':'仅解析日志'}.get(preferred_run_scope, preferred_run_scope) }"
+                                )
+                            print("")
+                            continue
                     continue
                 if sub_choice == "example":
-                    print("推荐：输入 1 进入交互引导（新手首选）。")
-                    print("或直接命令运行（适合熟手/脚本）：")
-                    print("sa-agent --crash-log <log.crash> --library-dir <lib_dir> --code-root <code_dir>")
-                    print("更多参数：sa-agent --help")
-                    print("")
+                    while True:
+                        print("━━━━━━━━━━━━━━━━━━━━━━")
+                        print("手动输入命令示例")
+                        print("")
+                        print("推荐：输入 1 进入交互引导（新手首选）。")
+                        print("或直接命令运行（适合熟手/脚本）：")
+                        print("sa-agent --crash-log <log.crash> --library-dir <lib_dir> --code-root <code_dir>")
+                        print("更多参数：sa-agent --help")
+                        print("━━━━━━━━━━━━━━━━━━━━━━")
+                        ex_action = _prompt_select(
+                            "请选择操作",
+                            [
+                                ("back", "返回"),
+                                ("done", "已掌握"),
+                            ],
+                            default_index=0,
+                        )
+                        if ex_action in {"done", "back"}:
+                            print("")
+                            break
                     continue
                 if sub_choice == "command_guide":
-                    _print_command_guide_grouped()
-                    print("")
+                    while True:
+                        print("━━━━━━━━━━━━━━━━━━━━━━")
+                        _show_command_reference()
+                        print("━━━━━━━━━━━━━━━━━━━━━━")
+                        cmd_action = _prompt_select(
+                            "请选择操作",
+                            [
+                                ("back", "返回"),
+                                ("done", "已掌握"),
+                            ],
+                            default_index=0,
+                        )
+                        if cmd_action in {"done", "back"}:
+                            print("")
+                            break
                     continue
-                if sub_choice == "quit":
-                    return None
                 break
             continue
         if choice == "5" and has_recent:
@@ -1731,6 +2233,7 @@ def _collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                 "code_roots": [str(x).strip() for x in (last_run.get("code_roots", []) or []) if str(x).strip()],
                 "engine": str(last_run.get("engine", "direct")).strip() or "direct",
                 "skip_ai": bool(last_run.get("skip_ai", False)),
+                "run_scope": str(last_run.get("run_scope", "full")).strip() or "full",
             }
             crash_path = Path(recent_state["crash_log"]).expanduser().resolve()
             if not recent_state["crash_log"] or not crash_path.exists() or not crash_path.is_file():
@@ -1760,10 +2263,10 @@ def _collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                     print(f"- {item}")
             print("将复跑最近一次分析：")
             print(f"- crash_log: {recent_state['crash_log']}")
-            print(f"- library_dir: {recent_state['library_dir'] or 'N/A'}")
-            print(f"- code_roots: {recent_state['code_roots'] or []}")
-            print(f"- engine: {recent_state['engine']}")
-            print(f"- skip_ai: {recent_state['skip_ai']}")
+            if recent_state["library_dir"]:
+                print(f"- library_dir: {recent_state['library_dir']}")
+            if recent_state["code_roots"]:
+                print(f"- code_roots: {recent_state['code_roots']}")
             quick_confirm = _prompt_select(
                 "请选择下一步",
                 [("run", "立即重跑"), ("edit", "编辑参数"), ("cancel", "取消")],
@@ -1780,58 +2283,40 @@ def _collect_interactive_run_state() -> Optional[Dict[str, Any]]:
         if choice == "1":
             break
 
+    status = _doctor_status()
     seed = last_run
-    crash_log_default = str(seed.get("crash_log", "")).strip()
-    library_default = str(seed.get("library_dir", "")).strip()
-    code_roots_default = seed.get("code_roots", []) if isinstance(seed.get("code_roots", []), list) else []
     engine_default = preferred_engine
-    skip_ai_default = bool(seed.get("skip_ai", False))
+    skip_ai_default = preferred_skip_ai
+    run_scope_default = preferred_run_scope
 
     if not status["llm_ok"]:
-        print("检测到 LLM 未配置完成。")
+        print("检测到 LLM 未配置完成，正在进入大模型配置引导...")
         while True:
-            fix_choice = _prompt_select(
-                "请选择后续操作",
+            _configure_llm_only()
+            status = _doctor_status()
+            if status["llm_ok"]:
+                skip_ai_default = False
+                preferred_skip_ai = False
+                break
+            retry_choice = _prompt_select(
+                "LLM 仍未配置完成。",
                 [
-                    ("1", "现在配置大模型"),
-                    ("2", "本次跳过 AI 继续"),
-                    ("3", "退出"),
+                    ("retry", "继续配置大模型"),
+                    ("back", "返回上一级菜单"),
                 ],
                 default_index=0,
-            ).strip()
-            if fix_choice == "__EOF__":
+            )
+            if retry_choice == "back":
                 return None
-            if fix_choice == "1":
-                _config_command_init()
-                status = _doctor_status()
-                if status["llm_ok"]:
-                    skip_ai_default = False
-                    break
-                print("仍未检测到可用 LLM，将默认跳过 AI。")
-                skip_ai_default = True
-                break
-            if fix_choice == "2":
-                skip_ai_default = True
-                break
-            if fix_choice == "3":
-                return None
-    skip_ai = skip_ai_default
-    if status["llm_ok"]:
-        skip_ai_choice = _prompt_select(
-            "请选择 AI 模式",
-            [
-                ("no", "使用 AI 分析"),
-                ("yes", "跳过 AI（不调用大模型；输出工具链结果并生成可复用提示词）"),
-            ],
-            default_index=1 if skip_ai_default else 0,
-        )
-        skip_ai = skip_ai_choice == "yes"
+    skip_ai = skip_ai_default or run_scope_default in {"parse_only", "parse_log_only"}
 
     while True:
-        raw = _prompt_with_default("请输入崩溃日志路径（输入 quit 退出）", crash_log_default)
-        if raw.lower() == "quit":
+        raw = _safe_input("请输入崩溃日志路径（直接回车返回上一级）: ").strip()
+        if raw == "__EOF__":
             return None
-        crash_log = raw or crash_log_default
+        if not raw:
+            return collect_interactive_run_state()
+        crash_log = raw
         if not crash_log:
             print("崩溃日志路径不能为空。")
             continue
@@ -1842,49 +2327,63 @@ def _collect_interactive_run_state() -> Optional[Dict[str, Any]]:
         crash_log = str(p)
         break
 
-    while True:
-        raw = _prompt_with_default(
-            "请输入库文件目录（若日志尚未完成符号化/地址解析，则必须填写；仅在日志已完成解析时可输入 skip）",
-            library_default,
-        )
-        if raw.lower() == "skip":
-            library_dir = ""
-            break
-        library_dir = raw or library_default
-        if not library_dir:
-            break
-        p = Path(library_dir).expanduser().resolve()
-        if not p.exists() or not p.is_dir():
-            print(f"路径无效（需要是目录）: {p}")
-            continue
-        library_dir = str(p)
-        break
+    library_dir_input: Optional[str] = None
+    code_roots_input: Optional[str] = None
 
-    while True:
-        default_text = ",".join([str(Path(x).expanduser().resolve()) for x in code_roots_default if str(x).strip()])
-        raw = _prompt_with_default(
-            "请输入代码目录（可多个，英文逗号分隔；若仅做日志提取或堆栈地址解析可输入 skip，若需源码上下文/AI分析则必须填写）",
-            default_text,
-        )
-        if raw.lower() == "skip":
-            code_roots: List[str] = []
-            break
-        path_items = [item.strip() for item in (raw or default_text).split(",") if item.strip()]
-        bad = []
-        normalized: List[str] = []
-        for item in path_items:
-            p = Path(item).expanduser().resolve()
+    if run_scope_default == "parse_log_only":
+        library_dir = ""
+        code_roots = []
+    else:
+        while True:
+            raw = _safe_input("请输入库文件目录（如果日志已完成堆栈解析可输入skip跳过，直接回车返回上一级）: ").strip()
+            if raw == "__EOF__":
+                return None
+            if not raw:
+                return collect_interactive_run_state()
+            if raw.lower() == "skip":
+                library_dir_input = "skip"
+                library_dir = ""
+                break
+            library_dir = raw
+            library_dir_input = library_dir
+            p = Path(library_dir).expanduser().resolve()
             if not p.exists() or not p.is_dir():
-                bad.append(str(p))
-            else:
-                normalized.append(str(p))
-        if bad:
-            print("以下代码目录无效：")
-            for item in bad:
-                print(f"- {item}")
-            continue
-        code_roots = normalized
-        break
+                print(f"路径无效（需要是目录）: {p}")
+                continue
+            library_dir = str(p)
+            break
+
+        if run_scope_default == "parse_only":
+            code_roots = []
+        else:
+            while True:
+                raw = _safe_input("请输入代码目录（可多个，英文逗号分隔，直接回车返回上一级）: ").strip()
+                if raw == "__EOF__":
+                    return None
+                if not raw:
+                    return collect_interactive_run_state()
+                if raw.lower() == "skip":
+                    code_roots_input = "skip"
+                    code_roots = []
+                    break
+                path_items = [item.strip() for item in raw.split(",") if item.strip()]
+                bad = []
+                normalized: List[str] = []
+                for item in path_items:
+                    p = Path(item).expanduser().resolve()
+                    if not p.exists() or not p.is_dir():
+                        bad.append(str(p))
+                    else:
+                        normalized.append(str(p))
+                if bad:
+                    print("以下代码目录无效：")
+                    for item in bad:
+                        print(f"- {item}")
+                    continue
+                code_roots = normalized
+                if code_roots:
+                    code_roots_input = raw
+                break
 
     engine = engine_default if engine_default in {"direct", "langchain", "langgraph"} else "direct"
 
@@ -1894,32 +2393,24 @@ def _collect_interactive_run_state() -> Optional[Dict[str, Any]]:
         "code_roots": code_roots,
         "engine": engine,
         "skip_ai": skip_ai,
+        "run_scope": run_scope_default,
     }
 
     print("")
     _print_execution_plan(state)
-    print("== 参数确认 ==")
-    print(f"- crash_log: {state['crash_log']}")
-    print(f"- library_dir: {state['library_dir'] or 'N/A'}")
-    print(f"- code_roots: {state['code_roots'] or []}")
-    print(f"- engine: {state['engine']}")
-    print(f"- skip_ai: {state['skip_ai']}")
-    confirm = _prompt_select(
-        "请选择下一步",
-        [("run", "立即执行"), ("edit", "重新填写参数"), ("cancel", "退出")],
-        default_index=0,
+    _print_user_parameter_confirmation(
+        state,
+        library_dir_input=library_dir_input,
+        code_roots_input=code_roots_input,
     )
-    if confirm == "cancel":
-        return None
-    if confirm == "edit":
-        return _collect_interactive_run_state()
+    print("- 提示: 运行中按 Ctrl+C 可立即终止当前任务。")
 
     session_state["last_run"] = state
     _save_session_state(session_state)
     return state
 
 
-def _execute_analysis(args: argparse.Namespace) -> int:
+def execute_analysis(args: argparse.Namespace) -> int:
     vector_cmd_exit = _run_vector_db_command(args)
     if vector_cmd_exit is not None:
         return vector_cmd_exit
@@ -1933,13 +2424,20 @@ def _execute_analysis(args: argparse.Namespace) -> int:
         print("错误: 崩溃日志内容为空", file=sys.stderr)
         return 1
 
+    run_scope = "full"
+    if getattr(args, "parse_log_only", False):
+        run_scope = "parse_log_only"
+    elif getattr(args, "parse_only", False):
+        run_scope = "parse_only"
     code_roots = _normalize_code_roots(args.code_roots)
+    effective_skip_ai = bool(args.skip_ai) or run_scope in {"parse_only", "parse_log_only"}
     problem = {
         "crash_log": crash_log_content,
         "library_dir": args.library_dir,
         "code_roots": code_roots,
         "engine": args.engine,
-        "skip_ai": bool(args.skip_ai),
+        "skip_ai": effective_skip_ai,
+        "run_scope": run_scope,
         "vector_db_path": args.vector_db_path,
         "vector_db_max_results": args.vector_db_max_results,
         "rule_confidence_threshold": args.rule_confidence_threshold,
@@ -1955,17 +2453,18 @@ def _execute_analysis(args: argparse.Namespace) -> int:
     if args.config:
         config = SystemConfig.from_file(args.config)
     else:
+        tool_entries = [ToolConfig(name="crash_log_parser", enabled=True)]
+        if run_scope in {"full", "parse_only"}:
+            tool_entries.append(ToolConfig(name="add2line_resolver", enabled=True))
+        if run_scope == "full":
+            tool_entries.append(ToolConfig(name="code_content_provider", enabled=True))
         config = SystemConfig(
-            tools=[
-                ToolConfig(name="crash_log_parser", enabled=True),
-                ToolConfig(name="add2line_resolver", enabled=True),
-                ToolConfig(name="code_content_provider", enabled=True),
-            ],
+            tools=tool_entries,
             workflows=[WorkflowConfig(name="crash_analysis", enabled=True)],
         )
 
     llm_adapter = None
-    if not args.skip_ai:
+    if not effective_skip_ai:
         if config.llm is None:
             llm_config = _build_llm_config_from_agent_config(args.engine)
             if llm_config is not None:
@@ -1987,7 +2486,7 @@ def _execute_analysis(args: argparse.Namespace) -> int:
     report_dir = _build_report_dir(args)
     applied_fix_result: Optional[Dict[str, Any]] = None
 
-    if args.apply_ai_fixes and result.get("status") == "success" and not args.skip_ai:
+    if args.apply_ai_fixes and result.get("status") == "success" and not effective_skip_ai and run_scope == "full":
         applied_fix_result = _maybe_apply_ai_fixes(
             llm_adapter, result, code_roots, report_dir, args.backup_original_sources
         )
@@ -2082,7 +2581,7 @@ def _execute_analysis(args: argparse.Namespace) -> int:
         result,
         output,
         applied_fix_result,
-        write_readme_output=not args.skip_ai,
+        write_readme_output=not effective_skip_ai,
     )
 
     if args.output_file:
@@ -2106,63 +2605,74 @@ def _is_tty_interactive() -> bool:
 
 def main(argv: Optional[List[str]] = None) -> int:
     raw_argv = list(argv if argv is not None else sys.argv[1:])
-    if raw_argv and raw_argv[0] == "config":
-        return _handle_config_command(raw_argv[1:])
-    if raw_argv and raw_argv[0] == "profile":
-        return _handle_profile_command(raw_argv[1:])
+    try:
+        if raw_argv and raw_argv[0] == "config":
+            return _handle_config_command(raw_argv[1:])
+        if raw_argv and raw_argv[0] == "profile":
+            return _handle_profile_command(raw_argv[1:])
+        if raw_argv and raw_argv[0] == "cancel":
+            return _handle_cancel_command(raw_argv[1:])
 
-    if raw_argv and raw_argv[0] == "run":
-        raw_argv = raw_argv[1:]
+        if raw_argv and raw_argv[0] == "run":
+            raw_argv = raw_argv[1:]
 
-    parser = build_parser()
-    args = parser.parse_args(raw_argv)
-    has_business_args = any(
-        [
-            bool(args.crash_log),
-            bool(args.init_vector_db),
-            bool(args.vector_db_stats),
-            args.export_vector_db is not None,
-            bool(args.import_vector_db),
-            bool(args.pattern_feedback),
-            args.vector_db_decay is not None,
-            bool(args.vector_db_gc),
-        ]
-    )
+        parser = build_parser()
+        args = parser.parse_args(raw_argv)
+        has_business_args = any(
+            [
+                bool(args.crash_log),
+                bool(args.init_vector_db),
+                bool(args.vector_db_stats),
+                args.export_vector_db is not None,
+                bool(args.import_vector_db),
+                bool(args.pattern_feedback),
+                args.vector_db_decay is not None,
+                bool(args.vector_db_gc),
+            ]
+        )
 
-    interactive_requested = args.interactive is True
-    interactive_forced_off = args.interactive is False
-    auto_interactive = (not raw_argv and _is_tty_interactive())
-    should_interactive = (interactive_requested or auto_interactive) and not has_business_args and not interactive_forced_off
+        interactive_requested = args.interactive is True
+        interactive_forced_off = args.interactive is False
+        auto_interactive = (not raw_argv and _is_tty_interactive())
+        should_interactive = (interactive_requested or auto_interactive) and not has_business_args and not interactive_forced_off
 
-    if should_interactive:
-        state = _collect_interactive_run_state()
-        if state is None:
-            print("已退出交互模式。")
-            return 0
-        argv_from_state: List[str] = [
-            "--crash-log",
-            state["crash_log"],
-            "--engine",
-            state["engine"],
-            "--interactive=false",
-        ]
-        if state.get("library_dir"):
-            argv_from_state.extend(["--library-dir", state["library_dir"]])
-        for code_root in state.get("code_roots", []):
-            argv_from_state.extend(["--code-root", code_root])
-        if state.get("skip_ai"):
-            argv_from_state.append("--skip-ai")
-        args = parser.parse_args(argv_from_state)
-        return _execute_analysis(args)
+        if should_interactive:
+            state = collect_interactive_run_state()
+            if state is None:
+                print("已退出交互模式。")
+                return 0
+            argv_from_state: List[str] = [
+                "--crash-log",
+                state["crash_log"],
+                "--engine",
+                state["engine"],
+                "--no-interactive",
+            ]
+            if state.get("library_dir"):
+                argv_from_state.extend(["--library-dir", state["library_dir"]])
+            for code_root in state.get("code_roots", []):
+                argv_from_state.extend(["--code-root", code_root])
+            if state.get("skip_ai"):
+                argv_from_state.append("--skip-ai")
+            run_scope = str(state.get("run_scope", "full")).strip()
+            if run_scope == "parse_only":
+                argv_from_state.append("--parse-only")
+            elif run_scope == "parse_log_only":
+                argv_from_state.append("--parse-log-only")
+            args = parser.parse_args(argv_from_state)
+            return execute_analysis(args)
 
-    if interactive_requested and not _is_tty_interactive():
-        print("错误: 当前为非交互环境，无法启用 --interactive。", file=sys.stderr)
-        return 1
+        if interactive_requested and not _is_tty_interactive():
+            print("错误: 当前为非交互环境，无法启用 --interactive。", file=sys.stderr)
+            return 1
 
-    if not args.crash_log and not has_business_args:
-        print("错误: 缺少 --crash-log（或直接运行 `sa-agent` 进入交互模式）", file=sys.stderr)
-        return 1
-    return _execute_analysis(args)
+        if not args.crash_log and not has_business_args:
+            print("错误: 缺少 --crash-log（或直接运行 `sa-agent` 进入交互模式）", file=sys.stderr)
+            return 1
+        return execute_analysis(args)
+    except KeyboardInterrupt:
+        print("\n已中止当前任务（Ctrl+C）。")
+        return 130
 
 
 if __name__ == "__main__":

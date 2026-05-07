@@ -135,11 +135,12 @@ pip install stability-analysis-agent
 # Verify installation
 sa-agent --help
 
-# One command onboarding (auto-check + guided setup + analysis)
+# One command opens the guided wizard (menus + in-flow setup; no blocking env scan on startup)
 sa-agent
 ```
 
-> When a previous analysis record exists, the interactive menu shows `5) Analyze recent log again` for one-click rerun.
+> When a previous analysis record exists, the interactive menu shows `5) 再次进行上一次分析` (rerun last analysis) for one-click rerun.
+> The first screen goes straight to the action menu (faster startup). LLM/symbolizer status is checked in context when you enter the corresponding configuration flows.
 > The onboarding interaction is inspired by Claude-style CLI UX: arrow-key menus, grouped "More options", clear back actions, and post-action confirmation panels.
 
 > Config files are saved in `~/.config/stability-analysis-agent/`:
@@ -156,14 +157,18 @@ sa-agent
 >
 > Upgrade with: `pip install -U stability-analysis-agent`
 
+### Programmatic API (embedding / enterprise wrappers)
+
+Since **v1.2.2**, the wheel includes a stable Python surface in [`cli/api.py`](./cli/api.py), for example `execute_analysis`, `build_parser`, `collect_interactive_run_state`, `interactive_state_to_argv`, `run_from_interactive_state`, and `run_cli_main`. Use it to drive the same pipeline as `sa-agent` from your own menus or automation without `subprocess`. See [`CHANGELOG.md`](./CHANGELOG.md).
+
 ### 2. Use Prebuilt CLI Binary (No Python Required)
 
-Download the latest binary from [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases), then run:
+Download the latest binary from [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases), then run. **Zip and folder names are versioned—use the exact names from the release you download** (the example below may not match every release):
 
 ```bash
-# Example for v1.2.1 macOS arm64 package
-unzip StabilityAnalyzer-v1.2.1-mac-arm64.zip
-cd output/cli_release/stability_analyzer_cli/v1.2.1-mac-arm64
+# Example: macOS arm64 layout (adjust version to match the downloaded zip)
+unzip StabilityAnalyzer-v1.2.2-mac-arm64.zip
+cd output/cli_release/stability_analyzer_cli/v1.2.2-mac-arm64
 
 chmod +x StabilityAnalyzer
 
@@ -275,6 +280,8 @@ For AI analysis and add2line customization after PyPI install, run:
 ```bash
 sa-agent
 ```
+
+The wizard opens on the main menu (no automatic env scan on startup). Enter the LLM/symbolizer configuration flows to run contextual checks and setup guidance.
 
 Default local config directory:
 

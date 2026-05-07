@@ -1,7 +1,7 @@
 # Stability Analysis Agent — CLI 命令参考
 
 本文档与仓库根目录下的 **`cli/main.py`**（Tool System 统一入口）保持一致。  
-CLI 为**扁平参数**（无子命令）：崩溃分析主流程与向量库运维类参数通过**是否携带向量库相关开关**区分；携带向量库运维参数时会**执行完即退出**，不跑崩溃分析。
+CLI 为**扁平参数**（含少量管理子命令）：崩溃分析主流程与向量库运维类参数通过**是否携带向量库相关开关**区分；携带向量库运维参数时会**执行完即退出**，不跑崩溃分析。另提供 `config/profile/cancel` 子命令用于配置管理、会话模板与 daemon 任务取消。
 
 **入口与典型工作目录**（在仓库根目录执行）：
 
@@ -23,6 +23,8 @@ python3 cli/main.py [参数...]
 | `--config PATH` | 否 | `SystemConfig` JSON 文件；不指定时使用内置默认工具链 + `crash_analysis` 工作流。 |
 | `--skip-ai` | 否 | 跳过 LLM，仅跑工具链（解析 + 符号化 + 代码上下文等）。 |
 | `--engine {direct,langchain,langgraph}` | 否 | 传给 `LLMConfig` 的引擎标记，默认 `direct`。 |
+| `--parse-only` | 否 | 仅执行“解析 + 符号化”（不提取代码上下文，不调用 AI）。 |
+| `--parse-log-only` | 否 | 仅执行日志解析（不符号化，不提取代码上下文，不调用 AI）。 |
 | `--output-format {markdown,json,text}` | 否 | 终端打印/写入 `--output-file` 的格式，默认 `markdown`。 |
 | `--output-file PATH` | 否 | 将上述格式结果写入文件；不指定则打印到 **stdout**。 |
 
@@ -105,7 +107,27 @@ LLM 密钥与默认厂商/模型来自 **`tools/configs/agent_config.json`**；�
 
 ---
 
-## 6. 参数组合速查
+## 6. 管理子命令
+
+| 子命令 | 作用 |
+|--------|------|
+| `config` | 进入/执行配置相关命令。 |
+| `profile` | 管理会话模板（list/show/use/save/delete）。 |
+| `cancel` | 取消 daemon 中正在运行的任务。 |
+
+### 6.1 取消 daemon 任务
+
+```bash
+# 取消默认 daemon（http://127.0.0.1:8765）中的任务
+python3 cli/main.py cancel <run_id>
+
+# 指定 daemon 地址
+python3 cli/main.py cancel <run_id> --daemon http://127.0.0.1:8765
+```
+
+---
+
+## 7. 参数组合速查
 
 | 场景 | 建议参数 |
 |------|----------|
@@ -118,10 +140,10 @@ LLM 密钥与默认厂商/模型来自 **`tools/configs/agent_config.json`**；�
 
 ---
 
-## 7. 文档维护
+## 8. 文档维护
 
 - **实现来源**：仓库根目录 `cli/main.py` 中 `build_parser()` 与 `main()`。
 - **最后更新**：2026-04-20（与当前 Tool System CLI 行为对齐）。
 - 若增减参数或改变 `cli_reports` / 改码语义，请同步更新本文件。
 
-**说明**：若你曾在旧版本文档中见到 `tools/cli/main.py`、`--parse-only`、`--daemon` 等条目，**当前本仓库以 `cli/main.py` 为准**；其他入口（如 `agent/ai_stability_agent.py`、daemon）的参数不在此文件覆盖范围内。
+**说明**：若你曾在旧版本文档中见到 `tools/cli/main.py`、`--daemon` 等条目，**当前本仓库以 `cli/main.py` 为准**；其他入口（如 `agent/ai_stability_agent.py`、daemon）的参数不在此文件覆盖范围内。
