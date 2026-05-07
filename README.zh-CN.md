@@ -15,7 +15,7 @@
 
 ---
 
-**Stability Analysis Agent** 是一个开源的、专为 **App 稳定性分析** 打造的 AI Agent —— 覆盖**崩溃（Crash）、ANR（应用无响应）、OOM（内存溢出）、卡死（Freeze / Watchdog Kill）** 等常见稳定性问题。给它一份稳定性日志，它会自动完成**解析、符号化、代码提取、根因推理和修复建议生成**。支持 **iOS、Android、macOS、Linux、Windows**，内置 `addr2line` / `atos` 集成、LangGraph 多轮推理和 RAG 知识库（ChromaDB）。
+**Stability Analysis Agent** 是一个开源的、面向 **App 稳定性分析** 的统一 AI Agent 框架，支持扩展到 **崩溃（Crash）、ANR（应用无响应）、OOM（内存溢出）、卡死（Freeze / Watchdog Kill）** 等场景。当前首个成熟落地场景为 **Crash（闪退）分析**；ANR、卡顿与内存治理能力正在持续演进中。给它一份稳定性日志，它会自动完成**解析、符号化、代码提取、根因推理和修复建议生成**。支持 **iOS、Android、macOS、Linux、Windows**，内置 `addr2line` / `atos` 集成、LangGraph 多轮推理和 RAG 知识库（ChromaDB）。
 
 ### 为什么不直接把日志丢给 AI 编程工具？
 
@@ -126,97 +126,67 @@
 - 源码使用：Python 3.9+
 - （可选）符号化工具：`atos`（macOS 自带）或 `addr2line`（Linux，来自 binutils）
 
-### 1. 通过 PyPI 安装（推荐）
+### 安装并启动（推荐）
 
 ```bash
 # 安装（中国大陆可加 -i https://pypi.tuna.tsinghua.edu.cn/simple）
 pip install stability-analysis-agent
 
-# 查看帮助
-sa-agent --help
-
-# 一条命令进入交互引导（主菜单引导配置与分析；首屏不做阻塞式环境扫描）
+# 进入交互向导
 sa-agent
 ```
 
-> 当存在最近一次分析记录时，交互菜单会出现 `5) 再次进行上一次分析`，可一键复跑上次崩溃日志。
-> 首屏直接进入意图菜单以缩短启动等待；进入“配置大模型 / 配置 addr2line 工具”时会自动执行对应检测并给出配置引导。
-> 交互体验参考 Claude 风格 CLI：支持上下键菜单选择、分组化“更多选项”、可返回路径和关键步骤确认面板，降低首次使用门槛。
+> 交互体验对标 Claude CLI：支持上下键菜单、分组化“更多选项”、可返回路径和关键步骤确认。  
+> 大多数场景可在终端向导内完成“配置 + 分析 + AI 修复建议”全流程。
 
-> 安装后的配置文件保存在 `~/.config/stability-analysis-agent/` 目录下：
-> - `agent_config.local.json`：大模型 provider / API key / model
-> - `add2line_resolver_config.local.json`：addr2line / atos 工具路径
->
-> provider 配置模板见 `tools/configs/agent_config.local.example.json`。  
-> 除了填写 API Key/Authorization，还必须将 `llm_config.active_provider` 设置为你当前要使用的 provider 名称（如 `openai` / `deepseek` / `zhipu_bigmodel`）。
-> 当前默认按 OpenAI Chat Completions 兼容格式请求；若某 provider 非该格式，需要新增 adapter 后再启用（仅改配置不一定可用）。
->
-> 即使不初始化配置，也可以通过 `--skip-ai` 运行完整非 AI 工具链。
->
-> PyPI 包默认包含完整运行依赖（向量数据库、tree-sitter、LangGraph 链路）。
->
-> 升级命令：`pip install -U stability-analysis-agent`
+## Demo：交互式 AI 修复（Crash）
+
+使用内置 Demo 快速体验“终端交互 + AI 完整链路”：
+
+```bash
+git clone https://github.com/baidu-maps/stability-analysis-agent.git
+cd stability-analysis-agent
+sa-agent
+```
+
+在向导中选择 `快速开始分析（推荐）`，然后输入：
+
+```text
+crash_log   -> examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash
+library_dir -> examples/crash_cases/demo_basic/lib/mac
+code_root   -> examples/crash_cases/demo_basic/code_dir
+```
+
+CLI 会先输出执行计划，再自动执行。AI 模式下将完成解析、符号化、代码上下文提取和 LLM 推理，并可回写修复建议（含备份）。
+
+分析你自己的崩溃日志同样使用 `sa-agent` 交互输入路径即可。输出位于 `./cli_reports/<timestamp>/`。
+
+## 其它方式（高级）
 
 ### 以 Python 集成（可编程接口）
 
 自 **v1.2.2** 起，PyPI 包提供稳定模块 [`cli/api.py`](./cli/api.py)，例如 `execute_analysis`、`build_parser`、`collect_interactive_run_state`、`interactive_state_to_argv`、`run_from_interactive_state`、`run_cli_main` 等，便于企业包装器或自动化脚本在进程内调用与 `sa-agent` 相同的分析链路，而无需 `subprocess`。变更说明见 [`CHANGELOG.md`](./CHANGELOG.md)。
 
-### 2. 使用预编译 CLI 二进制（无需 Python）
+### 使用预编译 CLI 二进制（无需 Python）
 
-从 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases) 下载最新二进制后执行。**压缩包与目录名随版本变化，请以实际下载的 Release 文件名为准**（下面仅为示例路径）：
+从 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases) 下载最新二进制。压缩包与目录名随版本变化，请以实际 Release 文件名为准：
 
 ```bash
-# 示例：macOS arm64 目录结构（请按你下载的包名调整版本）
 unzip StabilityAnalyzer-v1.2.2-mac-arm64.zip
 cd output/cli_release/stability_analyzer_cli/v1.2.2-mac-arm64
-
-chmod +x StabilityAnalyzer
-
-# 若 macOS Gatekeeper 拦截启动（未签名二进制）
-xattr -d com.apple.quarantine StabilityAnalyzer
-
-./StabilityAnalyzer --help
-
-# 可选：安装到 ~/.local/bin，命令名为 sa-agent（Release 压缩包内自带 install.sh）
-chmod +x install.sh
-./install.sh
-# 然后可直接: sa-agent --help
+./StabilityAnalyzer
 ```
 
-### 3. 开发者源码安装
+### 开发者源码安装
 
 ```bash
 git clone https://github.com/baidu-maps/stability-analysis-agent.git
 cd stability-analysis-agent
 pip install -e .
+sa-agent
 ```
 
 > `pip install -e .` 主要用于开发场景，同时也会暴露本地 `sa-agent` 命令。
-
-### 4. 运行内置 Demo（无需 API Key）
-
-通过 PyPI 安装（`pip install stability-analysis-agent`）或源码安装（`pip install -e .`）后，克隆仓库获取内置 Demo 样例，然后运行：
-
-```bash
-sa-agent \
-  --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
-  --library-dir examples/crash_cases/demo_basic/lib/mac \
-  --code-root examples/crash_cases/demo_basic/code_dir \
-  --skip-ai
-```
-
-输出保存在当前工作目录下的 `./cli_reports/<timestamp>/`，包含结构化 JSON 报告。
-
-### 5. 分析你自己的崩溃日志
-
-```bash
-sa-agent \
-  --crash-log <你的崩溃日志> \
-  --library-dir <库文件和符号目录> \
-  --code-root <源码根目录>
-```
-
-> 添加 `--skip-ai` 跳过 AI 分析，或使用 `--parse-only` 仅执行解析 + 符号化。
 
 ### CLI 参数说明
 
@@ -273,15 +243,13 @@ print(result)
 
 ## 配置 LLM 与符号化工具
 
-AI 分析为**可选功能**。即使不初始化配置，也可以通过 `--skip-ai` 运行完整非 AI 工具链。
-
-通过 PyPI 安装后，推荐直接运行：
+推荐通过交互向导配置：
 
 ```bash
 sa-agent
 ```
 
-进入后为首屏主菜单（不会自动做环境扫描）。若要自检与配置，可直接进入“配置大模型 / 配置 addr2line 工具”流程。
+进入后在 `更多选项` 中选择 `配置大模型` / `配置 addr2line 工具`，流程内会自动检测并给出引导。
 
 默认本地配置目录：
 
@@ -293,6 +261,11 @@ sa-agent
 - `add2line_resolver_config.local.json`：配置 addr2line/atos 工具路径
 
 若你偏好手动编辑，也可直接修改以上配置文件。
+
+高级可选模式：
+- `--skip-ai`（仅工具链）
+- `--parse-only`（仅解析 + 符号化）
+- `--parse-log-only`（仅解析日志）
 
 ### 高级：add2line 配置路径覆盖
 

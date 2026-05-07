@@ -15,7 +15,7 @@
 
 ---
 
-**Stability Analysis Agent** is an open-source AI Agent purpose-built for **app stability analysis** — covering **crashes, ANR (Application Not Responding), OOM (Out of Memory), freezes / watchdog kills**, and more. Feed it a stability log, and it will **parse, symbolize, extract code, reason about the root cause, and generate fix suggestions** — automatically. Supports **iOS, Android, macOS, Linux, and Windows** with built-in `addr2line` / `atos` integration, LangGraph multi-turn reasoning, and a RAG knowledge base (ChromaDB).
+**Stability Analysis Agent** is an open-source AI Agent framework for **app stability analysis**, designed to evolve across **crash, ANR (Application Not Responding), OOM (Out of Memory), and freeze / watchdog** scenarios. The first production-ready scenario today is **crash analysis**; ANR, freeze, and memory-focused workflows are under active evolution. Feed it a stability log, and it will **parse, symbolize, extract code, reason about the root cause, and generate fix suggestions** — automatically. Supports **iOS, Android, macOS, Linux, and Windows** with built-in `addr2line` / `atos` integration, LangGraph multi-turn reasoning, and a RAG knowledge base (ChromaDB).
 
 ### Why not just paste the log into an AI coding tool?
 
@@ -126,97 +126,67 @@ Crash Log → Parse → Symbolize → Extract Code
 - Source usage: Python 3.9+
 - (Optional) `atos` (macOS, built-in) or `addr2line` (Linux, via binutils) for symbolization
 
-### 1. Install via PyPI (Recommended)
+### Install and Launch (Recommended)
 
 ```bash
 # Install (for Mainland China, add -i https://pypi.tuna.tsinghua.edu.cn/simple)
 pip install stability-analysis-agent
 
-# Verify installation
-sa-agent --help
-
-# One command opens the guided wizard (menus + in-flow setup; no blocking env scan on startup)
+# Open the interactive wizard
 sa-agent
 ```
 
-> When a previous analysis record exists, the interactive menu shows `5) 再次进行上一次分析` (rerun last analysis) for one-click rerun.
-> The first screen goes straight to the action menu (faster startup). LLM/symbolizer status is checked in context when you enter the corresponding configuration flows.
-> The onboarding interaction is inspired by Claude-style CLI UX: arrow-key menus, grouped "More options", clear back actions, and post-action confirmation panels.
+> The UX is intentionally Claude CLI-like: arrow-key menus, grouped "More options", clear back paths, and concise confirmations.  
+> In most cases, you can finish configuration + analysis + AI fix flow directly in the terminal.
 
-> Config files are saved in `~/.config/stability-analysis-agent/`:
-> - `agent_config.local.json` — LLM provider / API key / model
-> - `add2line_resolver_config.local.json` — addr2line / atos tool paths
->
-> Provider template is available at `tools/configs/agent_config.local.example.json`.  
-> Besides setting API keys/authorization, you must set `llm_config.active_provider` to the provider key you want to use (for example `openai`, `deepseek`, or `zhipu_bigmodel`).
-> AI requests currently use OpenAI Chat Completions compatible format by default; for non-compatible providers, an adapter is required (config-only changes may not be sufficient).
->
-> Even without config initialization, you can run the full non-AI toolchain with `--skip-ai`.
->
-> The PyPI package includes full runtime dependencies (vector DB, tree-sitter, and LangGraph chain).
->
-> Upgrade with: `pip install -U stability-analysis-agent`
+## Demo: Interactive AI Fix (Crash)
+
+Use the bundled demo case to experience the end-to-end AI path:
+
+```bash
+git clone https://github.com/baidu-maps/stability-analysis-agent.git
+cd stability-analysis-agent
+sa-agent
+```
+
+In the wizard, choose `快速开始分析（推荐）`, then enter:
+
+```text
+crash_log  -> examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash
+library_dir -> examples/crash_cases/demo_basic/lib/mac
+code_root  -> examples/crash_cases/demo_basic/code_dir
+```
+
+The CLI prints an execution plan and runs automatically. In AI mode, it performs parse + symbolize + code-context extraction + LLM reasoning, and can apply fix suggestions with backup.
+
+To analyze your own case, run `sa-agent` and input your own paths using the same flow.
+
+## Other Ways (Advanced)
 
 ### Programmatic API (embedding / enterprise wrappers)
 
-Since **v1.2.2**, the wheel includes a stable Python surface in [`cli/api.py`](./cli/api.py), for example `execute_analysis`, `build_parser`, `collect_interactive_run_state`, `interactive_state_to_argv`, `run_from_interactive_state`, and `run_cli_main`. Use it to drive the same pipeline as `sa-agent` from your own menus or automation without `subprocess`. See [`CHANGELOG.md`](./CHANGELOG.md).
+Since **v1.2.2**, the wheel includes a stable Python surface in [`cli/api.py`](./cli/api.py), for example `execute_analysis`, `build_parser`, `collect_interactive_run_state`, `interactive_state_to_argv`, `run_from_interactive_state`, and `run_cli_main`. Use it to drive the same pipeline from custom menus or automation without `subprocess`. See [`CHANGELOG.md`](./CHANGELOG.md).
 
-### 2. Use Prebuilt CLI Binary (No Python Required)
+### Use Prebuilt CLI Binary (No Python Required)
 
-Download the latest binary from [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases), then run. **Zip and folder names are versioned—use the exact names from the release you download** (the example below may not match every release):
+Download the latest binary from [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases). Zip/folder names are versioned; use names from the release you downloaded.
 
 ```bash
-# Example: macOS arm64 layout (adjust version to match the downloaded zip)
 unzip StabilityAnalyzer-v1.2.2-mac-arm64.zip
 cd output/cli_release/stability_analyzer_cli/v1.2.2-mac-arm64
-
-chmod +x StabilityAnalyzer
-
-# If macOS Gatekeeper blocks launch (unsigned binary)
-xattr -d com.apple.quarantine StabilityAnalyzer
-
-./StabilityAnalyzer --help
-
-# Optional: install a stable command name into ~/.local/bin (also ships in release zips)
-chmod +x install.sh
-./install.sh
-# then: sa-agent --help
+./StabilityAnalyzer
 ```
 
-### 3. Developer Setup (from Source)
+### Developer Setup (from Source)
 
 ```bash
 git clone https://github.com/baidu-maps/stability-analysis-agent.git
 cd stability-analysis-agent
 pip install -e .
+sa-agent
 ```
 
-> `pip install -e .` is intended for development workflows. It also exposes the `sa-agent` command locally.
-
-### 4. Run the Built-in Demo (No API Key Needed)
-
-After installing via PyPI (`pip install stability-analysis-agent`) or from source (`pip install -e .`), clone the repo to get the bundled demo cases, then run:
-
-```bash
-sa-agent \
-  --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
-  --library-dir examples/crash_cases/demo_basic/lib/mac \
-  --code-root examples/crash_cases/demo_basic/code_dir \
-  --skip-ai
-```
-
-Output is saved to `./cli_reports/<timestamp>/` (under your current working directory) with structured JSON reports.
-
-### 5. Analyze Your Own Crash Log
-
-```bash
-sa-agent \
-  --crash-log <your-crash-log> \
-  --library-dir <path-to-libs-and-symbols> \
-  --code-root <path-to-source-code>
-```
-
-> Add `--skip-ai` to skip AI analysis, or `--parse-only` to only parse + symbolize.
+> `pip install -e .` is intended for development workflows and also exposes the local `sa-agent` command.
 
 ### CLI Options
 
@@ -273,15 +243,13 @@ print(result)
 
 ## LLM and Tool Configuration
 
-AI analysis is **optional**. You can still run full non-AI toolchain with `--skip-ai` without any initialization.
-
-For AI analysis and add2line customization after PyPI install, run:
+For LLM and add2line setup, use the interactive wizard:
 
 ```bash
 sa-agent
 ```
 
-The wizard opens on the main menu (no automatic env scan on startup). Enter the LLM/symbolizer configuration flows to run contextual checks and setup guidance.
+Then enter `更多选项` -> `配置大模型` / `配置 addr2line 工具`. Checks and guidance run contextually in flow.
 
 Default local config directory:
 
@@ -293,6 +261,11 @@ Default local config directory:
 - `add2line_resolver_config.local.json` for addr2line/atos tool paths
 
 If you prefer manual editing, edit these files directly in that directory.
+
+Optional advanced run modes:
+- `--skip-ai` (toolchain only)
+- `--parse-only` (parse + symbolize only)
+- `--parse-log-only` (parse log only)
 
 ### Advanced: add2line config override
 
