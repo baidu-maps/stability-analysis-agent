@@ -6,7 +6,10 @@ LLM 适配器接口定义 - 支持多种调用方式
 
 from __future__ import annotations
 
+import json
 import logging
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Generator, Union
@@ -93,6 +96,12 @@ class DirectLLMAdapter(BaseLLMAdapter):
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
+        self._request_format = str(config.get("request_format") or "openai_chat_completions_compatible").strip().lower()
+        self._auth_header = str(config.get("auth_header") or "Authorization").strip() or "Authorization"
+        self._auth_prefix = str(config.get("auth_prefix") or "")
+        if self._request_format in ("anthropic_messages_compatible", "openai_responses_compatible"):
+            self.client = None
+            return
         self._init_client(config)
 
     def _init_client(self, config: Dict[str, Any]):
@@ -134,7 +143,191 @@ class DirectLLMAdapter(BaseLLMAdapter):
             logger.warning(f"Unknown provider: {provider}")
             self.client = None
 
+    def _secret_for_http(self) -> str:
+        return str(
+            self.config.get("api_key")
+            or self.config.get("authorization")
+            or self.config.get("openai_api_key")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _extract_meaningful_error(error_obj: Any) -> str:
+        """
+        一些网关会返回成功响应，同时附带空错误对象：{"type":"","message":""}。
+        仅当错误对象包含有效信息时才视为失败。
+        """
+        if not error_obj:
+            return ""
+        if isinstance(error_obj, str):
+            return error_obj.strip()
+        if isinstance(error_obj, dict):
+            for key in ("message", "type", "code", "param"):
+                val = str(error_obj.get(key) or "").strip()
+                if val:
+                    return val
+            return ""
+        return str(error_obj).strip()
+
+    def _anthropic_messages_http_chat(self, messages: List[Dict[str, str]], **kwargs) -> LLMResponse:
+        base_url = (self.config.get("base_url") or "").strip().rstrip("/")
+        if not base_url:
+            raise RuntimeError("anthropic_messages_compatible 需要配置 base_url（完整 /v1/messages 地址）")
+        secret = self._secret_for_http()
+        if not secret:
+            raise RuntimeError("anthropic_messages_compatible 需要 api_key 或 authorization")
+
+        url = base_url if base_url.endswith("/messages") else f"{base_url}/messages"
+        headers = {"Content-Type": "application/json"}
+        headers[self._auth_header] = f"{self._auth_prefix}{secret}"
+        if "anthropic.com" in url.lower():
+            headers.setdefault("anthropic-version", "2023-06-01")
+
+        # Anthropic Messages API 要求 system 放在顶层字段，不能作为 messages 里的 role。
+        system_parts: List[str] = []
+        normalized_messages: List[Dict[str, str]] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "").strip().lower()
+            content = str(msg.get("content") or "")
+            if role == "system":
+                if content.strip():
+                    system_parts.append(content)
+                continue
+            if role not in {"user", "assistant"}:
+                # 兜底按 user 处理，避免网关因未知角色拒绝。
+                role = "user"
+            normalized_messages.append({"role": role, "content": content})
+        if not normalized_messages:
+            normalized_messages = [{"role": "user", "content": "pong"}]
+
+        body = {
+            "model": self.model,
+            "messages": normalized_messages,
+            "max_tokens": int(kwargs.get("max_tokens", self.max_tokens) or 1024),
+        }
+        if system_parts:
+            body["system"] = "\n\n".join(system_parts)
+        if kwargs.get("temperature") is not None:
+            body["temperature"] = float(kwargs["temperature"])
+        elif self.temperature is not None:
+            body["temperature"] = float(self.temperature)
+
+        req = urllib.request.Request(
+            url=url,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=float(self.timeout or 120)) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(f"LLM call failed: Error code: {exc.code} - {detail or exc.reason}") from exc
+
+        data = json.loads(raw) if raw else {}
+        if isinstance(data, dict):
+            err_text = self._extract_meaningful_error(data.get("error"))
+            if err_text:
+                raise RuntimeError(f"LLM call failed: {err_text}")
+
+        content = ""
+        if isinstance(data, dict):
+            blocks = data.get("content")
+            if isinstance(blocks, list):
+                parts: List[str] = []
+                for block in blocks:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        parts.append(str(block.get("text") or ""))
+                content = "".join(parts)
+            if not content and isinstance(data.get("choices"), list) and data["choices"]:
+                ch0 = data["choices"][0]
+                if isinstance(ch0, dict):
+                    msg = ch0.get("message") or {}
+                    if isinstance(msg, dict):
+                        content = str(msg.get("content") or "")
+
+        return LLMResponse(
+            content=content,
+            usage=None,
+            metadata={"provider": self.config.get("provider", "openai"), "request_format": self._request_format},
+        )
+
+    def _openai_responses_http_chat(self, messages: List[Dict[str, str]], **kwargs) -> LLMResponse:
+        base_url = (self.config.get("base_url") or "").strip().rstrip("/")
+        if not base_url:
+            raise RuntimeError("openai_responses_compatible 需要配置 base_url")
+        secret = self._secret_for_http()
+        if not secret:
+            raise RuntimeError("openai_responses_compatible 需要 api_key")
+
+        url = base_url if base_url.endswith("/responses") else f"{base_url}/responses"
+        headers = {"Content-Type": "application/json"}
+        headers[self._auth_header] = f"{self._auth_prefix}{secret}"
+
+        user_text = "\n".join(str(m.get("content") or "") for m in messages if m.get("role") == "user")
+        if not user_text.strip():
+            user_text = "\n".join(str(m.get("content") or "") for m in messages)
+
+        body = {
+            "model": self.model,
+            "input": user_text,
+            "max_output_tokens": int(kwargs.get("max_tokens", self.max_tokens) or 1024),
+        }
+
+        req = urllib.request.Request(
+            url=url,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=float(self.timeout or 120)) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(f"LLM call failed: Error code: {exc.code} - {detail or exc.reason}") from exc
+
+        data = json.loads(raw) if raw else {}
+        if isinstance(data, dict):
+            err_text = self._extract_meaningful_error(data.get("error"))
+            if err_text:
+                raise RuntimeError(f"LLM call failed: {err_text}")
+
+        content = ""
+        if isinstance(data, dict):
+            out = data.get("output")
+            if isinstance(out, list):
+                for item in out:
+                    if isinstance(item, dict) and item.get("type") == "message":
+                        inner = item.get("content")
+                        if isinstance(inner, list):
+                            for block in inner:
+                                if isinstance(block, dict) and block.get("type") == "output_text":
+                                    content += str(block.get("text") or "")
+
+        return LLMResponse(
+            content=content,
+            usage=None,
+            metadata={"provider": self.config.get("provider", "openai"), "request_format": self._request_format},
+        )
+
     def chat(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None, **kwargs) -> LLMResponse:
+        if self._request_format == "anthropic_messages_compatible":
+            try:
+                return self._anthropic_messages_http_chat(messages, **kwargs)
+            except Exception as e:
+                logger.error(f"LLM call failed: {e}")
+                raise
+        if self._request_format == "openai_responses_compatible":
+            try:
+                return self._openai_responses_http_chat(messages, **kwargs)
+            except Exception as e:
+                logger.error(f"LLM call failed: {e}")
+                raise
+
         if self.client is None:
             raise RuntimeError("LLM client not initialized")
 
@@ -166,6 +359,12 @@ class DirectLLMAdapter(BaseLLMAdapter):
             raise RuntimeError(f"LLM call failed: {e}")
 
     def stream(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None, **kwargs) -> Generator[str, None, None]:
+        if self._request_format in ("anthropic_messages_compatible", "openai_responses_compatible"):
+            resp = self.chat(messages, tools, **kwargs)
+            if resp.content:
+                yield resp.content
+            return
+
         if self.client is None:
             raise RuntimeError("LLM client not initialized")
 

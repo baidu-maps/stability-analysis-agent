@@ -136,7 +136,7 @@ pip install stability-analysis-agent
 sa-agent
 ```
 
-> 交互体验对标 Claude CLI：支持上下键菜单、分组化“更多选项”、可返回路径和关键步骤确认。  
+> 交互体验对标 Claude CLI：支持上下键菜单、分组化“设置 / 帮助”、可返回路径和关键步骤确认。  
 > 大多数场景可在终端向导内完成“配置 + 分析 + AI 修复建议”全流程。
 
 ## Demo：交互式 AI 修复（Crash）
@@ -165,15 +165,15 @@ CLI 会先输出执行计划，再自动执行。AI 模式下将完成解析、�
 
 ### 以 Python 集成（可编程接口）
 
-自 **v1.2.2** 起，PyPI 包提供稳定模块 [`cli/api.py`](./cli/api.py)，例如 `execute_analysis`、`build_parser`、`collect_interactive_run_state`、`interactive_state_to_argv`、`run_from_interactive_state`、`run_cli_main` 等，便于企业包装器或自动化脚本在进程内调用与 `sa-agent` 相同的分析链路，而无需 `subprocess`。变更说明见 [`CHANGELOG.md`](./CHANGELOG.md)。
+自 **v1.2.3** 起，PyPI 包提供稳定模块 [`cli/api.py`](./cli/api.py)，例如 `execute_analysis`、`build_parser`、`collect_interactive_run_state`、`interactive_state_to_argv`、`run_from_interactive_state`、`run_cli_main` 等，便于企业包装器或自动化脚本在进程内调用与 `sa-agent` 相同的分析链路，而无需 `subprocess`。变更说明见 [`CHANGELOG.md`](./CHANGELOG.md)。
 
 ### 使用预编译 CLI 二进制（无需 Python）
 
 从 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases) 下载最新二进制。压缩包与目录名随版本变化，请以实际 Release 文件名为准：
 
 ```bash
-unzip StabilityAnalyzer-v1.2.2-mac-arm64.zip
-cd output/cli_release/stability_analyzer_cli/v1.2.2-mac-arm64
+unzip StabilityAnalyzer-v1.2.3-mac-arm64.zip
+cd output/cli_release/stability_analyzer_cli/v1.2.3-mac-arm64
 ./StabilityAnalyzer
 ```
 
@@ -195,12 +195,19 @@ sa-agent
 | `--crash-log` | 是 | 崩溃日志文件路径 |
 | `--library-dir` | 是* | 库文件目录，包含 `.dylib`/`.so` 及调试符号（`.dSYM`） |
 | `--code-root` | 否 | 源码根目录，用于提取崩溃点代码上下文 |
-| `--skip-ai` | 否 | 跳过 AI 分析，只跑工具链（解析 + 符号化 + 代码提取） |
-| `--parse-only` | 否 | 仅解析 + 符号化（无需 `--code-root`） |
-| `--parse-log-only` | 否 | 仅解析崩溃日志（无需 `--library-dir`） |
+| `--scope <value>` | 否 | Agent 执行流程范围（默认 `full`），取值 `full` / `prompt_only` / `parse_only` / `parse_log_only`，详见下方。 |
 | `--daemon <url>` | 否 | 委托给运行中的 Daemon 实例 |
 
-\* 使用 `--parse-log-only` 时不需要。
+\* 使用 `--scope parse_log_only` 时不需要。
+
+### `--scope` 取值说明
+
+| 取值 | 行为 |
+|------|------|
+| `full`（默认） | 解析 + 符号化 + 取代码上下文 + AI 推理（含可选自动改码）。 |
+| `prompt_only` | 完整工具链，但不调用 LLM，仅生成可复用的提示词文件。 |
+| `parse_only` | 仅解析 + 符号化，无需 `--code-root`。 |
+| `parse_log_only` | 仅解析崩溃日志，`--library-dir` 与 `--code-root` 都可省略。 |
 
 ## Daemon 模式
 
@@ -249,7 +256,7 @@ print(result)
 sa-agent
 ```
 
-进入后在 `更多选项` 中选择 `配置大模型` / `配置 addr2line 工具`，流程内会自动检测并给出引导。
+进入后在 `设置` 中选择 `配置大模型` / `配置堆栈地址解析工具`，流程内会自动检测并给出引导。
 
 默认本地配置目录：
 
@@ -262,10 +269,10 @@ sa-agent
 
 若你偏好手动编辑，也可直接修改以上配置文件。
 
-高级可选模式：
-- `--skip-ai`（仅工具链）
-- `--parse-only`（仅解析 + 符号化）
-- `--parse-log-only`（仅解析日志）
+高级可选模式（通过 `--scope`）：
+- `--scope prompt_only`（完整工具链，跳过 LLM，仅生成提示词）
+- `--scope parse_only`（仅解析 + 符号化）
+- `--scope parse_log_only`（仅解析日志）
 
 ### 高级：add2line 配置路径覆盖
 
@@ -341,7 +348,7 @@ python3 test/agent_py_tool/test_vector_db.py
 确保 `--code-root` 指向的源码目录包含符号化堆栈中引用的文件。
 
 **Q：不配置 LLM Key 能用吗？**
-可以。使用 `--skip-ai` 即可运行完整工具链（解析 + 符号化 + 代码提取），输出的结构化 JSON 本身就对问题定位很有帮助。
+可以。使用 `--scope prompt_only` 即可运行完整工具链（解析 + 符号化 + 代码提取），跳过 LLM 调用并生成可复用提示词，结构化 JSON 输出本身就对问题定位很有帮助。
 
 ## 贡献
 

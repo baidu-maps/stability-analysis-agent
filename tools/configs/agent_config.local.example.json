@@ -35,7 +35,7 @@
       "auth_header": "Authorization",
       "auth_prefix": "Bearer ",
       "adapter_provider": "openai",
-      "request_timeout": 60
+      "request_timeout": 120
     },
     "providers": {
       "openai": {

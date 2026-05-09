@@ -165,15 +165,15 @@ To analyze your own case, run `sa-agent` and input your own paths using the same
 
 ### Programmatic API (embedding / enterprise wrappers)
 
-Since **v1.2.2**, the wheel includes a stable Python surface in [`cli/api.py`](./cli/api.py), for example `execute_analysis`, `build_parser`, `collect_interactive_run_state`, `interactive_state_to_argv`, `run_from_interactive_state`, and `run_cli_main`. Use it to drive the same pipeline from custom menus or automation without `subprocess`. See [`CHANGELOG.md`](./CHANGELOG.md).
+Since **v1.2.3**, the wheel includes a stable Python surface in [`cli/api.py`](./cli/api.py), for example `execute_analysis`, `build_parser`, `collect_interactive_run_state`, `interactive_state_to_argv`, `run_from_interactive_state`, and `run_cli_main`. Use it to drive the same pipeline from custom menus or automation without `subprocess`. See [`CHANGELOG.md`](./CHANGELOG.md).
 
 ### Use Prebuilt CLI Binary (No Python Required)
 
 Download the latest binary from [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases). Zip/folder names are versioned; use names from the release you downloaded.
 
 ```bash
-unzip StabilityAnalyzer-v1.2.2-mac-arm64.zip
-cd output/cli_release/stability_analyzer_cli/v1.2.2-mac-arm64
+unzip StabilityAnalyzer-v1.2.3-mac-arm64.zip
+cd output/cli_release/stability_analyzer_cli/v1.2.3-mac-arm64
 ./StabilityAnalyzer
 ```
 
@@ -195,12 +195,19 @@ sa-agent
 | `--crash-log` | Yes | Path to the crash log file |
 | `--library-dir` | Yes* | Directory with libraries (`.dylib`/`.so`) and debug symbols (`.dSYM`) |
 | `--code-root` | No | Source code root for extracting code context |
-| `--skip-ai` | No | Skip AI — run toolchain only (parser + resolver + code provider) |
-| `--parse-only` | No | Parse + symbolize only (no `--code-root` needed) |
-| `--parse-log-only` | No | Parse crash log only (no `--library-dir` needed) |
+| `--scope <value>` | No | Agent run scope (default `full`). One of `full` / `prompt_only` / `parse_only` / `parse_log_only`. See below. |
 | `--daemon <url>` | No | Delegate to a running daemon instance |
 
-\* Not required when using `--parse-log-only`.
+\* Not required when using `--scope parse_log_only`.
+
+### `--scope` values
+
+| Value | Behavior |
+|-------|----------|
+| `full` (default) | Parse + symbolize + extract code context + LLM analysis (with optional auto-fix). |
+| `prompt_only` | Run the full toolchain but skip the LLM call; emit a reusable prompt file. |
+| `parse_only` | Only parse + symbolize. `--code-root` not needed. |
+| `parse_log_only` | Only parse the crash log. Neither `--library-dir` nor `--code-root` is needed. |
 
 ## Daemon Mode
 
@@ -249,7 +256,7 @@ For LLM and add2line setup, use the interactive wizard:
 sa-agent
 ```
 
-Then enter `更多选项` -> `配置大模型` / `配置 addr2line 工具`. Checks and guidance run contextually in flow.
+Then enter `设置` -> `配置大模型` / `配置堆栈地址解析工具`. Checks and guidance run contextually in flow.
 
 Default local config directory:
 
@@ -262,10 +269,10 @@ Default local config directory:
 
 If you prefer manual editing, edit these files directly in that directory.
 
-Optional advanced run modes:
-- `--skip-ai` (toolchain only)
-- `--parse-only` (parse + symbolize only)
-- `--parse-log-only` (parse log only)
+Optional advanced run modes (via `--scope`):
+- `--scope prompt_only` (full toolchain, skip LLM, emit prompt file)
+- `--scope parse_only` (parse + symbolize only)
+- `--scope parse_log_only` (parse log only)
 
 ### Advanced: add2line config override
 
@@ -341,7 +348,7 @@ Verify your API key is set correctly. Quick check: `python3 test/llm/test_llm_co
 Ensure `--code-root` points to the source directory that contains the files listed in the symbolized stack trace.
 
 **Q: Can I use this without an LLM key?**
-Yes. Use `--skip-ai` to run the full toolchain (parse + symbolize + extract code). The structured JSON output is useful on its own for triage and debugging.
+Yes. Use `--scope prompt_only` to run the full toolchain (parse + symbolize + extract code) without calling the LLM. The structured JSON output is useful on its own for triage and debugging.
 
 ## Contributing
 

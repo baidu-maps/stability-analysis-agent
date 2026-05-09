@@ -320,6 +320,7 @@ class CodeContentProvider:
         # ========== 缓存机制（性能优化）==========
         self._function_def_cache: Dict[str, Tuple[str, int]] = {}  # 函数定义位置缓存 (file_path, line)
         self._file_mtime_cache: Dict[str, float] = {}  # 文件修改时间缓存
+        self._cpp_candidate_files_cache: Dict[Tuple[str, str], List[str]] = {}
 
         # ========== 调用链搜索缓存（跨进程/跨次分析复用）==========
         # 缓存格式: { (code_root, function_name): [CallChainFunction, ...] }
@@ -481,6 +482,7 @@ class CodeContentProvider:
         """清空所有缓存"""
         self._function_def_cache.clear()
         self._file_mtime_cache.clear()
+        self._cpp_candidate_files_cache.clear()
         logger.info("已清空代码内容提供器的缓存")
 
     # ========== 性能优化：并行文件扫描 ==========
@@ -1171,7 +1173,7 @@ class CodeContentProvider:
                     if r:
                         return r
             
-            logger.warning(
+            logger.info(
                 "未找到源文件（已跳过整仓库递归扫描以避免大仓库超时）: %s",
                 resolved_file,
             )
@@ -1522,7 +1524,7 @@ class CodeContentProvider:
                             logger.info(f"找到源文件（fallback受限搜索）: {file_path}")
                             return file_path
         
-        logger.warning(f"Fallback搜索未找到文件: {resolved_file}")
+        logger.debug(f"Fallback搜索未找到文件: {resolved_file}")
         return None
 
     def _ctor_or_dtor_class_name_from_resolved(self, resolved_function: str) -> Optional[str]:
@@ -2056,6 +2058,34 @@ class CodeContentProvider:
         if not class_name or not selector:
             return None
         return class_name, selector
+
+    @staticmethod
+    def _is_cpp_native_symbol(resolved_function: str) -> bool:
+        """
+        判定是否为应参与 native C++ 上下文提取的符号。
+        兼容策略：
+        - 保留 Itanium mangled 符号（_Z...）
+        - 保留 C++ 限定名（A::b(...)）
+        - 保留普通函数签名（foo(...) / operator+ (...) 等）
+        - 排除 ObjC 方法符号（-[Class sel:] / +[Class sel:]）
+        """
+        s = (resolved_function or "").strip()
+        if not s:
+            return False
+        # ObjC 方法符号在 native-only 流程中单独处理，这里直接排除。
+        if re.match(r"^[\-\+]\[[^\]]+\]$", s):
+            return False
+        if s.startswith("_Z"):
+            return True
+        if "::" in s and "(" in s:
+            return True
+        # 兼容普通函数签名，如 crash_nullptr() / main(int, char**) / operator new(...)
+        if "(" in s and ")" in s:
+            head = s.split("(", 1)[0].strip()
+            # 允许前导 * / & / ~ 等（如析构、返回值修饰），但需包含至少一个标识符字符。
+            if head and re.search(r"[A-Za-z_~]", head):
+                return True
+        return False
 
     def _find_objc_method_definition_location(
         self, class_name: str, selector: str, code_roots: List[str]
@@ -4043,6 +4073,10 @@ class CodeContentProvider:
         header_ext = {".h", ".hpp", ".hh", ".hxx", ".ipp", ".inl"}
 
         def _ordered_candidate_files(code_root: str) -> List[str]:
+            ckey = (str(code_root), owner_tail)
+            cached = self._cpp_candidate_files_cache.get(ckey)
+            if cached is not None:
+                return cached
             exact_impl: List[str] = []
             contain_impl: List[str] = []
             exact_header: List[str] = []
@@ -4075,8 +4109,11 @@ class CodeContentProvider:
                             other_supported.append(file_path)
                     else:
                         other_supported.append(file_path)
-            # 优先实现文件同名 -> 实现文件包含类名 -> 头文件同名 -> 头文件包含类名 -> 其它
-            ordered = exact_impl + contain_impl + exact_header + contain_header + other_supported
+            # 优先实现文件同名 -> 实现文件包含类名 -> 头文件同名 -> 头文件包含类名。
+            # 若存在高相关候选，默认不再进入 other_supported 的长尾全仓扫描。
+            ordered = exact_impl + contain_impl + exact_header + contain_header
+            if not ordered:
+                ordered = other_supported
             # 去重保序
             seen: set = set()
             uniq: List[str] = []
@@ -4085,6 +4122,7 @@ class CodeContentProvider:
                     continue
                 seen.add(p)
                 uniq.append(p)
+            self._cpp_candidate_files_cache[ckey] = uniq
             return uniq
 
         for code_root in code_roots or []:
@@ -4108,6 +4146,9 @@ class CodeContentProvider:
                                 continue
                             if best is None or sc > best[0]:
                                 best = (sc, file_path, i)
+                                if sc >= 124:
+                                    self._function_def_cache[cache_key] = (file_path, i)
+                                    return (file_path, i)
                     except (IOError, OSError):
                         continue
         if best is not None:
@@ -6667,6 +6708,26 @@ class CodeContentProvider:
                 )
             )
 
+        # 同类兄弟函数：补充生命周期/关联函数节点，供后续修复策略扩展可修改目标。
+        # 注意：此前 sibling_member_func_in_same_class 已在上游提取，但未并入 graph，导致 03/05 缺少关键函数。
+        for rf in sibling_member_func_in_same_class:
+            if not isinstance(rf, RelatedFunction):
+                continue
+            sig = rf.snippet[0].strip() if rf.snippet else None
+            if not _is_plausible_function_signature(sig):
+                continue
+            rid = ensure_func_node(rf.name, rf.file, sig, rf.snippet)
+            if rid == cf_id:
+                continue
+            edges.append(
+                GraphEdge(
+                    from_id=rid,
+                    to_id=cf_id,
+                    type="same_class_brother",
+                    relation=rf.description or rf.relation_type,
+                )
+            )
+
         # 5. 从 thread_context 构造 call_chain_from_add2line 视图（nodes 里放 GraphNode.id 序列），
         #    同时确保出现在调用链中的每个函数至少有一个对应的函数节点，尽量补充代码片段
         for tc in thread_context:
@@ -7220,7 +7281,7 @@ class CodeContentProvider:
         # 提取类名（支持 mangled name）
         class_name = self._extract_class_name_from_resolved(crash_function_name)
         if not class_name:
-            logger.warning(f"无法从函数名中提取类名: {crash_function_name}")
+            logger.debug(f"函数非类成员或无法提取类名，跳过同类函数扩展: {crash_function_name}")
             return related_functions
         
         logger.info(f"提取类名: {class_name}")
@@ -7246,10 +7307,27 @@ class CodeContentProvider:
             
             # 查找所有成员函数定义
             function_patterns = [
-                rf'(\w+)\s+{re.escape(class_name)}::(\w+)\s*\([^)]*\)\s*(?:{{|:)',  # return_type Class::function(...) { or :
-                rf'void\s+{re.escape(class_name)}::(\w+)\s*\([^)]*\)\s*(?:{{|:)',  # void Class::function(...) {
-                rf'{re.escape(class_name)}::(\w+)\s*\([^)]*\)\s*(?:{{|:)',  # Class::function(...) {
+                rf'([\w:\<\>\,\s\*&\~]+)\s+{re.escape(class_name)}::([~]?\w+)\s*\([^)]*\)\s*(?:{{|:)',  # return_type Class::function(...) { or :
+                rf'void\s+{re.escape(class_name)}::([~]?\w+)\s*\([^)]*\)\s*(?:{{|:)',  # void Class::function(...) {
+                rf'{re.escape(class_name)}::([~]?\w+)\s*\([^)]*\)\s*(?:{{|:)',  # Class::function(...) {
             ]
+
+            def _snippet_matches_member_signature(
+                snippet_lines: List[str], expected_class: str, expected_func: str
+            ) -> bool:
+                """校验提取片段首行是否真的是 expected_class::expected_func，避免跨函数误抽取。"""
+                first_non_empty = ""
+                for s in snippet_lines or []:
+                    t = (s or "").strip()
+                    if t:
+                        first_non_empty = t
+                        break
+                if not first_non_empty:
+                    return False
+                sig_re = re.compile(
+                    rf"\b{re.escape(expected_class)}\s*::\s*{re.escape(expected_func)}\s*\("
+                )
+                return bool(sig_re.search(first_non_empty))
             
             for i, line in enumerate(lines):
                 for pattern in function_patterns:
@@ -7274,10 +7352,17 @@ class CodeContentProvider:
                         # 提取函数完整代码
                         func_code = self._extract_full_function_code(lines, i)
                         if func_code:
+                            function_snippet = [line.rstrip() for line in func_code.split('\n') if line.strip()]
+                            if not _snippet_matches_member_signature(function_snippet, class_name, func_name):
+                                logger.debug(
+                                    "跳过疑似误匹配的同类函数片段: expected=%s::%s first_line=%s",
+                                    class_name,
+                                    func_name,
+                                    function_snippet[0] if function_snippet else "",
+                                )
+                                continue
                             # 分析函数类型和相关性
                             relation_type, description = self._analyze_function_relation(func_code, crash_function_name)
-
-                            function_snippet = [line.rstrip() for line in func_code.split('\n') if line.strip()]
                             # 应用代码片段截断
                             if self.max_code_length > 0:
                                 function_snippet = self._truncate_snippet(function_snippet)
@@ -7661,7 +7746,7 @@ class CodeContentProvider:
                     else:
                         # 未找到文件，跳过该帧；若有符号仍写 hint（常见于工具链路径）
                         skipped_count += 1
-                        if frame.get("resolved_function"):
+                        if self._is_cpp_native_symbol(str(frame.get("resolved_function") or "")):
                             self._append_external_frame_semantic_hint(
                                 semantic_hints, original_idx, frame
                             )
@@ -7773,6 +7858,18 @@ class CodeContentProvider:
                 module_c = (candidate.get("module") or "").strip()
                 rfile = candidate.get("resolved_file", "") or ""
                 rline_raw = candidate.get("resolved_line", 0)
+                objc_info = self._parse_objc_symbol_class_selector(rf_or_raw)
+                # Native C++ 崩溃分析默认不提取 ObjC selector 的源码上下文，避免大量无效全仓扫描。
+                if objc_info:
+                    extraction_warnings.append(
+                        f"帧[{fi}] ObjC selector 已按 native-only 策略跳过: {rf_or_raw}"
+                    )
+                    continue
+                if not self._is_cpp_native_symbol(rf_or_raw):
+                    extraction_warnings.append(
+                        f"帧[{fi}] 非 C++ 符号已按 native-only 策略跳过: {rf_or_raw}"
+                    )
+                    continue
                 try:
                     rline_int = int(rline_raw) if rline_raw not in (None, "", False) else 0
                 except (TypeError, ValueError):
@@ -7789,10 +7886,7 @@ class CodeContentProvider:
                     # 兜底：当 02 只有符号（无 file:line）时，尝试按函数名在 code_roots 中定位定义行
                     # 常见于「已符号化日志 + 未提供/不可用库目录」场景。
                     loc = None
-                    objc_info = self._parse_objc_symbol_class_selector(rf_or_raw)
-                    if objc_info:
-                        cls, sel = objc_info
-                        loc = self._find_objc_method_definition_location(cls, sel, code_roots_abs_strs)
+                    # native-only 模式：禁用 ObjC 兜底定位，避免 selector 触发 code_root 大范围检索。
                     cpp_qualified = self._extract_cpp_qualified_parts(rf_or_raw)
                     if (not loc) and cpp_qualified:
                         loc = self._find_cpp_qualified_definition_location(rf_or_raw, code_roots_abs_strs)
@@ -8253,7 +8347,7 @@ class CodeContentProvider:
         except _CodeContextPhaseTimeout as e:
             detail = str(e) or "unknown"
             logger.warning("代码上下文整阶段超时（静态分析前）: %s", detail)
-            return self._minimal_code_content_on_phase_timeout(add2line_data, detail)
+            return self._minimal_code_context_on_phase_timeout(add2line_data, detail)
             
         except json.JSONDecodeError as e:
             logger.error(f"JSON解析错误: {e}")
@@ -8440,6 +8534,16 @@ _tool_logger = _logging_tool.getLogger(__name__)
 class CodeContentProviderTool(BaseTool):
     """代码内容提取工具 — 内置 Tool 实现，自包含所有代码提取逻辑。"""
 
+    def __init__(
+        self,
+        include_subdirs: _Optional_tool[list] = None,
+        exclude_dirs: _Optional_tool[list] = None,
+        backend: str = "tree-sitter",
+    ):
+        self.include_subdirs = list(include_subdirs or [])
+        self.exclude_dirs = list(exclude_dirs or [])
+        self.backend = backend
+
     @property
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -8471,13 +8575,18 @@ class CodeContentProviderTool(BaseTool):
 
         resolved_stack = input_data.get("resolved_stack", "")
         code_roots = input_data.get("code_roots", [])
-        backend = input_data.get("backend", "tree-sitter")
+        backend = input_data.get("backend", self.backend)
 
         if isinstance(code_roots, str):
             code_roots = [code_roots]
 
         provider = CodeContentProvider(code_parser_backend=backend)
-        result = provider.code_content_provider(resolved_stack, code_roots)
+        result = provider.code_content_provider(
+            resolved_stack,
+            code_roots,
+            exclude_dirs=self.exclude_dirs or None,
+            include_subdirs=self.include_subdirs or None,
+        )
         try:
             parsed = _json.loads(result)
         except Exception:

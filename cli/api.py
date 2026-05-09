@@ -11,7 +11,7 @@
 
     from cli.api import build_parser, execute_analysis, interactive_state_to_argv
 
-    state = {...}  # crash_log, library_dir, code_roots, engine, skip_ai, run_scope
+    state = {...}  # crash_log, library_dir, code_roots, engine, scope
     parser = build_parser()
     args = parser.parse_args(interactive_state_to_argv(state))
     raise SystemExit(execute_analysis(args))
@@ -45,12 +45,28 @@ __all__ = [
 ]
 
 
+_VALID_SCOPES = {"full", "prompt_only", "parse_only", "parse_log_only"}
+
+
+def _resolve_state_scope(state: Dict[str, Any]) -> str:
+    """从 state 解析 scope，兼容旧字段（skip_ai + run_scope）。"""
+    raw_scope = str(state.get("scope") or "").strip()
+    if raw_scope in _VALID_SCOPES:
+        return raw_scope
+    legacy_scope = str(state.get("run_scope") or "").strip()
+    if legacy_scope in {"parse_only", "parse_log_only"}:
+        return legacy_scope
+    if bool(state.get("skip_ai", False)):
+        return "prompt_only"
+    return "full"
+
+
 def interactive_state_to_argv(state: Dict[str, Any]) -> List[str]:
     """
     将交互采集得到的 state 转为与 `sa-agent` 等价的 argv 片段（不含程序名）。
 
     state 键与 `collect_interactive_run_state()` 返回值一致：
-    crash_log, library_dir, code_roots, engine, skip_ai, run_scope
+    crash_log, library_dir, code_roots, engine, scope
     """
     argv: List[str] = [
         "--crash-log",
@@ -65,13 +81,9 @@ def interactive_state_to_argv(state: Dict[str, Any]) -> List[str]:
     for root in state.get("code_roots") or []:
         if root and str(root).strip():
             argv.extend(["--code-root", str(root)])
-    if state.get("skip_ai"):
-        argv.append("--skip-ai")
-    run_scope = str(state.get("run_scope", "full")).strip()
-    if run_scope == "parse_only":
-        argv.append("--parse-only")
-    elif run_scope == "parse_log_only":
-        argv.append("--parse-log-only")
+    scope = _resolve_state_scope(state)
+    if scope != "full":
+        argv.extend(["--scope", scope])
     return argv
 
 

@@ -19,29 +19,38 @@ Stability Analysis Agent is an AI-driven crash log analysis toolchain with a mul
 ### Run CLI Analysis
 
 ```bash
-# Direct run (development)
+# Direct run (development) — full scope (default)
 python3 cli/main.py \
   --crash-log <path> --library-dir <path> --code-root <path>
 
-# Skip AI, generate prompt file only (no LLM key required)
+# prompt_only: full toolchain but skip LLM, generate prompt file only (no LLM key required)
 python3 cli/main.py \
   --crash-log <path> --library-dir <path> --code-root <path> \
-  --skip-ai
+  --scope prompt_only
 
-# Parse log + addr2line only (no code-root required)
+# parse_only: parse log + addr2line only (no code-root required)
 python3 cli/main.py \
   --crash-log <path> --library-dir <path> \
-  --parse-only
+  --scope parse_only
 
-# Parse crash log only
+# parse_log_only: parse crash log only
 python3 cli/main.py \
   --crash-log <path> \
-  --parse-log-only
+  --scope parse_log_only
 
 # Via daemon (recommended for VSCode / repeated runs)
 python3 cli/main.py --daemon http://127.0.0.1:8765 \
   --crash-log <path> --library-dir <path> --code-root <path>
 ```
+
+### Scope values
+
+`--scope` controls how deep the agent runs (default `full`):
+
+- `full`: parse + symbolize + extract code context + LLM analysis (and optional auto-fix).
+- `prompt_only`: full toolchain, but skip LLM call; produces a reusable prompt file.
+- `parse_only`: only parse + symbolize.
+- `parse_log_only`: only parse the crash log.
 
 ### Start Daemon
 
@@ -84,7 +93,7 @@ python3 cli/main.py \
   --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
   --code-root examples/crash_cases/demo_basic/code_dir \
-  --skip-ai
+  --scope prompt_only
 # Output: cli_reports/<timestamp>/01~03 JSON + round_0/05_ai_final_tip.txt
 ```
 

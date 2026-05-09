@@ -227,9 +227,6 @@ class FullStabilityAnalyzer:
             opts = replace(opts, library_dir=os.path.abspath(library_dir))
         return opts
 
-    def _cli_quiet(self) -> bool:
-        return os.environ.get("MAP_SDK_CRASH_AGENT_QUIET") == "1"
-    
     def _build_graph(self) -> Optional[StateGraph]:
         """构建 LangGraph 执行图（支持多轮工具调用，状态机模式）"""
         if not LANGGRAPH_AVAILABLE:
@@ -1296,7 +1293,7 @@ class FullStabilityAnalyzer:
             print(f"TOOL_OUTPUT:code_content_provider:{json.dumps(prompt_data, separators=(',', ':'), ensure_ascii=False)}")
             analysis_steps.append(AnalysisStep("code_content_provider", resolved_data, prompt_data, t3, "success"))
 
-            # 与 run bundle 对齐：输出 vector_memory + ai_prompt（即使 skip-ai）
+            # 与 run bundle 对齐：输出 vector_memory + ai_prompt（即使在 prompt_only 模式下）
             rule_hits = pattern_hits = strategy_hits = []
             evidence_map: Dict[str, Any] = {}
             decision_trace: List[Dict[str, Any]] = []

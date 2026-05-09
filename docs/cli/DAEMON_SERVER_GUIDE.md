@@ -51,14 +51,14 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
   "code_roots": ["/path/to/src"],
   "output_format": "markdown",
   "engine": "direct",
-  "skip_ai": false,
-  "parse_only": false,
+  "scope": "full",
   "streaming": false
 }
 ```
 - `crash_log` 与 `crash_log_content` 二选一；`crash_log_content` 通过 stdin 传入
 - `engine`：`direct`（默认）/ `langchain` / `langgraph`
 - `output_format`：`markdown`（默认）/ `json` / `text`
+- `scope`：`full`（默认）/ `prompt_only` / `parse_only` / `parse_log_only`，控制 Agent 执行流程范围（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--scope-取值)）
 
 **响应：**
 ```json

@@ -59,7 +59,7 @@ python3 cli/main.py \
   --library-dir examples/crash_cases/demo_multithread/demo_mtd3/lib
 ```
 
-如果你只想验证工具链，可加 `--skip-ai`。
+如果你只想验证工具链，可加 `--scope prompt_only`。
 
 ## 相关文档
 

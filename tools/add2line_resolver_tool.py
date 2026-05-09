@@ -156,6 +156,9 @@ class Add2lineResult:
     errors: List[str]
     # 新增字段：记录本次解析实际使用的堆栈地址解析工具，便于回溯与对比环境
     tool_name: Optional[str] = None          # 例如: "atos" / "addr2line" / "llvm-addr2line"
+                                              # 注：当系统仅有 llvm-symbolizer（缺少 llvm-addr2line / addr2line）时，
+                                              # 解析器会将 llvm-symbolizer 注册为 "llvm-addr2line" 的兼容回退，
+                                              # 此处仍记为 "llvm-addr2line"，可结合 tool_path 区分真实可执行文件。
     tool_path: Optional[str] = None          # 例如: "/usr/bin/atos"
     tools_available: Optional[Dict[str, str]] = None  # 当前环境中探测到的所有可用工具 {name: path}
     resolution_source: Optional[str] = None  # 如 ios_log_symbolicated：无库时从已符号化日志回填
@@ -187,19 +190,20 @@ class Add2lineResolver:
         self.quick_mode = quick_mode
         self.config = self._load_config_file()
         self.os_type = self._detect_current_os()
+        # 当系统未直接提供 llvm-addr2line / addr2line 但提供 llvm-symbolizer 时，
+        # 我们会把 llvm-symbolizer 注册为 llvm-addr2line 的兼容回退；
+        # 此字段记录该回退的真实可执行路径，调用 _resolve_with_addr2line 时据此切换命令行格式。
+        self._llvm_addr2line_alias_path: Optional[str] = None
         self.resolver_tools = self._find_resolver_tools()
         self.primary_tool = self._select_primary_tool()
         self._function_location_cache: Dict[str, Optional[Tuple[str, int]]] = {}
         
         # 仅在需要时使用 library_dir 查找库文件，不再构建显式白名单
 
-    def _is_quiet_mode(self) -> bool:
-        """CLI run-bundle quiet 模式下，避免大量 stdout 影响性能。"""
-        return os.environ.get("MAP_SDK_CRASH_AGENT_QUIET") == "1"
-
     def _emit_progress(self, message: str) -> None:
-        if not self._is_quiet_mode():
-            print(message)
+        # CLI 端默认由 workflow 统一展示阶段进展，工具级细节写入 report 文件即可。
+        # 保留接口以兼容历史调用点，但默认不向终端打印逐条日志。
+        _ = message
     
     def _load_config_file(self) -> Dict[str, Any]:
         """
@@ -315,7 +319,7 @@ class Add2lineResolver:
                         content = f.read()
                         if any(android_var in content for android_var in ['ANDROID_NDK_HOME', 'ANDROID_SDK_HOME']):
                             return True
-                except:
+                except Exception:
                     continue
         
         return False
@@ -463,7 +467,19 @@ class Add2lineResolver:
             if atos_path:
                 available_tools["atos"] = atos_path
                 logger.info(f"强制添加macOS atos工具: {atos_path}")
-        
+
+        # 兼容回退：llvm-addr2line 实质上是 llvm-symbolizer 的别名（默认参数不同）。
+        # 当未直接发现 llvm-addr2line（也无 addr2line）但能找到 llvm-symbolizer 时，
+        # 将其注册为 llvm-addr2line 的等价实现，调用时自动切换为 llvm-symbolizer 兼容参数。
+        if "llvm-addr2line" not in available_tools and "addr2line" not in available_tools:
+            symbolizer_path = self._find_tool_in_paths("llvm-symbolizer", search_paths)
+            if symbolizer_path:
+                available_tools["llvm-addr2line"] = symbolizer_path
+                self._llvm_addr2line_alias_path = symbolizer_path
+                logger.info(
+                    f"未找到 llvm-addr2line / addr2line，使用 llvm-symbolizer 作为 llvm-addr2line 兼容回退: {symbolizer_path}"
+                )
+
         if not available_tools:
             logger.warning(f"未找到任何堆栈地址解析工具，当前系统: {self.os_type}")
             logger.info("建议安装以下工具之一:")
@@ -482,6 +498,7 @@ class Add2lineResolver:
             version_commands = {
                 "addr2line": ["--version"],
                 "llvm-addr2line": ["--version"],
+                "llvm-symbolizer": ["--version"],
                 "eu-addr2line": ["--version"],
                 "atos": ["--version"],
                 "llvm-atos": ["--version"],
@@ -831,7 +848,19 @@ class Add2lineResolver:
             "/Applications/Xcode.app/Contents/Developer/usr/bin"  # Xcode开发者工具
         ]
         search_paths.extend([p for p in common_toolchain_paths if Path(p).exists()])
-        
+
+        # 同步 IDE / SDK 默认安装路径（与 CLI 检测层保持一致）：
+        #   Android Studio NDK / Xcode (xcrun) / DevEco Studio OpenHarmony SDK / Homebrew 多版本 / Linux LLVM 发行版包
+        # 采用懒导入避免与 cli.main 的循环依赖；闭源 / 打包场景缺失 cli 包时安全降级。
+        try:
+            from cli.main import _candidate_tool_dirs_from_ides as _cli_ide_paths  # type: ignore
+            for ide_path, _ide_labels in _cli_ide_paths():
+                p = str(ide_path)
+                if p and p not in search_paths and len(p) < 500:
+                    search_paths.append(p)
+        except Exception as exc:  # pragma: no cover - 仅做防御性降级
+            logger.debug(f"未加载 CLI 端 IDE 路径探测器: {exc}")
+
         # 去重并过滤无效路径
         valid_paths = []
         seen_paths = set()
@@ -852,7 +881,7 @@ class Add2lineResolver:
                 tool_path = result.stdout.strip()
                 if self._test_tool_availability(tool_name, tool_path):
                     return tool_path
-        except:
+        except Exception:
             pass
         
         # 在扩展路径中查找
@@ -1311,12 +1340,11 @@ class Add2lineResolver:
             # 检查库路径下的文件
             try:
                 lib_file_list = os.listdir(library_dir)
-                if not self._is_quiet_mode():
-                    preview = lib_file_list[:20]
-                    suffix = " ..." if len(lib_file_list) > 20 else ""
-                    self._emit_progress(
-                        f"📚 [add2line_resolver] 库路径文件总数: {len(lib_file_list)}，示例: {preview}{suffix}"
-                    )
+                preview = lib_file_list[:20]
+                suffix = " ..." if len(lib_file_list) > 20 else ""
+                self._emit_progress(
+                    f"📚 [add2line_resolver] 库路径文件总数: {len(lib_file_list)}，示例: {preview}{suffix}"
+                )
                 lib_files_filtered = [f for f in lib_file_list if f.endswith(('.dylib', '.so', '.dll', '.a')) or '.dSYM' in f]
                 self._emit_progress(f"📚 [add2line_resolver] 库文件数量: {len(lib_files_filtered)}")
             except Exception as e:
@@ -1632,21 +1660,41 @@ class Add2lineResolver:
 
 
     def _resolve_with_addr2line(self, address: str, library_path: str, tool_path: str) -> Optional[ResolvedFrame]:
-        """使用addr2line工具解析地址"""
+        """使用addr2line工具解析地址。
+
+        若当前 tool_path 是 llvm-symbolizer 别名（系统未提供 llvm-addr2line / addr2line 时启用），
+        则使用 llvm-symbolizer 的兼容参数集合，并通过 --output-style=GNU 让输出与 GNU addr2line 对齐，
+        从而复用现有 _parse_add2line_output 的解析逻辑。
+        """
         try:
-            cmd = [
-                tool_path,
-                "-e", library_path,
-                "-f",  # 显示函数名
-                "-C",  # 显示C++符号名
-                address
-            ]
-            
+            is_symbolizer_alias = bool(
+                self._llvm_addr2line_alias_path
+                and tool_path == self._llvm_addr2line_alias_path
+            )
+            if is_symbolizer_alias:
+                cmd = [
+                    tool_path,
+                    "-e", library_path,
+                    "--functions=linkage",  # 显示函数名（与 -f 等价）
+                    "--demangle",           # 还原 C++/Rust 符号（与 -C 等价）
+                    "--inlines=false",      # 关闭内联展开，确保输出仅有 [function, file:line] 两行
+                    "--output-style=GNU",   # 让输出格式对齐 GNU addr2line
+                    address,
+                ]
+            else:
+                cmd = [
+                    tool_path,
+                    "-e", library_path,
+                    "-f",  # 显示函数名
+                    "-C",  # 显示C++符号名
+                    address,
+                ]
+
             result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
-            
+
             if result.returncode == 0:
                 function, file_path, line_number = self._parse_add2line_output(result.stdout)
-                
+
                 return ResolvedFrame(
                     address=address,
                     resolved_function=function,
@@ -1656,7 +1704,7 @@ class Add2lineResolver:
             else:
                 logger.warning(f"addr2line命令执行失败: {result.stderr}")
                 return None
-                
+
         except subprocess.TimeoutExpired:
             logger.warning(f"addr2line命令超时: {address}")
             return None

@@ -358,7 +358,7 @@ def test_openai_compatible_model(config: Dict[str, Any], model_config: Dict[str,
             "Content-Type": "application/json",
             **_build_auth_headers(provider_key, model_config),
         }
-        timeout_s = int(model_config.get("request_timeout", 60) or 60)
+        timeout_s = int(model_config.get("request_timeout", 120) or 120)
         headers = {
             **headers
         }
@@ -508,7 +508,7 @@ def test_anthropic_compatible_model(config: Dict[str, Any], model_config: Dict[s
         print(f"   🔑 模型: {model}")
 
         start_time = time.time()
-        response = requests.post(base_url, headers=headers, json=data, timeout=int(model_config.get("request_timeout", 60) or 60))
+        response = requests.post(base_url, headers=headers, json=data, timeout=int(model_config.get("request_timeout", 120) or 120))
         end_time = time.time()
         elapsed_time = end_time - start_time
 
@@ -565,7 +565,7 @@ def test_openai_responses_compatible_model(config: Dict[str, Any], model_config:
         model = model_config.get("model", model_name)
         messages = get_test_messages(config)
         user_content = next((m.get("content") for m in messages if m.get("role") == "user"), "") or "Hello"
-        timeout_s = int(model_config.get("request_timeout", 60) or 60)
+        timeout_s = int(model_config.get("request_timeout", 120) or 120)
         headers = {
             "Content-Type": "application/json",
             **_build_auth_headers(provider_key, model_config),

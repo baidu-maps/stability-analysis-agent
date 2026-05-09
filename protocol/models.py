@@ -10,6 +10,7 @@ from .version import PROTOCOL_VERSION
 RunStatus = Literal["queued", "running", "done", "error", "canceled"]
 OutputFormat = Literal["json", "markdown", "text"]
 EngineType = Literal["sequential", "langgraph"]
+ScopeType = Literal["full", "prompt_only", "parse_only", "parse_log_only"]
 
 
 def normalize_run_code_roots(req: "RunRequest") -> List[str]:
@@ -48,8 +49,7 @@ class RunRequest:
 
     output_format: OutputFormat = "markdown"
 
-    skip_ai: bool = False
-    parse_only: bool = False
+    scope: ScopeType = "full"
     optimized: bool = False
     streaming: bool = False
 

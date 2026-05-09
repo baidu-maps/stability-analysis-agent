@@ -281,14 +281,14 @@ python3 tools/cli/main.py \
   --code-root crash_cases/demo_basic/code_dir
 ```
 
-#### 2) 无密钥/快速回归：跳过 AI（只跑前三步工具链）
+#### 2) 无密钥/快速回归：仅生成提示词（跑完整工具链但不调 LLM）
 
 ```bash
 python3 tools/cli/main.py \
   --crash-log crash_cases/demo_basic/logs/mac/_SIGSEGV_2025-09-10_18-06-22.crash \
   --library-dir crash_cases/demo_basic/lib/mac \
   --code-root crash_cases/demo_basic/code_dir \
-  --skip-ai
+  --scope prompt_only
 ```
 
 #### 3) 更快：只做解析 + 地址解析（此模式不需要 code_root）
@@ -297,7 +297,7 @@ python3 tools/cli/main.py \
 python3 tools/cli/main.py \
   --crash-log crash_cases/demo_basic/logs/mac/_SIGSEGV_2025-09-10_18-06-22.crash \
   --library-dir crash_cases/demo_basic/lib/mac \
-  --parse-only
+  --scope parse_only
 ```
 
 #### 4) 高频调试：先起 daemon，再让 CLI 走 daemon（可选）

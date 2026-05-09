@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file.
 
 - **`cli.api`**: stable programmatic entry points for embedding and enterprise wrappers (`build_parser`, `execute_analysis`, `collect_interactive_run_state`, `interactive_state_to_argv`, `parse_analysis_args`, `run_from_interactive_state`, `run_cli_main`).
 - **`bd-sa-agent` / closed-workspace note**: downstream packages should avoid shipping a top-level `cli` package that shadows this library’s `cli` module.
+- **Enterprise LLM menu (opt-in)**: when env `STABILITY_AGENT_BD_ENTERPRISE` is set to `1`/`true`/`yes`/`on`, the interactive “配置大模型” flow adds **「配置百度内部API-KEY」** (under “重新设置”, and also when LLM is not yet configured). Default `sa-agent` behavior is unchanged.
 
 ### Changed
 

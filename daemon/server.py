@@ -199,10 +199,9 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
     if getattr(req, "engine", None):
         cmd += ["--engine", str(req.engine)]
 
-    if req.skip_ai:
-        cmd += ["--skip-ai"]
-    if req.parse_only:
-        cmd += ["--parse-only"]
+    scope = str(getattr(req, "scope", "full") or "full")
+    if scope and scope != "full":
+        cmd += ["--scope", scope]
     if req.optimized:
         cmd += ["--optimized"]
     if req.streaming:
@@ -292,6 +291,16 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
 
 
 def _start_run(req_dict: Dict[str, Any]) -> RunState:
+    # 旧字段（skip_ai / parse_only）兼容：静默归并为 scope 后再丢弃。
+    if "scope" not in req_dict:
+        legacy_skip_ai = bool(req_dict.get("skip_ai", False))
+        legacy_parse_only = bool(req_dict.get("parse_only", False))
+        if legacy_parse_only:
+            req_dict["scope"] = "parse_only"
+        elif legacy_skip_ai:
+            req_dict["scope"] = "prompt_only"
+    req_dict.pop("skip_ai", None)
+    req_dict.pop("parse_only", None)
     req = RunRequest(**req_dict)
     run = RUNS.create_run(req)
 

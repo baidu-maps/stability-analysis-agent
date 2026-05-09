@@ -23,17 +23,17 @@ python3 cli/main.py \
 
 > 交互模式（直接运行 `sa-agent`）支持快捷复跑：当存在最近一次分析记录时，菜单会显示 `5) 再次进行上一次分析`，可一键复用上次参数重跑。
 > 菜单型选择支持上下键切换，回车确认（也兼容数字键）。
-> 交互首屏不做自动环境检测；配置大模型/配置 addr2line 工具时会先做对应检测并展示结论。`2) 更多选项` 同时提供命令参考（单屏说明常用参数与子命令作用）、手动输入命令示例，以及 **高级选项（手动编辑配置文件、执行引擎切换、AI 模式开关、执行范围切换等）**，`1) 快速开始分析` 路径保持精简。
+> 交互首屏不做自动环境检测；配置大模型/配置 addr2line 工具时会先做对应检测并展示结论。`2) 设置` 提供 **配置大模型 / 配置堆栈地址解析工具 / 高级选项（手动编辑配置文件、AI 推理模式切换、Agent 执行流程切换等）**；`3) 帮助` 提供 **全部命令参考（完整参数手册）/ 命令快速示例（最小可运行）**，方便随时查阅；`1) 快速开始分析` 路径保持精简。
 > 参数采集完成后会直接执行，不再二次确认；执行前会提示“运行中按 `Ctrl+C` 可终止当前任务”。
 
-### 2) 跳过 AI（推荐回归测试）
+### 2) prompt_only 模式（推荐回归测试）
 
 ```bash
 python3 cli/main.py \
   --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
   --code-root examples/crash_cases/demo_basic/code_dir \
-  --skip-ai
+  --scope prompt_only
 ```
 
 ### 3) 解析模式
@@ -43,12 +43,12 @@ python3 cli/main.py \
 python3 cli/main.py \
   --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
-  --parse-only
+  --scope parse_only
 
 # 只解析崩溃日志
 python3 cli/main.py \
   --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
-  --parse-log-only
+  --scope parse_log_only
 ```
 
 ### 4) 指定引擎
@@ -191,7 +191,7 @@ python3 cli/main.py cancel <run_id> --daemon http://127.0.0.1:8765
 ## 故障排查建议
 
 - **无 AI 输出**：
-  - 检查 `--skip-ai` 是否开启
+  - 检查 `--scope` 是否为 `full`（其它取值会跳过 LLM 调用）
   - 检查 `tools/configs/agent_config.local.json` 是否正确配置
 - **向量检索未生效**：
   - 先看 `--vector-db-stats`
