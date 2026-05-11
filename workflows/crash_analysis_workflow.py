@@ -137,10 +137,23 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             # Step 3: 提取代码上下文
             print(f"[阶段 3/{total_steps}] 提取源码上下文...")
             logger.info(f"[{self.definition.name}] Step 3: Extracting code context...")
-            code_context = context.execute_tool("code_content_provider", {
+            ccp_input: Dict[str, Any] = {
                 "resolved_stack": json.dumps(resolved),
-                "code_roots": code_roots
-            })
+                "code_roots": code_roots,
+            }
+            for _k in (
+                "max_sibling_member_functions",
+                "max_direct_callers",
+                "max_shared_var_related_functions",
+                "min_key_read_related_functions",
+                "max_static_call_chain_depth",
+                "max_symbol_only_rescues",
+                "find_source_timeout_sec",
+                "code_context_timeout_sec",
+            ):
+                if isinstance(problem, dict) and _k in problem and problem[_k] is not None:
+                    ccp_input[_k] = problem[_k]
+            code_context = context.execute_tool("code_content_provider", ccp_input)
             memory_context = ""
             rule_hits: List[Dict[str, Any]] = []
             pattern_hits: List[Dict[str, Any]] = []
@@ -514,6 +527,143 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         lines.append("")
         lines.append("")
 
+        # ---------- 共享成员与跨函数写路径（来自 graph use_shared_var，列表展示） ----------
+        def _norm_graph_nid(raw: Optional[str]) -> str:
+            if not isinstance(raw, str):
+                return ""
+            return raw.rstrip().rstrip("{").rstrip()
+
+        def _relation_write_like(rel: Optional[str]) -> bool:
+            """图中 relation 的写类语义（含 assign/delete），用于优先突出竞态写路径。"""
+            r = (rel or "").strip().lower()
+            return r in ("write", "assign", "delete")
+
+        crash_fn_norm_ids: Set[str] = set()
+        if isinstance(crash_node, dict) and crash_node.get("id"):
+            crash_fn_norm_ids.add(_norm_graph_nid(str(crash_node.get("id"))))
+        if isinstance(node_id, str):
+            crash_fn_norm_ids.add(_norm_graph_nid(node_id))
+        crash_fn_norm_ids.discard("")
+
+        edges_list = graph.get("edges", []) if isinstance(graph, dict) else []
+        if not isinstance(edges_list, list):
+            edges_list = []
+
+        var_rel_by_tid: Dict[str, Set[str]] = {}
+        shared_var_tids: Set[str] = set()
+        if crash_fn_norm_ids:
+            for e in edges_list:
+                if not isinstance(e, dict):
+                    continue
+                if e.get("type") != "use_shared_var":
+                    continue
+                fid = _norm_graph_nid(str(e.get("from_id") or ""))
+                if fid not in crash_fn_norm_ids:
+                    continue
+                tid = str(e.get("to_id") or "")
+                if not tid.startswith("var|"):
+                    continue
+                rel = str(e.get("relation") or "unknown")
+                var_rel_by_tid.setdefault(tid, set()).add(rel)
+                shared_var_tids.add(tid)
+
+        if var_rel_by_tid:
+            lines.append("### 共享成员与写路径交叉（崩溃点关联）")
+            lines.append("崩溃函数关联的成员/共享变量：")
+            lines.append(
+                "说明：以下“声明摘录”来自成员变量定义行（通常位于头文件），用于识别变量类型与存储形态，不代表运行时值。"
+            )
+            for tid in sorted(var_rel_by_tid.keys()):
+                vn = node_map.get(tid) if isinstance(node_map, dict) else None
+                vname = tid
+                decl = ""
+                if isinstance(vn, dict):
+                    vname = str(vn.get("name") or tid)
+                    decl = str(vn.get("signature") or "").strip()
+                rels = "/".join(sorted(var_rel_by_tid[tid]))
+                if decl and len(decl) > 160:
+                    decl = decl[:157] + "..."
+                if decl:
+                    lines.append(f"- 变量: {vname}；访问: {rels}；声明摘录: {decl}")
+                else:
+                    lines.append(f"- 变量: {vname}；访问: {rels}")
+
+            def _looks_like_key_read_name(sig_or_name: str) -> bool:
+                n = str(sig_or_name or "").lower()
+                return any(
+                    kw in n
+                    for kw in (
+                        "get",
+                        "read",
+                        "fetch",
+                        "query",
+                        "find",
+                        "lookup",
+                        "scan",
+                        "walk",
+                        "traverse",
+                        "visit",
+                        "modify",
+                        "update",
+                        "access",
+                    )
+                )
+
+            other_fid_write: Set[str] = set()
+            other_fid_key_read: Set[str] = set()
+            if shared_var_tids:
+                for e in edges_list:
+                    if not isinstance(e, dict):
+                        continue
+                    if e.get("type") != "use_shared_var":
+                        continue
+                    tid = str(e.get("to_id") or "")
+                    if tid not in shared_var_tids:
+                        continue
+                    raw_fid = str(e.get("from_id") or "")
+                    if _norm_graph_nid(raw_fid) in crash_fn_norm_ids:
+                        continue
+                    fn = node_map.get(raw_fid)
+                    if not isinstance(fn, dict) or fn.get("type") != "function":
+                        continue
+                    rel = str(e.get("relation") or "")
+                    if _relation_write_like(rel):
+                        other_fid_write.add(raw_fid)
+                    elif rel.strip().lower() == "read":
+                        sig = str(fn.get("signature") or raw_fid)
+                        if _looks_like_key_read_name(sig):
+                            other_fid_key_read.add(raw_fid)
+
+            def _fid_to_sig(fid: str) -> str:
+                fn = node_map.get(fid)
+                if isinstance(fn, dict):
+                    return str(fn.get("signature") or fid).strip() or fid
+                return fid
+
+            _OTHER_SIG_CAP = 15
+            if other_fid_write:
+                lines.append("")
+                lines.append("同一批变量的其它写路径函数（仅列签名，源码见后文专门小节）：")
+                sig_list = sorted({_fid_to_sig(x) for x in other_fid_write})
+                shown = sig_list[:_OTHER_SIG_CAP]
+                for s in shown:
+                    lines.append(f"- {s}")
+                rest = len(sig_list) - len(shown)
+                if rest > 0:
+                    lines.append(f"- … 另有 {rest} 个函数未列出")
+            if other_fid_key_read:
+                lines.append("")
+                lines.append("同一批变量的关键读路径函数（仅列签名，源码见后文专门小节）：")
+                sig_list = sorted({_fid_to_sig(x) for x in other_fid_key_read})
+                shown = sig_list[:_OTHER_SIG_CAP]
+                for s in shown:
+                    lines.append(f"- {s}")
+                rest = len(sig_list) - len(shown)
+                if rest > 0:
+                    lines.append(f"- … 另有 {rest} 个函数未列出")
+            lines.append("")
+        lines.append("")
+
         lines.append("## 可疑代码片段")
         lines.append("可疑崩溃代码行（基于地址解析）:")
         lines.append(f"- 文件: {((crash_node or {}).get('file') or 'N/A')}:{(crash_summary.get('crash_line_number') if isinstance(crash_summary, dict) else 'N/A')}")
@@ -523,8 +673,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
 
         lines.append("## 以上涉及的函数源码")
         lines.append("")
-        shown_ids: List[str] = []
-        shown_signatures: Set[str] = set()
+
         source_ids: List[str] = []
         # 仅展示主调用链，避免多路径重复噪声
         source_ids.extend(primary_path_nodes)
@@ -538,6 +687,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         m_owner = re.search(r"\b([A-Za-z_]\w*)::[~]?[A-Za-z_]\w*\s*\(", crash_sig)
         if m_owner:
             owner = m_owner.group(1)
+        lifecycle_ids: Set[str] = set()
         if owner:
             lifecycle_re = re.compile(
                 rf"\b{re.escape(owner)}::(~{re.escape(owner)}|clear(?:_[A-Za-z_]\w*)?|destroy(?:_[A-Za-z_]\w*)?|shutdown(?:_[A-Za-z_]\w*)?|stop(?:_[A-Za-z_]\w*)?)\s*\("
@@ -548,36 +698,294 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 sig = str(n.get("signature") or "")
                 if lifecycle_re.search(sig):
                     source_ids.append(nid)
+                    lifecycle_ids.add(_norm_graph_nid(nid))
 
-        for nid in source_ids:
-            normalized = nid.rstrip().rstrip("{").rstrip() if isinstance(nid, str) else nid
-            node = node_map.get(nid) or node_map.get(normalized)
+        # ---------- 共享变量相关函数预算（写优先 + 关键读保底） ----------
+        opts_cc = code_context.get("code_context_options") if isinstance(code_context, dict) else None
+        k_raw: Any = None
+        key_read_floor_raw: Any = None
+        if isinstance(opts_cc, dict):
+            k_raw = opts_cc.get("max_shared_var_related_functions")
+            key_read_floor_raw = opts_cc.get("min_key_read_related_functions")
+        if k_raw is None and isinstance(problem, dict):
+            k_raw = problem.get("max_shared_var_related_functions")
+        if key_read_floor_raw is None and isinstance(problem, dict):
+            key_read_floor_raw = problem.get("min_key_read_related_functions")
+        try:
+            k_tip = int(k_raw) if k_raw is not None else 20
+        except (TypeError, ValueError):
+            k_tip = 20
+        k_tip = max(1, min(k_tip, 20))
+        try:
+            key_read_floor = int(key_read_floor_raw) if key_read_floor_raw is not None else 2
+        except (TypeError, ValueError):
+            key_read_floor = 2
+        key_read_floor = max(0, min(key_read_floor, 20))
+
+        def _looks_like_key_read_function_name(name: str) -> bool:
+            n = str(name or "").lower()
+            return any(
+                kw in n
+                for kw in (
+                    "get",
+                    "read",
+                    "fetch",
+                    "query",
+                    "find",
+                    "lookup",
+                    "scan",
+                    "walk",
+                    "traverse",
+                    "visit",
+                    "modify",
+                    "update",
+                    "access",
+                )
+            )
+
+        shared_extra_ids: List[str] = []
+        shared_extra_from_write = False
+        if shared_var_tids and crash_fn_norm_ids:
+            cand_write: Set[str] = set()
+            cand_key_read: Set[str] = set()
+            cand_any: Set[str] = set()
+            for e in edges_list:
+                if not isinstance(e, dict):
+                    continue
+                if e.get("type") != "use_shared_var":
+                    continue
+                tid = str(e.get("to_id") or "")
+                if tid not in shared_var_tids:
+                    continue
+                raw_fid = str(e.get("from_id") or "")
+                if _norm_graph_nid(raw_fid) in crash_fn_norm_ids:
+                    continue
+                fn = node_map.get(raw_fid)
+                if not isinstance(fn, dict) or fn.get("type") != "function":
+                    continue
+                cand_any.add(raw_fid)
+                rel = str(e.get("relation") or "")
+                if _relation_write_like(rel):
+                    cand_write.add(raw_fid)
+                elif rel.strip().lower() == "read":
+                    sig_name = str(fn.get("signature") or raw_fid)
+                    if _looks_like_key_read_function_name(sig_name):
+                        cand_key_read.add(raw_fid)
+
+            shared_extra_from_write = bool(cand_write)
+            crash_sid = str((crash_node or {}).get("id") or "")
+            if shared_extra_from_write:
+                ordered_write = sorted(
+                    cand_write, key=lambda x: str((node_map.get(x) or {}).get("signature") or x)
+                )
+                ordered_key_read = sorted(
+                    cand_key_read, key=lambda x: str((node_map.get(x) or {}).get("signature") or x)
+                )
+                chosen: List[str] = []
+                key_quota = min(key_read_floor, len(ordered_key_read), k_tip)
+                write_quota = max(0, k_tip - key_quota)
+
+                for fid in ordered_write:
+                    if len(chosen) >= write_quota:
+                        break
+                    if fid == crash_sid or _norm_graph_nid(fid) in crash_fn_norm_ids:
+                        continue
+                    snippet = (node_map.get(fid) or {}).get("snippet", [])
+                    if not (isinstance(snippet, list) and snippet):
+                        continue
+                    chosen.append(fid)
+
+                for fid in ordered_key_read:
+                    if len(chosen) >= k_tip:
+                        break
+                    if fid in chosen:
+                        continue
+                    if fid == crash_sid or _norm_graph_nid(fid) in crash_fn_norm_ids:
+                        continue
+                    snippet = (node_map.get(fid) or {}).get("snippet", [])
+                    if not (isinstance(snippet, list) and snippet):
+                        continue
+                    chosen.append(fid)
+
+                # 余量用其它候选补齐（按签名稳定排序）
+                if len(chosen) < k_tip:
+                    ordered_any = sorted(
+                        cand_any, key=lambda x: str((node_map.get(x) or {}).get("signature") or x)
+                    )
+                    for fid in ordered_any:
+                        if len(chosen) >= k_tip:
+                            break
+                        if fid in chosen:
+                            continue
+                        if fid == crash_sid or _norm_graph_nid(fid) in crash_fn_norm_ids:
+                            continue
+                        snippet = (node_map.get(fid) or {}).get("snippet", [])
+                        if not (isinstance(snippet, list) and snippet):
+                            continue
+                        chosen.append(fid)
+                shared_extra_ids = chosen
+            else:
+                ordered_any = sorted(
+                    cand_any, key=lambda x: str((node_map.get(x) or {}).get("signature") or x)
+                )
+                for fid in ordered_any:
+                    if fid == crash_sid or _norm_graph_nid(fid) in crash_fn_norm_ids:
+                        continue
+                    snippet = (node_map.get(fid) or {}).get("snippet", [])
+                    if not (isinstance(snippet, list) and snippet):
+                        continue
+                    shared_extra_ids.append(fid)
+                    if len(shared_extra_ids) >= k_tip:
+                        break
+
+        # ---------- 按函数聚合：一个函数只展示一次，并打来源标签 ----------
+        function_index: Dict[str, Dict[str, Any]] = {}
+
+        add2line_norm_ids: Set[str] = set()
+        call_chain_from_add2line = graph.get("call_chain_from_add2line", []) if isinstance(graph, dict) else []
+        if isinstance(call_chain_from_add2line, list):
+            for item in call_chain_from_add2line:
+                if not isinstance(item, dict):
+                    continue
+                for nid in item.get("nodes", []) or []:
+                    if isinstance(nid, str):
+                        add2line_norm_ids.add(_norm_graph_nid(nid))
+
+        primary_path_norm_ids: Set[str] = {_norm_graph_nid(nid) for nid in primary_path_nodes if isinstance(nid, str)}
+
+        write_shared_func_norm: Set[str] = set()
+        key_read_shared_func_norm: Set[str] = set()
+        any_shared_func_norm: Set[str] = set()
+        shared_rels_by_func_var: Dict[Tuple[str, str], Set[str]] = {}
+        for e in edges_list:
+            if not isinstance(e, dict) or e.get("type") != "use_shared_var":
+                continue
+            fid = _norm_graph_nid(str(e.get("from_id") or ""))
+            tid = str(e.get("to_id") or "")
+            if not fid or not tid.startswith("var|"):
+                continue
+            any_shared_func_norm.add(fid)
+            rel = str(e.get("relation") or "unknown")
+            if _relation_write_like(rel):
+                write_shared_func_norm.add(fid)
+            elif rel.strip().lower() == "read":
+                fn2 = node_map.get(str(e.get("from_id") or ""))
+                sig2 = str((fn2 or {}).get("signature") or e.get("from_id") or "")
+                if _looks_like_key_read_function_name(sig2):
+                    key_read_shared_func_norm.add(fid)
+            shared_rels_by_func_var.setdefault((fid, tid), set()).add(rel)
+
+        def _register_func(fid_raw: str) -> None:
+            node = node_map.get(fid_raw) or node_map.get(_norm_graph_nid(fid_raw))
             if not isinstance(node, dict):
-                continue
-            sid = str(node.get("id"))
-            if sid in shown_ids:
-                continue
-            shown_ids.append(sid)
+                return
+            if str(node.get("type") or "") != "function":
+                return
+            sid = str(node.get("id") or "")
+            if not sid:
+                return
             sig = str(node.get("signature") or "")
-            if sig:
-                shown_signatures.add(sig)
             # 默认跳过信号处理/日志类函数，避免稀释主根因函数；崩溃函数例外。
             if sid != str((crash_node or {}).get("id") or "") and re.search(
                 r"\b(signal_handler|sig_handler|crash_handler|log|logger)\b", sig
             ):
-                continue
-            lines.append("堆栈地址解析相关函数的代码片段:")
-            lines.append(f"- 文件: {node.get('file', 'N/A')}:N/A")
-            lines.append(f"- 函数: {node.get('signature', 'N/A')}")
-            lines.append("- 代码片段:")
-            snippet = node.get("snippet", [])
-            if isinstance(snippet, list) and snippet:
-                lines.extend([str(s) for s in snippet])
+                return
+            nfid = _norm_graph_nid(sid)
+            rec = function_index.setdefault(
+                sid,
+                {
+                    "node": node,
+                    "norm_id": nfid,
+                    "tags": set(),
+                    "shared_vars": {},
+                    "priority": 99,
+                },
+            )
+            tags: Set[str] = rec["tags"]
+            if nfid in crash_fn_norm_ids:
+                tags.add("崩溃函数")
+            if nfid in primary_path_norm_ids:
+                tags.add("调用链")
+            if nfid in add2line_norm_ids:
+                tags.add("堆栈列表")
+            if nfid in lifecycle_ids:
+                tags.add("生命周期函数")
+            if nfid in write_shared_func_norm:
+                tags.add("共享变量写")
+            elif nfid in key_read_shared_func_norm:
+                tags.add("共享变量关键读")
+            elif nfid in any_shared_func_norm:
+                tags.add("共享变量读/访问")
+            # 聚合共享变量命中明细
+            shared_vars: Dict[str, Set[str]] = rec["shared_vars"]
+            for (fid_n, tid), rels in shared_rels_by_func_var.items():
+                if fid_n != nfid:
+                    continue
+                vn = node_map.get(tid) if isinstance(node_map, dict) else None
+                vname = str((vn or {}).get("name") or tid).strip()
+                if not vname:
+                    continue
+                shared_vars.setdefault(vname, set()).update(rels)
+
+            # 统一优先级：崩溃函数 > 共享变量写 > 共享变量关键读 > 调用链 > 堆栈列表 > 共享变量读/访问 > 生命周期函数 > 其它
+            if "崩溃函数" in tags:
+                rec["priority"] = 0
+            elif "共享变量写" in tags:
+                rec["priority"] = 1
+            elif "共享变量关键读" in tags:
+                rec["priority"] = 2
+            elif "调用链" in tags:
+                rec["priority"] = 3
+            elif "堆栈列表" in tags:
+                rec["priority"] = 4
+            elif "共享变量读/访问" in tags:
+                rec["priority"] = 5
+            elif "生命周期函数" in tags:
+                rec["priority"] = 6
             else:
-                continue
+                rec["priority"] = 9
+
+        for nid in source_ids:
+            if isinstance(nid, str):
+                _register_func(nid)
+        for fid in shared_extra_ids:
+            if isinstance(fid, str):
+                _register_func(fid)
+
+        ordered_records = sorted(
+            function_index.values(),
+            key=lambda r: (
+                int(r.get("priority", 99)),
+                str((r.get("node") or {}).get("signature") or ""),
+            ),
+        )
+
+        lines.append("### 函数源码（按函数唯一输出）")
+        if not ordered_records:
+            lines.append("- N/A")
             lines.append("")
-        # 对未提取到完整源码片段的堆栈函数不再补充 N/A 区块，避免重复/冲突信息误导模型。
-        # 若未来需要展示，可考虑仅在 debug 模式输出。
+        else:
+            for rec in ordered_records:
+                node = rec["node"]
+                snippet = node.get("snippet", [])
+                if not (isinstance(snippet, list) and snippet):
+                    continue
+                tags = sorted(list(rec["tags"]))
+                tag_txt = "、".join(tags) if tags else "上下文候选"
+                lines.append(f"#### 函数源码: {node.get('signature', 'N/A')}")
+                lines.append(f"- 来源: {tag_txt}")
+                shared_vars = rec.get("shared_vars") or {}
+                if isinstance(shared_vars, dict) and shared_vars:
+                    detail = []
+                    for vn in sorted(shared_vars.keys()):
+                        rel_txt = "/".join(sorted(shared_vars[vn]))
+                        detail.append(f"{vn}({rel_txt})")
+                    lines.append(f"- 命中说明: 共享变量命中 {', '.join(detail)}")
+                lines.append(f"- 文件: {node.get('file', 'N/A')}:N/A")
+                lines.append("- 代码片段:")
+                lines.extend([str(s) for s in snippet])
+                lines.append("")
+
         code_roots: List[str] = []
         if isinstance(problem, dict):
             prob_roots = problem.get("code_roots")
@@ -639,6 +1047,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         lines.append("- 必须基于实际源代码进行修复；")
         lines.append("- 修复代码必须完整且可编译；")
         lines.append("- **修复代码只允许包含“需要修改的函数”**；对“无需修改的函数”，只允许给出不修改理由（1–2 句），禁止输出其完整代码；")
+        lines.append("- 对来源标签含“共享变量关键读”的同类函数，必须逐个判断是否需要修改；若判定无需修改，必须给出可验证理由（例如：锁覆盖、边界检查、生命周期同步已闭环），不得笼统写“非直接原因”。")
         lines.append("- 禁止使用“未知”“假设”“示例”等表述性的占位词。")
         lines.append("")
         if memory_context:

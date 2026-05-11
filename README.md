@@ -165,15 +165,15 @@ To analyze your own case, run `sa-agent` and input your own paths using the same
 
 ### Programmatic API (embedding / enterprise wrappers)
 
-Since **v1.2.3**, the wheel includes a stable Python surface in [`cli/api.py`](./cli/api.py), for example `execute_analysis`, `build_parser`, `collect_interactive_run_state`, `interactive_state_to_argv`, `run_from_interactive_state`, and `run_cli_main`. Use it to drive the same pipeline from custom menus or automation without `subprocess`. See [`CHANGELOG.md`](./CHANGELOG.md).
+Since **v1.2.4**, the wheel includes a stable Python surface in [`cli/api.py`](./cli/api.py), for example `execute_analysis`, `build_parser`, `collect_interactive_run_state`, `interactive_state_to_argv`, `run_from_interactive_state`, and `run_cli_main`. Use it to drive the same pipeline from custom menus or automation without `subprocess`. See [`CHANGELOG.md`](./CHANGELOG.md).
 
 ### Use Prebuilt CLI Binary (No Python Required)
 
 Download the latest binary from [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases). Zip/folder names are versioned; use names from the release you downloaded.
 
 ```bash
-unzip StabilityAnalyzer-v1.2.3-mac-arm64.zip
-cd output/cli_release/stability_analyzer_cli/v1.2.3-mac-arm64
+unzip StabilityAnalyzer-v1.2.4-mac-arm64.zip
+cd output/cli_release/stability_analyzer_cli/v1.2.4-mac-arm64
 ./StabilityAnalyzer
 ```
 
@@ -318,7 +318,7 @@ stability-analysis-agent/
 | Tool Extension Guide | [docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md](./docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md) |
 | Workflow System | [docs/workflows/WORKFLOWS.md](./docs/workflows/WORKFLOWS.md) |
 | RAG Vector Database | [docs/rag/README.md](./docs/rag/README.md) |
-| Crash Demos | [docs/crash_demos/README.md](./docs/crash_demos/README.md) |
+| Crash Demos | [docs/crash_cases/README.md](./docs/crash_cases/README.md) |
 
 ## Testing
 

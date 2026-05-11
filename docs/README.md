@@ -11,7 +11,7 @@ docs/
 ├── workflows/                # Workflow 系统
 ├── rag/                   # RAG 向量库
 ├── tools/                 # 工具链
-└── crash_demos/           # 崩溃示例
+└── crash_cases/           # 崩溃示例文档
 ```
 
 > 快速开始请直接阅读项目根目录 [README.md](../README.md)（[中文版](../README.zh-CN.md)）。
@@ -59,9 +59,9 @@ docs/
 
 | 文档 | 说明 |
 |------|------|
-| [crash_demos/README.md](./crash_demos/README.md) | 崩溃示例总览导航 |
-| [crash_demos/demo_basic/README.md](./crash_demos/demo_basic/README.md) | 基础崩溃示例 |
-| [crash_demos/demo_multithread/README.md](./crash_demos/demo_multithread/README.md) | 多线程崩溃示例 |
+| [crash_cases/README.md](./crash_cases/README.md) | 崩溃示例总览导航 |
+| [crash_cases/demo_basic/README.md](./crash_cases/demo_basic/README.md) | 基础崩溃示例 |
+| [crash_cases/demo_multithread/README.md](./crash_cases/demo_multithread/README.md) | 多线程崩溃示例 |
 
 ## 相关链接
 

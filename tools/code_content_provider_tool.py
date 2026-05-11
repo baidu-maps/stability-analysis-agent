@@ -24,6 +24,20 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _use_shared_var_edge_relation_strength(rel: Optional[str]) -> int:
+    """合并 / 截断共享变量函数关系时优先保留写类语义（delete > assign > write > read）。"""
+    r = (rel or "").strip().lower()
+    if r == "delete":
+        return 4
+    if r == "assign":
+        return 3
+    if r == "write":
+        return 2
+    if r == "read":
+        return 1
+    return 0
+
+
 class _FindSourceFileTimeout(Exception):
     """单次「解析源文件路径」总超时，用于从深层循环中跳出。"""
 
@@ -203,6 +217,8 @@ class CodeContentProvider:
                  max_static_call_chain_depth: Optional[int] = None,
                  max_direct_callers: Optional[int] = None,
                  max_shared_var_related_functions: Optional[int] = None,
+                 min_key_read_related_functions: Optional[int] = None,
+                 max_sibling_member_functions: Optional[int] = None,
                  max_symbol_only_rescues: Optional[int] = None,
                  find_source_timeout_sec: Optional[float] = None,
                  code_context_timeout_sec: Optional[float] = None):
@@ -215,7 +231,9 @@ class CodeContentProvider:
             code_index_service: 代码索引服务实例（可选）
             max_static_call_chain_depth: 静态调用链 graph.call_chain_from_code 的最大节点数（含崩溃函数），默认 5，至少 1
             max_direct_callers: 静态分析得到的「直接调用崩溃函数」候选最多保留个数，默认 10，至少 1，上限 512
-            max_shared_var_related_functions: 共享变量相关函数记录最多保留条数，默认 10，至少 1，上限 512
+            max_shared_var_related_functions: 共享变量相关函数记录最多保留条数，默认 20，至少 1，上限 512
+            min_key_read_related_functions: 共享变量相关函数截断时，关键读路径最少保留条数（默认 2，允许 0）
+            max_sibling_member_functions: 同类「兄弟成员函数」最多纳入条数；默认 0（关闭，大库避免图膨胀），>0 时启用并截断
             max_symbol_only_rescues: add2line 缺失 file:line 时，按符号名兜底定位的最多尝试帧数，默认 5，允许 0（关闭）
             find_source_timeout_sec: 单次 _find_source_file 总超时（秒）；None 表示 360
             code_context_timeout_sec: 第三步整阶段 wall-clock 上限（秒）；None 表示 180；0 表示不限制
@@ -232,8 +250,12 @@ class CodeContentProvider:
         self.min_static_call_chain_nodes = 1
         _mdc = 10 if max_direct_callers is None else int(max_direct_callers)
         self.max_direct_callers = max(1, min(_mdc, 512))
-        _msv = 10 if max_shared_var_related_functions is None else int(max_shared_var_related_functions)
+        _msv = 20 if max_shared_var_related_functions is None else int(max_shared_var_related_functions)
         self.max_shared_var_related_functions = max(1, min(_msv, 512))
+        _mkr = 2 if min_key_read_related_functions is None else int(min_key_read_related_functions)
+        self.min_key_read_related_functions = max(0, min(_mkr, 64))
+        _sib = 0 if max_sibling_member_functions is None else int(max_sibling_member_functions)
+        self.max_sibling_member_functions = max(0, min(_sib, 512))
         _msr = 5 if max_symbol_only_rescues is None else int(max_symbol_only_rescues)
         self.max_symbol_only_rescues = max(0, min(_msr, 512))
         
@@ -1889,7 +1911,13 @@ class CodeContentProvider:
             logger.error(f"JSON 解析错误: {e}")
             return None
         except Exception as e:
-            logger.error(f"提取崩溃函数失败: {e}")
+            logger.error(
+                "提取崩溃函数失败: %s (func=%s, file=%s, line=%s)",
+                e,
+                resolved_function,
+                resolved_file,
+                resolved_line,
+            )
             return None
 
     def _fallback_crash_function_line_window(
@@ -2550,10 +2578,18 @@ class CodeContentProvider:
         """
         提取函数签名（优先按 resolved_function 的函数名 token 定位），避免把 else if/switch 等语句误判为签名。
         """
+        if not lines:
+            return "unknown function"
+
+        line_count = len(lines)
+        safe_target_line_index = min(max(0, int(target_line_index)), line_count - 1)
+
         # 0) tree-sitter 后端优先（阶段1：仅用于函数签名/函数体边界稳定化）
         if self.code_parser_backend == "tree_sitter" and self._ts_parser is not None:
             src = "\n".join(lines)
-            ts_sig, _ = self._ts_extract_signature_and_body(src, target_line_index, target_function_name)
+            ts_sig, _ = self._ts_extract_signature_and_body(
+                src, safe_target_line_index, target_function_name
+            )
             if ts_sig:
                 return ts_sig
 
@@ -2563,8 +2599,8 @@ class CodeContentProvider:
             if fn:
                 # 从目标行向上找包含 “fn(” 的起始行，再向下拼到 “)” 结束
                 max_lookback = 220
-                start = max(0, target_line_index)
-                end = max(0, target_line_index - max_lookback)
+                start = safe_target_line_index
+                end = max(0, safe_target_line_index - max_lookback)
                 for i in range(start, end - 1, -1):
                     line = lines[i].strip()
                     if not line or line.startswith("//") or line.startswith("/*"):
@@ -2609,7 +2645,7 @@ class CodeContentProvider:
             "try",
         )
 
-        for i in range(target_line_index, -1, -1):
+        for i in range(safe_target_line_index, -1, -1):
             line = lines[i].strip()
             if not line or line.startswith('//') or line.startswith('/*'):
                 continue
@@ -6109,6 +6145,217 @@ class CodeContentProvider:
                     out.add(name)
         return out
 
+    _CPP_TYPE_NAME_SKIP = frozenset(
+        {
+            "volatile",
+            "const",
+            "mutable",
+            "static",
+            "thread_local",
+            "extern",
+            "inline",
+            "virtual",
+            "explicit",
+            "constexpr",
+            "unsigned",
+            "signed",
+            "struct",
+            "class",
+            "union",
+            "enum",
+            "typename",
+            "template",
+            "public",
+            "private",
+            "protected",
+            "operator",
+            "using",
+            "friend",
+            "typedef",
+            "register",
+            "auto",
+            "decltype",
+            "sizeof",
+            "alignas",
+            "alignof",
+            "concept",
+            "requires",
+            "std",
+            "atomic",
+            "mutex",
+            "lock_guard",
+            "unique_ptr",
+            "shared_ptr",
+            "vector",
+            "string",
+            "size_t",
+            "ssize_t",
+            "intptr_t",
+            "uintptr_t",
+            "int8_t",
+            "int16_t",
+            "int32_t",
+            "int64_t",
+            "uint8_t",
+            "uint16_t",
+            "uint32_t",
+            "uint64_t",
+            "ptrdiff_t",
+            "nullptr_t",
+            "true",
+            "false",
+            "nullptr",
+            "NULL",
+            "void",
+            "bool",
+            "char",
+            "short",
+            "int",
+            "long",
+            "float",
+            "double",
+            "wchar_t",
+            "char16_t",
+            "char32_t",
+        }
+    )
+
+    def _extract_shallow_class_body_text(self, full_text: str, class_name: str) -> str:
+        """
+        从 C++ 源码中提取「最外层类/结构体」花括号内、且不在嵌套 type 块中的文本片段。
+        用于识别成员字段名（跳过 class/struct 内嵌套定义块），避免把嵌套 struct 的字段当成外层成员。
+        """
+        if not (full_text and class_name):
+            return ""
+        m = re.search(rf"\b(?:class|struct)\s+{re.escape(class_name)}\b", full_text)
+        if not m:
+            return ""
+        brace0 = full_text.find("{", m.start())
+        if brace0 < 0:
+            return ""
+        i = brace0 + 1
+        depth = 1
+        out_chars: List[str] = []
+        n = len(full_text)
+        while i < n and depth > 0:
+            c = full_text[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            else:
+                if depth == 1:
+                    out_chars.append(c)
+            i += 1
+        return "".join(out_chars)
+
+    def _parse_field_names_from_shallow_class_body(self, shallow_body: str) -> set:
+        """从浅层类体文本中解析成员变量/成员对象名（跳过方法声明等含括号行）。"""
+        names: set = set()
+        if not (shallow_body and shallow_body.strip()):
+            return names
+        for raw in shallow_body.splitlines():
+            line = (raw or "").strip()
+            if not line or line.startswith("//") or line.startswith("#"):
+                continue
+            if re.match(r"^(public|private|protected)\s*:\s*$", line):
+                continue
+            if line.startswith("using ") or line.startswith("friend ") or line.startswith("typedef "):
+                continue
+            if not line.endswith(";"):
+                continue
+            if "(" in line and ")" in line:
+                continue
+            head = line.split("//", 1)[0].strip()
+            if not head.endswith(";"):
+                continue
+            toks = re.findall(r"\b([A-Za-z_]\w*)\b", head.partition(";")[0])
+            picked: Optional[str] = None
+            for name in reversed(toks):
+                if name in self._CPP_TYPE_NAME_SKIP:
+                    continue
+                if not self._is_valid_variable_name(name):
+                    continue
+                picked = name
+                break
+            if picked:
+                names.add(picked)
+        return names
+
+    def _collect_outer_class_field_names(
+        self, class_name: str, crash_file: str, code_roots: List[str]
+    ) -> set:
+        """在 code_roots 下定位类定义所在头/源文件，收集最外层成员字段名集合。"""
+        out: set = set()
+        if not class_name or not crash_file:
+            return out
+        try:
+            actual = self._find_source_file(crash_file, code_roots) or crash_file
+            ap = os.path.abspath(actual)
+        except Exception:
+            ap = os.path.abspath(crash_file)
+        if not ap or not os.path.isfile(ap):
+            return out
+        dirname = os.path.dirname(ap)
+        base_noext = os.path.splitext(os.path.basename(ap))[0]
+        candidates: List[str] = []
+        for ext in (".h", ".hpp", ".hh", ".hxx"):
+            hp = os.path.join(dirname, base_noext + ext)
+            if os.path.isfile(hp):
+                candidates.append(os.path.abspath(hp))
+        candidates.append(ap)
+        seen_paths: set = set()
+        for path in candidates:
+            if not path or path in seen_paths or not os.path.isfile(path):
+                continue
+            seen_paths.add(path)
+            try:
+                text = Path(path).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if rf"class {class_name}" not in text and rf"struct {class_name}" not in text:
+                continue
+            shallow = self._extract_shallow_class_body_text(text, class_name)
+            out |= self._parse_field_names_from_shallow_class_body(shallow)
+        return out
+
+    def _merge_class_field_usage_into_shared_vars(
+        self,
+        base_shared: List[str],
+        func_code: str,
+        resolved_function: str,
+        crash_file: str,
+        code_roots: List[str],
+    ) -> List[str]:
+        """
+        在原有「this-> / ::」启发式结果之上，合并「类成员字段名 ∩ 崩溃函数体内出现的标识符」，
+        解决成员函数里大量 `head`/`tail` 未写 `this->` 时共享变量候选为空的问题。
+        """
+        merged: set = set(base_shared or [])
+        cls = self._extract_class_name_from_resolved(resolved_function or "")
+        if not cls or not (func_code and func_code.strip()):
+            return sorted(merged)
+        fields = self._collect_outer_class_field_names(cls, crash_file, code_roots)
+        if not fields:
+            return sorted(merged)
+        lines = func_code.split("\n")
+        try:
+            local_decl = self._collect_local_declared_vars(lines)
+            param_vars = self._collect_function_param_vars(lines)
+        except Exception:
+            local_decl, param_vars = set(), set()
+        for tok in set(re.findall(r"\b([A-Za-z_]\w*)\b", func_code)):
+            if tok not in fields:
+                continue
+            if tok in local_decl or tok in param_vars or tok in self._SHARED_VAR_BLOCKLIST:
+                continue
+            if not self._is_valid_variable_name(tok):
+                continue
+            merged.add(tok)
+        return sorted(merged)
+
     def _extract_shared_variables_from_code(self, code_text: str) -> List[str]:
         """
         从代码片段中提取“共享变量”候选集合（仅类成员/全局变量），不包含函数参数与局部变量。
@@ -6157,7 +6404,9 @@ class CodeContentProvider:
             'unsigned', 'signed', 'const', 'mutable', 'volatile', 'restrict'
         }
         
-        return name not in excluded_words and name.isalnum()
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name or ""):
+            return False
+        return name not in excluded_words
     
     def _contains_variable_usage(self, line: str, variable_name: str) -> bool:
         """检查行是否包含变量使用"""
@@ -6670,6 +6919,7 @@ class CodeContentProvider:
         def var_node_id(var_name: str) -> str:
             return f"var|{var_name}"
 
+        merged_use_shared: Dict[Tuple[str, str], str] = {}
         for vf in use_same_var_related_fun:
             sig = vf.snippet[0].strip() if vf.snippet else None
             fn_id = ensure_func_node(vf.name, vf.file, sig, vf.snippet)
@@ -6699,12 +6949,20 @@ class CodeContentProvider:
                     role="crash_func_shared_var",
                 )
             nodes.setdefault(v_id, var_nodes[v_id])
+            ek = (fn_id, v_id)
+            rnew = str(vf.relation or "unknown")
+            if ek not in merged_use_shared or _use_shared_var_edge_relation_strength(
+                rnew
+            ) > _use_shared_var_edge_relation_strength(merged_use_shared.get(ek)):
+                merged_use_shared[ek] = rnew
+
+        for (fn_id, v_id), rel in merged_use_shared.items():
             edges.append(
                 GraphEdge(
                     from_id=fn_id,
                     to_id=v_id,
                     type="use_shared_var",
-                    relation=vf.relation,
+                    relation=rel,
                 )
             )
 
@@ -7516,6 +7774,15 @@ class CodeContentProvider:
             graph_dict["edges_empty_reason"] = "未生成任何边；原因未单独记录。"
         result_dict["graph"] = graph_dict
         result_dict["code_parser_backend"] = self.code_parser_backend
+        result_dict["code_context_options"] = {
+            "max_sibling_member_functions": int(getattr(self, "max_sibling_member_functions", 0) or 0),
+            "max_shared_var_related_functions": int(
+                getattr(self, "max_shared_var_related_functions", 20) or 20
+            ),
+            "min_key_read_related_functions": int(
+                getattr(self, "min_key_read_related_functions", 2) or 0
+            ),
+        }
         if extra_top_level:
             result_dict.update(extra_top_level)
 
@@ -8124,7 +8391,9 @@ class CodeContentProvider:
 
             # 2. 提取崩溃函数信息（已在上方完成）
             try:
-                setattr(crash_func, "file", resolved_file)
+                # 保留前序阶段已定位到的工程源码文件，避免被外部符号文件（如系统/生成头）覆盖。
+                if not getattr(crash_func, "file", None):
+                    setattr(crash_func, "file", resolved_file)
             except Exception:
                 pass
             if is_rescue_frame:
@@ -8239,6 +8508,38 @@ class CodeContentProvider:
                         else:
                             code_for_vars = "\n".join(crash_func.snippet) if crash_func.snippet else (crash_func.crash_line or "")
                             shared_vars = self._extract_shared_variables_from_code(code_for_vars)
+                    if not is_template_generic_crash:
+                        merge_src_parts: List[str] = []
+                        if crash_func.crash_line:
+                            merge_src_parts.append(str(crash_func.crash_line))
+                        if crash_func.snippet:
+                            merge_src_parts.append("\n".join(crash_func.snippet))
+                        merge_src = "\n".join(merge_src_parts)
+                        merge_resolved_function = str(resolved_function or "").strip()
+                        crash_sig_for_merge = str(getattr(crash_func, "signature", None) or "").strip()
+                        crash_name_for_merge = str(getattr(crash_func, "name", None) or "").strip()
+                        # from_log_deduce 场景中 resolved_function 可能退化成 add_data()，
+                        # 此时优先回退到 crash_func.signature（通常保留 Class::method 形态）。
+                        if "::" not in merge_resolved_function and "::" in crash_sig_for_merge:
+                            merge_resolved_function = crash_sig_for_merge
+                        if not merge_resolved_function:
+                            merge_resolved_function = crash_sig_for_merge or crash_name_for_merge
+                        merge_crash_file = str(getattr(crash_func, "file", None) or "").strip() or str(resolved_file or "")
+                        if not (merge_crash_file and os.path.isfile(merge_crash_file)):
+                            simple_fn = self._extract_simple_function_name(
+                                merge_resolved_function or str(getattr(crash_func, "name", None) or "")
+                            )
+                            if simple_fn:
+                                loc = self._find_function_definition_location(simple_fn, code_roots_abs_strs)
+                                if loc and loc[0]:
+                                    merge_crash_file = loc[0]
+                        shared_vars = self._merge_class_field_usage_into_shared_vars(
+                            shared_vars,
+                            merge_src,
+                            merge_resolved_function,
+                            merge_crash_file,
+                            code_roots_abs_strs,
+                        )
                     if shared_vars:
                         use_same_var_related_fun = self._find_variable_functions_for_vars(
                             shared_vars,
@@ -8246,12 +8547,119 @@ class CodeContentProvider:
                             code_roots_abs_strs,
                             stack_priority_files=stack_priority_files,
                         )
-                        if len(use_same_var_related_fun) > self.max_shared_var_related_functions:
-                            use_same_var_related_fun = use_same_var_related_fun[
-                                : self.max_shared_var_related_functions
-                            ]
+                        # 同一 (函数, 文件, 变量) 只保留关系强度最高的一条。
+                        _vf_merge: Dict[Tuple[str, str, str], VariableFunction] = {}
+                        for vf in use_same_var_related_fun:
+                            mk = (str(vf.name or ""), str(vf.file or ""), str(vf.variable or ""))
+                            cur = _vf_merge.get(mk)
+                            if cur is None or _use_shared_var_edge_relation_strength(
+                                vf.relation
+                            ) > _use_shared_var_edge_relation_strength(cur.relation):
+                                _vf_merge[mk] = vf
+                        use_same_var_related_fun = list(_vf_merge.values())
+                        # 截断时**始终保留崩溃函数**的全部 (函数, 变量) 关系，再对其余条目按“写优先 + 关键读保底”填充预算。
+                        cap = int(self.max_shared_var_related_functions)
+                        key_read_floor = int(getattr(self, "min_key_read_related_functions", 2) or 0)
+                        crash_fn_name = str(getattr(crash_func, "name", None) or "").strip()
+                        crash_fn_file = str(resolved_file or "").strip()
+                        pri: List[VariableFunction] = []
+                        rest: List[VariableFunction] = []
+                        for vf in use_same_var_related_fun:
+                            vf_file = str(getattr(vf, "file", "") or "")
+                            same_file = False
+                            try:
+                                if crash_fn_file and vf_file:
+                                    same_file = os.path.normpath(vf_file) == os.path.normpath(
+                                        crash_fn_file
+                                    )
+                            except Exception:
+                                same_file = bool(crash_fn_file and vf_file and crash_fn_file == vf_file)
+                            vn = str(getattr(vf, "name", "") or "")
+                            name_hit = bool(crash_fn_name) and (
+                                crash_fn_name in vn
+                                or vn in crash_fn_name
+                                or crash_fn_name.split("::")[-1] == vn.split("::")[-1]
+                            )
+                            if same_file and name_hit:
+                                pri.append(vf)
+                            else:
+                                rest.append(vf)
+
+                        def _is_write_like(vf: VariableFunction) -> bool:
+                            return _use_shared_var_edge_relation_strength(getattr(vf, "relation", "")) >= 2
+
+                        def _looks_like_key_read_func_name(name: str) -> bool:
+                            n = str(name or "").lower()
+                            return any(
+                                kw in n
+                                for kw in (
+                                    "get",
+                                    "read",
+                                    "fetch",
+                                    "query",
+                                    "find",
+                                    "lookup",
+                                    "scan",
+                                    "walk",
+                                    "traverse",
+                                    "visit",
+                                    "modify",
+                                    "update",
+                                    "access",
+                                )
+                            )
+
+                        def _is_key_read(vf: VariableFunction) -> bool:
+                            rel = _use_shared_var_edge_relation_strength(getattr(vf, "relation", ""))
+                            return rel == 1 and _looks_like_key_read_func_name(getattr(vf, "name", ""))
+
+                        def _vf_sort_key(vf: VariableFunction) -> Tuple[int, str, str]:
+                            return (
+                                _use_shared_var_edge_relation_strength(vf.relation),
+                                str(vf.name or ""),
+                                str(vf.variable or ""),
+                            )
+
+                        rest_write: List[VariableFunction] = []
+                        rest_key_read: List[VariableFunction] = []
+                        rest_other: List[VariableFunction] = []
+                        for vf in rest:
+                            if _is_write_like(vf):
+                                rest_write.append(vf)
+                            elif _is_key_read(vf):
+                                rest_key_read.append(vf)
+                            else:
+                                rest_other.append(vf)
+
+                        rest_write.sort(key=_vf_sort_key, reverse=True)
+                        rest_key_read.sort(key=_vf_sort_key, reverse=True)
+                        rest_other.sort(key=_vf_sort_key, reverse=True)
+
+                        remaining = max(0, cap - len(pri))
+                        key_quota = min(max(0, key_read_floor), len(rest_key_read), remaining)
+                        write_quota = max(0, remaining - key_quota)
+
+                        chosen_write = rest_write[:write_quota]
+                        chosen_key = rest_key_read[:key_quota]
+
+                        used_ids: Set[int] = set()
+                        for _vf in chosen_write + chosen_key:
+                            used_ids.add(id(_vf))
+
+                        remain_slots = max(0, remaining - len(chosen_write) - len(chosen_key))
+                        tail_pool: List[VariableFunction] = []
+                        for _vf in rest_write[write_quota:] + rest_key_read[key_quota:] + rest_other:
+                            if id(_vf) in used_ids:
+                                continue
+                            tail_pool.append(_vf)
+                        tail_pool.sort(key=_vf_sort_key, reverse=True)
+                        tail_pick = tail_pool[:remain_slots]
+
+                        use_same_var_related_fun = pri + chosen_write + chosen_key + tail_pick
+                        if len(pri) + len(rest) > cap:
                             logger.info(
-                                f"共享变量相关函数已截断为最多 {self.max_shared_var_related_functions} 条（防止输出膨胀）"
+                                f"共享变量相关函数已截断为最多 {cap} 条（保留崩溃函数命中 {len(pri)} 条；"
+                                f"其余写类优先，关键读保底 {key_quota} 条）"
                             )
                 except _CodeContextPhaseTimeout:
                     raise
@@ -8265,15 +8673,21 @@ class CodeContentProvider:
                 if getattr(crash_func, "signature", None) and "::" in (crash_func.signature or ""):
                     name_for_related = (crash_func.signature or "").split("(")[0].strip()
                 sibling_member_func_in_same_class: List[RelatedFunction] = []
-                try:
-                    sibling_member_func_in_same_class = self._find_related_functions_in_class(
-                        name_for_related, resolved_file, getattr(self, "current_code_roots", []) or []
-                    )
-                except _CodeContextPhaseTimeout:
-                    raise
-                except Exception as e:
-                    logger.warning(f"兄弟函数查找失败，已跳过: {e}")
-                    extraction_warnings.append(f"兄弟函数查找失败: {e}")
+                _sib_cap = int(getattr(self, "max_sibling_member_functions", 0) or 0)
+                if _sib_cap > 0:
+                    try:
+                        sibling_member_func_in_same_class = self._find_related_functions_in_class(
+                            name_for_related, resolved_file, getattr(self, "current_code_roots", []) or []
+                        )
+                        if len(sibling_member_func_in_same_class) > _sib_cap:
+                            sibling_member_func_in_same_class = sibling_member_func_in_same_class[:_sib_cap]
+                    except _CodeContextPhaseTimeout:
+                        raise
+                    except Exception as e:
+                        logger.warning(f"兄弟函数查找失败，已跳过: {e}")
+                        extraction_warnings.append(f"兄弟函数查找失败: {e}")
+                else:
+                    logger.info("同类兄弟成员函数扫描已关闭（max_sibling_member_functions=0），跳过 _find_related_functions_in_class")
                 logger.info(f"找到 {len(sibling_member_func_in_same_class)} 个同一类中的兄弟函数或其他关联函数")
 
                 # 7. 分析线程上下文
@@ -8555,6 +8969,18 @@ class CodeContentProviderTool(BaseTool):
                     "resolved_stack": {"type": "string", "description": "解析后的堆栈信息 JSON"},
                     "code_roots": {"type": "array", "description": "代码根目录列表"},
                     "backend": {"type": "string", "description": "解析后端: tree-sitter/native", "default": "tree-sitter"},
+                    "max_sibling_member_functions": {
+                        "type": "integer",
+                        "description": "同类兄弟成员函数最大条数；0=关闭（默认），>0 启用",
+                        "default": 0,
+                    },
+                    "max_direct_callers": {"type": "integer", "description": "静态直接调用者候选上限（可选）"},
+                    "max_shared_var_related_functions": {"type": "integer", "description": "共享变量关联函数上限（可选）"},
+                    "min_key_read_related_functions": {
+                        "type": "integer",
+                        "description": "共享变量关联函数截断时，关键读路径最少保留条数（可选）",
+                    },
+                    "max_static_call_chain_depth": {"type": "integer", "description": "静态调用链最大深度（可选）"},
                 },
                 "required": ["resolved_stack", "code_roots"],
             },
@@ -8580,7 +9006,40 @@ class CodeContentProviderTool(BaseTool):
         if isinstance(code_roots, str):
             code_roots = [code_roots]
 
-        provider = CodeContentProvider(code_parser_backend=backend)
+        def _maybe_int(d: _Dict_tool[str, _Any_tool], key: str) -> _Optional_tool[int]:
+            if key not in d or d[key] is None:
+                return None
+            try:
+                return int(d[key])
+            except (TypeError, ValueError):
+                return None
+
+        def _maybe_float(d: _Dict_tool[str, _Any_tool], key: str) -> _Optional_tool[float]:
+            if key not in d or d[key] is None:
+                return None
+            try:
+                return float(d[key])
+            except (TypeError, ValueError):
+                return None
+
+        prov_kw: _Dict_tool[str, _Any_tool] = {"code_parser_backend": backend}
+        for _k in (
+            "max_sibling_member_functions",
+            "max_direct_callers",
+            "max_shared_var_related_functions",
+            "min_key_read_related_functions",
+            "max_static_call_chain_depth",
+            "max_symbol_only_rescues",
+        ):
+            _v = _maybe_int(input_data, _k)
+            if _v is not None:
+                prov_kw[_k] = _v
+        for _k in ("find_source_timeout_sec", "code_context_timeout_sec"):
+            _v = _maybe_float(input_data, _k)
+            if _v is not None:
+                prov_kw[_k] = _v
+
+        provider = CodeContentProvider(**prov_kw)
         result = provider.code_content_provider(
             resolved_stack,
             code_roots,

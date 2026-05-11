@@ -63,5 +63,5 @@ python3 cli/main.py \
 
 ## 相关文档
 
-- `docs/crash_demos/demo_basic/README.md`
+- `docs/crash_cases/demo_basic/README.md`
 - `docs/cli/CLI_GUIDE.md`

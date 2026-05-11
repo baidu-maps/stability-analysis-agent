@@ -162,6 +162,7 @@ class FullStabilityAnalyzer:
         max_static_call_chain_depth: Optional[int] = None,
         max_direct_callers: Optional[int] = None,
         max_shared_var_related_functions: Optional[int] = None,
+        max_sibling_member_functions: Optional[int] = None,
         max_symbol_only_rescues: Optional[int] = None,
         find_source_timeout_sec: Optional[float] = None,
         code_context_timeout_sec: Optional[float] = None,
@@ -172,6 +173,7 @@ class FullStabilityAnalyzer:
         self.max_static_call_chain_depth = max_static_call_chain_depth
         self.max_direct_callers = max_direct_callers
         self.max_shared_var_related_functions = max_shared_var_related_functions
+        self.max_sibling_member_functions = max_sibling_member_functions
         self.max_symbol_only_rescues = max_symbol_only_rescues
         self.find_source_timeout_sec = find_source_timeout_sec
         self.code_context_timeout_sec = code_context_timeout_sec
@@ -220,6 +222,23 @@ class FullStabilityAnalyzer:
         print(f"INFO: 默认模型: {self.default_model}", file=sys.stderr)
         print(f"INFO: LangGraph模式: {'启用' if self.graph else '禁用（使用传统模式）'}", file=sys.stderr)
         print(f"INFO: 向量数据库: {'启用' if self.vector_db_analyzer else '禁用'}", file=sys.stderr)
+
+    def _make_code_content_provider(self, code_parser_backend_override: Optional[str] = None) -> CodeContentProvider:
+        """构造与 CLI/配置对齐的 CodeContentProvider（含同类兄弟函数开关等）。"""
+        _b = code_parser_backend_override or self.code_parser_backend or os.environ.get(
+            "MAP_SDK_CRASH_CODE_PARSER_BACKEND", "tree-sitter"
+        )
+        return CodeContentProvider(
+            code_parser_backend=_b,
+            code_index_service=self.code_index_service,
+            max_static_call_chain_depth=self.max_static_call_chain_depth,
+            max_direct_callers=self.max_direct_callers,
+            max_shared_var_related_functions=self.max_shared_var_related_functions,
+            max_sibling_member_functions=self.max_sibling_member_functions,
+            max_symbol_only_rescues=self.max_symbol_only_rescues,
+            find_source_timeout_sec=self.find_source_timeout_sec,
+            code_context_timeout_sec=self.code_context_timeout_sec,
+        )
 
     def _merge_crash_parse_options(self, crash_parse_options: Optional[CrashParseOptions], library_dir: Optional[str]) -> CrashParseOptions:
         opts = crash_parse_options or CrashParseOptions()
@@ -468,11 +487,7 @@ class FullStabilityAnalyzer:
             
             code_roots = state.get("code_roots") or ([state["code_root"]] if state.get("code_root") else [])
             # 使用代码索引服务（如果可用）
-            _backend = os.environ.get("MAP_SDK_CRASH_CODE_PARSER_BACKEND", "tree-sitter")
-            provider = CodeContentProvider(
-                code_parser_backend=_backend,
-                code_index_service=self.code_index_service,
-            )
+            provider = self._make_code_content_provider()
             code_context_prompt = provider.code_content_provider(resolved_stack_trace, code_roots)
             prompt_data = json.loads(code_context_prompt)
             
@@ -913,11 +928,7 @@ class FullStabilityAnalyzer:
                     print(f"WARNING: 代码索引服务初始化失败: {e}，将不使用索引", file=sys.stderr)
                     self.code_index_service = None
             
-            _backend = os.environ.get("MAP_SDK_CRASH_CODE_PARSER_BACKEND", "tree-sitter")
-            provider = CodeContentProvider(
-                code_parser_backend=_backend,
-                code_index_service=self.code_index_service,
-            )
+            provider = self._make_code_content_provider()
             code_context_prompt = provider.code_content_provider(resolved_stack_trace, code_roots)
             prompt_data = json.loads(code_context_prompt)
             
@@ -1274,6 +1285,7 @@ class FullStabilityAnalyzer:
                 max_static_call_chain_depth=self.max_static_call_chain_depth,
                 max_direct_callers=self.max_direct_callers,
                 max_shared_var_related_functions=self.max_shared_var_related_functions,
+                max_sibling_member_functions=self.max_sibling_member_functions,
                 max_symbol_only_rescues=self.max_symbol_only_rescues,
                 find_source_timeout_sec=self.find_source_timeout_sec,
                 code_context_timeout_sec=self.code_context_timeout_sec,

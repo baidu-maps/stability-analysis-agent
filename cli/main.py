@@ -2697,6 +2697,33 @@ def build_parser() -> argparse.ArgumentParser:
             "仅打印摘要，避免与落盘内容重复；管道或非终端仍输出全文）"
         ),
     )
+    p.add_argument(
+        "--max-sibling-member-functions",
+        type=int,
+        default=0,
+        help=(
+            "code_content_provider：同类「兄弟成员函数」最多纳入条数（默认 0=关闭）。"
+            "大代码库建议保持 0，依赖共享变量关联扩展相关函数。"
+        ),
+    )
+    p.add_argument(
+        "--max-shared-var-related-functions",
+        type=int,
+        default=20,
+        help=(
+            "code_content_provider：共享变量关联的函数-变量关系最多保留条数（默认 20，范围 1～512）；"
+            "final_tip 中「共享状态的其它读写方」源码块数量亦参考该上限（另设硬顶 20）。"
+        ),
+    )
+    p.add_argument(
+        "--min-key-read-related-functions",
+        type=int,
+        default=2,
+        help=(
+            "code_content_provider：在共享变量关系截断时，关键读路径最少保留条数（默认 2，允许 0）；"
+            "用于避免 modify/get/read 类关键读取函数被写路径完全挤出。"
+        ),
+    )
     return p
 
 
@@ -3805,7 +3832,9 @@ def _print_tty_markdown_brief_summary(
         elif applied_fix_result.get("success"):
             applied_items = applied_fix_result.get("applied", []) or []
             file_list: List[str] = []
+            backup_list: List[str] = []
             seen = set()
+            seen_backup = set()
             for item in applied_items:
                 if not isinstance(item, dict) or item.get("status") != "applied":
                     continue
@@ -3817,10 +3846,23 @@ def _print_tty_markdown_brief_summary(
                     continue
                 seen.add(abs_fp)
                 file_list.append(abs_fp)
+                backup_path = str(item.get("backup_path") or "").strip()
+                if backup_path:
+                    abs_backup = str(Path(backup_path).expanduser().resolve())
+                    if abs_backup not in seen_backup:
+                        seen_backup.add(abs_backup)
+                        backup_list.append(abs_backup)
             if file_list:
                 print(f"【改码】{_green(f'已修改 {len(file_list)} 个文件')}")
                 for idx, fp in enumerate(file_list, start=1):
                     print(f"  {idx}. {fp}")
+                if backup_list:
+                    print("【回退保障】待修改的文件备份列表（修改前源码）")
+                    for idx, bp in enumerate(backup_list, start=1):
+                        print(f"  {idx}. {bp}")
+                    print("  可直接从以上备份路径恢复修改前源码。")
+                else:
+                    print("【回退保障】未生成“待修改的文件”备份（当前可能关闭了源码备份）")
             else:
                 print("【改码】未检测到已修改文件")
         else:
@@ -4389,6 +4431,13 @@ def execute_analysis(args: argparse.Namespace) -> int:
         "vector_db_path": args.vector_db_path,
         "vector_db_max_results": args.vector_db_max_results,
         "rule_confidence_threshold": args.rule_confidence_threshold,
+        "max_sibling_member_functions": int(getattr(args, "max_sibling_member_functions", 0) or 0),
+        "max_shared_var_related_functions": int(
+            getattr(args, "max_shared_var_related_functions", 20) or 20
+        ),
+        "min_key_read_related_functions": int(
+            getattr(args, "min_key_read_related_functions", 2) or 0
+        ),
     }
 
     registry = ToolAndWorkflowRegistry()

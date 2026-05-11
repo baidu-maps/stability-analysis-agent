@@ -165,15 +165,15 @@ CLI 会先输出执行计划，再自动执行。AI 模式下将完成解析、�
 
 ### 以 Python 集成（可编程接口）
 
-自 **v1.2.3** 起，PyPI 包提供稳定模块 [`cli/api.py`](./cli/api.py)，例如 `execute_analysis`、`build_parser`、`collect_interactive_run_state`、`interactive_state_to_argv`、`run_from_interactive_state`、`run_cli_main` 等，便于企业包装器或自动化脚本在进程内调用与 `sa-agent` 相同的分析链路，而无需 `subprocess`。变更说明见 [`CHANGELOG.md`](./CHANGELOG.md)。
+自 **v1.2.4** 起，PyPI 包提供稳定模块 [`cli/api.py`](./cli/api.py)，例如 `execute_analysis`、`build_parser`、`collect_interactive_run_state`、`interactive_state_to_argv`、`run_from_interactive_state`、`run_cli_main` 等，便于企业包装器或自动化脚本在进程内调用与 `sa-agent` 相同的分析链路，而无需 `subprocess`。变更说明见 [`CHANGELOG.md`](./CHANGELOG.md)。
 
 ### 使用预编译 CLI 二进制（无需 Python）
 
 从 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases) 下载最新二进制。压缩包与目录名随版本变化，请以实际 Release 文件名为准：
 
 ```bash
-unzip StabilityAnalyzer-v1.2.3-mac-arm64.zip
-cd output/cli_release/stability_analyzer_cli/v1.2.3-mac-arm64
+unzip StabilityAnalyzer-v1.2.4-mac-arm64.zip
+cd output/cli_release/stability_analyzer_cli/v1.2.4-mac-arm64
 ./StabilityAnalyzer
 ```
 
@@ -318,7 +318,7 @@ stability-analysis-agent/
 | 工具扩展指南 | [docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md](./docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md) |
 | Workflow 系统 | [docs/workflows/WORKFLOWS.md](./docs/workflows/WORKFLOWS.md) |
 | RAG 向量数据库 | [docs/rag/README.md](./docs/rag/README.md) |
-| 崩溃示例 | [docs/crash_demos/README.md](./docs/crash_demos/README.md) |
+| 崩溃示例 | [docs/crash_cases/README.md](./docs/crash_cases/README.md) |
 
 ## 测试
 

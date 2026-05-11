@@ -17,7 +17,85 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
-from stability_analyzer_agent.tools import CodeContentProvider
+try:
+    from tools.code_content_provider_tool import CodeContentProvider
+except ImportError:  # 兼容部分环境仍使用旧包名
+    from stability_analyzer_agent.tools import CodeContentProvider  # type: ignore
+
+try:
+    from workflows.crash_analysis_workflow import iOSCrashAnalyzeWorkflow
+except ImportError:
+    iOSCrashAnalyzeWorkflow = None  # type: ignore
+
+
+@unittest.skipUnless(iOSCrashAnalyzeWorkflow is not None, "workflow import failed")
+class TestBuildPromptFinalTip(unittest.TestCase):
+    def test_shared_var_sections_in_final_tip(self):
+        crash_id = "func|/tmp/x.cpp|void Foo::bar()"
+        code_ctx = {
+            "crash_summary": {
+                "node_id": crash_id + " {",
+                "crash_line_number": 10,
+                "crash_line_code": "x = y;",
+                "error_type": "SIGSEGV",
+            },
+            "graph": {
+                "nodes": [
+                    {
+                        "id": crash_id,
+                        "type": "function",
+                        "signature": "void Foo::bar()",
+                        "file": "/tmp/x.cpp",
+                        "snippet": ["void Foo::bar() {", "  head = 0;", "}"],
+                    },
+                    {
+                        "id": "func|/tmp/x.cpp|void Foo::baz()",
+                        "type": "function",
+                        "signature": "void Foo::baz()",
+                        "file": "/tmp/x.cpp",
+                        "snippet": ["void Foo::baz() {", "  tail = 0;", "}"],
+                    },
+                    {
+                        "id": "var|head",
+                        "type": "variable",
+                        "name": "head",
+                        "signature": "int* head;",
+                    },
+                ],
+                "edges": [
+                    {
+                        "type": "use_shared_var",
+                        "from_id": crash_id,
+                        "to_id": "var|head",
+                        "relation": "write",
+                    },
+                    {
+                        "type": "use_shared_var",
+                        "from_id": "func|/tmp/x.cpp|void Foo::baz()",
+                        "to_id": "var|head",
+                        "relation": "write",
+                    },
+                ],
+                "call_chain_from_code": [{"nodes": [crash_id]}],
+            },
+            "code_context_options": {"max_shared_var_related_functions": 10},
+        }
+        resolved = {
+            "resolved_frames": [
+                {
+                    "resolved_function": "bar()",
+                    "resolved_file": "x.cpp",
+                    "resolved_line": 10,
+                }
+            ]
+        }
+        wf = iOSCrashAnalyzeWorkflow()
+        text = wf._build_prompt_final_tip({}, resolved, code_ctx, problem={})
+        self.assertIn("### 共享成员与写路径交叉（崩溃点关联）", text)
+        self.assertIn("head", text)
+        self.assertIn("### 函数源码（按函数唯一输出）", text)
+        self.assertIn("- 来源:", text)
+        self.assertIn("void Foo::baz()", text)
 
 
 class TestCodeContentProviderV2(unittest.TestCase):
@@ -69,13 +147,13 @@ class TestCodeContentProviderV2(unittest.TestCase):
                 "resolved_frames": [
                     {
                         "address": "0x0000000100001234",
-                        "resolved_function": "call_example_function",
+                        "resolved_function": "call_example_function()",
                         "resolved_file": "my_lib.cpp",
                         "resolved_line": crash_line,
                     },
                     {
                         "address": "0x0000000100001567",
-                        "resolved_function": "main",
+                        "resolved_function": "main()",
                         "resolved_file": "main.cpp",
                         "resolved_line": 1,
                     },
@@ -116,6 +194,30 @@ class TestCodeContentProviderV2(unittest.TestCase):
         self.assertIn("crash_line_code", cs)
         self.assertIn("node_id", cs)
         self.assertIn("my_lib.cpp", cs["node_id"])
+
+    def test_merge_class_field_usage_into_shared_vars(self):
+        """成员函数内未写 this-> 的成员名，应能从类定义合并进共享变量候选。"""
+        root = Path(self.test_dir) / "cls_merge"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "Foo.h").write_text(
+            "class Foo {\npublic:\n    int head;\n    int tail;\n};\n",
+            encoding="utf-8",
+        )
+        cpp = root / "Foo.cpp"
+        cpp.write_text(
+            "void Foo::bar() {\n    head = tail;\n}\n",
+            encoding="utf-8",
+        )
+        p = CodeContentProvider(code_parser_backend="regex")
+        merged = p._merge_class_field_usage_into_shared_vars(
+            [],
+            "head = tail;",
+            "Foo::bar",
+            str(cpp),
+            [str(root.resolve())],
+        )
+        self.assertIn("head", merged)
+        self.assertIn("tail", merged)
 
 
 if __name__ == "__main__":
