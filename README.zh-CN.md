@@ -256,7 +256,7 @@ print(result)
 sa-agent
 ```
 
-进入后在 `设置` 中选择 `配置大模型` / `配置堆栈地址解析工具`，流程内会自动检测并给出引导。
+进入后在 `设置` 中选择 `配置大模型` / `配置堆栈地址解析工具`，流程内会自动检测并给出引导。堆栈符号化向导为 **「自动获取」** 与 **「手动设置符号化工具绝对路径」**（可填可执行文件或工具所在目录）；选择「快速开始分析」且流程需要符号化时，会先静默尝试与「自动获取」相同的写入，减少重复配置。
 
 默认本地配置目录：
 
@@ -264,8 +264,8 @@ sa-agent
 ~/.config/stability-analysis-agent/
 ```
 
-- `agent_config.local.json`：配置大模型 provider/key/model
-- `add2line_resolver_config.local.json`：配置 addr2line/atos 工具路径
+- `agent_config.local.json`：配置大模型 **厂商 / 密钥 / 模型**（对应 `llm_config.active_provider` 与 `llm_config.providers`）
+- `add2line_resolver_config.local.json`：配置符号化工具搜索路径（`tool_paths` 为工具所在目录；可选 `environment_vars` 为 NDK/LLVM 等安装根，常由自动获取写入）
 
 若你偏好手动编辑，也可直接修改以上配置文件。
 
@@ -339,7 +339,7 @@ python3 test/agent_py_tool/test_vector_db.py
 ## 常见问题
 
 **Q：符号化失败？**
-确保 `--library-dir` 包含二进制文件（`.dylib` / `.so`）及其调试符号（`.dSYM` 目录或 DWARF 信息）。
+确保 `--library-dir` 包含二进制文件（`.dylib` / `.so`）及其调试符号（`.dSYM` 目录或 DWARF 信息）。交互式 CLI 中可在 `设置 → 配置堆栈地址解析工具` 使用 **自动获取**，或 **手动设置符号化工具绝对路径**（可执行文件或工具所在目录）；亦可编辑 `~/.config/stability-analysis-agent/add2line_resolver_config.local.json`（参见 `tools/configs/add2line_resolver_config.local.example.json`）。
 
 **Q：LLM 调用失败？**
 检查 API Key 是否正确设置。快速验证：`python3 test/llm/test_llm_connection.py --provider openai`

@@ -1142,22 +1142,25 @@ def _prompt_base_url_with_examples(provider: str, default_value: str) -> str:
         or provider_url_map["openai"]
     ).strip()
 
-    print("base_url 是大模型 API 的完整请求地址（不要省略协议路径，避免拼接出错）。")
+    print(
+        "接口请求地址（配置 JSON 中的字段名仍为 base_url）须为大模型 API 的完整 URL，"
+        "包含协议与路径，不要只填域名，以免拼接出错。"
+    )
     print("常见厂商示例（仅供参考，请以该厂商官方文档为准）：")
     label_width = max(_display_width(label) for _, label, _ in provider_examples)
     for pid, label, url in provider_examples:
-        marker = " ← 当前 provider 推荐" if pid == provider else ""
+        marker = " ← 当前厂商推荐" if pid == provider else ""
         print(f"- {_pad_display(label, label_width)} : {url}{marker}")
     if provider and provider not in provider_url_map:
         print(
-            f"提示: 未识别 provider「{provider}」，请参考上方任一厂商或查阅其官方文档，"
+            f"提示: 未识别厂商或配置标识「{provider}」，请参考上方任一厂商或查阅其官方文档，"
             "填写完整的 chat completion / messages 接口地址。"
         )
     print("")
 
     current_label = provider_label_map.get(provider) or (provider or "未指定")
     raw = _safe_input(
-        f"请输入 base_url（直接回车使用「{current_label}」默认） (默认: {suggested}): "
+        f"请输入接口请求地址（对应 base_url；直接回车使用「{current_label}」推荐默认） (默认: {suggested}): "
     ).strip()
     if raw == "__EOF__":
         return suggested
@@ -1298,7 +1301,7 @@ def _config_command_doctor() -> int:
         provider_defaults = {}
     active_provider = llm_cfg.get("active_provider") if isinstance(llm_cfg, dict) else None
     if not active_provider:
-        problems.append("LLM active_provider 未配置")
+        problems.append("大模型未配置当前启用厂商（llm_config.active_provider 为空）")
     provider_cfg = (
         {**provider_defaults, **(providers.get(active_provider, {}) or {})}
         if isinstance(providers, dict) and active_provider else {}
@@ -1311,7 +1314,7 @@ def _config_command_doctor() -> int:
         if _is_placeholder_secret(provider_cfg.get(auth_field)):
             problems.append(f"{active_provider}.{auth_field} 为空或仍为占位符")
     else:
-        problems.append("LLM provider 配置缺失")
+        problems.append("大模型厂商配置缺失（无法读取 llm_config.providers 下有效条目）")
 
     tool_status = _detect_add2line_tool_status()
     tools = {name: (meta.get("path") or None) for name, meta in tool_status.items()}
@@ -1447,7 +1450,7 @@ def _update_llm_config_interactive() -> bool:
 
     provider_options: List[Tuple[str, str]] = [("back", "返回")]
     provider_options.extend([(k, _provider_label(k)) for k in provider_keys])
-    provider_options.append(("custom", "自定义输入 provider 名称"))
+    provider_options.append(("custom", "自定义厂商或配置标识名"))
     selected_provider = _prompt_select(
         "请选择大模型厂商",
         provider_options,
@@ -1456,7 +1459,10 @@ def _update_llm_config_interactive() -> bool:
     if selected_provider == "back":
         return False
     if selected_provider == "custom":
-        provider = _prompt_non_empty("请输入自定义 provider 名称", "")
+        provider = _prompt_non_empty(
+            "请输入自定义厂商或配置标识（将作为 llm_config.providers 与 active_provider 的键名）",
+            "",
+        )
         if not provider:
             return False
     else:
@@ -1526,7 +1532,7 @@ def _update_llm_config_interactive() -> bool:
         "✅ LLM 配置已保存",
         [
             f"配置文件: {target}",
-            f"provider: {provider}",
+            f"当前启用厂商（配置键）: {provider}",
             f"secret: {_mask_secret(secret)}",
         ],
         follow_up=[
@@ -1591,12 +1597,22 @@ def _auto_detect_per_platform_plan() -> List[Dict[str, Any]]:
 
 
 def _auto_configure_add2line(
-    data: Dict[str, Any], platforms: Dict[str, Any], target: Path
+    data: Dict[str, Any],
+    platforms: Dict[str, Any],
+    target: Path,
+    *,
+    interactive: bool = True,
 ) -> bool:
+    """按「自动获取」逻辑探测并（在需要时）写入 add2line 本地配置。
+
+    interactive=False 时：不展示菜单；若存在待写入的 env / IDE 路径则直接写入（与用户在菜单中
+    点「确认写入配置文件」等价），用于「快速开始」路径下减少手动配置。
+    """
     plan = _auto_detect_per_platform_plan()
 
-    print("")
-    print("== 自动检测堆栈地址解析工具 ==")
+    if interactive:
+        print("")
+        print("== 自动检测堆栈地址解析工具 ==")
     has_any_hit = False
     label_width = max(len(_AUTO_PLATFORM_LABELS[p]) for p in _AUTO_PLATFORM_ORDER)
     pending_env: List[Tuple[str, List[str]]] = []                         # 待写 environment_vars 的 (plat, keys)
@@ -1605,7 +1621,8 @@ def _auto_configure_add2line(
         plat = entry["platform"]
         label = _AUTO_PLATFORM_LABELS.get(plat, plat).ljust(label_width)
         if entry["tool"] is None:
-            print(f"- {label}: {_red('⚠ 未找到推荐工具（跳过）')}")
+            if interactive:
+                print(f"- {label}: {_red('⚠ 未找到推荐工具（跳过）')}")
             continue
         has_any_hit = True
         tool = entry["tool"]
@@ -1614,27 +1631,31 @@ def _auto_configure_add2line(
         alias_suffix = f"，via {alias_src}" if alias_src else ""
         existed = isinstance(platforms.get(plat), dict) and bool(platforms.get(plat))
         if existed:
-            print(
-                f"- {label}: {_yellow(f'⚠ {tool} 可用，但 {plat} 已有手动配置，跳过覆盖')}"
-            )
+            if interactive:
+                print(
+                    f"- {label}: {_yellow(f'⚠ {tool} 可用，但 {plat} 已有手动配置，跳过覆盖')}"
+                )
             continue
         if src == "path":
-            print(
-                f"- {label}: {_green(f'✅ {tool}')} （来源: PATH{alias_suffix}，无需写入配置）"
-            )
+            if interactive:
+                print(
+                    f"- {label}: {_green(f'✅ {tool}')} （来源: PATH{alias_suffix}，无需写入配置）"
+                )
             continue
         if src == "config":
-            print(
-                f"- {label}: {_green(f'✅ {tool}')} （来源: 已有配置{alias_suffix}，无需重复写入）"
-            )
+            if interactive:
+                print(
+                    f"- {label}: {_green(f'✅ {tool}')} （来源: 已有配置{alias_suffix}，无需重复写入）"
+                )
             continue
         if src == "env":
             keys = entry.get("env_keys") or []
             keys_disp = ", ".join(keys) if keys else "（未知）"
-            print(
-                f"- {label}: {_green(f'✅ {tool}')} "
-                f"（来源: env{alias_suffix}，将写入 platforms.{plat}.environment_vars: {keys_disp}）"
-            )
+            if interactive:
+                print(
+                    f"- {label}: {_green(f'✅ {tool}')} "
+                    f"（来源: env{alias_suffix}，将写入 platforms.{plat}.environment_vars: {keys_disp}）"
+                )
             if keys:
                 pending_env.append((plat, list(keys)))
             continue
@@ -1648,86 +1669,83 @@ def _auto_configure_add2line(
                     bin_dir = str(Path(tool_path).parent)
                 except Exception:
                     bin_dir = ""
-            print(
-                f"- {label}: {_green(f'✅ {tool}')} "
-                f"（来源: {label_disp}{alias_suffix}，将写入 platforms.{plat}.tool_paths: {bin_dir or tool_path}）"
-            )
+            if interactive:
+                print(
+                    f"- {label}: {_green(f'✅ {tool}')} "
+                    f"（来源: {label_disp}{alias_suffix}，将写入 platforms.{plat}.tool_paths: {bin_dir or tool_path}）"
+                )
             if bin_dir:
                 pending_paths.append((plat, bin_dir, list(ide_labels)))
             continue
-        print(f"- {label}: {tool}（来源: {src}{alias_suffix}）")
-    print("")
+        if interactive:
+            print(f"- {label}: {tool}（来源: {src}{alias_suffix}）")
+    if interactive:
+        print("")
 
     if not has_any_hit:
-        print(_red("❌ 未在 PATH、常用环境变量、已有配置、IDE 默认安装路径中找到任何推荐工具。"))
-        print("- 排查建议：")
-        print("  · macOS / iOS：安装 Xcode 或 Command Line Tools（`xcode-select --install`）")
-        print("  · Android：安装 Android Studio 或 NDK 并 export ANDROID_NDK_HOME；或安装 LLVM 并 export LLVM_HOME")
-        print("  · HarmonyOS：安装 DevEco Studio（自带 OpenHarmony Native SDK）")
-        print("  · Linux：通过包管理器安装 binutils 或 llvm")
-        print("- 你也可以手动设置环境变量或 bin 目录。")
-        print("")
-        action = _prompt_select(
-            "请选择操作",
-            [
-                ("back", "返回上一级"),
-                ("manual_env", "手动设置环境变量"),
-                ("manual_bin", "手动设置符号化工具链 bin 目录"),
-            ],
-            default_index=0,
-        )
-        if action == "manual_env":
-            return _update_add2line_config_interactive(initial_mode="env")
-        if action == "manual_bin":
-            return _update_add2line_config_interactive(initial_mode="path")
+        if interactive:
+            print(_red("❌ 未在 PATH、常用环境变量、已有配置、IDE 默认安装路径中找到任何推荐工具。"))
+            print("- 排查建议：")
+            print("  · macOS / iOS：安装 Xcode 或 Command Line Tools（`xcode-select --install`）")
+            print("  · Android：安装 Android Studio 或 NDK 并 export ANDROID_NDK_HOME；或安装 LLVM 并 export LLVM_HOME")
+            print("  · HarmonyOS：安装 DevEco Studio（自带 OpenHarmony Native SDK）")
+            print("  · Linux：通过包管理器安装 binutils 或 llvm")
+            print("- 你也可以手动设置符号化工具的绝对路径，或直接编辑配置文件。")
+            print("")
+            action = _prompt_select(
+                "请选择操作",
+                [
+                    ("back", "返回上一级"),
+                    ("manual_path", "手动设置符号化工具绝对路径"),
+                ],
+                default_index=0,
+            )
+            if action == "manual_path":
+                return _update_add2line_config_interactive(initial_mode="path")
         return False
 
     if not pending_env and not pending_paths:
-        print(_green("✅ 检测到的工具均已可用（来自 PATH 或已有配置），无需写入配置文件。"))
-        print("如检测结果不符合预期，可手动指定环境变量或 bin 目录。")
+        if interactive:
+            print(_green("✅ 检测到的工具均已可用（来自 PATH 或已有配置），无需写入配置文件。"))
+            print("如检测结果不符合预期，可手动指定符号化工具的绝对路径，或直接编辑配置文件。")
+            print("")
+            action = _prompt_select(
+                "请选择操作",
+                [
+                    ("done", "完成，返回上一级"),
+                    ("manual_path", "不符预期？手动设置符号化工具绝对路径"),
+                ],
+                default_index=0,
+            )
+            if action == "manual_path":
+                return _update_add2line_config_interactive(initial_mode="path")
+        return False
+
+    if interactive:
+        print("即将写入的最小配置：")
+        for plat, keys in pending_env:
+            for k in keys:
+                v = os.environ.get(k, "").strip() or "（当前 shell 未设置）"
+                print(f"  - platforms.{plat}.environment_vars.{k} = {v}")
+        for plat, bin_dir, labels in pending_paths:
+            labels_disp = f"  # 来源: {', '.join(labels)}" if labels else ""
+            print(f"  - platforms.{plat}.tool_paths += {bin_dir}{labels_disp}")
+        print("如检测结果不符合预期，可手动指定符号化工具的绝对路径，或直接编辑配置文件。")
         print("")
+
         action = _prompt_select(
             "请选择操作",
             [
-                ("done", "完成，返回上一级"),
-                ("manual_env", "不符预期？手动设置环境变量"),
-                ("manual_bin", "不符预期？手动设置符号化工具链 bin 目录"),
+                ("confirm", "确认写入配置文件"),
+                ("manual_path", "不符预期？手动设置符号化工具绝对路径"),
+                ("back", "返回上一级（不写入）"),
             ],
             default_index=0,
         )
-        if action == "manual_env":
-            return _update_add2line_config_interactive(initial_mode="env")
-        if action == "manual_bin":
+        if action == "manual_path":
             return _update_add2line_config_interactive(initial_mode="path")
-        return False
-
-    print("即将写入的最小配置：")
-    for plat, keys in pending_env:
-        for k in keys:
-            v = os.environ.get(k, "").strip() or "（当前 shell 未设置）"
-            print(f"  - platforms.{plat}.environment_vars.{k} = {v}")
-    for plat, bin_dir, labels in pending_paths:
-        labels_disp = f"  # 来源: {', '.join(labels)}" if labels else ""
-        print(f"  - platforms.{plat}.tool_paths += {bin_dir}{labels_disp}")
-    print("如检测结果不符合预期，可手动指定环境变量或 bin 目录。")
-    print("")
-
-    action = _prompt_select(
-        "请选择操作",
-        [
-            ("confirm", "确认写入配置文件"),
-            ("manual_env", "不符预期？手动设置环境变量"),
-            ("manual_bin", "不符预期？手动设置符号化工具链 bin 目录"),
-            ("back", "返回上一级（不写入）"),
-        ],
-        default_index=0,
-    )
-    if action == "manual_env":
-        return _update_add2line_config_interactive(initial_mode="env")
-    if action == "manual_bin":
-        return _update_add2line_config_interactive(initial_mode="path")
-    if action != "confirm":
-        return False
+        if action != "confirm":
+            return False
 
     written: List[str] = []
     for plat, keys in pending_env:
@@ -1756,19 +1774,28 @@ def _auto_configure_add2line(
         platforms[plat] = plat_cfg
 
     if not written:
-        print(_red("❌ 取消写入：所选环境变量在当前 shell 中均无值，且没有可写入的 IDE 路径。"))
+        if interactive:
+            print(_red("❌ 取消写入：待写入的环境变量在当前 shell 中均无值，且没有可写入的 IDE 路径。"))
         return False
 
     data["platforms"] = platforms
     _write_json_pretty(target, data)
-    _show_success_panel(
-        "✅ 已自动写入堆栈地址解析工具配置",
-        [f"配置文件: {target}", *written],
-    )
+    if interactive:
+        _show_success_panel(
+            "✅ 已自动写入堆栈地址解析工具配置",
+            [f"配置文件: {target}", *written],
+        )
+    else:
+        print(
+            _green(
+                "✅ 已根据本机探测自动写入堆栈符号化工具配置（与「设置 → 自动获取」一致），"
+                f"条目数: {len(written)}。配置文件: {target}"
+            )
+        )
     return True
 
 
-def _update_add2line_config_interactive(initial_mode: Optional[str] = None) -> bool:
+def _update_add2line_config_interactive(initial_mode: Optional[str] = None) -> Optional[bool]:
     target = _user_add2line_config_file()
     data = _load_json_or_empty(target)
     if not isinstance(data, dict):
@@ -1777,21 +1804,19 @@ def _update_add2line_config_interactive(initial_mode: Optional[str] = None) -> b
     if not isinstance(platforms, dict):
         platforms = {}
 
-    if initial_mode in {"env", "path"}:
-        mode = initial_mode
-    else:
+    if initial_mode != "path":
         mode = _prompt_select(
             "请选择配置方式",
             [
                 ("back", "返回"),
                 ("auto", "自动获取（推荐）"),
-                ("env", "手动设置环境变量"),
-                ("path", "手动设置符号化工具链 bin 目录"),
+                ("path", "手动设置符号化工具绝对路径"),
             ],
             default_index=1,
         )
         if mode == "back":
-            return False
+            # 与「已取消向导」区分：首屏返回应静默回到上一级菜单
+            return None
         if mode == "auto":
             return _auto_configure_add2line(data, platforms, target)
 
@@ -1817,30 +1842,28 @@ def _update_add2line_config_interactive(initial_mode: Optional[str] = None) -> b
     if not isinstance(os_cfg, dict):
         os_cfg = {}
 
-    env_vars: Dict[str, str] = {}
-    if mode == "env":
-        raw_env_key = _safe_input("请输入要读取的环境变量名 KEY（直接回车返回上一级）: ").strip()
-        if raw_env_key == "__EOF__" or not raw_env_key or raw_env_key.lower() in {"back", "b"}:
+    raw_path = _safe_input(
+        "请输入符号化工具的绝对路径：可为可执行文件本身（如 .../llvm-addr2line），"
+        "或仅含该可执行文件的目录（直接回车返回上一级）: "
+    ).strip()
+    if raw_path == "__EOF__" or not raw_path or raw_path.lower() in {"back", "b"}:
+        return False
+    resolved = Path(raw_path).expanduser().resolve()
+    if not resolved.exists():
+        print(_red(f"❌ 路径不存在: {resolved}"))
+        return False
+    if resolved.is_dir():
+        tool_dir = str(resolved)
+    elif resolved.is_file():
+        if not os.access(str(resolved), os.X_OK):
+            print(_red(f"❌ 不是可执行文件或无可执行权限: {resolved}"))
             return False
-        key = raw_env_key
-        val = os.environ.get(key)
-        if val is None or str(val).strip() == "":
-            print(_red(f"❌ 当前 shell 未读取到环境变量「{key}」的值，已取消保存。"))
-            print("- 排查建议：")
-            print(f"  · 检查变量名是否拼写正确（区分大小写）；")
-            print(f"  · 在当前 shell 执行 `echo ${key}` 确认是否已 export；")
-            print("  · 若刚配置过 ~/.zshrc / ~/.bashrc，重新打开终端或 `source` 之后再试；")
-            print("  · 或改用「手动设置符号化工具链 bin 目录」模式。")
-            return False
-        env_vars[key] = str(val)
+        tool_dir = str(resolved.parent)
     else:
-        raw_bin = _safe_input("请输入符号化工具链 bin 目录（直接回车返回上一级）: ").strip()
-        if raw_bin == "__EOF__" or not raw_bin or raw_bin.lower() in {"back", "b"}:
-            return False
-        os_cfg["tool_paths"] = [str(Path(raw_bin).expanduser().resolve())]
+        print(_red(f"❌ 无效路径（既不是文件也不是目录）: {resolved}"))
+        return False
 
-    if env_vars:
-        os_cfg["environment_vars"] = env_vars
+    os_cfg["tool_paths"] = [tool_dir]
 
     platforms[os_choice] = os_cfg
     data["platforms"] = platforms
@@ -1851,7 +1874,6 @@ def _update_add2line_config_interactive(initial_mode: Optional[str] = None) -> b
             f"配置文件: {target}",
             f"平台: {os_choice}",
             f"tool_paths: {os_cfg.get('tool_paths') or []}",
-            f"environment_vars: {list((os_cfg.get('environment_vars') or {}).keys())}",
         ],
     )
     return True
@@ -1901,17 +1923,17 @@ def _print_llm_detection_summary(status: Dict[str, Any]) -> None:
     print(f"- 配置文件: {_user_agent_config_file()}")
     if status.get("llm_ok"):
         print(f"- 状态: {_green('已配置（当前设置了密钥）')}")
-        print(f"- 当前 provider: {status.get('active_provider') or '未知'}")
+        print(f"- 当前启用厂商（active_provider）: {status.get('active_provider') or '未知'}")
         model_disp = status.get("model") or "（未填写 model）"
         print(f"- 当前模型: {model_disp}")
         print("- 注: 仅检查了配置完整性，未验证联通性。如需验证，请选择「检测联通性」。")
     else:
-        print(f"- 状态: {_red('未就绪（缺少 provider、密钥或未替换占位符等）')}")
+        print(f"- 状态: {_red('未就绪（缺少厂商配置、密钥或未替换占位符等）')}")
         ap = status.get("active_provider")
         if ap:
-            print(f"- active_provider: {ap}（{_red('请检查密钥等字段是否有效')}）")
+            print(f"- 当前启用厂商（active_provider）: {ap}（{_red('请检查密钥等字段是否有效')}）")
         else:
-            print(f"- active_provider: {_red('未设置')}")
+            print(f"- 当前启用厂商（active_provider）: {_red('未设置')}")
     print("")
 
 
@@ -1984,7 +2006,7 @@ def _connectivity_probe_via_http(runtime_cfg: Dict[str, Any]) -> Dict[str, Any]:
     timeout = float(runtime_cfg.get("timeout") or 10)
 
     if not base_url:
-        raise RuntimeError("base_url 为空，无法执行联通性检测")
+        raise RuntimeError("接口请求地址（base_url）未填写，无法执行联通性检测")
 
     headers = {"Content-Type": "application/json"}
     auth_type = str(runtime_cfg.get("auth_type") or "api_key")
@@ -2052,7 +2074,7 @@ def _check_llm_connectivity() -> None:
 
     runtime_cfg = _resolve_active_provider_runtime_config()
     if runtime_cfg is None:
-        print(_red("❌ 当前配置未就绪：请先完成 provider / 密钥配置。"))
+        print(_red("❌ 当前配置未就绪：请先完成厂商与密钥配置。"))
         _ack_result()
         return
 
@@ -2065,7 +2087,9 @@ def _check_llm_connectivity() -> None:
         if len(content) > 80:
             content = content[:80] + "..."
         print("✅ 联通性检测通过")
-        print(f"- provider: {probe.get('provider') or (_doctor_status().get('active_provider') or 'unknown')}")
+        print(
+            f"- 厂商（配置键）: {probe.get('provider') or (_doctor_status().get('active_provider') or 'unknown')}"
+        )
         print(f"- request_format: {probe.get('request_format')}")
         print(f"- endpoint: {probe.get('url')}")
         print(f"- 耗时: {elapsed:.2f}s")
@@ -2120,7 +2144,9 @@ def _configure_llm_only() -> None:
             if rerun == "reconfig":
                 ext_actions = _get_llm_reconfig_extension_actions()
                 if ext_actions:
-                    sub_options: List[Tuple[str, str]] = [("wizard", "通用交互向导（选择 provider…）")]
+                    sub_options: List[Tuple[str, str]] = [
+                        ("wizard", "交互向导：选择厂商并填写密钥"),
+                    ]
                     sub_options.extend(ext_actions)
                     sub_options.append(("back", "返回"))
                     sub = _prompt_select(
@@ -2162,7 +2188,7 @@ def _configure_llm_only() -> None:
                     return
                 continue
         print("")
-        print("—— 进入交互向导（将依次选择 provider、填写密钥等）——")
+        print("—— 进入交互向导（将依次选择厂商、填写密钥等）——")
         print("")
         changed = _update_llm_config_interactive()
         if changed:
@@ -2200,10 +2226,10 @@ def _configure_llm_manual_panel() -> None:
             return
         if action == "help":
             print("最小必填：")
-            print("- llm_config.active_provider")
-            print("- llm_config.providers.<provider>.model")
-            print("- llm_config.providers.<provider>.base_url")
-            print("- llm_config.providers.<provider>.api_key 或 authorization（非占位符）")
+            print("- llm_config.active_provider（当前启用厂商的配置键）")
+            print("- llm_config.providers.<厂商配置键>.model")
+            print("- llm_config.providers.<厂商配置键>.base_url（接口请求地址，须为完整 URL）")
+            print("- llm_config.providers.<厂商配置键>.api_key 或 authorization（非占位符）")
             print("")
             print("— 请在下方的菜单中继续操作 —")
             if _is_tty_interactive():
@@ -2222,7 +2248,13 @@ def _configure_llm_manual_panel() -> None:
             continue
         st2 = _doctor_status()
         if st2.get("llm_ok"):
-            _show_success_panel("✅ LLM 配置检测通过", [f"provider: {st2.get('active_provider')}", f"model: {st2.get('model') or 'N/A'}"])
+            _show_success_panel(
+                "✅ LLM 配置检测通过",
+                [
+                    f"当前启用厂商（active_provider）: {st2.get('active_provider')}",
+                    f"model: {st2.get('model') or 'N/A'}",
+                ],
+            )
             return
         print("LLM 配置仍未完成，请继续编辑后再检查。")
         print("")
@@ -2349,7 +2381,7 @@ def _print_add2line_detection_explainer(status: Dict[str, Any]) -> None:
             (tool_name, str(meta.get("path") or ""), list(meta.get("ide_labels") or []))
         )
     if ide_hits:
-        print(_yellow("提示：以下工具来自 IDE / SDK 默认安装路径（IDE 升级 / 卸载后路径可能变化，建议正式环境用环境变量固定）："))
+        print(_yellow("提示：以下工具来自 IDE / SDK 默认安装路径（IDE 升级 / 卸载后路径可能变化）："))
         for tool_name, tool_path, labels in ide_hits:
             label_disp = ", ".join(labels) if labels else "未知"
             print(f"- {tool_name}  ← {label_disp}  ({tool_path})")
@@ -2396,8 +2428,10 @@ def _configure_add2line_only() -> None:
     print("—— 进入交互向导（将选择平台并填写工具路径等）——")
     print("")
     changed = _update_add2line_config_interactive()
-    if changed:
+    if changed is True:
         _show_success_panel("✅ 已完成符号化工具配置", ["你可以返回上一级继续操作。"])
+        return
+    if changed is None:
         return
     _prompt_select(
         "已取消向导或未保存修改。",
@@ -2459,8 +2493,8 @@ def _configure_add2line_manual_panel() -> None:
             return
         if action == "help":
             print("关键字段：")
-            print("- platforms.<platform>.tool_paths")
-            print("- platforms.<platform>.environment_vars")
+            print("- platforms.<platform>.tool_paths：目录绝对路径列表（内含 llvm-addr2line / addr2line / atos 等）")
+            print("- platforms.<platform>.environment_vars：（可选）工具链安装根路径，如 ANDROID_NDK_HOME；可由自动获取写入，亦可手编")
             print("")
             print("— 请在下方的菜单中继续操作 —")
             if _is_tty_interactive():
@@ -4255,6 +4289,22 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                 break
             print("")
             print(_red("⚠ 大模型仍未配置完成。"))
+
+    if needs_symbol:
+        # 与「设置 → 自动获取（推荐）」同一套探测与写入逻辑：在阻断用户前静默尝试写入 env / IDE 路径，
+        # 减少「已能探测到工具但仍需手动点一次自动获取」的配置成本。
+        _ensure_user_config_templates()
+        add_target = _user_add2line_config_file()
+        add_data = _load_json_or_empty(add_target)
+        if not isinstance(add_data, dict):
+            add_data = {}
+        add_platforms = add_data.get("platforms", {})
+        if not isinstance(add_platforms, dict):
+            add_platforms = {}
+        if _auto_configure_add2line(
+            add_data, add_platforms, add_target, interactive=False
+        ):
+            status = _doctor_status()
 
     if needs_symbol and not status.get("tool_ok"):
         print("")

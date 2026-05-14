@@ -120,8 +120,8 @@ python3 cli/main.py \
 ### Configuration
 - `tools/configs/agent_config.json` - LLM provider template (no keys, safe to commit)
 - `tools/configs/agent_config.local.json` - Local overrides with real keys (gitignored)
-- `tools/configs/add2line_resolver_config.json` - Toolchain path template
-- `tools/configs/add2line_resolver_config.local.json` - Local toolchain paths (gitignored)
+- `tools/configs/add2line_resolver_config.local.example.json` - Example local add2line config (safe paths)
+- `~/.config/stability-analysis-agent/add2line_resolver_config.local.json` - Local toolchain paths (gitignored); resolver loads this filename from several candidate locations (see `tools/add2line_resolver_tool.py`)
 - Environment variables: `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, etc.
 
 ## Documentation Rules

@@ -1,5 +1,5 @@
 {
-  "_comment": "复制本文件为 agent_config.local.json 并填入真实密钥。一次只会调用一个 provider，建议只保留当前使用的 provider 节点，并将 llm_config.active_provider 设置为对应 provider 名称。",
+  "_comment": "复制本文件为 agent_config.local.json 并填入真实密钥。交互式 CLI 菜单中称「厂商」，对应此处 llm_config.active_provider（当前启用哪一条）与 llm_config.providers（各厂商/网关的配置键与内容）。一次只会调用一个 active_provider，建议只保留当前使用的节点。",
   "_provider_guide": {
     "required_fields": ["model", "base_url", "auth_type"],
     "auth_type": "api_key | authorization | none",
@@ -19,7 +19,7 @@
       "minimax_text_chatcompletion_v2_compatible",
       "custom_unsupported_need_adapter"
     ],
-    "notes": "公共配置放在 llm_config.provider_defaults；各 provider 只写差异字段。base_url 会被原样使用（仅去除末尾 /），请填写完整请求地址。",
+    "notes": "公共配置放在 llm_config.provider_defaults；providers 下各厂商条目只写差异字段。接口请求地址对应 base_url，须为完整 URL（仅去除末尾 /）。本文件不在 providers 内放置仅占位的自定义键（如 your_*），以免用户复制为 agent_config.local.json 后，交互 CLI 的「请选择大模型厂商」菜单多出无关项；自建网关或 OpenAI Responses 等示例见 docs/cli/CLI_GUIDE.md「自定义厂商与示例文件说明」及「多协议最小配置示例」。",
     "request_format_notes": {
       "openai_chat_completions_compatible": "请求体为 model+messages，典型路径: /v1/chat/completions",
       "anthropic_messages_compatible": "请求体为 model+messages(+system)，典型路径: /v1/messages；通常使用 x-api-key 且 auth_prefix 为空字符串",
@@ -98,20 +98,6 @@
         "request_format": "custom_unsupported_need_adapter",
         "base_url": "https://api.mi.com/llm/v1/chat/completions",
         "model": "mi-plus"
-      },
-      "your_new_provider": {
-        "api_key": "YOUR_PROVIDER_API_KEY",
-        "api_key_env": ["YOUR_PROVIDER_API_KEY"],
-        "request_format": "openai_chat_completions_compatible",
-        "base_url": "https://your-provider.example.com/v1/chat/completions",
-        "model": "your-model-name"
-      },
-      "your_responses_provider": {
-        "api_key": "YOUR_RESPONSES_PROVIDER_API_KEY",
-        "api_key_env": ["YOUR_RESPONSES_PROVIDER_API_KEY"],
-        "request_format": "openai_responses_compatible",
-        "base_url": "https://your-provider.example.com/v1/responses",
-        "model": "your-responses-model-name"
       }
     }
   },

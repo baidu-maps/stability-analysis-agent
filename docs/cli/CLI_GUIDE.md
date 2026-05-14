@@ -77,31 +77,42 @@ python3 cli/main.py --daemon http://127.0.0.1:8765 \
 - 若传入 `--config` 且其中定义了 `llm`，优先使用 `--config`
 - 否则固定读取：`~/.config/stability-analysis-agent/agent_config.local.json`
 - 不再从当前工作目录或仓库内配置回退，避免多来源导致行为不确定
-- `active_provider` 指向当前启用的 provider
-- `active_provider` 的值必须是 `llm_config.providers` 下的某个 key（例如 `openai` / `deepseek`）
+- 交互菜单中的 **「厂商」** 对应配置文件里的 **`active_provider`**：即当前启用哪一条 `providers` 下的配置。
+- `active_provider` 的值必须是 `llm_config.providers` 下的某个 key（例如 `openai` / `deepseek`）；自定义网关等可另取键名（菜单里称「自定义厂商或配置标识名」）。
 
-### Provider 配置与请求格式
+## 符号化工具（堆栈地址解析）
+
+- **配置文件**：默认使用 `~/.config/stability-analysis-agent/add2line_resolver_config.local.json`（亦支持工作目录 `configs/` 下同名文件等候选路径；可用环境变量 `STABILITY_AGENT_ADD2LINE_CONFIG_FILE` 指向单一文件）。字段说明与示例见 `tools/configs/add2line_resolver_config.local.example.json` 与 [docs/tools/addr2line/README.md](../tools/addr2line/README.md)。
+- **交互式配置**：`设置` → `配置堆栈地址解析工具` 中，**「自动获取（推荐）」** 会按本机探测结果写入 `tool_paths` / `environment_vars`；**「手动设置符号化工具绝对路径」** 可输入 **可执行文件路径**（如 `.../llvm-addr2line`）或 **含该工具的目录**，写入配置时统一为 `tool_paths` 中的目录项。
+- **快速开始**：在需要符号化的流程里，会在拦截用户前**静默尝试**与「自动获取」一致的写入，便于首次使用即落盘。
+
+### 厂商配置与请求格式（`llm_config` / `providers`）
 
 - 配置示例见：`tools/configs/agent_config.local.example.json`
-- 可将公共项放在 `llm_config.provider_defaults`（如 `auth_header`、`auth_prefix`、`request_timeout`），各 provider 仅覆盖差异字段。
-- 每个 provider 建议至少包含：
+- 可将公共项放在 `llm_config.provider_defaults`（如 `auth_header`、`auth_prefix`、`request_timeout`），**各厂商条目**（`providers` 下的每个 key）仅覆盖差异字段。
+- 每个厂商条目建议至少包含：
   - `model`
   - `base_url`
   - `auth_type`（`api_key` / `authorization` / `none`）
 - 当前 AI 分析请求默认按 **OpenAI Chat Completions 兼容格式** 发送；`base_url` 使用配置原值（仅去除末尾 `/`），请填写完整请求地址。
-- 可通过 `request_format` 字段标记 provider 的协议类型：
+- 可通过 `request_format` 字段标记该厂商所用协议的请求格式：
   - `openai_chat_completions_compatible`
   - `anthropic_messages_compatible`
   - `openai_responses_compatible`
   - `minimax_text_chatcompletion_v2_compatible`
   - `custom_unsupported_need_adapter`
 - `base_url` 使用配置原值（仅去除末尾 `/`），建议始终填写完整 endpoint（例如 `.../v1/chat/completions` 或 `.../v1/messages`）。
-- 若使用 Anthropic 协议网关，通常需要在 provider 中显式配置：
+- 若使用 Anthropic 协议网关，通常需要在对应厂商条目中显式配置：
   - `request_format: anthropic_messages_compatible`
   - `auth_header: x-api-key`
   - `auth_prefix: ""`
   - `base_url: .../v1/messages`
-- 当 provider 非 OpenAI 兼容协议时，需要新增 adapter 后再启用（仅改配置不足以跑通）。
+- 当某厂商所用协议非 OpenAI 兼容时，需要新增 adapter 后再启用（仅改配置不足以跑通）。
+
+### 自定义厂商与示例文件说明
+
+- `tools/configs/agent_config.local.example.json` 中的 `providers` **只保留**常用预置厂商键名，**不包含**仅占演示用的自定义键（例如历史上的 `your_new_provider`）。原因：用户若整份复制为 `~/.config/stability-analysis-agent/agent_config.local.json`，交互式 CLI 会把 `providers` 下**所有**键都列入「请选择大模型厂商」，多余的占位键会干扰选择。
+- 需要自建兼容网关、Anthropic 协议网关或 OpenAI Responses 等时，请在本节下方「多协议最小配置示例」的 JSON 模板中**自选有意义的键名**（如 `my_gateway`、`my_responses_provider`），再按需合并进自己的 `agent_config.local.json`，并设置 `llm_config.active_provider` 指向该键。
 
 ### 多协议最小配置示例
 
@@ -114,6 +125,24 @@ python3 cli/main.py --daemon http://127.0.0.1:8765 \
         "api_key": "YOUR_OPENAI_API_KEY",
         "base_url": "https://api.openai.com/v1/chat/completions",
         "model": "gpt-4o"
+      }
+    }
+  }
+}
+```
+
+OpenAI Chat Completions 兼容自建网关（`providers` 下的键名请自行命名，避免使用仅占位的 `your_*`，以免与交互菜单混淆）：
+
+```json
+{
+  "llm_config": {
+    "active_provider": "my_openai_compatible",
+    "providers": {
+      "my_openai_compatible": {
+        "api_key": "YOUR_API_KEY",
+        "request_format": "openai_chat_completions_compatible",
+        "base_url": "https://your-provider.example.com/v1/chat/completions",
+        "model": "your-model-name"
       }
     }
   }

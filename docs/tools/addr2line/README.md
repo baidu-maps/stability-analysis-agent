@@ -7,40 +7,41 @@
 当执行崩溃分析时，Agent 会把堆栈中的地址解析为 **函数名 / 文件路径 / 行号**。  
 解析器会根据**当前平台**和**可用工具**选择最合适的解析工具（例如 `atos`、`llvm-addr2line`、`addr2line`、`gdb` 等）。
 
-工具选择逻辑的核心来源是以下两个配置文件：
+配置与示例以 **`add2line_resolver_config.local.json`** 为主（见下文加载顺序）；仓库内提供示例：
 
-- `tools/configs/add2line_resolver_config.json`
 - `tools/configs/add2line_resolver_config.local.example.json`
 
 ## 2. 配置文件说明
 
-### 2.1 `add2line_resolver_config.json`（默认配置）
+### 2.1 生效的本地配置 `add2line_resolver_config.local.json`
 
-这是**默认配置文件**，用于描述各平台的：
+解析器默认按候选路径**依次查找**该文件名（先找到者生效），例如：
 
-- `preferred_tools`：解析工具优先级列表  
-  - 例如 macOS：`["atos", "llvm-atos", "llvm-addr2line", "addr2line", "gdb", "otool"]`
-- `tool_paths`：额外工具路径（默认空）
-- `environment_vars`：依赖的环境变量键位（默认 `null`）
+- 当前工作目录下 `configs/add2line_resolver_config.local.json`（便于发布产物同目录配置）
+- 仓库内 `tools/configs/add2line_resolver_config.local.json`
+- 用户目录 `~/.config/stability-analysis-agent/add2line_resolver_config.local.json`
 
-该文件可被版本控制，是**通用配置模板**。
+也可通过环境变量 **`STABILITY_AGENT_ADD2LINE_CONFIG_FILE`** 指定单一绝对路径，覆盖上述候选列表。
 
-### 2.2 `add2line_resolver_config.local.example.json`（本地示例）
+文件内典型字段：
 
-这是**本地配置示例**，提供可替换的路径与环境变量写法，用于指导开发者在本机创建私有配置：
+- **`preferred_tools`**（可选）：该平台下解析工具优先级列表。若未在 local 中声明，解析器仍可按内置默认顺序探测。
+- **`tool_paths`**：额外搜索路径，为 **字符串数组**；每项必须是**目录**的绝对路径（目录内需能直接找到 `llvm-addr2line`、`addr2line`、`atos` 等之一）。交互式 CLI 的「手动设置符号化工具绝对路径」允许用户输入**可执行文件的绝对路径**，保存时会写入其**父目录**到 `tool_paths`。
+- **`environment_vars`**（可选）：键为环境变量名，值为**工具链安装根目录**（如 `ANDROID_NDK_HOME` 指向 NDK 根路径）。解析器对已知键名会推导其下的 `bin` 等子路径。该块常由 CLI **「自动获取」**或**快速开始**前的静默自动写入生成；高级用户也可手编 JSON 维护。
 
-- 填写实际工具路径（如 `llvm-addr2line` 或 `atos` 所在目录）
-- 填写实际环境变量值（如 `ANDROID_NDK_HOME`、`DEVELOPER_DIR`）
+示例与字段注释见：`tools/configs/add2line_resolver_config.local.example.json`。
 
-你可以基于该示例创建自己的本地配置文件（例如 `add2line_resolver_config.local.json`）。  
-加载策略为：**命中 local 后不再读取 base（非 merge）**，并可避免把本地路径提交到仓库。
+### 2.2 与交互式 CLI 的关系
+
+- **设置 → 配置堆栈地址解析工具**：先展示符号化工具检测；向导内为 **「自动获取（推荐）」** 与 **「手动设置符号化工具绝对路径」**（可填可执行文件或含该工具的目录），不再提供「从 shell 读取环境变量 KEY」的独立菜单。
+- **快速开始分析**：当当前 Agent 流程需要符号化时，会在阻断用户前**静默尝试**与「自动获取」相同的写入逻辑（若有可写入的 env / IDE 路径），减少重复配置。
 
 ## 3. 工具选择机制（行为说明）
 
 解析器会按以下顺序选择工具：
 
-1. 根据当前平台读取 `preferred_tools` 列表
-2. 结合 `tool_paths` 与系统 `PATH` 寻找可用工具
+1. 根据当前平台读取 `preferred_tools` 列表（若配置中有）
+2. 结合 `tool_paths`、配置中的 `environment_vars` 所推导路径、以及系统 `PATH` 等寻找可用工具
 3. 选择第一个可用工具执行解析
 
 常见情况举例：
@@ -50,6 +51,5 @@
 
 ## 4. 常见问题
 
-- **解析失败**：通常是工具不可用或路径不正确，建议配置本地 `tool_paths` 与环境变量。
-- **平台切换**：不同平台应维护各自的工具优先级，避免误用。
-
+- **解析失败**：通常是工具不可用或路径不正确；优先使用 **「自动获取」**，或手动指定 **符号化工具绝对路径**（可执行文件或其所在目录），或直接编辑 `add2line_resolver_config.local.json` 中的 `tool_paths` / `environment_vars`。
+- **平台切换**：不同平台应维护各自的工具优先级与路径，避免误用。

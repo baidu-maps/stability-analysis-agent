@@ -256,7 +256,7 @@ For LLM and add2line setup, use the interactive wizard:
 sa-agent
 ```
 
-Then enter `设置` -> `配置大模型` / `配置堆栈地址解析工具`. Checks and guidance run contextually in flow.
+Then enter `设置` -> `配置大模型` / `配置堆栈地址解析工具`. Checks and guidance run contextually in flow. For stack symbolization: **Auto-detect (recommended)** and **Manually set absolute path to the symbolizer** (executable or directory containing it). When you choose **Quick start** and the run needs symbolization, the CLI also tries the same silent auto-write as **Auto-detect** first to avoid repeating setup.
 
 Default local config directory:
 
@@ -264,8 +264,8 @@ Default local config directory:
 ~/.config/stability-analysis-agent/
 ```
 
-- `agent_config.local.json` for LLM provider/key/model
-- `add2line_resolver_config.local.json` for addr2line/atos tool paths
+- `agent_config.local.json` for LLM vendor selection (`active_provider` key), credentials, and model
+- `add2line_resolver_config.local.json` for symbolizer search paths (`tool_paths` = directories; optional `environment_vars` for toolchain roots such as NDK, often filled by auto-detect)
 
 If you prefer manual editing, edit these files directly in that directory.
 
@@ -339,7 +339,7 @@ python3 test/agent_py_tool/test_vector_db.py
 ## FAQ
 
 **Q: Symbolization failed?**
-Ensure `--library-dir` contains the binary files (`.dylib` / `.so`) along with their debug symbols (`.dSYM` directories or DWARF info).
+Ensure `--library-dir` contains the binary files (`.dylib` / `.so`) along with their debug symbols (`.dSYM` directories or DWARF info). In interactive mode, use **Settings → Configure stack symbolization tools** with **Auto-detect** or **Manually set absolute path to the symbolizer** (executable or directory). You can also edit `~/.config/stability-analysis-agent/add2line_resolver_config.local.json` (see `tools/configs/add2line_resolver_config.local.example.json`).
 
 **Q: LLM call failed?**
 Verify your API key is set correctly. Quick check: `python3 test/llm/test_llm_connection.py --provider openai`
