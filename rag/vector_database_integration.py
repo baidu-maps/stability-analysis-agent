@@ -14,7 +14,6 @@ from typing import Any, Dict, List, Optional
 
 from .rule_store import RuleStore
 from .metadata_store import MetadataStore
-from .pattern_index import PatternIndex
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +29,8 @@ def _normalize_text(s: Any) -> str:
 
 class StabilityMemorySystem:
     def __init__(self, db_path: str = "./vector_db"):
+        from .pattern_index import PatternIndex
+
         self.db_path = db_path
         self.rule_store = RuleStore(f"{db_path}/metadata.sqlite3")
         self.meta_store = MetadataStore(f"{db_path}/metadata.sqlite3")

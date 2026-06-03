@@ -10,6 +10,8 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from cli.phase_spinner import PhaseSpinner
+
 from tool_system import BaseWorkflow, WorkflowDefinition, WorkflowContext, Priority, register_workflow
 from tool_system.registry import ToolAndWorkflowRegistry
 
@@ -24,16 +26,32 @@ except ImportError as e:
     PROMPTS_AVAILABLE = False
     generate_crash_analysis_prompt = None
 
-try:
-    from rag.feature_extractor import extract_features, build_pattern_query
-    from rag.vector_database_integration import AIStabilityAnalyzerWithVectorDB
-    RAG_AVAILABLE = True
-except ImportError as e:
-    logger.warning(f"RAG modules not available: {e}")
-    extract_features = None  # type: ignore
-    build_pattern_query = None  # type: ignore
-    AIStabilityAnalyzerWithVectorDB = None  # type: ignore
-    RAG_AVAILABLE = False
+from rag.feature_extractor import extract_features, build_pattern_query
+from rag.runtime import get_ai_stability_analyzer_class, rag_stack_available
+
+
+def _get_rag_analyzer_class():
+    return get_ai_stability_analyzer_class()
+
+
+def _truncate_analysis_prompt(prompt: str, prompt_cap: int) -> str:
+    """截断分析 prompt：保留头部上下文与尾部输出约束。"""
+    if len(prompt) <= prompt_cap:
+        return prompt
+    keep_head = max(1000, int(prompt_cap * 0.72))
+    keep_tail = max(500, prompt_cap - keep_head - 80)
+    merged = (
+        prompt[:keep_head]
+        + "\n\n...[PROMPT TRUNCATED — 中间省略]...\n\n"
+        + prompt[-keep_tail:]
+    )
+    if len(merged) > prompt_cap:
+        merged = merged[:prompt_cap]
+    return merged
+
+
+def _rag_available() -> bool:
+    return rag_stack_available() and extract_features is not None and build_pattern_query is not None
 
 
 # ==================== Base Crash Analysis Workflow ====================
@@ -47,10 +65,10 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
     def solve(self, problem: Dict[str, Any], context: WorkflowContext) -> Dict[str, Any]:
         """
         标准的崩溃分析流程：
-        1. 解析 crash log
-        2. 解析地址符号化
-        3. 提取代码上下文
-        4. 调用 LLM 分析
+        1. 解析崩溃日志
+        2. 堆栈符号化
+        3. 定位崩溃源码
+        4. AI 分析根因
         """
         crash_log = problem.get("crash_log", "")
         library_dir = problem.get("library_dir")
@@ -69,16 +87,20 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             total_steps = 1
         elif scope == "parse_only":
             total_steps = 2
-        else:
+        elif scope == "prompt_only":
             total_steps = 4
+        else:
+            # full scope: 4 steps in workflow + step 5 (apply fix) handled by CLI
+            apply_ai_fixes = problem.get("apply_ai_fixes", True)
+            total_steps = 5 if apply_ai_fixes else 4
 
         try:
             # Step 1: 解析崩溃日志
-            print(f"[阶段 1/{total_steps}] 解析崩溃日志...")
-            logger.info(f"[{self.definition.name}] Step 1: Parsing crash log...")
-            parse_result = context.execute_tool("crash_log_parser", {
-                "log_content": crash_log
-            })
+            with PhaseSpinner("解析崩溃日志", step=1, total_steps=total_steps):
+                logger.info(f"[{self.definition.name}] Step 1: Parsing crash log...")
+                parse_result = context.execute_tool("crash_log_parser", {
+                    "log_content": crash_log
+                })
 
             if scope == "parse_log_only":
                 return {
@@ -103,13 +125,13 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     }
                 }
 
-            # Step 2: 符号化地址
-            print(f"[阶段 2/{total_steps}] 符号化堆栈地址...")
-            logger.info(f"[{self.definition.name}] Step 2: Resolving symbols...")
-            resolved = context.execute_tool("add2line_resolver", {
-                "crash_json": json.dumps(parse_result),
-                "library_dir": library_dir
-            })
+            # Step 2: 堆栈符号化
+            with PhaseSpinner("堆栈符号化", step=2, total_steps=total_steps):
+                logger.info(f"[{self.definition.name}] Step 2: Resolving symbols...")
+                resolved = context.execute_tool("add2line_resolver", {
+                    "crash_json": json.dumps(parse_result),
+                    "library_dir": library_dir
+                })
 
             if scope == "parse_only":
                 return {
@@ -134,42 +156,63 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     }
                 }
 
-            # Step 3: 提取代码上下文
-            print(f"[阶段 3/{total_steps}] 提取源码上下文...")
-            logger.info(f"[{self.definition.name}] Step 3: Extracting code context...")
-            ccp_input: Dict[str, Any] = {
-                "resolved_stack": json.dumps(resolved),
-                "code_roots": code_roots,
-            }
-            for _k in (
-                "max_sibling_member_functions",
-                "max_direct_callers",
-                "max_shared_var_related_functions",
-                "min_key_read_related_functions",
-                "max_static_call_chain_depth",
-                "max_symbol_only_rescues",
-                "find_source_timeout_sec",
-                "code_context_timeout_sec",
-            ):
-                if isinstance(problem, dict) and _k in problem and problem[_k] is not None:
-                    ccp_input[_k] = problem[_k]
-            code_context = context.execute_tool("code_content_provider", ccp_input)
-            memory_context = ""
-            rule_hits: List[Dict[str, Any]] = []
-            pattern_hits: List[Dict[str, Any]] = []
-            evidence_map: Dict[str, Any] = {}
-            strategy_hits: List[Dict[str, Any]] = []
-            decision_trace: List[Dict[str, Any]] = []
-            vector_used = False
+            # Step 3: 定位崩溃源码
+            with PhaseSpinner("定位崩溃源码", step=3, total_steps=total_steps):
+                logger.info(f"[{self.definition.name}] Step 3: Extracting code context...")
+                ccp_input: Dict[str, Any] = {
+                    "resolved_stack": json.dumps(resolved),
+                    "code_roots": code_roots,
+                }
+                # Step 3a: 先做轻量调用点召回，给 code_content_provider 提供优先文件 seed
+                try:
+                    callsite_seed = context.execute_tool(
+                        "symbol_callsite_finder",
+                        {
+                            "resolved_stack": json.dumps(resolved),
+                            "code_roots": code_roots,
+                            "max_results": 500,
+                        },
+                    )
+                    if isinstance(callsite_seed, dict):
+                        candidate_files = callsite_seed.get("candidate_files") or []
+                        if isinstance(candidate_files, list) and candidate_files:
+                            ccp_input["_candidate_callsite_files"] = candidate_files
+                except Exception as seed_exc:
+                    logger.info(f"[{self.definition.name}] symbol_callsite_finder skipped: {seed_exc}")
+                for _k in (
+                    "max_sibling_member_functions",
+                    "max_direct_callers",
+                    "max_shared_var_related_functions",
+                    "min_key_read_related_functions",
+                    "max_static_call_chain_depth",
+                    "max_symbol_only_rescues",
+                    "find_source_timeout_sec",
+                    "code_context_timeout_sec",
+                    "max_nearby_module_scan_files",
+                    "max_prompt_stack_frame_functions",
+                    "max_crash_caller_search_files",
+                    "_code_index_service",
+                    "use_ctags_index",
+                ):
+                    if isinstance(problem, dict) and _k in problem and problem[_k] is not None:
+                        ccp_input[_k] = problem[_k]
+                code_context = context.execute_tool("code_content_provider", ccp_input)
+                memory_context = ""
+                rule_hits: List[Dict[str, Any]] = []
+                pattern_hits: List[Dict[str, Any]] = []
+                evidence_map: Dict[str, Any] = {}
+                strategy_hits: List[Dict[str, Any]] = []
+                decision_trace: List[Dict[str, Any]] = []
+                vector_used = False
 
-            rag_result = self._collect_memory_context(problem, parse_result, resolved, code_context)
-            if rag_result:
-                memory_context = rag_result.get("memory_context", "")
-                rule_hits = rag_result.get("rule_hits", []) or []
-                pattern_hits = rag_result.get("pattern_hits", []) or []
-                evidence_map = rag_result.get("evidence_map", {}) or {}
-                strategy_hits = rag_result.get("strategy_hits", []) or []
-                decision_trace = rag_result.get("decision_trace", []) or []
+                rag_result = self._collect_memory_context(problem, parse_result, resolved, code_context)
+                if rag_result:
+                    memory_context = rag_result.get("memory_context", "")
+                    rule_hits = rag_result.get("rule_hits", []) or []
+                    pattern_hits = rag_result.get("pattern_hits", []) or []
+                    evidence_map = rag_result.get("evidence_map", {}) or {}
+                    strategy_hits = rag_result.get("strategy_hits", []) or []
+                    decision_trace = rag_result.get("decision_trace", []) or []
                 vector_used = bool(rag_result.get("vector_used", False))
 
             # 检查是否有 LLM
@@ -178,13 +221,14 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 assembled_prompt = ""
                 if scope == "prompt_only":
                     # prompt_only 模式：完整工具链已就绪，仅生成可复用提示词，不调用 LLM
-                    assembled_prompt = self._build_prompt_final_tip(
-                        parse_result=parse_result,
-                        resolved=resolved,
-                        code_context=code_context,
-                        memory_context=memory_context,
-                        problem=problem,
-                    )
+                    with PhaseSpinner("生成分析提示词", step=4, total_steps=total_steps):
+                        assembled_prompt = self._build_prompt_final_tip(
+                            parse_result=parse_result,
+                            resolved=resolved,
+                            code_context=code_context,
+                            memory_context=memory_context,
+                            problem=problem,
+                        )
                 return {
                     "status": "success",
                     "platform": self.platform,
@@ -208,7 +252,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 }
 
             # Step 4: LLM 分析
-            print(f"[阶段 4/{total_steps}] 进行 AI 推理与修复建议...")
+            _phase4_spinner = PhaseSpinner("AI 分析根因", step=4, total_steps=total_steps)
+            _phase4_spinner.__enter__()
             logger.info(f"[{self.definition.name}] Step 4: LLM analysis...")
             # 与 prompt_only 模式对齐：统一使用同一份 final_tip 作为 LLM 输入与 05 文件落盘内容
             analysis_prompt = self._build_prompt_final_tip(
@@ -220,26 +265,25 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             )
             # 超长 prompt 会在部分网关返回空错误体（如 {'type':'','message':''}），
             # 这里做硬性上限保护，优先保证请求可被受理。
+            # 默认不限制 prompt 字符长度：优先保证信息完整性。
+            # 仅当显式配置 max_prompt_chars / SA_MAX_PROMPT_CHARS 且 > 0 时才启用截断。
             prompt_cap_raw = problem.get("max_prompt_chars") if isinstance(problem, dict) else None
             if prompt_cap_raw is None:
-                prompt_cap_raw = os.getenv("SA_MAX_PROMPT_CHARS", "50000")
-            try:
-                prompt_cap = int(prompt_cap_raw)
-            except (TypeError, ValueError):
-                prompt_cap = 50000
-            if prompt_cap <= 0:
-                prompt_cap = 50000
-            if len(analysis_prompt) > prompt_cap:
+                prompt_cap_raw = os.getenv("SA_MAX_PROMPT_CHARS")
+            prompt_cap: Optional[int] = None
+            if prompt_cap_raw not in (None, ""):
+                try:
+                    parsed = int(prompt_cap_raw)
+                    if parsed > 0:
+                        prompt_cap = parsed
+                except (TypeError, ValueError):
+                    prompt_cap = None
+            if prompt_cap and len(analysis_prompt) > prompt_cap:
+                orig_len = len(analysis_prompt)
+                analysis_prompt = _truncate_analysis_prompt(analysis_prompt, prompt_cap)
                 logger.warning(
-                    f"[{self.definition.name}] analysis_prompt too long ({len(analysis_prompt)} chars), "
-                    f"truncating to {prompt_cap} chars"
-                )
-                keep_head = max(1000, int(prompt_cap * 0.75))
-                keep_tail = max(500, prompt_cap - keep_head)
-                analysis_prompt = (
-                    analysis_prompt[:keep_head]
-                    + "\n\n...[PROMPT TRUNCATED DUE TO LENGTH LIMIT]...\n\n"
-                    + analysis_prompt[-keep_tail:]
+                    f"[{self.definition.name}] analysis_prompt too long ({orig_len} chars), "
+                    f"smart-truncated to {len(analysis_prompt)} chars (max_prompt_chars={prompt_cap})"
                 )
             # 动态 max_tokens 策略：
             # - 首轮不再盲打固定 12000，而是受当前 provider 配置上限约束；
@@ -253,14 +297,14 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             except Exception:
                 configured_max_tokens = 0
 
-            first_try_tokens = 12000
+            first_try_tokens = 8192
             if configured_max_tokens > 0:
                 first_try_tokens = min(first_try_tokens, configured_max_tokens)
 
             token_attempts: List[Optional[int]] = []
             if first_try_tokens > 0:
                 token_attempts.append(first_try_tokens)
-            for candidate in [4000, 2000, 1200, 800]:
+            for candidate in [4096, 2048]:
                 if candidate not in token_attempts and candidate < first_try_tokens:
                     token_attempts.append(candidate)
             token_attempts.append(None)  # 最后兜底走适配器默认值
@@ -271,10 +315,20 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 try:
                     if tok is None:
                         logger.info(f"[{self.definition.name}] LLM attempt {idx}: default max_tokens")
-                        llm_response = context.call_llm(analysis_prompt)
+                        llm_response = context.call_llm(analysis_prompt, temperature=0)
                     else:
                         logger.info(f"[{self.definition.name}] LLM attempt {idx}: max_tokens={tok}")
-                        llm_response = context.call_llm(analysis_prompt, max_tokens=tok)
+                        llm_response = context.call_llm(analysis_prompt, max_tokens=tok, temperature=0)
+                    # 检测输出是否被 max_tokens 截断：completion_tokens >= max_tokens * 0.95
+                    if tok is not None and llm_response is not None:
+                        usage = getattr(llm_response, "usage", None) or {}
+                        completion_tokens = usage.get("completion_tokens", 0) or 0
+                        if completion_tokens >= tok * 0.95:
+                            logger.warning(
+                                f"[{self.definition.name}] LLM output likely truncated "
+                                f"(completion_tokens={completion_tokens}, max_tokens={tok}), retrying with more tokens"
+                            )
+                            continue
                     break
                 except Exception as llm_exc:
                     last_llm_exc = llm_exc
@@ -284,7 +338,16 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     )
 
             if llm_response is None:
+                _phase4_spinner.__exit__(RuntimeError, None, None)
                 raise RuntimeError(f"LLM call failed after retries: {last_llm_exc}")
+
+            # 提取 token 使用统计
+            if hasattr(llm_response, "usage") and isinstance(llm_response.usage, dict):
+                _phase4_spinner.set_tokens(
+                    input_tokens=llm_response.usage.get("prompt_tokens"),
+                    output_tokens=llm_response.usage.get("completion_tokens"),
+                )
+            _phase4_spinner.__exit__(None, None, None)
 
             return {
                 "status": "success",
@@ -438,6 +501,232 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             return "prompt_only"
         return "full"
 
+    @staticmethod
+    def _norm_graph_nid(raw: Optional[str]) -> str:
+        if not isinstance(raw, str):
+            return ""
+        return raw.rstrip().rstrip("{").rstrip()
+
+    @classmethod
+    def _function_node_has_snippet(cls, node: Any) -> bool:
+        return (
+            isinstance(node, dict)
+            and node.get("type") == "function"
+            and isinstance(node.get("snippet"), list)
+            and bool(node.get("snippet"))
+        )
+
+    @classmethod
+    def _resolve_max_prompt_stack_frame_functions(
+        cls,
+        graph: Dict[str, Any],
+        code_context: Dict[str, Any],
+        problem: Optional[Dict[str, Any]],
+    ) -> int:
+        for src in (
+            (code_context.get("code_context_options") or {})
+            if isinstance(code_context, dict)
+            else {},
+            problem or {},
+        ):
+            if not isinstance(src, dict):
+                continue
+            raw = src.get("max_prompt_stack_frame_functions")
+            if raw is not None:
+                try:
+                    return max(1, min(int(raw), 32))
+                except (TypeError, ValueError):
+                    pass
+        if isinstance(graph, dict):
+            kept = graph.get("stack_kept_original_indices")
+            if isinstance(kept, list) and kept:
+                return max(3, min(len(kept) + 2, 16))
+        return 8
+
+    @classmethod
+    def _collect_add2line_stack_node_ids(
+        cls,
+        graph: Dict[str, Any],
+        node_map: Dict[str, Any],
+        max_frames: int,
+    ) -> List[str]:
+        """从 call_chain_from_add2line 收集带 snippet 的工程栈帧节点（保持栈序、去重）。"""
+        out: List[str] = []
+        seen: Set[str] = set()
+        chains = graph.get("call_chain_from_add2line") if isinstance(graph, dict) else []
+        if not isinstance(chains, list):
+            return out
+        for item in chains:
+            if not isinstance(item, dict):
+                continue
+            for nid in item.get("nodes") or []:
+                if not isinstance(nid, str):
+                    continue
+                norm = cls._norm_graph_nid(nid)
+                if norm in seen:
+                    continue
+                node = node_map.get(nid) or node_map.get(norm)
+                if not cls._function_node_has_snippet(node):
+                    continue
+                seen.add(norm)
+                out.append(nid)
+                if len(out) >= max_frames:
+                    return out
+        return out
+
+    @classmethod
+    def _collect_prompt_source_node_ids(
+        cls,
+        graph: Dict[str, Any],
+        crash_summary: Dict[str, Any],
+        primary_path_nodes: List[str],
+        node_map: Dict[str, Any],
+        code_context: Dict[str, Any],
+        problem: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        """
+        汇总应送入 LLM 的函数节点 id：崩溃函数优先；
+        静态调用链不足时以 add2line 栈帧补全（避免仅有崩溃点一行源码）。
+        """
+        ordered: List[str] = []
+        seen: Set[str] = set()
+
+        def _append(nid: Optional[str]) -> None:
+            if not isinstance(nid, str) or not nid.strip():
+                return
+            norm = cls._norm_graph_nid(nid)
+            if norm in seen:
+                return
+            node = node_map.get(nid) or node_map.get(norm)
+            if not cls._function_node_has_snippet(node):
+                return
+            seen.add(norm)
+            ordered.append(nid)
+
+        node_id = crash_summary.get("node_id") if isinstance(crash_summary, dict) else None
+        if isinstance(node_id, str):
+            _append(node_id)
+
+        path_nodes = [n for n in primary_path_nodes if isinstance(n, str)]
+        if len(path_nodes) < 2:
+            max_sf = cls._resolve_max_prompt_stack_frame_functions(graph, code_context, problem)
+            for nid in cls._collect_add2line_stack_node_ids(graph, node_map, max_sf):
+                _append(nid)
+        else:
+            for nid in path_nodes:
+                _append(nid)
+            # 即使静态调用链充足，也补充 add2line 栈顶帧（实际崩溃路径），
+            # 确保 LLM 能看到运行时调用方的源码（避免幻觉）。
+            for nid in cls._collect_add2line_stack_node_ids(graph, node_map, 3):
+                _append(nid)
+
+        if len(ordered) <= 1:
+            max_sf = cls._resolve_max_prompt_stack_frame_functions(graph, code_context, problem)
+            for nid in cls._collect_add2line_stack_node_ids(graph, node_map, max_sf):
+                _append(nid)
+
+        return ordered
+
+    @staticmethod
+    def _top_resolved_frame_has_file_line(resolved: Any) -> bool:
+        """栈顶帧是否带有 add2line 解析出的 file:line。"""
+        if not isinstance(resolved, dict):
+            return False
+        frames = resolved.get("resolved_frames") or []
+        if not frames or not isinstance(frames[0], dict):
+            return False
+        top = frames[0]
+        if not str(top.get("resolved_file") or "").strip():
+            return False
+        try:
+            return int(top.get("resolved_line") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _prompt_has_confident_crash_line(crash_summary: Any, resolved: Any) -> bool:
+        """
+        是否向 LLM 展示「可疑崩溃代码行」。
+        symbol-only / from_log_deduce 等无明确 addr2line 行号时不展示。
+        """
+        if not isinstance(crash_summary, dict):
+            return False
+        source = str(crash_summary.get("crash_location_source") or "").strip()
+        if source == "from_log_deduce":
+            return False
+        if source not in ("", "from_add2line"):
+            return False
+        try:
+            line_no = int(crash_summary.get("crash_line_number") or 0)
+        except (TypeError, ValueError):
+            return False
+        if line_no <= 0:
+            return False
+        if not str(crash_summary.get("crash_line_code") or "").strip():
+            return False
+        if not BaseCrashAnalysisWorkflow._top_resolved_frame_has_file_line(resolved):
+            return False
+        return True
+
+    @staticmethod
+    def _crash_location_prompt_conclusion(
+        crash_summary: Any,
+        resolved: Any,
+    ) -> str:
+        """供 LLM 提示词使用的崩溃点定位结论（一句，不含过程说明）。"""
+        source = str(crash_summary.get("crash_location_source") or "").strip()
+        if BaseCrashAnalysisWorkflow._prompt_has_confident_crash_line(crash_summary, resolved):
+            return "结论：崩溃点已通过符号化堆栈关联到具体源码行（置信度有限，需结合函数上下文验证）。"
+        if source == "from_log_deduce":
+            return "结论：未精确定位到 file:line 级崩溃行；已关联到工程内崩溃函数，请以下文该函数完整源码为准。"
+        if source == "from_add2line":
+            return "结论：已定位到崩溃函数及参考行号，请以该函数完整源码为主要分析依据。"
+        return "结论：崩溃点定位信息有限，请以下文函数源码与调用链为准。"
+
+    @staticmethod
+    def _append_crash_location_prompt_section(
+        lines: List[str],
+        crash_summary: Any,
+        crash_node: Any,
+        resolved: Any,
+    ) -> None:
+        """
+        崩溃点定位：向 LLM 输出一句结论；仅有明确 addr2line 行号时再附带可疑单行。
+        详细过程说明保留在 03 crash_line_note，不写入提示词。
+        """
+        if not isinstance(crash_summary, dict):
+            return
+
+        source = str(crash_summary.get("crash_location_source") or "").strip()
+        has_confident_line = BaseCrashAnalysisWorkflow._prompt_has_confident_crash_line(
+            crash_summary, resolved
+        )
+
+        if not source and not has_confident_line:
+            return
+
+        lines.append("## 崩溃点定位")
+        lines.append("")
+        lines.append(
+            BaseCrashAnalysisWorkflow._crash_location_prompt_conclusion(
+                crash_summary, resolved
+            )
+        )
+
+        if has_confident_line:
+            crash_file = str((crash_node or {}).get("file") or "").strip() or "N/A"
+            try:
+                line_no = int(crash_summary.get("crash_line_number") or 0)
+            except (TypeError, ValueError):
+                line_no = 0
+            code_line = str(crash_summary.get("crash_line_code") or "").strip()
+            lines.append(
+                f"可疑单行：`{crash_file}:{line_no}` — `{code_line}`（低置信度，勿单独作为改码依据）。"
+            )
+
+        lines.append("")
+        lines.append("")
+
     def _build_prompt_final_tip(
         self,
         parse_result: Dict[str, Any],
@@ -468,11 +757,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         lines.append("## 崩溃摘要")
         if isinstance(crash_summary, dict):
             for key in [
-                "crash_line_number",
                 "error_type",
                 "thread_id",
-                "crash_location_source",
-                "crash_line_note",
             ]:
                 if crash_summary.get(key) is not None:
                     lines.append(f"- {key}: {crash_summary.get(key)}")
@@ -480,30 +766,84 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
 
         lines.append("## 崩溃上下文")
         lines.append("崩溃函数被调用的路径（基于代码结构推断，自上而下）:")
+        edges_list_early = graph.get("edges", []) if isinstance(graph, dict) else []
+        evidence_summary = (
+            graph.get("evidence_summary") if isinstance(graph, dict) else None
+        )
+        has_calls_direct = False
+        has_calls_to_crash_site = False
+        has_calls_stack_order = False
+        has_shared_var_write_upstream = False
+        if isinstance(evidence_summary, dict):
+            has_calls_direct = bool(evidence_summary.get("has_calls_direct"))
+            has_calls_to_crash_site = bool(evidence_summary.get("has_calls_to_crash_site"))
+            has_calls_stack_order = bool(evidence_summary.get("has_calls_stack_order"))
+            has_shared_var_write_upstream = bool(
+                evidence_summary.get("has_shared_var_write_upstream")
+            )
+        if isinstance(edges_list_early, list):
+            for e in edges_list_early:
+                if not isinstance(e, dict):
+                    continue
+                et = str(e.get("type") or "")
+                if et == "calls_direct":
+                    has_calls_direct = True
+                elif et == "calls_to_crash_site":
+                    has_calls_to_crash_site = True
+                elif et == "calls_stack_order":
+                    has_calls_stack_order = True
+                elif et == "use_shared_var":
+                    rel = str(e.get("relation") or "").strip().lower()
+                    if rel in ("write", "assign", "delete"):
+                        has_shared_var_write_upstream = True
         call_paths = graph.get("call_chain_from_code", []) if isinstance(graph, dict) else []
         primary_path_nodes: List[str] = []
+        all_path_nodes_list: List[List[str]] = []
         if isinstance(call_paths, list) and call_paths:
             for path in call_paths:
                 if not isinstance(path, dict):
                     continue
                 path_nodes = path.get("nodes", [])
                 if isinstance(path_nodes, list) and path_nodes:
-                    primary_path_nodes = [nid for nid in path_nodes if isinstance(nid, str)]
+                    extracted = [nid for nid in path_nodes if isinstance(nid, str)]
+                    if extracted:
+                        all_path_nodes_list.append(extracted)
+                        if not primary_path_nodes:
+                            primary_path_nodes = extracted
+        path_label = "路径1"
+        if isinstance(call_paths, list):
+            for path in call_paths:
+                if not isinstance(path, dict):
+                    continue
+                desc = str(
+                    path.get("inference") or path.get("description") or ""
+                ).strip()
+                if desc == "inferred_from_add2line_stack_order":
+                    path_label = "路径1（addr2line 栈序；静态未校验相邻帧调用关系）"
                     break
         if primary_path_nodes:
-            lines.append("- 路径1:")
-            for nid in primary_path_nodes:
-                node = node_map.get(nid)
-                if isinstance(node, dict):
-                    lines.append(f"  - {node.get('signature', nid)}")
-                else:
-                    lines.append(f"  - {nid}")
+            if has_calls_direct or has_calls_to_crash_site:
+                lines.append("- 证据强度说明：高置信度，可单独作为改码依据。")
+            elif "addr2line 栈序" in path_label or has_calls_stack_order:
+                lines.append("- 证据强度说明：本节主要来自栈序关联，属于线索证据，不能单独作为改码依据。")
+        if all_path_nodes_list:
+            for path_idx, path_nodes in enumerate(all_path_nodes_list, 1):
+                label = path_label if path_idx == 1 else f"路径{path_idx}"
+                lines.append(f"- {label}:")
+                for nid in path_nodes:
+                    node = node_map.get(nid)
+                    if isinstance(node, dict):
+                        lines.append(f"  - {node.get('signature', nid)}")
+                    else:
+                        lines.append(f"  - {nid}")
         else:
             lines.append("- 路径1: N/A")
         lines.append("")
 
         lines.append("根据堆栈顺序解析的函数/帧语义列表（按调用顺序，自下而上）：")
         resolved_frames = resolved.get("resolved_frames", []) if isinstance(resolved, dict) else []
+        if isinstance(resolved_frames, list) and resolved_frames:
+            lines.append("- 证据强度说明：低置信度，只能作为排查线索，不能单独作为改码依据。")
         if isinstance(resolved_frames, list):
             for idx, frame in enumerate(resolved_frames, 1):
                 if not isinstance(frame, dict):
@@ -569,6 +909,10 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
 
         if var_rel_by_tid:
             lines.append("### 共享成员与写路径交叉（崩溃点关联）")
+            if has_shared_var_write_upstream:
+                lines.append("- 证据强度说明：高置信度，可单独作为改码依据。")
+            else:
+                lines.append("- 证据强度说明：本节仅提供共享变量关联线索；若无“其它函数写/删同一变量”，不能单独作为改码依据。")
             lines.append("崩溃函数关联的成员/共享变量：")
             lines.append(
                 "说明：以下“声明摘录”来自成员变量定义行（通常位于头文件），用于识别变量类型与存储形态，不代表运行时值。"
@@ -664,41 +1008,49 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.append("")
         lines.append("")
 
-        lines.append("## 可疑代码片段")
-        lines.append("可疑崩溃代码行（基于地址解析）:")
-        lines.append(f"- 文件: {((crash_node or {}).get('file') or 'N/A')}:{(crash_summary.get('crash_line_number') if isinstance(crash_summary, dict) else 'N/A')}")
-        lines.append(f"- 代码行: {(crash_summary.get('crash_line_code') if isinstance(crash_summary, dict) else 'N/A')}")
-        lines.append("")
-        lines.append("")
+        self._append_crash_location_prompt_section(
+            lines, crash_summary, crash_node, resolved
+        )
 
         lines.append("## 以上涉及的函数源码")
         lines.append("")
 
-        source_ids: List[str] = []
-        # 仅展示主调用链，避免多路径重复噪声
-        source_ids.extend(primary_path_nodes)
-        # 崩溃函数优先展示
-        if isinstance(node_id, str):
-            source_ids.insert(0, node_id)
+        source_ids = self._collect_prompt_source_node_ids(
+            graph if isinstance(graph, dict) else {},
+            crash_summary if isinstance(crash_summary, dict) else {},
+            primary_path_nodes,
+            node_map,
+            code_context if isinstance(code_context, dict) else {},
+            problem,
+        )
 
-        # 补充同类生命周期关键函数（如析构/clear/destroy/shutdown/stop），提升修复可操作性。
-        crash_sig = str((crash_node or {}).get("signature") or "")
-        owner = ""
-        m_owner = re.search(r"\b([A-Za-z_]\w*)::[~]?[A-Za-z_]\w*\s*\(", crash_sig)
-        if m_owner:
-            owner = m_owner.group(1)
-        lifecycle_ids: Set[str] = set()
-        if owner:
-            lifecycle_re = re.compile(
-                rf"\b{re.escape(owner)}::(~{re.escape(owner)}|clear(?:_[A-Za-z_]\w*)?|destroy(?:_[A-Za-z_]\w*)?|shutdown(?:_[A-Za-z_]\w*)?|stop(?:_[A-Za-z_]\w*)?)\s*\("
-            )
-            for nid, n in node_map.items():
-                if not isinstance(nid, str) or not isinstance(n, dict):
-                    continue
-                sig = str(n.get("signature") or "")
-                if lifecycle_re.search(sig):
-                    source_ids.append(nid)
-                    lifecycle_ids.add(_norm_graph_nid(nid))
+        from tools._prompt_context_filter import (
+            build_stack_anchor_paths,
+            filter_prompt_function_records,
+            match_resolved_frames_to_node_ids,
+            resolve_prompt_filter_options,
+        )
+
+        prompt_filter_opts = resolve_prompt_filter_options(
+            code_context if isinstance(code_context, dict) else None,
+            problem,
+        )
+        stack_anchors = build_stack_anchor_paths(
+            code_context if isinstance(code_context, dict) else None,
+            resolved if isinstance(resolved, dict) else None,
+        )
+
+        stack_frame_ids = match_resolved_frames_to_node_ids(
+            node_map,
+            resolved if isinstance(resolved, dict) else None,
+            max_frames=prompt_filter_opts.max_stack_frames_in_prompt,
+        )
+        stack_frame_norm_ids: Set[str] = {_norm_graph_nid(nid) for nid in stack_frame_ids}
+        for nid in stack_frame_ids:
+            if isinstance(nid, str) and nid not in source_ids:
+                source_ids.append(nid)
+
+        root_cause_norm_ids: Set[str] = set()
 
         # ---------- 共享变量相关函数预算（写优先 + 关键读保底） ----------
         opts_cc = code_context.get("code_context_options") if isinstance(code_context, dict) else None
@@ -906,10 +1258,12 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 tags.add("崩溃函数")
             if nfid in primary_path_norm_ids:
                 tags.add("调用链")
+            if nfid in caller_to_crash_norm:
+                tags.add("调用崩溃点")
             if nfid in add2line_norm_ids:
-                tags.add("堆栈列表")
-            if nfid in lifecycle_ids:
-                tags.add("生命周期函数")
+                tags.add("堆栈帧")
+            if nfid in stack_frame_norm_ids:
+                tags.add("栈序保留")
             if nfid in write_shared_func_norm:
                 tags.add("共享变量写")
             elif nfid in key_read_shared_func_norm:
@@ -927,27 +1281,48 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     continue
                 shared_vars.setdefault(vname, set()).update(rels)
 
-            # 统一优先级：崩溃函数 > 共享变量写 > 共享变量关键读 > 调用链 > 堆栈列表 > 共享变量读/访问 > 生命周期函数 > 其它
-            if "崩溃函数" in tags:
+            if "栈序保留" in tags:
                 rec["priority"] = 0
-            elif "共享变量写" in tags:
+            elif "崩溃函数" in tags:
                 rec["priority"] = 1
-            elif "共享变量关键读" in tags:
+            elif "共享变量写" in tags:
                 rec["priority"] = 2
-            elif "调用链" in tags:
+            elif "调用崩溃点" in tags:
                 rec["priority"] = 3
-            elif "堆栈列表" in tags:
+            elif "共享变量关键读" in tags:
                 rec["priority"] = 4
-            elif "共享变量读/访问" in tags:
+            elif "调用链" in tags:
                 rec["priority"] = 5
-            elif "生命周期函数" in tags:
+            elif "堆栈帧" in tags or "堆栈列表" in tags:
                 rec["priority"] = 6
+            elif "共享变量读/访问" in tags:
+                rec["priority"] = 7
             else:
-                rec["priority"] = 9
+                rec["priority"] = 8
+
+        crash_site_norm_ids: Set[str] = set(crash_fn_norm_ids)
+        caller_to_crash_norm: Set[str] = set()
+        if isinstance(edges_list_early, list):
+            for e in edges_list_early:
+                if not isinstance(e, dict):
+                    continue
+                if str(e.get("type") or "") not in ("calls_direct", "calls_to_crash_site"):
+                    continue
+                tid = _norm_graph_nid(str(e.get("to_id") or ""))
+                if tid in crash_site_norm_ids:
+                    caller_to_crash_norm.add(_norm_graph_nid(str(e.get("from_id") or "")))
 
         for nid in source_ids:
             if isinstance(nid, str):
                 _register_func(nid)
+        for fid in sorted(caller_to_crash_norm):
+            if isinstance(fid, str) and fid:
+                raw = fid
+                for k, n in node_map.items():
+                    if _norm_graph_nid(k) == fid:
+                        raw = k
+                        break
+                _register_func(raw)
         for fid in shared_extra_ids:
             if isinstance(fid, str):
                 _register_func(fid)
@@ -960,19 +1335,42 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             ),
         )
 
-        lines.append("### 函数源码（按函数唯一输出）")
-        if not ordered_records:
+        included_records, excluded_index_lines = filter_prompt_function_records(
+            ordered_records,
+            root_cause_norm_ids=root_cause_norm_ids,
+            stack_frame_norm_ids=stack_frame_norm_ids,
+            anchor_paths=stack_anchors,
+            max_functions=prompt_filter_opts.max_functions_in_prompt,
+        )
+        # 将 prompt 裁剪/未纳入信息写入 code_context（03_code_content_provider.json），
+        # 避免把元信息噪音塞进 05_ai_final_tip 文本。
+        if isinstance(code_context, dict):
+            meta = code_context.get("prompt_context_meta")
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["max_functions_in_prompt"] = int(prompt_filter_opts.max_functions_in_prompt)
+            meta["max_stack_frames_in_prompt"] = int(prompt_filter_opts.max_stack_frames_in_prompt)
+            meta["excluded_function_index"] = list(excluded_index_lines or [])
+            code_context["prompt_context_meta"] = meta
+
+        lines.append("### 函数源码（按置信度筛选，高价值函数优先）")
+        lines.append("")
+        if not included_records:
             lines.append("- N/A")
             lines.append("")
         else:
-            for rec in ordered_records:
+            for rec in included_records:
                 node = rec["node"]
                 snippet = node.get("snippet", [])
                 if not (isinstance(snippet, list) and snippet):
                     continue
+                sig = str(node.get("signature", "N/A"))
+                snippet, is_complete_snippet, incomplete_reason = self._prepare_prompt_function_snippet(node, snippet)
+                if not snippet:
+                    continue
                 tags = sorted(list(rec["tags"]))
                 tag_txt = "、".join(tags) if tags else "上下文候选"
-                lines.append(f"#### 函数源码: {node.get('signature', 'N/A')}")
+                lines.append(f"#### 函数源码: {sig}")
                 lines.append(f"- 来源: {tag_txt}")
                 shared_vars = rec.get("shared_vars") or {}
                 if isinstance(shared_vars, dict) and shared_vars:
@@ -982,9 +1380,30 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         detail.append(f"{vn}({rel_txt})")
                     lines.append(f"- 命中说明: 共享变量命中 {', '.join(detail)}")
                 lines.append(f"- 文件: {node.get('file', 'N/A')}:N/A")
+                if not is_complete_snippet:
+                    lines.append(f"- 片段状态: {incomplete_reason}")
                 lines.append("- 代码片段:")
                 lines.extend([str(s) for s in snippet])
                 lines.append("")
+
+        # 输出类骨架（若存在）：让 AI 了解完整类结构以做出结构性修复决策
+        for nid, n in node_map.items():
+            if not isinstance(n, dict) or n.get("type") != "class_skeleton":
+                continue
+            skel_text = n.get("skeleton", "")
+            if not skel_text.strip():
+                continue
+            cls_name = n.get("class_name", "Unknown")
+            skel_file = n.get("file", "N/A")
+            lines.append(f"### 崩溃所属类骨架（{cls_name}）")
+            lines.append(f"- 文件: {skel_file}")
+            lines.append("- 说明: 以下为类的精简骨架（成员变量 + 函数签名），函数体已省略。")
+            lines.append("  若修复方案需要修改成员变量声明（如 volatile → std::atomic）或其他未列出函数体的函数，")
+            lines.append("  请在修复代码中明确给出对应修改。")
+            lines.append("```cpp")
+            lines.append(skel_text)
+            lines.append("```")
+            lines.append("")
 
         code_roots: List[str] = []
         if isinstance(problem, dict):
@@ -1005,6 +1424,11 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         lines.append("- 建议从“为什么会出现当前崩溃现象”倒推，结合代码上下文和数据流寻找根因。")
         lines.append("- 若涉及共享数据/多线程入口（如 `*_thread` / 回调 / handler），重点检查：锁保护是否覆盖所有访问路径、加锁/解锁是否成对、是否存在数据竞争。")
         lines.append("- 若涉及对象销毁/资源释放，重点检查：是否只释放一次、释放后是否仍会被访问、是否避免“持锁删除对象本身”导致后续访问悬空对象或引入死锁。")
+        lines.append("- 若修改继承链相关函数（含 `Class::Method` / override），需结合上下文判断是否保留或调整 `Base::method(...)` 等调用，并在说明中给出理由。")
+        lines.append(
+            "- 非静态成员函数内不得用 `if (this == nullptr)` 等形式作为 use-after-free/悬空对象 的修复；"
+            "应在释放路径、任务/线程同步或所有权转移处消除非法访问。"
+        )
         lines.append("")
         lines.append("**通用分析步骤**：")
         lines.append("1. 明确崩溃点的直接原因（例如空指针、越界访问、使用已释放内存等）。")
@@ -1015,12 +1439,21 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         lines.append("")
         lines.append("## 输出要求")
         lines.append("**必须提供**：")
-        lines.append("1. 崩溃原因分析（直接原因和根本原因）。")
-        lines.append("2. 需要修改的函数列表（仅列出需要改动的函数）。")
-        lines.append("3. 修复代码（仅包含需要修改的函数的最终完整代码）。")
-        lines.append("")
-        lines.append("**可选提供**：")
-        lines.append("- 无需修改但与根因相关的函数列表（只写“不修改原因”，不要粘贴原代码）。")
+        lines.append("1. **证据清单（使用分项序号）**：每条结论标注置信度标签（按各章节中的“证据强度说明”）；")
+        lines.append("   每条证据都要引用具体的 file:line，或明确指出对应的调用关系/共享变量关系。")
+        lines.append("2. 崩溃原因分析（直接原因和根本原因）。")
+        lines.append("3. 需要修改的函数列表（仅列出需要改动的函数）。")
+        lines.append(
+            "4. 修复代码（仅包含「需要修改的函数」列表中的函数；每个函数给出最终完整可编译代码，"
+            "不得包含未列入该列表的函数，也不得重复粘贴无需改动的原函数）。"
+        )
+        if isinstance(evidence_summary, dict) and evidence_summary.get("auto_fix_allowed") is False:
+            lines.append("")
+            lines.append(
+                "**重要**：当前图证据不满足自动改码条件（auto_fix_allowed=false）。"
+                "请勿在「需要修改的函数」中列出仅因栈序关联（calls_stack_order）而怀疑的函数；"
+                "不得对崩溃点函数做 this==nullptr 类防护；应给出需人工验证的调查步骤。"
+            )
         lines.append("")
         lines.append("## 输出格式")
         lines.append("### 结论（崩溃定位与根因）")
@@ -1037,18 +1470,41 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         lines.append("- [函数名1] - [修改原因]")
         lines.append("- [函数名2] - [修改原因]")
         lines.append("")
-        lines.append("#### 无需修改但关键相关的函数（可选）")
-        lines.append("- [函数名X] - [为什么不需要修改]")
+        lines.append("#### 无法生成完整修复代码/需人工处理（可选）")
+        lines.append("- [函数名Y] - [缺少哪些上下文，为什么不能输出完整可替换函数]")
         lines.append("")
         lines.append("#### 修复代码（仅包含“需要修改的函数”）")
-        lines.append("（只粘贴需要修改的函数的最终完整可编译代码块；未修改函数禁止粘贴原代码）")
+        lines.append(
+            "（修复代码块中的函数必须与上一节「需要修改的函数」列表完全一致；"
+            "只粘贴列表中每一项的最终完整可编译代码，禁止粘贴未列入列表的函数或原样复制的无关函数）"
+        )
         lines.append("")
         lines.append("## 关键约束")
         lines.append("- 必须基于实际源代码进行修复；")
         lines.append("- 修复代码必须完整且可编译；")
-        lines.append("- **修复代码只允许包含“需要修改的函数”**；对“无需修改的函数”，只允许给出不修改理由（1–2 句），禁止输出其完整代码；")
-        lines.append("- 对来源标签含“共享变量关键读”的同类函数，必须逐个判断是否需要修改；若判定无需修改，必须给出可验证理由（例如：锁覆盖、边界检查、生命周期同步已闭环），不得笼统写“非直接原因”。")
+        lines.append("- 修复代码必须相对提供的原源码包含实质逻辑变化；禁止仅调整格式、缩进、空行或只添加解释性注释作为修复。")
+        lines.append(
+            "- **「需要修改的函数」与「修复代码」必须一一对应**：列表有几项，修复代码块中就只包含几项完整函数；"
+            "禁止多写、少写，或同一函数在列表与代码块中含义矛盾。"
+        )
+        lines.append(
+            "- **禁止**单独列出「无需修改的函数」章节；不需要改的函数不得出现在「需要修改的函数」或修复代码中；"
+            "若需在分析中说明某相关函数为何不改，仅在根因分析文字中简要带过，不要粘贴其源码。"
+        )
+        lines.append(
+            "- 对来源标签含「共享变量关键读」的同类函数，逐个判断是否需改；仅当确需修改时才纳入「需要修改的函数」与修复代码。"
+        )
         lines.append("- 禁止使用“未知”“假设”“示例”等表述性的占位词。")
+        lines.append("- 若删除或改写 `Base::method(...)`/继承链关键调用，必须在结论中明确给出语义等价性或替代路径依据。")
+        lines.append(
+            "- 禁止调用源码片段中未出现的成员方法；不要编造 Cancel/Abort 等异步控制 API。"
+        )
+        lines.append("- **修复代码格式**：每个修复函数必须使用独立的 ```cpp 围栏包裹；函数体必须完整，禁止用 `...`、`// ...`、`/* ... */`、`[其他代码]`、`其他逻辑保持不变`、`省略` 等任何占位内容代替代码行。")
+        lines.append("- “需要修改的函数”列表中的每一项，都必须在“修复代码”中给出对应的完整函数定义（包含函数签名、完整函数体和全部原有必要逻辑），不能只给函数体片段、局部代码片段、diff 片段或伪代码。")
+        lines.append("- 修复代码必须保持原函数签名不变：不得修改返回类型、函数名、类作用域、参数列表、const/static/virtual 等限定；构造函数和析构函数绝对不能添加返回类型（例如禁止写成 `VBool Class::~Class()`）。")
+        lines.append("- 如果确实需要调整函数签名或类接口，不能输出自动替换代码；应放到“无法生成完整修复代码/需人工处理”并说明需要人工同步修改声明、定义和所有调用点。")
+        lines.append("- 如果当前上下文不足以输出某个函数的完整可替换代码，必须不要把该函数列入“需要修改的函数”；应放到“无法生成完整修复代码/需人工处理”并说明缺少哪些上下文。")
+        lines.append("- 禁止在修复函数中用注释表示保留原逻辑；所有未改动但仍需要保留的原代码也必须原样写出。")
         lines.append("")
         if memory_context:
             lines.append("## 规则与经验模式参考")
@@ -1093,11 +1549,202 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         snippet = file_lines[start:end + 1]
         if not snippet:
             return []
-        max_lines = 180
-        if len(snippet) > max_lines:
-            snippet = snippet[:max_lines]
-            snippet.append("... [truncated] ...")
         return snippet
+
+    @staticmethod
+    def _extract_simple_name_from_signature(signature: str) -> str:
+        s = str(signature or "").strip()
+        if not s:
+            return ""
+        paren_idx = s.find("(")
+        head = s[:paren_idx].strip() if paren_idx > 0 else s
+        head = BaseCrashAnalysisWorkflow._strip_template_args(head)
+        if "::" in head:
+            head = head.split("::")[-1].strip()
+        parts = head.split()
+        if parts:
+            head = parts[-1].strip()
+        head = head.lstrip("*&")
+        m = re.search(r"([~]?[A-Za-z_]\w*)$", head)
+        if m:
+            return m.group(1)
+        return ""
+
+    @staticmethod
+    def _strip_template_args(text: str) -> str:
+        out: List[str] = []
+        depth = 0
+        for ch in str(text or ""):
+            if ch == "<":
+                depth += 1
+                continue
+            if ch == ">" and depth > 0:
+                depth -= 1
+                continue
+            if depth == 0:
+                out.append(ch)
+        return "".join(out)
+
+    @classmethod
+    def _sanitize_prompt_function_snippet(cls, signature: str, snippet: List[str]) -> List[str]:
+        """净化函数片段：去除前置污染，并尽量裁剪到目标函数闭合括号。"""
+        if not (isinstance(snippet, list) and snippet):
+            return snippet
+        token = cls._extract_simple_name_from_signature(signature)
+        if not token:
+            return snippet
+
+        start_idx = cls._find_signature_index_in_snippet(signature, snippet)
+        if start_idx is None:
+            return snippet
+
+        trimmed = [str(x) for x in snippet[start_idx:]]
+        end_idx = cls._find_function_end_index(trimmed)
+        if end_idx is not None:
+            trimmed = trimmed[: end_idx + 1]
+        return trimmed if trimmed else snippet
+
+    @classmethod
+    def _find_signature_index_in_snippet(
+        cls,
+        signature: str,
+        snippet: List[str],
+    ) -> Optional[int]:
+        token = cls._extract_simple_name_from_signature(signature)
+        if not token:
+            return None
+        pat = re.compile(rf"(?:\b\w+\s*::\s*)?\b~?{re.escape(token)}\s*(?:\[[^\]]+\])?\s*\(")
+        for i, ln in enumerate(snippet):
+            s = str(ln or "").strip()
+            if not s:
+                continue
+            if ";" in s and "{" not in s:
+                continue
+            if pat.search(s):
+                return i
+        return None
+
+    @staticmethod
+    def _snippet_has_omission_marker(snippet: List[str]) -> bool:
+        markers = (
+            "lines omitted",
+            "more lines",
+            "[truncated]",
+            "PROMPT TRUNCATED",
+            "代码省略",
+            "省略",
+            "其他代码",
+        )
+        for ln in snippet or []:
+            s = str(ln or "")
+            if any(m in s for m in markers):
+                return True
+            if re.search(r"\.\.\.\s*\[\d+\s+", s):
+                return True
+        return False
+
+    @classmethod
+    def _find_definition_line_in_file(cls, file_path: str, signature: str) -> Optional[int]:
+        token = cls._extract_simple_name_from_signature(signature)
+        if not file_path or not token or not os.path.isfile(file_path):
+            return None
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.read().splitlines()
+        except Exception:
+            return None
+
+        token_pat = re.compile(rf"(?:\b\w+\s*::\s*)?{re.escape(token)}\s*\(")
+        for idx, line in enumerate(lines):
+            stripped = str(line or "").strip()
+            if not stripped or stripped.startswith("//"):
+                continue
+            if not token_pat.search(stripped):
+                continue
+            # 函数定义允许左括号在后续几行，但在遇到分号前必须出现 "{"。
+            head = ""
+            for j in range(idx, min(len(lines), idx + 8)):
+                head += "\n" + str(lines[j] or "")
+                if "{" in lines[j]:
+                    return idx + 1
+                if ";" in lines[j]:
+                    break
+        return None
+
+    @staticmethod
+    def _find_function_end_index(snippet: List[str]) -> Optional[int]:
+        depth = 0
+        seen_open = False
+        for i, ln in enumerate(snippet):
+            for ch in ln:
+                if ch == "{":
+                    depth += 1
+                    seen_open = True
+                elif ch == "}":
+                    depth -= 1
+                    if seen_open and depth == 0:
+                        return i
+        return None
+
+    @classmethod
+    def _is_complete_function_snippet(cls, snippet: List[str]) -> bool:
+        return cls._find_function_end_index(snippet) is not None
+
+    def _prepare_prompt_function_snippet(
+        self,
+        node: Dict[str, Any],
+        raw_snippet: List[str],
+    ) -> Tuple[List[str], bool, str]:
+        """为 05 提示词准备函数片段：优先回源重提完整函数，并做完整性校验。"""
+        sig = str(node.get("signature") or "")
+        snippet = self._sanitize_prompt_function_snippet(sig, raw_snippet)
+        has_signature = self._find_signature_index_in_snippet(sig, snippet) is not None
+        has_omission = self._snippet_has_omission_marker(snippet)
+        if has_signature and not has_omission and self._is_complete_function_snippet(snippet):
+            return snippet, True, ""
+
+        file_path = str(node.get("file") or "").strip()
+        token = self._extract_simple_name_from_signature(sig)
+        if file_path and os.path.isfile(file_path) and token:
+            line_no: Optional[int] = None
+            start_line = node.get("snippet_start_line")
+            sig_idx = self._find_signature_index_in_snippet(sig, raw_snippet)
+            if sig_idx is not None and not has_omission:
+                try:
+                    if start_line is not None:
+                        line_no = int(start_line) + int(sig_idx)
+                except (TypeError, ValueError):
+                    line_no = None
+
+            # 截断片段、缺少签名或行号不可信时，回源按函数定义全局查找。
+            if line_no is None or line_no <= 0 or has_omission or not has_signature:
+                line_no = self._find_definition_line_in_file(file_path, sig)
+
+            if line_no is None or line_no <= 0:
+                line_no = 1
+
+            try:
+                from tools.snippet_extractor_tool import SnippetExtractorTool
+
+                out = SnippetExtractorTool().execute(
+                    {
+                        "file_path": file_path,
+                        "line_number": line_no,
+                        "function_name": token,
+                        "max_code_length": 0,
+                    }
+                )
+                extracted = out.get("snippet")
+                if isinstance(extracted, list) and extracted:
+                    extracted_lines = [str(x) for x in extracted]
+                    if bool(out.get("is_complete_function")) and self._is_complete_function_snippet(extracted_lines):
+                        return extracted_lines, True, ""
+                    snippet = self._sanitize_prompt_function_snippet(sig, extracted_lines)
+            except Exception:
+                pass
+
+        reason = "函数源码片段不完整：未能从源文件重提取到闭合函数体。"
+        return snippet, False, reason
 
     def _resolve_source_file_path(self, resolved_file: str, code_roots: List[str]) -> Optional[str]:
         if os.path.exists(resolved_file):
@@ -1183,11 +1830,12 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         prompt_data: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         """规则优先 + 向量兜底（可选）。"""
-        if not RAG_AVAILABLE or extract_features is None or build_pattern_query is None or AIStabilityAnalyzerWithVectorDB is None:
+        analyzer_cls = _get_rag_analyzer_class()
+        if not _rag_available() or analyzer_cls is None:
             return None
         try:
             vector_db_path = str(problem.get("vector_db_path") or "./vector_db")
-            analyzer = AIStabilityAnalyzerWithVectorDB(vector_db_path=vector_db_path)
+            analyzer = analyzer_cls(vector_db_path=vector_db_path)
             features = extract_features(parsed_data, resolved_data, prompt_data)
             rule_threshold = float(problem.get("rule_confidence_threshold", 0.85))
             max_results = int(problem.get("vector_db_max_results", 3))

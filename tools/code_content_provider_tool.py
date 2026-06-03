@@ -9,11 +9,14 @@ import json
 import os
 import logging
 import re
+import subprocess
 import time
 from typing import Dict, List, Any, Optional, Tuple, Union
 from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from tools._stack_symbol_utils import sanitize_stack_symbol
 try:
     from tree_sitter_languages import get_parser as _ts_get_parser
 except Exception:
@@ -142,7 +145,7 @@ class GraphEdge:
     """崩溃相关代码图中的边，描述节点之间的关系"""
     from_id: str
     to_id: str
-    type: str  # "calls_direct" | "use_shared_var"
+    type: str  # "calls_direct" | "calls_stack_order" | "calls_to_crash_site" | "use_shared_var"
     thread_id: Optional[str] = None
     relation: Optional[str] = None   # 如变量读写关系等
 
@@ -194,22 +197,48 @@ def _normalize_code_roots_arg(code_root: Union[str, List[str], None]) -> List[st
 
 
 def _file_under_any_project_root(path: Path, code_roots_abs: List[str]) -> bool:
-    try:
-        rp = path.resolve()
-        for r in code_roots_abs:
-            try:
-                rp.relative_to(Path(r))
-                return True
-            except ValueError:
-                continue
-    except Exception:
+    """
+    判断 path 是否位于任一 code_root 下。
+
+    使用 abspath（不展开 code_root 内的符号链接）与 resolve 两种路径各判一次：
+    工程内常见 src/vi -> engine-vi/src/vi 等布局，若仅用 resolve() 会把已定位的源文件
+    误判为在 code_root 之外，导致整帧被过滤。
+    """
+    if not code_roots_abs:
         return False
+    path_variants: List[str] = []
+    for getter in (os.path.abspath, lambda p: str(Path(p).resolve())):
+        try:
+            path_variants.append(getter(str(path)))
+        except Exception:
+            continue
+    for p_str in path_variants:
+        for r in code_roots_abs:
+            for root_getter in (os.path.abspath, lambda x: str(Path(x).resolve())):
+                try:
+                    r_str = root_getter(str(r))
+                    if os.path.commonpath([p_str, r_str]) == r_str:
+                        return True
+                except (ValueError, OSError):
+                    continue
     return False
 
 
 class CodeContentProvider:
     """代码内容提供器 - 重构版本 V2"""
-    
+
+    _rg_available: Optional[bool] = None  # 类级缓存：ripgrep 是否可用
+
+    @classmethod
+    def _check_rg_available(cls) -> bool:
+        """检测 rg (ripgrep) 是否可用，仅首次调用时执行一次。"""
+        try:
+            subprocess.run(["rg", "--version"], check=False, capture_output=True, timeout=5)
+            return True
+        except (FileNotFoundError, OSError):
+            logger.info("ripgrep (rg) 未安装，调用者搜索将使用 Python 回退方式")
+            return False
+
     def __init__(self, exclude_dirs: Optional[List[str]] = None, 
                  include_subdirs: Optional[List[str]] = None,
                  code_index_service=None,
@@ -221,7 +250,11 @@ class CodeContentProvider:
                  max_sibling_member_functions: Optional[int] = None,
                  max_symbol_only_rescues: Optional[int] = None,
                  find_source_timeout_sec: Optional[float] = None,
-                 code_context_timeout_sec: Optional[float] = None):
+                 code_context_timeout_sec: Optional[float] = None,
+                 max_nearby_module_scan_files: Optional[int] = None,
+                 max_crash_caller_search_files: Optional[int] = None,
+                 seed_callsite_files: Optional[List[str]] = None,
+                 use_ctags_index: bool = False):
         """
         初始化代码内容提供器
         
@@ -235,15 +268,21 @@ class CodeContentProvider:
             min_key_read_related_functions: 共享变量相关函数截断时，关键读路径最少保留条数（默认 2，允许 0）
             max_sibling_member_functions: 同类「兄弟成员函数」最多纳入条数；默认 0（关闭，大库避免图膨胀），>0 时启用并截断
             max_symbol_only_rescues: add2line 缺失 file:line 时，按符号名兜底定位的最多尝试帧数，默认 5，允许 0（关闭）
-            find_source_timeout_sec: 单次 _find_source_file 总超时（秒）；None 表示 360
-            code_context_timeout_sec: 第三步整阶段 wall-clock 上限（秒）；None 表示 180；0 表示不限制
+            find_source_timeout_sec: 单次 _find_source_file 总超时（秒）；None 表示 600
+            code_context_timeout_sec: 第三步整阶段 wall-clock 上限（秒）；None 表示 360；0 表示不限制
+            max_nearby_module_scan_files: 堆栈帧邻近模块补扫时最多参与 tree-sitter/正则扫描的文件数，默认 300
+            max_crash_caller_search_files: 反向搜索「谁调用了崩溃函数」时最多扫描的文件数，默认 600
+            seed_callsite_files: 外部轻量召回得到的候选调用点文件列表；用于优先扫描补全直接调用者
+            use_ctags_index: 是否启用 ctags 函数索引加速。默认 False（使用 rg 直接搜索，避免首次 29s 构建开销）；设为 True 时首次运行会构建索引（较慢），后续运行通过缓存加速函数定义查找
         """
+        self.use_ctags_index = use_ctags_index
         self.supported_extensions = {
             '.c', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.hxx',
             '.java', '.kt', '.swift', '.m', '.mm', '.py', '.js', '.ts'
         }
         self.max_file_size = 1024 * 1024  # 1MB
-        self.max_code_length = 2000  # 代码片段长度限制
+        # 自动改码依赖完整函数体；默认不截断函数源码，避免向 LLM 暴露 omitted 占位片段。
+        self.max_code_length = 0
         # 静态「崩溃函数调用链」路径节点数（含崩溃函数）：至少 1（仅崩溃函数）；上限由 max_static_call_chain_depth 控制
         _depth = 5 if max_static_call_chain_depth is None else int(max_static_call_chain_depth)
         self.max_static_call_chain_nodes = max(1, min(_depth, 128))
@@ -272,7 +311,11 @@ class CodeContentProvider:
         
         self.exclude_dirs = set((exclude_dirs or []) + default_exclude_dirs)
         self.include_subdirs = set(include_subdirs) if include_subdirs else None
-        
+
+        # ripgrep 可用性检测（类级缓存，只检测一次）
+        if CodeContentProvider._rg_available is None:
+            CodeContentProvider._rg_available = self._check_rg_available()
+
         # 代码索引服务（可选）
         self.code_index_service = code_index_service
         
@@ -310,8 +353,8 @@ class CodeContentProvider:
         
         # 「addr2line 路径 → 本地源文件」查找预算（秒）。
         # 兼容原语义：该值仍是用户给定的核心超时参数；
-        # 新策略：在一次代码上下文生成过程中按“剩余预算”动态调整单次查找窗口。
-        _fs_to = 360.0 if find_source_timeout_sec is None else float(find_source_timeout_sec)
+        # 新策略：在一次代码上下文生成过程中按"剩余预算"动态调整单次查找窗口。
+        _fs_to = 600.0 if find_source_timeout_sec is None else float(find_source_timeout_sec)
         self.find_source_timeout_sec = max(1.0, min(_fs_to, 3600.0))
         self._find_source_deadline: Optional[float] = None
         self._find_source_cur_timeout_sec: float = self.find_source_timeout_sec
@@ -320,12 +363,27 @@ class CodeContentProvider:
         self._find_source_lookup_calls: int = 0
 
         # 第三步「代码上下文」整阶段 wall-clock（与 find_source 预算独立；到点必停并输出可序列化结果）
-        _cct = 180.0 if code_context_timeout_sec is None else float(code_context_timeout_sec)
+        _cct = 360.0 if code_context_timeout_sec is None else float(code_context_timeout_sec)
         if _cct <= 0:
             self.code_context_timeout_sec = 0.0
         else:
             self.code_context_timeout_sec = max(1.0, min(_cct, 7200.0))
         self._code_context_deadline: Optional[float] = None
+        _mnm = 300 if max_nearby_module_scan_files is None else int(max_nearby_module_scan_files)
+        self.max_nearby_module_scan_files = max(32, min(_mnm, 4000))
+        _mcs = 600 if max_crash_caller_search_files is None else int(max_crash_caller_search_files)
+        self.max_crash_caller_search_files = max(32, min(_mcs, 2000))
+        self.seed_callsite_files: List[str] = []
+        for fp in seed_callsite_files or []:
+            try:
+                ap = os.path.abspath(str(fp))
+            except Exception:
+                continue
+            if os.path.isfile(ap) and self._is_supported_file(ap):
+                self.seed_callsite_files.append(ap)
+        if self.seed_callsite_files:
+            # 去重保序，避免重复扫描
+            self.seed_callsite_files = list(dict.fromkeys(self.seed_callsite_files))
         
         # 线程安全相关关键词
         self.thread_keywords = {
@@ -344,13 +402,25 @@ class CodeContentProvider:
         self._file_mtime_cache: Dict[str, float] = {}  # 文件修改时间缓存
         self._cpp_candidate_files_cache: Dict[Tuple[str, str], List[str]] = {}
 
+        # ========== 全局文件内容缓存（Per-Run，减少重复磁盘 I/O）==========
+        self._file_content_cache: Dict[str, str] = {}
+        self._file_content_cache_bytes: int = 0
+        _FILE_CONTENT_CACHE_MAX_BYTES = 200 * 1024 * 1024  # 200MB
+        _FILE_CONTENT_CACHE_MAX_FILES = 500
+        self._FILE_CONTENT_CACHE_MAX_BYTES = _FILE_CONTENT_CACHE_MAX_BYTES
+        self._FILE_CONTENT_CACHE_MAX_FILES = _FILE_CONTENT_CACHE_MAX_FILES
+
         # ========== 调用链搜索缓存（跨进程/跨次分析复用）==========
         # 缓存格式: { (code_root, function_name): [CallChainFunction, ...] }
         self._call_chain_cache: Dict[Tuple[str, str], List[Any]] = {}
         # 缓存文件路径（可选持久化到磁盘）
         self._cache_file_path: Optional[Path] = None
-        # 类型信息缓存：按“源文件路径”缓存可见类信息（成员类型 + 继承关系）
+        # 类型信息缓存：按"源文件路径"缓存可见类信息（成员类型 + 继承关系）
         self._class_info_by_source_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._ctags_index = None
+
+        # ========== nearby module 结果缓存（避免多阶段重复 os.walk）==========
+        self._nearby_module_files_cache: Dict[tuple, List[str]] = {}
 
         # ========== 并行扫描配置 ==========
         # 并行 worker 数量，None 表示自动（CPU核心数），0 表示禁用并行
@@ -365,6 +435,30 @@ class CodeContentProvider:
         self._truncation_head_ratio = 0.3
         # 截断时保留的尾部比例
         self._truncation_tail_ratio = 0.4
+
+        # ========== CodeLocatorService（统一代码定位服务）==========
+        from services.code_locator import CodeLocatorService, LocatorConfig
+        _locator_config = LocatorConfig(
+            supported_extensions=frozenset(self.supported_extensions),
+            exclude_dirs=frozenset(self.exclude_dirs),
+            include_subdirs=frozenset(self.include_subdirs) if self.include_subdirs else None,
+            max_file_size=self.max_file_size,
+            max_code_length=self.max_code_length,
+            find_source_timeout_sec=self.find_source_timeout_sec,
+            code_context_timeout_sec=self.code_context_timeout_sec,
+            max_direct_callers=self.max_direct_callers,
+            max_shared_var_related_functions=self.max_shared_var_related_functions,
+            max_nearby_module_scan_files=self.max_nearby_module_scan_files,
+            max_crash_caller_search_files=self.max_crash_caller_search_files,
+            max_workers=self.max_workers,
+            parallel_threshold=self.parallel_threshold,
+            use_ctags_index=self.use_ctags_index,
+        )
+        self._locator = CodeLocatorService(
+            _locator_config,
+            code_index_service=self.code_index_service,
+            ts_parser=self._ts_parser,
+        )
 
     def _truncate_snippet(self, snippet: List[str], max_length: int = None) -> List[str]:
         """
@@ -551,7 +645,108 @@ class CodeContentProvider:
                     results[file_path] = {"functions": [], "success": False, "error": str(e)}
 
         return results
-    
+
+    # ========== ripgrep 加速辅助方法 ==========
+
+    def _rg_grep_lines(
+        self,
+        pattern: str,
+        search_paths: List[str],
+        max_matches: int = 5000,
+    ) -> Optional[List[Tuple[str, int, str]]]:
+        """用 rg 快速搜索匹配行。
+
+        Returns:
+            [(file_path, line_number, line_text), ...] 或 None（rg 不可用/调用失败时）。
+            调用方收到 None 应 fallback 到 Python 扫描。
+        """
+        if not CodeContentProvider._rg_available:
+            return None
+        if not search_paths:
+            return None
+
+        cmd = ["rg", "-n", "--no-heading", "--color", "never"]
+        # 扩展名过滤
+        ext_list = sorted(ext.lstrip(".") for ext in self.supported_extensions)
+        cmd += ["--glob", "*.{" + ",".join(ext_list) + "}"]
+        # 排除目录
+        for d in sorted(self.exclude_dirs):
+            cmd += ["--glob", f"!{d}/"]
+        # 文件大小限制
+        cmd += ["--max-filesize", str(self.max_file_size)]
+        # 搜索模式
+        cmd.append(pattern)
+        # 搜索路径
+        cmd += search_paths
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+        except subprocess.TimeoutExpired:
+            logger.debug("rg 搜索超时(60s)")
+            return None
+        except Exception:
+            CodeContentProvider._rg_available = False
+            return None
+
+        if proc.returncode not in (0, 1):
+            logger.debug("rg 返回异常 code=%s", proc.returncode)
+            return None
+
+        results: List[Tuple[str, int, str]] = []
+        for raw_line in (proc.stdout or "").splitlines():
+            if len(results) >= max_matches:
+                break
+            m = re.match(r"^(.*?):(\d+):(.*)$", raw_line)
+            if m:
+                results.append((m.group(1), int(m.group(2)), m.group(3)))
+        return results
+
+    def _rg_grep_files(
+        self,
+        pattern: str,
+        search_paths: List[str],
+        max_files: int = 5000,
+    ) -> Optional[List[str]]:
+        """用 rg --files-with-matches 快速获取包含匹配的文件列表。
+
+        Returns:
+            [file_path, ...] 或 None（rg 不可用时）。
+        """
+        if not CodeContentProvider._rg_available:
+            return None
+        if not search_paths:
+            return None
+
+        cmd = ["rg", "--files-with-matches", "--color", "never"]
+        ext_list = sorted(ext.lstrip(".") for ext in self.supported_extensions)
+        cmd += ["--glob", "*.{" + ",".join(ext_list) + "}"]
+        for d in sorted(self.exclude_dirs):
+            cmd += ["--glob", f"!{d}/"]
+        cmd += ["--max-filesize", str(self.max_file_size)]
+        cmd.append(pattern)
+        cmd += search_paths
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+        except subprocess.TimeoutExpired:
+            logger.debug("rg --files-with-matches 超时(60s)")
+            return None
+        except Exception:
+            CodeContentProvider._rg_available = False
+            return None
+
+        if proc.returncode not in (0, 1):
+            return None
+
+        files: List[str] = []
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            if line:
+                files.append(line)
+            if len(files) >= max_files:
+                break
+        return files
+
     def _is_supported_file(self, file_path: str) -> bool:
         """检查是否为支持的文件类型"""
         return Path(file_path).suffix.lower() in self.supported_extensions
@@ -562,6 +757,30 @@ class CodeContentProvider:
             return os.path.isfile(file_path) and os.access(file_path, os.R_OK)
         except Exception:
             return False
+
+    def _read_file_cached(self, file_path: str) -> Optional[str]:
+        """实例级文件内容缓存，减少同一分析轮次内的重复磁盘 I/O。
+
+        返回文件文本内容，若文件不可读则返回 None。
+        缓存受 _FILE_CONTENT_CACHE_MAX_BYTES / _FILE_CONTENT_CACHE_MAX_FILES 限制，
+        超限后仍正常读取但不缓存新条目。
+        """
+        cached = self._file_content_cache.get(file_path)
+        if cached is not None:
+            return cached
+        try:
+            if not os.path.isfile(file_path):
+                return None
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            content_size = len(content)
+            if (self._file_content_cache_bytes + content_size <= self._FILE_CONTENT_CACHE_MAX_BYTES
+                    and len(self._file_content_cache) < self._FILE_CONTENT_CACHE_MAX_FILES):
+                self._file_content_cache[file_path] = content
+                self._file_content_cache_bytes += content_size
+            return content
+        except Exception:
+            return None
     
     def _should_skip_file(self, file_path: str, root: str) -> bool:
         """
@@ -631,7 +850,7 @@ class CodeContentProvider:
             "/Users/",
         )
 
-        # 若路径落在任一工程根下，则不是“外部路径”
+        # 若路径落在任一工程根下，则不是"外部路径"
         try:
             resolved_abs = os.path.abspath(resolved_file)
             for cr in code_roots_abs or []:
@@ -986,7 +1205,8 @@ class CodeContentProvider:
         except Exception:
             nm = None
         if nm is not None:
-            return source_text[nm.start_byte:nm.end_byte].strip()
+            source_bytes = source_text.encode("utf-8", errors="ignore")
+            return source_bytes[nm.start_byte:nm.end_byte].decode("utf-8", errors="replace").strip()
         return None
 
     def _enclosing_struct_name_for_field_line(
@@ -1029,53 +1249,14 @@ class CodeContentProvider:
             return True
         return n in ("API", "DLL")
     
-    def _find_source_budget_remaining_sec(self) -> float:
-        if self._find_source_budget_deadline is None:
-            return self.find_source_timeout_sec
-        return max(0.0, self._find_source_budget_deadline - time.monotonic())
-
-    def _compute_dynamic_find_source_timeout_sec(self) -> float:
-        base = self.find_source_timeout_sec
-        remaining = self._find_source_budget_remaining_sec()
-        calls = self._find_source_lookup_calls
-        if remaining <= 0.0:
-            return 0.0
-        # 预算宽松：前几次允许更充分搜索；预算紧张：快速收敛
-        if remaining >= base * 0.8 and calls <= 2:
-            return min(base, remaining)
-        if remaining <= base * 0.35:
-            return min(max(1.0, remaining * 0.5), remaining)
-        return min(max(1.0, remaining * 0.75), base, remaining)
-
-    def _find_source_deadline_begin(self) -> None:
-        if self._find_source_budget_deadline is None:
-            self._find_source_budget_total_sec = self.find_source_timeout_sec
-            self._find_source_budget_deadline = time.monotonic() + self._find_source_budget_total_sec
-            logger.info(
-                "源文件定位动态预算已启用：总预算 %.1fs（参数 --find-source-timeout-sec）",
-                self._find_source_budget_total_sec,
-            )
-        self._find_source_lookup_calls += 1
-        eff = self._compute_dynamic_find_source_timeout_sec()
-        self._find_source_cur_timeout_sec = eff
-        if eff <= 0.0:
-            raise _FindSourceFileTimeout()
-        self._find_source_deadline = time.monotonic() + eff
-
-    def _find_source_deadline_clear(self) -> None:
-        self._find_source_deadline = None
-
-    def _find_source_check_time(self) -> None:
-        if self._find_source_deadline is None:
-            return
-        if time.monotonic() >= self._find_source_deadline:
-            raise _FindSourceFileTimeout()
-
     def _session_reset_timeouts_for_code_content_phase(self) -> None:
         """每次进入 code_content_provider 时重置：避免跨次分析泄漏 find_source 预算状态。"""
         self._find_source_budget_deadline = None
         self._find_source_lookup_calls = 0
         self._code_context_deadline = None
+        # 同步重置 CodeLocatorService 的运行时状态
+        if hasattr(self, '_locator') and self._locator is not None:
+            self._locator._ctx.session_reset()
 
     def _code_context_phase_start(self) -> None:
         """第三步整阶段 wall-clock 起点（与单次源文件查找预算独立）。"""
@@ -1100,454 +1281,10 @@ class CodeContentProvider:
 
     def _find_source_file(self, resolved_file: str, code_roots: List[str]) -> Optional[str]:
         """
-        在代码根目录（可多根，顺序有意义）中查找源文件
-        
-        查找策略（按优先级）：
-        1. 直接命中策略：addr2line 返回的路径在 code-root 下可直接访问
-        2. 工程根目录名锚点：addr2line 路径中含与 code-root 同名的目录段时，取其后的相对路径拼到 code-root（应对 CI/构建机绝对路径）
-        3. 尾部路径拼接策略：提取尾部 N 级目录 + 文件名，逐级尝试拼接
-        4. 父目录 + 文件名联合匹配：查找 */<parent_dir>/<filename>
-        5. CodeIndexService 查找（索引已就绪时）
-        6. Fallback 搜索（索引未就绪时）
-        7. 受限 Fallback（无索引或索引未命中时，在常见源码子目录下浅层搜索；不做整棵 code-root 的 os.walk）
-        
-        采用动态预算超时：
-        - CLI --find-source-timeout-sec 作为本阶段总预算；
-        - 每次 _find_source_file 调用按剩余预算动态分配单次窗口；
-        - 当预算逼近耗尽时，单次窗口自动缩短以快速收敛。
+        在代码根目录（可多根，顺序有意义）中查找源文件。
+        委托给 CodeLocatorService.file_locator.find_source_file()。
         """
-        if not code_roots:
-            return None
-        code_roots_abs = _normalize_code_roots_arg(code_roots)
-        # 工具链 / 系统头 / NDK sysroot 等：不参与工程内解析，避免 glob/浅层遍历在大仓库上耗时
-        if resolved_file and self._is_external_path(resolved_file, code_roots_abs):
-            logger.debug("跳过外部路径查找（工具链/系统库等）: %s", resolved_file)
-            return None
-
-        logger.info(f"查找源文件: {resolved_file} 在目录: {code_roots}")
-        
-        filename = os.path.basename(resolved_file)
-        self._find_source_deadline_begin()
-        try:
-            for code_root_abs in code_roots_abs:
-                self._find_source_check_time()
-                # ========== 策略1: 直接命中策略（最高优先级）==========
-                result = self._try_direct_hit(resolved_file, code_root_abs)
-                if result:
-                    return result
-                
-                # ========== 策略2: 工程根目录名锚点（addr2line 构建路径 → 本地 code-root）==========
-                result = self._try_suffix_after_code_root_dirname(resolved_file, code_root_abs)
-                if result:
-                    return result
-                
-                # ========== 策略3: 尾部路径拼接策略 ==========
-                result = self._try_tail_path_concatenation(resolved_file, code_root_abs)
-                if result:
-                    return result
-                
-                # ========== 策略4: 父目录 + 文件名联合匹配 ==========
-                result = self._try_parent_dir_filename_match(resolved_file, code_root_abs)
-                if result:
-                    return result
-            
-            # ========== 策略5: CodeIndexService 查找 ==========
-            self._find_source_check_time()
-            if self.code_index_service and self.code_index_service.is_ready():
-                candidates = self.code_index_service.lookup(filename)
-                if candidates:
-                    # 如果只有一个候选，直接返回
-                    if len(candidates) == 1:
-                        if self._is_file_readable(candidates[0]):
-                            logger.info(f"找到源文件（索引查找，唯一匹配）: {candidates[0]}")
-                            return candidates[0]
-                    else:
-                        # 多个候选，尝试根据路径相似度选择最佳匹配
-                        best_match = self._select_best_candidate(candidates, resolved_file)
-                        if best_match:
-                            logger.info(f"找到源文件（索引查找，多候选选择）: {best_match}")
-                            return best_match
-                        # 如果无法选择，记录警告但返回第一个（保持向后兼容）
-                        logger.warning(f"索引中找到 {len(candidates)} 个候选文件，返回第一个: {candidates[0]}")
-                        return candidates[0] if self._is_file_readable(candidates[0]) else None
-                logger.info(f"索引中未找到文件: {filename}")
-            
-            # ========== 策略6: Fallback 搜索（索引未就绪时）==========
-            self._find_source_check_time()
-            if self.code_index_service and not self.code_index_service.is_ready():
-                logger.info(f"索引未就绪，使用受限搜索: {filename}")
-                for cr in code_roots_abs:
-                    self._find_source_check_time()
-                    r = self._fallback_search(resolved_file, cr)
-                    if r:
-                        return r
-                return None
-            
-            # ========== 策略7: 受限 Fallback（无索引服务，或索引已就绪但未命中文件名）==========
-            # 替代原「整棵 code-root os.walk」；避免大仓库超时
-            self._find_source_check_time()
-            if not self.code_index_service or self.code_index_service.is_ready():
-                tag = "无索引服务" if not self.code_index_service else "索引未命中后"
-                logger.info(f"{tag}，使用受限搜索: {filename}")
-                for cr in code_roots_abs:
-                    self._find_source_check_time()
-                    r = self._fallback_search(resolved_file, cr)
-                    if r:
-                        return r
-            
-            logger.info(
-                "未找到源文件（已跳过整仓库递归扫描以避免大仓库超时）: %s",
-                resolved_file,
-            )
-            return None
-        except _FindSourceFileTimeout:
-            logger.warning(
-                "查找源文件超时（本次窗口 %.1fs，剩余预算 %.1fs），中止: %s",
-                self._find_source_cur_timeout_sec,
-                self._find_source_budget_remaining_sec(),
-                resolved_file,
-            )
-            return None
-        finally:
-            self._find_source_deadline_clear()
-    
-    def _try_direct_hit(self, resolved_file: str, code_root_abs: str) -> Optional[str]:
-        """
-        策略1: 直接命中策略（最高优先级）
-        若 addr2line 返回的路径在 code-root 下可直接访问，则直接使用
-        """
-        self._find_source_check_time()
-        # 如果是绝对路径，首先检查它是否直接存在且可读
-        if os.path.isabs(resolved_file):
-            if self._is_file_readable(resolved_file):
-                # 检查是否在 code_root 下
-                try:
-                    resolved_file_abs = os.path.abspath(resolved_file)
-                    common_path = os.path.commonpath([code_root_abs, resolved_file_abs])
-                    if common_path == code_root_abs:
-                        logger.info(f"找到源文件（直接命中）: {resolved_file}")
-                        return resolved_file
-                except (ValueError, OSError):
-                    pass
-        
-        # 尝试从 code_root 构建相对路径
-        try:
-            if os.path.isabs(resolved_file):
-                resolved_file_abs = os.path.abspath(resolved_file)
-                try:
-                    relative_path = os.path.relpath(resolved_file_abs, code_root_abs)
-                    if not relative_path.startswith('..'):
-                        potential_path = os.path.join(code_root_abs, relative_path)
-                        if self._is_file_readable(potential_path):
-                            logger.info(f"找到源文件（相对路径构建）: {potential_path}")
-                            return potential_path
-                except ValueError:
-                    pass
-        except (OSError, ValueError):
-            pass
-        
-        # 如果resolved_file是相对路径或文件名，先尝试直接路径
-        potential_paths = [
-            os.path.join(code_root_abs, resolved_file),
-            os.path.join(code_root_abs, os.path.basename(resolved_file))
-        ]
-        
-        for path in potential_paths:
-            if self._is_file_readable(path):
-                logger.info(f"找到源文件（直接路径）: {path}")
-                return path
-        
-        return None
-    
-    def _try_suffix_after_code_root_dirname(self, resolved_file: str, code_root_abs: str) -> Optional[str]:
-        """
-        将 addr2line 在 CI/构建机上记录的绝对路径映射到本地 code-root。
-        若路径中出现与 code-root 最后一级目录名相同的目录段（如 .../engine-dev/src/foo.cpp），
-        则取该段之后的相对路径拼到 code-root 下。存在多处同名段时从右向左依次尝试。
-        """
-        if not resolved_file or not code_root_abs:
-            return None
-        basename = os.path.basename(os.path.normpath(code_root_abs))
-        if not basename:
-            return None
-        norm = resolved_file.replace("\\", "/")
-        marker = f"/{basename}/"
-        positions: List[int] = []
-        pos = 0
-        while True:
-            i = norm.find(marker, pos)
-            if i == -1:
-                break
-            positions.append(i)
-            pos = i + len(marker)
-        for start in reversed(positions):
-            self._find_source_check_time()
-            rel = norm[start + len(marker) :]
-            if not rel:
-                continue
-            rel = rel.lstrip("/")
-            if any(p == ".." for p in rel.split("/")):
-                continue
-            potential = os.path.normpath(os.path.join(code_root_abs, rel))
-            try:
-                root_p = Path(code_root_abs).resolve()
-                cand_p = Path(potential).resolve()
-                cand_p.relative_to(root_p)
-            except ValueError:
-                continue
-            except (OSError, RuntimeError):
-                continue
-            if self._is_file_readable(potential):
-                logger.info(f"找到源文件（工程目录名锚点）: {potential}")
-                return potential
-        return None
-    
-    def _try_tail_path_concatenation(self, resolved_file: str, code_root_abs: str) -> Optional[str]:
-        """
-        策略2: 尾部路径拼接策略（强烈推荐）
-        从 addr2line 返回路径中提取尾部的 N 级目录 + 文件名
-        逐级尝试将该尾部路径拼接到 code-root 下
-        优先从较短的尾部路径开始（如 d/xxx.cpp → c/d/xxx.cpp）
-        """
-        # 标准化路径分隔符
-        normalized_path = resolved_file.replace('\\', '/')
-        
-        # 移除开头的绝对路径部分，只保留相对路径结构
-        # 例如：/build/path/to/src/a/b/file.cpp -> src/a/b/file.cpp 或 a/b/file.cpp
-        path_parts = [p for p in normalized_path.split('/') if p and p != '.']
-        
-        if len(path_parts) < 2:  # 至少需要文件名 + 1级目录
-            return None
-        
-        filename = path_parts[-1]
-        
-        # 从尾部开始，逐级尝试拼接（1级、2级、3级...）
-        # 例如：file.cpp -> dir1/file.cpp -> dir2/dir1/file.cpp
-        # CI 路径前缀很长，相对工程根目录常超过 5 级，故提高上限；仍仅做 O(级数) 次 stat，不扫全仓库
-        max_levels = min(32, len(path_parts) - 1)
-        
-        for level in range(1, max_levels + 1):
-            self._find_source_check_time()
-            # 提取尾部 N 级目录 + 文件名
-            tail_parts = path_parts[-level-1:]
-            tail_path = '/'.join(tail_parts)
-            
-            # 尝试在 code_root 下查找
-            potential_path = os.path.join(code_root_abs, tail_path)
-            if self._is_file_readable(potential_path):
-                logger.info(f"找到源文件（尾部路径拼接，{level}级）: {potential_path}")
-                return potential_path
-            
-            # 也尝试使用 os.path.join（处理路径分隔符）
-            potential_path = os.path.join(code_root_abs, *tail_parts)
-            if self._is_file_readable(potential_path):
-                logger.info(f"找到源文件（尾部路径拼接，{level}级）: {potential_path}")
-                return potential_path
-        
-        return None
-    
-    def _try_parent_dir_filename_match(self, resolved_file: str, code_root_abs: str) -> Optional[str]:
-        """
-        策略3: 父目录 + 文件名联合匹配
-        若完整路径结构差异较大，尝试在 code-root 下查找 */<parent_dir>/<filename>
-        若仅命中一个结果，可直接使用
-        """
-        normalized_path = resolved_file.replace('\\', '/')
-        path_parts = [p for p in normalized_path.split('/') if p and p != '.']
-        
-        if len(path_parts) < 2:
-            return None
-        
-        filename = path_parts[-1]
-        parent_dir = path_parts[-2]  # 父目录名
-        
-        # 在 code_root 下查找 */<parent_dir>/<filename>
-        matches = []
-        
-        # 使用 glob 模式查找（限制搜索深度，避免过慢）
-        try:
-            from pathlib import Path
-            code_root_path = Path(code_root_abs)
-            
-            # 限制搜索深度为3层，避免在大代码库中过慢
-            _glob_i = 0
-            for depth in range(1, 4):
-                self._find_source_check_time()
-                pattern = f"*/{parent_dir}/{filename}"
-                if depth > 1:
-                    pattern = "*/" * (depth - 1) + pattern
-                
-                for match_path in code_root_path.glob(pattern):
-                    _glob_i += 1
-                    if _glob_i % 400 == 0:
-                        self._find_source_check_time()
-                    if match_path.is_file() and self._is_file_readable(str(match_path)):
-                        matches.append(str(match_path))
-                
-                # 如果找到匹配，停止搜索更深层
-                if matches:
-                    break
-        except Exception as e:
-            logger.debug(f"父目录+文件名匹配搜索失败: {e}")
-        
-        if len(matches) == 1:
-            logger.info(f"找到源文件（父目录+文件名匹配，唯一）: {matches[0]}")
-            return matches[0]
-        elif len(matches) > 1:
-            # 多个匹配，尝试选择最佳（优先选择路径较短的）
-            matches.sort(key=len)
-            logger.info(f"找到源文件（父目录+文件名匹配，多候选，选择最短）: {matches[0]}")
-            return matches[0]
-        
-        return None
-    
-    def _select_best_candidate(self, candidates: List[str], resolved_file: str) -> Optional[str]:
-        """
-        从多个候选文件中选择最佳匹配
-        优先考虑路径相似度
-        """
-        if not candidates:
-            return None
-        
-        if len(candidates) == 1:
-            return candidates[0] if self._is_file_readable(candidates[0]) else None
-        
-        # 提取 resolved_file 的路径特征
-        normalized_resolved = resolved_file.replace('\\', '/')
-        resolved_parts = [p for p in normalized_resolved.split('/') if p]
-        
-        best_match = None
-        best_score = -1
-        
-        for candidate in candidates:
-            self._find_source_check_time()
-            if not self._is_file_readable(candidate):
-                continue
-            
-            score = 0
-            normalized_candidate = candidate.replace('\\', '/')
-            candidate_parts = [p for p in normalized_candidate.split('/') if p]
-            
-            # 路径长度相似度（较短的路径优先）
-            length_diff = abs(len(candidate_parts) - len(resolved_parts))
-            score += max(0, 10 - length_diff * 2)
-            
-            # 目录名匹配度
-            # 检查 resolved_file 中的目录名是否出现在 candidate 中
-            resolved_dirs = set(resolved_parts[:-1])  # 排除文件名
-            candidate_dirs = set(candidate_parts[:-1])
-            common_dirs = resolved_dirs & candidate_dirs
-            score += len(common_dirs) * 5
-            
-            # 路径尾部相似度（尾部匹配更重要）
-            min_len = min(len(resolved_parts), len(candidate_parts))
-            for i in range(1, min_len + 1):
-                if resolved_parts[-i] == candidate_parts[-i]:
-                    score += i * 3  # 越靠近尾部，权重越高
-                else:
-                    break
-            
-            if score > best_score:
-                best_score = score
-                best_match = candidate
-        
-        return best_match
-    
-    def _full_recursive_search(self, resolved_file: str, code_root: str) -> Optional[str]:
-        """
-        完整递归搜索（大仓库上极慢；_find_source_file 已不再调用，保留供少数直接调用或测试）。
-        """
-        filename = os.path.basename(resolved_file)
-        name_without_ext = os.path.splitext(filename)[0]
-        file_ext = os.path.splitext(filename)[1]
-        
-        best_match = None
-        best_score = 0
-        
-        for root, dirs, files in os.walk(code_root):
-            # 过滤排除的目录
-            dirs[:] = [d for d in dirs if d not in self.exclude_dirs]
-            
-            for file in files:
-                file_path = os.path.join(root, file)
-                if not self._is_file_readable(file_path):
-                    continue
-                
-                # 计算匹配分数
-                score = 0
-                
-                # 完全匹配文件名
-                if file == filename:
-                    score = 100
-                # 匹配文件名（无扩展名）
-                elif os.path.splitext(file)[0] == name_without_ext:
-                    score = 80
-                # 部分匹配
-                elif name_without_ext in file:
-                    score = 60
-                # 扩展名匹配
-                elif file_ext and file.endswith(file_ext):
-                    score = 40
-                
-                # 特殊处理：mylib.cpp 和 my_lib.cpp 的匹配
-                if filename == "mylib.cpp" and file == "my_lib.cpp":
-                    score = 95
-                elif filename == "my_lib.cpp" and file == "mylib.cpp":
-                    score = 95
-                
-                # 路径相似度加分
-                if resolved_file in file_path or any(part in file_path for part in resolved_file.split('/')):
-                    score += 20
-                
-                if score > best_score:
-                    best_score = score
-                    best_match = file_path
-        
-        if best_match and best_score >= 40:  # 最低匹配阈值
-            logger.info(f"找到源文件（智能匹配，分数: {best_score}）: {best_match}")
-            return best_match
-        
-        logger.warning(f"未找到源文件: {resolved_file}")
-        return None
-    
-    def _fallback_search(self, resolved_file: str, code_root: str) -> Optional[str]:
-        """
-        Fallback 搜索（当索引未就绪时使用）
-        只在常见的源代码目录中搜索，避免全目录扫描
-        """
-        filename = os.path.basename(resolved_file)
-        common_source_dirs = ['src', 'source', 'lib', 'common', 'include', 'inc']
-        
-        # 先尝试在根目录
-        potential_path = os.path.join(code_root, filename)
-        if self._is_file_readable(potential_path):
-            logger.info(f"找到源文件（fallback根目录）: {potential_path}")
-            return potential_path
-        
-        # 在常见源代码目录中搜索
-        _walk_i = 0
-        for source_dir in common_source_dirs:
-            self._find_source_check_time()
-            source_path = os.path.join(code_root, source_dir)
-            if os.path.isdir(source_path):
-                for root, dirs, files in os.walk(source_path):
-                    _walk_i += 1
-                    if _walk_i % 200 == 0:
-                        self._find_source_check_time()
-                    # 限制搜索深度（最多2层）
-                    depth = root[len(source_path):].count(os.sep)
-                    if depth > 2:
-                        dirs[:] = []  # 不再深入
-                        continue
-                    
-                    if filename in files:
-                        file_path = os.path.join(root, filename)
-                        if self._is_file_readable(file_path):
-                            logger.info(f"找到源文件（fallback受限搜索）: {file_path}")
-                            return file_path
-        
-        logger.debug(f"Fallback搜索未找到文件: {resolved_file}")
-        return None
+        return self._locator.find_source_file(resolved_file, code_roots)
 
     def _ctor_or_dtor_class_name_from_resolved(self, resolved_function: str) -> Optional[str]:
         """
@@ -1617,6 +1354,57 @@ class CodeContentProvider:
             return None
         return snippet, struct_start + 1, struct_end + 1
 
+    def _refine_function_snippet_bounds(
+        self,
+        file_path: Optional[str],
+        snippet: Optional[List[str]],
+        signature: Optional[str],
+        start_line: Optional[int],
+        end_line: Optional[int],
+    ) -> Tuple[Optional[List[str]], Optional[int], Optional[int]]:
+        """修正误把 NAMESPACE 宏或相邻函数包进 snippet 时的起止行与片段内容。"""
+        if not file_path or not snippet:
+            return snippet, start_line, end_line
+        fn = self._extract_function_name_from_resolved(signature or "")
+        if not fn or not self._snippet_contains_target_signature(snippet, fn):
+            return snippet, start_line, end_line
+
+        def _is_namespace_macro(line: str) -> bool:
+            s = str(line or "").strip()
+            return bool(re.match(r"^[A-Z][A-Z0-9_]*_(BEGIN|END)\b", s))
+
+        head = next((ln for ln in snippet if str(ln or "").strip()), "")
+        flines = self._read_file_lines_cached(file_path, {}) or []
+        if start_line and 0 < start_line <= len(flines):
+            file_head = flines[start_line - 1].strip()
+            if (
+                not _is_namespace_macro(head)
+                and file_head == head.strip()
+                and end_line
+                and end_line >= start_line
+            ):
+                return snippet, start_line, end_line
+        if head and not _is_namespace_macro(head) and start_line and end_line:
+            return snippet, start_line, end_line
+
+        code_roots: List[str] = list(getattr(self, "current_code_roots", None) or [])
+        if not code_roots and getattr(self, "current_code_root", None):
+            code_roots = [str(getattr(self, "current_code_root"))]
+        def_line = int(start_line or 0)
+        if def_line and flines and 0 < def_line <= len(flines) and _is_namespace_macro(flines[def_line - 1]):
+            idx = self._find_function_definition_line_by_name(flines, fn, def_line - 1)
+            if idx is not None:
+                def_line = idx + 1
+        if def_line <= 0 and code_roots and signature:
+            loc = self._find_cpp_qualified_definition_location(signature, code_roots)
+            if loc:
+                def_line = int(loc[1])
+        if def_line > 0 and signature and code_roots:
+            cf = self._extract_crash_function(signature, file_path, def_line, code_roots)
+            if cf and cf.snippet and cf.snippet_start_line and cf.snippet_end_line:
+                return cf.snippet, cf.snippet_start_line, cf.snippet_end_line
+        return snippet, start_line, end_line
+
     def _locate_snippet_in_file(
         self,
         lines: List[str],
@@ -1676,6 +1464,26 @@ class CodeContentProvider:
         b = min(n, L0 + half_window + 1)
         return [all_lines[i].rstrip() for i in range(a, b)], a + 1, b
 
+    def _snippet_contains_target_signature(
+        self,
+        snippet: List[str],
+        function_name: str,
+    ) -> bool:
+        """判断片段中是否包含目标函数定义签名（而非仅函数调用）。"""
+        if not snippet or not function_name:
+            return False
+        fn = str(function_name).split("::")[-1].strip()
+        if not fn:
+            return False
+        sig_pat = re.compile(rf"(?:\b\w+\s*::\s*)?\b~?{re.escape(fn)}\s*\(")
+        for line in snippet[:12]:
+            s = (line or "").strip()
+            if not s:
+                continue
+            if sig_pat.search(s) and self._locator.symbol_locator.is_function_definition_line(s):
+                return True
+        return False
+
     def _effective_crash_signature(self, function_signature: str, resolved_function: str) -> str:
         """
         合并「源码扫描得到的签名」与 addr2line 的 demangled 符号。
@@ -1695,7 +1503,7 @@ class CodeContentProvider:
         s = (sig or "").strip()
         if not s:
             return ""
-        # 仅保留第一个 '{' 之前内容；若带 '{' 则补一个 '{' 便于表达“函数定义”。
+        # 仅保留第一个 '{' 之前内容；若带 '{' 则补一个 '{' 便于表达"函数定义"。
         if "{" in s:
             s = s.split("{", 1)[0].rstrip() + " {"
         # 压缩多空格
@@ -1723,7 +1531,7 @@ class CodeContentProvider:
         
         try:
             with open(source_file, 'r', encoding='utf-8', errors='ignore') as f:
-                lines = f.readlines()
+                lines = [ln.rstrip("\n\r") for ln in f.readlines()]
 
             # 提取函数名和签名
             function_name = self._extract_function_name_from_resolved(resolved_function)
@@ -1838,6 +1646,20 @@ class CodeContentProvider:
                         fallback_def_index,
                         target_function_name=function_name,
                     )
+                # 兜底1.5：若同文件按行回溯仍失败，尝试全局函数定义定位再提取
+                if not full_function and function_name:
+                    loc = self._find_function_definition_location(function_name, code_roots)
+                    if loc:
+                        _, global_line = loc
+                        if global_line > 0:
+                            logger.info(
+                                f"按全局函数定义定位兜底命中: {function_name} (line={global_line})"
+                            )
+                            full_function = self._extract_full_function_code(
+                                lines,
+                                global_line - 1,
+                                target_function_name=function_name,
+                            )
 
             if not full_function:
                 # 兜底2：无法提取完整函数时，返回行窗口片段而不是直接失败
@@ -1884,10 +1706,45 @@ class CodeContentProvider:
                     display_line_no = picked_num
             
             # 构建函数代码片段，并与 addr2line 行对齐（避免误扩到其它函数）
-            raw_lines = [line.rstrip() for line in full_function.split("\n")]
-            function_snippet, s1, e1 = self._ensure_snippet_covers_anchor_line(
-                lines, resolved_line, raw_lines
+            span = self._line_span_for_extracted_function_text(
+                lines, full_function, resolved_line
             )
+            if span:
+                s1, e1 = span
+                function_snippet = [lines[i - 1].rstrip() for i in range(s1, e1 + 1)]
+            else:
+                raw_lines = [ln for ln in full_function.splitlines()]
+                while raw_lines and not raw_lines[-1].strip():
+                    raw_lines.pop()
+                loc = self._locate_snippet_in_file(lines, raw_lines, resolved_line)
+                if loc:
+                    s1, e1 = loc
+                    function_snippet = raw_lines
+                else:
+                    function_snippet, s1, e1 = self._ensure_snippet_covers_anchor_line(
+                        lines, resolved_line, raw_lines
+                    )
+            # 若片段未包含目标函数定义（常见于窗口降级），按函数名再次强制回提。
+            if not self._snippet_contains_target_signature(function_snippet, function_name):
+                fallback_def_index = self._find_function_definition_line_by_name(
+                    lines, function_name, resolved_line - 1
+                )
+                if fallback_def_index is not None:
+                    force_full = self._extract_full_function_code(
+                        lines,
+                        fallback_def_index,
+                        target_function_name=function_name,
+                    )
+                    if force_full:
+                        forced_lines = [ln for ln in force_full.splitlines()]
+                        while forced_lines and not forced_lines[-1].strip():
+                            forced_lines.pop()
+                        loc = self._locate_snippet_in_file(lines, forced_lines, resolved_line)
+                        if loc:
+                            s1, e1 = loc
+                        else:
+                            s1, e1 = fallback_def_index + 1, fallback_def_index + len(forced_lines)
+                        function_snippet = forced_lines
 
             # 应用代码片段截断（根据 max_code_length）
             if self.max_code_length > 0:
@@ -1998,7 +1855,7 @@ class CodeContentProvider:
         #  - std::__ndk1::shared_ptr<T>::shared_ptr[abi:ne180000](...)
         #  - _baidu_framework::tagHouseDrawObjKey::~tagHouseDrawObjKey()
         #  - ParseRGCOverlay(...)
-        #  中提取 “函数名 token”（Handle/shared_ptr/~tagHouseDrawObjKey/ParseRGCOverlay）
+        #  中提取 "函数名 token"（Handle/shared_ptr/~tagHouseDrawObjKey/ParseRGCOverlay）
         #
         # 注意：resolved_function 里模板参数也包含 '::'，不能用 split('::')[-1]
         m = re.search(
@@ -2089,31 +1946,24 @@ class CodeContentProvider:
 
     @staticmethod
     def _is_cpp_native_symbol(resolved_function: str) -> bool:
-        """
-        判定是否为应参与 native C++ 上下文提取的符号。
-        兼容策略：
-        - 保留 Itanium mangled 符号（_Z...）
-        - 保留 C++ 限定名（A::b(...)）
-        - 保留普通函数签名（foo(...) / operator+ (...) 等）
-        - 排除 ObjC 方法符号（-[Class sel:] / +[Class sel:]）
-        """
-        s = (resolved_function or "").strip()
-        if not s:
+        from tools._stack_symbol_utils import is_cpp_native_stack_symbol
+
+        return is_cpp_native_stack_symbol(resolved_function)
+
+    @staticmethod
+    def _is_standard_library_cpp_symbol(resolved_function: str) -> bool:
+        """识别标准库自身符号，避免 symbol-only 场景对业务仓做无意义全仓定位。"""
+        s = sanitize_stack_symbol(resolved_function) or ""
+        head = s.split("(", 1)[0].strip()
+        if not head:
             return False
-        # ObjC 方法符号在 native-only 流程中单独处理，这里直接排除。
-        if re.match(r"^[\-\+]\[[^\]]+\]$", s):
+        # 若返回类型是 std::，但函数本体是业务限定名（如 "std::string Foo::bar"），不能跳过。
+        if re.search(
+            r"\s(?!std::|std::__|__gnu_cxx::)[A-Za-z_]\w*(?:::[A-Za-z_]\w*)+::[~A-Za-z_]\w*(?:\s*(?:<|\[|$))",
+            head,
+        ):
             return False
-        if s.startswith("_Z"):
-            return True
-        if "::" in s and "(" in s:
-            return True
-        # 兼容普通函数签名，如 crash_nullptr() / main(int, char**) / operator new(...)
-        if "(" in s and ")" in s:
-            head = s.split("(", 1)[0].strip()
-            # 允许前导 * / & / ~ 等（如析构、返回值修饰），但需包含至少一个标识符字符。
-            if head and re.search(r"[A-Za-z_~]", head):
-                return True
-        return False
+        return head.startswith(("std::", "__gnu_cxx::"))
 
     def _find_objc_method_definition_location(
         self, class_name: str, selector: str, code_roots: List[str]
@@ -2268,14 +2118,14 @@ class CodeContentProvider:
                 logger.info(f"从 mangled name 中提取类名: {class_name}")
                 return class_name
         
-        # 处理正常格式：Class::function_name
-        if '::' in resolved_function:
-            parts = resolved_function.split('::')
+        # 处理正常格式：ns::Class::method 或 Class::method
+        if "::" in resolved_function:
+            head = resolved_function.split("(", 1)[0].strip()
+            parts = [p.strip() for p in head.split("::") if p.strip()]
             if len(parts) >= 2:
-                class_name = parts[0].split('(')[0].strip()
-                # 清理可能的返回类型
-                class_name = class_name.split()[-1] if ' ' in class_name else class_name
-                return class_name
+                owner = parts[-2].split("<", 1)[0].strip()
+                owner = owner.split()[-1] if " " in owner else owner
+                return owner or None
         
         return None
     
@@ -2412,7 +2262,7 @@ class CodeContentProvider:
         self, lines: List[str], full_function: str, resolved_line: int
     ) -> Optional[Tuple[int, int]]:
         """将 _extract_full_function_code 得到的函数文本对齐到源文件中的 [1-based 起, 1-based 止] 行号区间。"""
-        raw = [ln.rstrip() for ln in full_function.split("\n")]
+        raw = full_function.splitlines()
         while raw and not raw[0].strip():
             raw.pop(0)
         while raw and not raw[-1].strip():
@@ -2591,13 +2441,20 @@ class CodeContentProvider:
                 src, safe_target_line_index, target_function_name
             )
             if ts_sig:
-                return ts_sig
+                from services.code_fixer import (
+                    _signature_is_plausible_for_edit,
+                    sanitize_function_signature,
+                )
+
+                clean = sanitize_function_signature(ts_sig)
+                if _signature_is_plausible_for_edit(clean):
+                    return clean
 
         # 1) regex 方案：按函数名 token 定位多行签名（支持成员函数/全局函数）
         if target_function_name:
             fn = target_function_name.strip()
             if fn:
-                # 从目标行向上找包含 “fn(” 的起始行，再向下拼到 “)” 结束
+                # 从目标行向上找包含 "fn(" 的起始行，再向下拼到 ")" 结束
                 max_lookback = 220
                 start = safe_target_line_index
                 end = max(0, safe_target_line_index - max_lookback)
@@ -2626,10 +2483,14 @@ class CodeContentProvider:
                         sig_lines.append(nxt)
                         balance += nxt.count("(") - nxt.count(")")
                         if balance <= 0:
-                            return " ".join(" ".join(x.split()) for x in sig_lines).strip()
+                            return self._finalize_function_signature(
+                                " ".join(" ".join(x.split()) for x in sig_lines).strip()
+                            )
 
                     # 如果没拼到 ')'，至少返回目前拼出来的（防止完全失败）
-                    return " ".join(" ".join(x.split()) for x in sig_lines).strip()
+                    return self._finalize_function_signature(
+                        " ".join(" ".join(x.split()) for x in sig_lines).strip()
+                    )
 
         # 2) fallback：单行正则（带关键字屏蔽，避免 else if/switch 误匹配）
         keywords_start = (
@@ -2669,9 +2530,18 @@ class CodeContentProvider:
                 match = re.search(pattern, line)
                 if match:
                     # 只返回捕获到的分组（若没有 group(1)，则返回整个匹配）
-                    return match.group(1) if match.groups() else match.group(0)
+                    raw = match.group(1) if match.groups() else match.group(0)
+                    return self._finalize_function_signature(raw)
 
         return "unknown function"
+
+    def _finalize_function_signature(self, sig: str) -> str:
+        from services.code_fixer import _signature_is_plausible_for_edit, sanitize_function_signature
+
+        clean = sanitize_function_signature(str(sig or "").strip())
+        if _signature_is_plausible_for_edit(clean):
+            return clean
+        return str(sig or "").strip() or "unknown function"
 
     def _ts_extract_signature_and_body(
         self, source_text: str, target_line_index: int, target_function_name: Optional[str]
@@ -2726,8 +2596,8 @@ class CodeContentProvider:
                 fn_start = _ts_fn_slice_start_byte(node)
                 fn_text = _ts_slice_utf8(fn_start, node.end_byte)
                 sig_raw = fn_text.split("{", 1)[0].strip()
-                # 关键修正：仅在“签名区”匹配函数 token，不能在函数体内匹配，
-                # 否则会把“调用了目标函数的其它函数”误识别成目标函数本身。
+                # 关键修正：仅在"签名区"匹配函数 token，不能在函数体内匹配，
+                # 否则会把"调用了目标函数的其它函数"误识别成目标函数本身。
                 if token_pat and not token_pat.search(sig_raw):
                     # token 已知时，优先筛掉不相关函数定义
                     pass
@@ -2832,7 +2702,8 @@ class CodeContentProvider:
             return None
 
         try:
-            tree = self._ts_parser.parse(source_text.encode("utf-8", errors="ignore"))
+            source_bytes = source_text.encode("utf-8", errors="ignore")
+            tree = self._ts_parser.parse(source_bytes)
             root = tree.root_node
         except Exception:
             return None
@@ -2856,12 +2727,12 @@ class CodeContentProvider:
 
                     capture_list = ""
                     if capture_node:
-                        capture_text = source_text[capture_node.start_byte:capture_node.end_byte]
+                        capture_text = source_bytes[capture_node.start_byte:capture_node.end_byte].decode("utf-8", errors="replace")
                         capture_list = capture_text.strip()
 
                     body_text = ""
                     if body_node:
-                        body_text = source_text[body_node.start_byte:body_node.end_byte].strip()
+                        body_text = source_bytes[body_node.start_byte:body_node.end_byte].decode("utf-8", errors="replace").strip()
 
                     return {
                         "capture_list": capture_list,
@@ -3132,6 +3003,101 @@ class CodeContentProvider:
                 out.append(ap)
         return out
 
+    def _normalize_scan_file_list(self, paths: Optional[List[str]]) -> List[str]:
+        """去重并规范为可读绝对路径列表（用于分级扫描）。"""
+        out: List[str] = []
+        seen: set = set()
+        for raw in paths or []:
+            if not raw or not str(raw).strip():
+                continue
+            try:
+                ap = os.path.abspath(str(raw))
+            except Exception:
+                ap = str(raw)
+            if ap in seen:
+                continue
+            if os.path.isfile(ap) and self._is_supported_file(ap):
+                seen.add(ap)
+                out.append(ap)
+        return out
+
+    def _resolve_local_source_path(
+        self, resolved_file: str, code_roots: List[str]
+    ) -> Optional[str]:
+        """将 addr2line 构建机路径映射为本地 code_root 下可读源文件（复用 _find_source_file）。"""
+        if not resolved_file or not str(resolved_file).strip():
+            return None
+        roots = _normalize_code_roots_arg(code_roots)
+        if self._is_external_path(resolved_file, roots):
+            return None
+        return self._find_source_file(resolved_file, code_roots)
+
+    def _collect_crash_adjacent_source_files(
+        self, local_crash_file: str, code_roots: List[str]
+    ) -> List[str]:
+        """崩溃文件所在目录及同名 .h/.hpp/.cpp（类声明/实现常成对）。"""
+        out: List[str] = []
+        seen: set = set()
+        try:
+            ap = os.path.abspath(local_crash_file)
+        except Exception:
+            ap = local_crash_file
+        if not os.path.isfile(ap):
+            return out
+        seen.add(ap)
+        out.append(ap)
+        dirname = os.path.dirname(ap)
+        base = os.path.splitext(os.path.basename(ap))[0]
+        if dirname and base:
+            for ext in (".h", ".hpp", ".hh", ".hxx", ".cpp", ".cc", ".cxx"):
+                cand = os.path.join(dirname, base + ext)
+                try:
+                    cap = os.path.abspath(cand)
+                except Exception:
+                    cap = cand
+                if cap in seen or not os.path.isfile(cap):
+                    continue
+                if not self._is_supported_file(cap):
+                    continue
+                cr = self._pick_code_root_for_file(cap, code_roots)
+                if self._should_skip_file(cap, cr):
+                    continue
+                seen.add(cap)
+                out.append(cap)
+        return out
+
+    def _resolve_merge_crash_file(
+        self,
+        crash_func: "CrashFunction",
+        resolved_file: str,
+        resolved_line: int,
+        code_roots: List[str],
+    ) -> str:
+        """
+        合并类成员字段时使用的崩溃文件路径：优先本地已映射路径，避免 CI 绝对路径触发全仓 walk。
+        """
+        local = str(getattr(crash_func, "file", None) or "").strip()
+        if local and os.path.isfile(local):
+            return local
+        mapped = self._resolve_local_source_path(resolved_file, code_roots)
+        if mapped and os.path.isfile(mapped):
+            return mapped
+        # 已有 file:line 时不按函数名全仓搜索；仅在外部路径/无行号时兜底
+        if resolved_file and int(resolved_line or 0) > 0:
+            roots = _normalize_code_roots_arg(code_roots)
+            if not self._is_external_path(resolved_file, roots):
+                return mapped or resolved_file
+        simple_fn = self._extract_simple_function_name(
+            str(getattr(crash_func, "signature", None) or "")
+            or str(getattr(crash_func, "name", None) or "")
+            or str(resolved_file or "")
+        )
+        if simple_fn:
+            loc = self._find_function_definition_location(simple_fn, code_roots)
+            if loc and loc[0] and os.path.isfile(loc[0]):
+                return loc[0]
+        return mapped or local or resolved_file or ""
+
     def _pick_code_root_for_file(self, file_path: str, code_roots: List[str]) -> str:
         try:
             ap = os.path.abspath(file_path)
@@ -3199,11 +3165,25 @@ class CodeContentProvider:
         code_roots: List[str],
         parent_levels: int = 2,
         descend_depth: int = 3,
-        max_files: int = 4000,
+        max_files: Optional[int] = None,
     ) -> List[str]:
-        """基于堆栈命中文件，收集“同模块/父模块有限深度”的候选文件，避免全仓补扫。"""
+        """基于堆栈命中文件，收集同模块/父模块有限深度的候选文件，避免全仓补扫。"""
+        if max_files is None:
+            max_files = int(getattr(self, "max_nearby_module_scan_files", 300) or 300) * 4
+        max_files = max(64, min(int(max_files), 8000))
         if not stack_priority_files or not code_roots:
             return []
+
+        # 缓存查找：相同参数直接返回已缓存结果
+        _cache_key = (
+            tuple(sorted(stack_priority_files)),
+            tuple(sorted(code_roots)),
+            max_files,
+        )
+        cached = self._nearby_module_files_cache.get(_cache_key)
+        if cached is not None:
+            return list(cached)
+
         seeds: List[Tuple[str, str]] = []
         for raw in stack_priority_files:
             if not raw:
@@ -3287,7 +3267,9 @@ class CodeContentProvider:
                     seen_files.add(ap)
                     out.append(ap)
                     if len(out) >= max_files:
+                        self._nearby_module_files_cache[_cache_key] = out
                         return out
+        self._nearby_module_files_cache[_cache_key] = out
         return out
 
     def _find_call_chain_functions_tree_sitter(
@@ -3358,9 +3340,11 @@ class CodeContentProvider:
             self.search_stats["files_scanned"] += 1
             try:
                 self.search_stats["files_read"] += 1
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    source_text = f.read()
-                if not source_text.strip():
+                source_text = self._read_file_cached(file_path)
+                if not source_text or not source_text.strip():
+                    continue
+                # 快速预筛：文件内容中不含目标函数名则跳过昂贵的 AST 解析
+                if simple_function_name not in source_text:
                     continue
                 source_bytes = source_text.encode("utf-8", errors="ignore")
                 tree = self._ts_parser.parse(source_bytes)
@@ -3438,9 +3422,11 @@ class CodeContentProvider:
             file_path, cr = file_info
             local_results = []
             try:
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    source_text = f.read()
-                if not source_text.strip():
+                source_text = self._read_file_cached(file_path)
+                if not source_text or not source_text.strip():
+                    return []
+                # 快速预筛：文件内容中不含目标函数名则跳过昂贵的 AST 解析
+                if simple_function_name not in source_text:
                     return []
                 source_bytes = source_text.encode("utf-8", errors="ignore")
                 tree = self._ts_parser.parse(source_bytes)
@@ -3538,175 +3524,14 @@ class CodeContentProvider:
             return ""
         return "\n".join(ln.rstrip("\n\r") for ln in lines_slice).strip()
 
-    def _extract_full_function_code_by_token_regex(
-        self,
-        lines: List[str],
-        target_line_index: int,
-        token: str,
-    ) -> Optional[str]:
-        """
-        用函数名 token 在崩溃行上方回溯到签名行，再按大括号配对截取「单个」函数体。
-        在已知目标函数名时优先于 tree-sitter：TS 用「最小行跨度」选 function_definition，
-        在部分 C++ 源上可能误选到跨多成员函数的节点，导致片段从其它函数体中间开始。
-        """
-        if not token:
-            return None
-        sig_re = re.compile(rf"(?:(?:^|::)\s*~?{re.escape(token)}\s*\(|\b~?{re.escape(token)}\s*\()")
-
-        def _is_control_line(l: str) -> bool:
-            ll = (l or "").lstrip()
-            while ll.startswith("}"):
-                ll = ll[1:].lstrip()
-            return bool(
-                re.match(r"^(else\s+if|if|for|while|switch|catch|return|throw|do|try)\b", ll)
-                or ll.startswith("case")
-                or ll.startswith("default")
-            )
-
-        max_lookback = 400
-        search_start = max(0, target_line_index - max_lookback)
-        sig_start = -1
-        for i in range(target_line_index, search_start - 1, -1):
-            l = lines[i].strip()
-            if not l or l.startswith("//") or l.startswith("/*"):
-                continue
-            if _is_control_line(l):
-                continue
-            if sig_re.search(l):
-                # 排除函数调用/声明语句，必须像函数定义起始。
-                if ";" in l and "{" not in l:
-                    continue
-                sig_start = i
-                break
-
-        if sig_start == -1:
-            return None
-
-        brace_start = -1
-        for j in range(sig_start, min(len(lines), sig_start + 250)):
-            if "{" in lines[j]:
-                brace_start = j
-                break
-
-        if brace_start == -1:
-            return None
-
-        function_end = len(lines)
-        brace_count = 0
-        found_opening_brace = False
-        for k in range(brace_start, len(lines)):
-            for char in lines[k]:
-                if char == "{":
-                    brace_count += 1
-                    found_opening_brace = True
-                elif char == "}":
-                    brace_count -= 1
-                    if found_opening_brace and brace_count == 0:
-                        function_end = k + 1
-                        break
-            if found_opening_brace and brace_count == 0:
-                break
-        function_lines = lines[sig_start:function_end]
-        return self._join_source_line_slice(function_lines)
-
     def _extract_full_function_code(
         self,
         lines: List[str],
         target_line_index: int,
         target_function_name: Optional[str] = None,
     ) -> Optional[str]:
-        """提取完整函数代码"""
-        try:
-            token = ""
-            if target_function_name:
-                token = target_function_name.strip().split("::")[-1].strip()
-
-            # 1) 已知目标函数名：优先 token + 大括号配对（比 tree-sitter 的 smallest-span 更稳）
-            if token:
-                by_regex = self._extract_full_function_code_by_token_regex(
-                    lines, target_line_index, token
-                )
-                if by_regex:
-                    return by_regex
-
-            # 2) tree-sitter
-            if self.code_parser_backend == "tree_sitter" and self._ts_parser is not None:
-                src = "\n".join(lines)
-                _, ts_body = self._ts_extract_signature_and_body(src, target_line_index, target_function_name)
-                if ts_body:
-                    return ts_body
-
-            # 3) 兼容旧逻辑的兜底路径：依赖 `_cpp_signature_probe_string`（含多行成员签名）
-            # 从目标行开始向上搜索函数开始
-            function_start = -1
-
-            # 向上搜索函数开始，寻找函数定义行
-            for i in range(target_line_index, -1, -1):
-                line = lines[i].strip()
-                if not line or line.startswith('//') or line.startswith('/*'):
-                    continue
-                
-                # 检查是否是函数定义行（含多行成员函数签名）
-                if self._cpp_signature_probe_string(lines, i):
-                    if token:
-                        # 某些多行签名：候选行可能只有 ')' 但不包含 token
-                        # 所以在候选行附近向上找 token 证据，避免把 else if / switch 误判为函数开始
-                        window_start = max(0, i - 6)
-                        window_lines = "\n".join(lines[window_start:i + 1])
-                        if not re.search(rf"\b~?{re.escape(token)}\b\s*\(", window_lines):
-                            continue
-                    function_start = i
-                    break
-                
-                # 如果遇到函数开始的大括号，继续向上搜索函数定义行
-                if '{' in line:
-                    # 继续向上搜索函数定义行
-                    for j in range(i-1, max(i-10, -1), -1):  # 向前搜索最多10行
-                        prev_line = lines[j].strip()
-                        if prev_line and not prev_line.startswith('//') and not prev_line.startswith('/*'):
-                            if self._cpp_signature_probe_string(lines, j):
-                                if token:
-                                    window_start = max(0, j - 6)
-                                    window_lines = "\n".join(lines[window_start:j + 1])
-                                    if not re.search(rf"\b~?{re.escape(token)}\b\s*\(", window_lines):
-                                        continue
-                                function_start = j
-                                break
-                    if function_start != -1:
-                        break
-            
-            if function_start == -1:
-                return None
-            
-            # 向下搜索函数结束
-            function_end = len(lines)
-            brace_count = 0
-            found_opening_brace = False
-            
-            for i in range(function_start, len(lines)):
-                line = lines[i]
-                
-                # 计算大括号
-                for char in line:
-                    if char == '{':
-                        brace_count += 1
-                        found_opening_brace = True
-                    elif char == '}':
-                        brace_count -= 1
-                        if found_opening_brace and brace_count == 0:
-                            function_end = i + 1
-                            break
-                
-                if found_opening_brace and brace_count == 0:
-                    break
-            
-            # 提取完整函数（行切片可能来自 readlines 或 split('\\n')，统一经 _join_source_line_slice）
-            function_lines = lines[function_start:function_end]
-            return self._join_source_line_slice(function_lines)
-            
-        except Exception as e:
-            logger.debug(f"提取完整函数代码失败: {e}")
-            return None
+        """提取完整函数代码，委托给 CodeLocatorService。"""
+        return self._locator.extract_function_body(lines, target_line_index, target_function_name)
 
     def _extract_full_function_code_for_caller(
         self, lines: List[str], target_line_index: int, caller_function_name: Optional[str]
@@ -3808,6 +3633,9 @@ class CodeContentProvider:
             r'void\s+\w+::\w+\s*\([^)]*\)\s*$',       # void Class::function_name(...) (大括号在下一行)
             r'\w+\s+\w+::\w+\s*\([^)]*\)\s*$',        # return_type Class::function_name(...) (大括号在下一行)
             r'\w+::\w+\s*\([^)]*\)\s*$',              # Class::function_name(...) (大括号在下一行)
+            # 支持带 const/override/noexcept/final 限定的成员函数（大括号在下一行或同行）
+            r'\w+\s+\w+::\w+\s*\([^)]*\)\s*(?:const|override|noexcept|final)[\s{]*$',
+            r'\w+::\w+\s*\([^)]*\)\s*(?:const|override|noexcept|final)[\s{]*$',
             # 支持普通自由函数（含 static）定义行与大括号分行
             r'(?:static|inline|constexpr|extern|virtual)?\s*[\w:\<\>\~\*&]+\s+\w+\s*\([^;{}]*\)\s*$',
             # 支持模板类成员函数（大括号在下一行）：VVoid CVList< TYPE, ARG_TYPE >::RemoveAt(...)
@@ -3931,39 +3759,28 @@ class CodeContentProvider:
                 return known
         return None
 
+    def _ensure_ctags_index(self, code_roots: List[str]) -> None:
+        if not self.use_ctags_index:
+            return
+        if os.environ.get("STABILITY_AGENT_DISABLE_CODE_ACCELERATION", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            return
+        if getattr(self, "_ctags_index", None) is not None:
+            return
+        try:
+            from services.ctags_function_index import get_ctags_index_for_roots
+
+            self._ctags_index = get_ctags_index_for_roots(code_roots)
+        except Exception as exc:
+            logger.debug("ctags 函数索引不可用: %s", exc)
+            self._ctags_index = None
+
     def _find_function_definition_location(self, simple_name: str, code_roots: List[str]) -> Optional[Tuple[str, int]]:
-        """在 code_roots 下按函数名查找函数定义位置，返回 (文件路径, 行号) 或 None。"""
-        _def_loc_files = 0
-        for code_root in code_roots or []:
-            # 尝试从缓存获取
-            for root, dirs, files in os.walk(code_root):
-                dirs[:] = [d for d in dirs if d not in self.exclude_dirs]
-                for file in files:
-                    _def_loc_files += 1
-                    if _def_loc_files % 50 == 0:
-                        self._code_context_phase_check("find_function_definition_location")
-                    file_path = os.path.join(root, file)
-                    if not self._is_supported_file(file_path) or not self._is_file_readable(file_path):
-                        continue
-                    # 检查缓存
-                    cached = self._get_cached_function_defs(file_path, simple_name)
-                    if cached:
-                        return cached
-                    # 继续搜索（因为缓存可能不存在）
-                    try:
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                            lines = f.readlines()
-                        for i, line in enumerate(lines, 1):
-                            probe = self._cpp_signature_probe_string(lines, i - 1)
-                            if probe and re.search(
-                                rf"\b{re.escape(simple_name)}\s*\(", probe
-                            ):
-                                # 缓存结果
-                                self._cache_function_def(file_path, simple_name, i)
-                                return (file_path, i)
-                    except (IOError, OSError):
-                        continue
-        return None
+        """在 code_roots 下按函数名查找函数定义位置，委托给 CodeLocatorService。"""
+        return self._locator.find_function_definition(simple_name, code_roots)
 
     def _extract_cpp_qualified_parts(self, resolved_function: str) -> Optional[Tuple[str, str]]:
         """
@@ -3971,9 +3788,11 @@ class CodeContentProvider:
         例：
         - _baidu_vi::CVString::CVString() -> (_baidu_vi::CVString, CVString)
         - Foo::bar(int) -> (Foo, bar)
+        - walk_navi::CRoute::GetLegSize -> (walk_navi::CRoute, GetLegSize)
         """
-        s = (resolved_function or "").strip()
-        if "::" not in s or "(" not in s:
+        s = sanitize_stack_symbol(resolved_function) or ""
+        s = s.strip()
+        if "::" not in s:
             return None
         head = s.split("(", 1)[0].strip()
         if "::" not in head:
@@ -4092,6 +3911,8 @@ class CodeContentProvider:
         """
         按 C++ 限定名（owner::method）严格定位定义，避免退化到 simple_name 产生误命中。
         """
+        if self._is_standard_library_cpp_symbol(resolved_function):
+            return None
         parsed = self._extract_cpp_qualified_parts(resolved_function)
         if not parsed:
             return None
@@ -4107,6 +3928,42 @@ class CodeContentProvider:
 
         impl_ext = {".cpp", ".cc", ".cxx", ".mm", ".m", ".c"}
         header_ext = {".h", ".hpp", ".hh", ".hxx", ".ipp", ".inl"}
+
+        # === rg 快速定位：在逐文件扫描前，先用 ripgrep 搜索 "owner_tail::method" ===
+        rg_result = self._rg_grep_lines(
+            rf"\b{re.escape(owner_tail)}\s*::\s*{re.escape(method)}\s*\(",
+            code_roots,
+            max_matches=20,
+        )
+        if rg_result:
+            # rg 命中：直接对命中行做签名评分，避免全仓逐文件扫描
+            for rg_file, rg_line, rg_text in rg_result:
+                try:
+                    with open(rg_file, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.readlines()
+                    probe = self._cpp_signature_probe_string(lines, rg_line - 1)
+                    if not probe:
+                        continue
+                    sc = self._score_cpp_candidate_signature(
+                        probe, owner, owner_tail, method, param_hints
+                    )
+                    if sc < 0:
+                        continue
+                    if best is None or sc > best[0]:
+                        best = (sc, rg_file, rg_line)
+                        if sc >= 124:
+                            self._function_def_cache[cache_key] = (rg_file, rg_line)
+                            return (rg_file, rg_line)
+                except (IOError, OSError):
+                    continue
+            if best is not None:
+                _sc, _fp, _ln = best
+                self._function_def_cache[cache_key] = (_fp, _ln)
+                return (_fp, _ln)
+        elif rg_result == []:
+            # rg 已正常完成且无命中；Python 逐文件扫描同一模式只会重复全仓 I/O。
+            self._function_def_cache[cache_key] = None
+            return None
 
         def _ordered_candidate_files(code_root: str) -> List[str]:
             ckey = (str(code_root), owner_tail)
@@ -4248,7 +4105,7 @@ class CodeContentProvider:
             "back",
         }
     )
-    # 业务中高频且语义宽泛的方法名，易在全仓静态扫描中发生“同名误匹配”
+    # 业务中高频且语义宽泛的方法名，易在全仓静态扫描中发生"同名误匹配"
     # （例如 m_render->UnInit() 被误连到 WalkMapControl::UnInit）。
     _GENERIC_METHOD_NAMES_FOR_CALL_CHAIN = frozenset(
         {
@@ -4292,11 +4149,27 @@ class CodeContentProvider:
     ) -> List[CallChainFunction]:
         """正则扫描：在 restrict 文件集或全仓（可 exclude 栈文件）中查找调用崩溃函数的函数。
 
-        优化：支持并行扫描
+        优化：支持并行扫描；当 rg 可用且为全仓扫描模式时，先用 rg 预筛候选文件。
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         out: List[CallChainFunction] = []
+
+        # === rg 快速预筛：仅全仓扫描（restrict_to_files=None）时启用 ===
+        rg_prefiltered = False
+        if restrict_to_files is None and code_roots and CodeContentProvider._rg_available:
+            rg_pattern = rf"\b{re.escape(simple_function_name)}\s*\("
+            rg_hit_files = self._rg_grep_files(rg_pattern, code_roots)
+            if rg_hit_files is not None:
+                # rg 成功返回：缩减到只扫命中的文件
+                if rg_hit_files:
+                    restrict_to_files = rg_hit_files
+                    rg_prefiltered = True
+                    logger.info(f"rg 预筛: 全仓缩减到 {len(rg_hit_files)} 个命中文件")
+                else:
+                    # rg 运行正常但无命中 → 全仓没有该函数调用
+                    logger.info("rg 预筛: 全仓无命中，跳过 Python 扫描")
+                    return out
 
         # 收集所有待扫描的文件
         all_files = []
@@ -4390,52 +4263,86 @@ class CodeContentProvider:
 
         优化策略：分两阶段
         1. 第一阶段：快速扫描，只找 caller 函数名和行号（不提取完整函数体）
+           - 优先用 rg 批量扫描（极快）；rg 不可用时 fallback ThreadPoolExecutor
         2. 第二阶段：串行提取函数体（这部分慢，但需要访问文件）
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        from collections import defaultdict
 
-        # 第一阶段：并行快速扫描，找出调用点
-        caller_locations: List[Tuple[str, int, str]] = []  # [(file_path, line_number, caller_function), ...]
+        # 第一阶段：找出调用点 [(file_path, line_number, caller_function), ...]
+        caller_locations: List[Tuple[str, int, str]] = []
 
-        def _quick_scan(file_info: Tuple[str, str]) -> List[Tuple[str, int, str]]:
-            """快速扫描：只找调用点，不提取完整函数体"""
-            file_path, cr = file_info
-            local_results = []
-            try:
-                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-                lines = content.split("\n")
-                for i, line in enumerate(lines, 1):
-                    if self._contains_function_call(line, simple_function_name):
-                        if self._is_function_call_line(line, simple_function_name):
-                            caller_function = self._extract_function_name_at_line(lines, i)
-                            if caller_function and caller_function != simple_function_name:
-                                local_results.append((file_path, i, caller_function))
-            except Exception:
-                pass
-            return local_results
+        # === 尝试 rg 批量 Stage 1 ===
+        rg_used = False
+        if CodeContentProvider._rg_available:
+            rg_pattern = rf"\b{re.escape(simple_function_name)}\s*\("
+            file_paths_only = [fp for fp, _ in file_infos]
+            rg_hits = self._rg_grep_lines(rg_pattern, file_paths_only, max_matches=3000)
+            if rg_hits is not None:
+                rg_used = True
+                if rg_hits:
+                    # 按文件分组
+                    hits_by_file: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
+                    for fp, ln, text in rg_hits:
+                        hits_by_file[fp].append((ln, text))
+                    logger.info(f"rg Stage1: {len(rg_hits)} 行命中, 涉及 {len(hits_by_file)} 个文件")
+                    # 对命中文件做精确验证 + 提取 caller 函数名
+                    for fp, hit_lines in hits_by_file.items():
+                        try:
+                            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                                content = f.read()
+                            lines = content.split("\n")
+                            for ln, text in hit_lines:
+                                if self._is_function_call_line(text, simple_function_name):
+                                    caller_function = self._extract_function_name_at_line(lines, ln)
+                                    if caller_function and caller_function != simple_function_name:
+                                        caller_locations.append((fp, ln, caller_function))
+                        except Exception:
+                            pass
+                else:
+                    logger.info("rg Stage1: 无命中行")
 
-        scanned_count = 0
-        executor = ThreadPoolExecutor(max_workers=max_workers)
-        try:
-            futures = {executor.submit(_quick_scan, info): info for info in file_infos}
-            for future in as_completed(futures):
-                self._code_context_phase_check("parallel_regex_quick")
-                scanned_count += 1
-                if scanned_count % 500 == 0:
-                    logger.info(f"正则并行扫描(快速阶段): {scanned_count}/{len(file_infos)}")
+        # === fallback: 原有 ThreadPoolExecutor 逐文件扫描 ===
+        if not rg_used:
+            def _quick_scan(file_info: Tuple[str, str]) -> List[Tuple[str, int, str]]:
+                """快速扫描：只找调用点，不提取完整函数体"""
+                file_path, cr = file_info
+                local_results = []
                 try:
-                    locations = future.result()
-                    caller_locations.extend(locations)
+                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    lines = content.split("\n")
+                    for i, line in enumerate(lines, 1):
+                        if self._contains_function_call(line, simple_function_name):
+                            if self._is_function_call_line(line, simple_function_name):
+                                caller_function = self._extract_function_name_at_line(lines, i)
+                                if caller_function and caller_function != simple_function_name:
+                                    local_results.append((file_path, i, caller_function))
                 except Exception:
                     pass
-        except _CodeContextPhaseTimeout:
-            logger.warning("正则并行扫描(快速阶段)因整阶段超时中止")
-            raise
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+                return local_results
 
-        logger.info(f"快速扫描完成: 找到 {len(caller_locations)} 个调用点")
+            scanned_count = 0
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            try:
+                futures = {executor.submit(_quick_scan, info): info for info in file_infos}
+                for future in as_completed(futures):
+                    self._code_context_phase_check("parallel_regex_quick")
+                    scanned_count += 1
+                    if scanned_count % 500 == 0:
+                        logger.info(f"正则并行扫描(快速阶段): {scanned_count}/{len(file_infos)}")
+                    try:
+                        locations = future.result()
+                        caller_locations.extend(locations)
+                    except Exception:
+                        pass
+            except _CodeContextPhaseTimeout:
+                logger.warning("正则并行扫描(快速阶段)因整阶段超时中止")
+                raise
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+
+        logger.info(f"快速扫描完成: 找到 {len(caller_locations)} 个调用点" + (" (via rg)" if rg_used else ""))
 
         # 第二阶段：串行提取函数体（逐个提取，控制并发）
         results: List[CallChainFunction] = []
@@ -4530,19 +4437,14 @@ class CodeContentProvider:
                     stack_norm.append(ap)
         stack_set = set(stack_norm)
         nearby_module_files: List[str] = []
+        nearby_cap = int(getattr(self, "max_nearby_module_scan_files", 300) or 300)
         is_generic_method = simple_function_name.lower() in self._GENERIC_METHOD_NAMES_FOR_CALL_CHAIN
-        # 通用名（如 UnInit）在大仓库中同名噪音高：邻近补扫限制 Top-N，兼顾召回与耗时
-        generic_nearby_top_n = 300
         if stack_norm:
             nearby_module_files = self._collect_nearby_module_files(stack_norm, code_roots)
-            nearby_scan_files = (
-                nearby_module_files[:generic_nearby_top_n]
-                if is_generic_method
-                else nearby_module_files
-            )
+            nearby_scan_files = nearby_module_files[:nearby_cap]
             logger.info(
-                f"静态调用链：堆栈优先 {len(stack_norm)} 个源文件，随后邻近模块补扫 "
-                f"{len(nearby_scan_files)} 个文件（去重合并）"
+                f"静态调用链：堆栈优先 {len(stack_norm)} 个源文件，邻近模块候选 {len(nearby_module_files)} 个，"
+                f"实际补扫 {len(nearby_scan_files)} 个（上限 {nearby_cap}）"
             )
         else:
             nearby_scan_files = nearby_module_files
@@ -4558,13 +4460,19 @@ class CodeContentProvider:
                 p1 = self._find_call_chain_functions_tree_sitter(
                     crash_function_name, code_roots, restrict_to_files=stack_norm, exclude_files=None
                 )
-                p2 = []
-                if nearby_scan_files:
+                p2: List[CallChainFunction] = []
+                skip_nearby = len(p1) >= self.max_direct_callers
+                if skip_nearby:
+                    logger.info(
+                        "tree-sitter 调用链：堆栈优先已找到 %s 个调用者（>= max_direct_callers=%s），跳过邻近补扫",
+                        len(p1),
+                        self.max_direct_callers,
+                    )
+                elif nearby_scan_files:
                     if is_generic_method and p1:
                         logger.info(
-                            "tree-sitter 调用链搜索：通用方法名在堆栈优先已命中，"
-                            "继续执行有限 Top-N 邻近补扫（N=%d）",
-                            generic_nearby_top_n,
+                            "tree-sitter 调用链：通用方法名在堆栈优先已命中，继续有限邻近补扫（%s 个文件）",
+                            len(nearby_scan_files),
                         )
                     p2 = self._find_call_chain_functions_tree_sitter(
                         crash_function_name,
@@ -4647,12 +4555,11 @@ class CodeContentProvider:
                 )
             )
         if stack_norm:
-            if nearby_scan_files:
+            if nearby_scan_files and len(call_chain_functions) < self.max_direct_callers:
                 if is_generic_method and call_chain_functions:
                     logger.info(
-                        "正则调用链搜索：通用方法名在堆栈优先已命中，"
-                        "继续执行有限 Top-N 邻近补扫（N=%d）",
-                        generic_nearby_top_n,
+                        "正则调用链：堆栈优先已命中，继续有限邻近补扫（%s 个文件）",
+                        len(nearby_scan_files),
                     )
                 call_chain_functions.extend(
                     self._regex_scan_callers_in_paths(
@@ -4662,6 +4569,11 @@ class CodeContentProvider:
                         exclude_files=stack_set,
                         seen_caller_keys=seen_caller_keys,
                     )
+                )
+            elif nearby_scan_files:
+                logger.info(
+                    "正则调用链：堆栈优先已找到 %s 个调用者，跳过邻近补扫",
+                    len(call_chain_functions),
                 )
         else:
             call_chain_functions.extend(
@@ -4695,6 +4607,20 @@ class CodeContentProvider:
             logger.info(f"已缓存调用链结果: {crash_function_name}")
 
         return call_chain_functions
+
+    def _find_callers_of_crash_site(
+        self,
+        crash_function_name: str,
+        code_roots: List[str],
+        stack_priority_files: Optional[List[str]] = None,
+        max_search_files: Optional[int] = None,
+    ) -> List[CallChainFunction]:
+        """搜索调用崩溃函数的代码位置，委托给 CodeLocatorService。"""
+        return self._locator.find_callers(
+            crash_function_name, code_roots,
+            stack_priority_files=stack_priority_files,
+            max_search_files=max_search_files,
+        )
 
     def _line_suggests_implicit_ctor_use(self, line: str, type_name: str) -> bool:
         """
@@ -5002,7 +4928,7 @@ class CodeContentProvider:
                 layer_cache[cache_key] = layer
             if not layer:
                 break
-            # 选第一个“不会引入环”且“调用证据可信”的父函数候选，避免同名误匹配。
+            # 选第一个"不会引入环"且"调用证据可信"的父函数候选，避免同名误匹配。
             parent: Optional[CallChainFunction] = None
             for cand in layer:
                 ckey = (cand.name or "", cand.file or "")
@@ -5026,7 +4952,7 @@ class CodeContentProvider:
         self, parent: CallChainFunction, callee: CallChainFunction
     ) -> bool:
         """
-        判断 parent 是否“可信地”调用了 callee。
+        判断 parent 是否"可信地"调用了 callee。
 
         对普通方法名：只要在 parent 片段内出现调用 token 即可；
         对高碰撞方法名（Init/UnInit/Destroy...）：要求更强证据，避免同名误连边。
@@ -5061,7 +4987,7 @@ class CodeContentProvider:
         if not owner:
             return False
 
-        # 先走“接收者类型约束”：obj->method()/obj.method() 中 obj 的类型需与 callee owner 兼容（含基类）。
+        # 先走"接收者类型约束"：obj->method()/obj.method() 中 obj 的类型需与 callee owner 兼容（含基类）。
         # 这是避免同名方法误匹配的核心校验。
         recv_vars = self._extract_receiver_vars_for_method(ps, method)
         if recv_vars:
@@ -5080,7 +5006,7 @@ class CodeContentProvider:
             if typed_seen:
                 return False
 
-        # 允许“变量调用 + 近邻声明里出现 owner 类型名”的场景（如 shared_ptr<WalkMapControl> walkMap; walkMap->UnInit();）
+        # 允许"变量调用 + 近邻声明里出现 owner 类型名"的场景（如 shared_ptr<WalkMapControl> walkMap; walkMap->UnInit();）
         var_call_pat = re.compile(rf"\b([A-Za-z_]\w*)\s*(?:->|\.)\s*{re.escape(method)}\s*\(")
         owner_pat = re.compile(rf"\b{re.escape(owner)}\b")
         decl_pat_tpl = r"\b{owner}\b[^;\n]*\b{var}\b"
@@ -5465,7 +5391,7 @@ class CodeContentProvider:
     ) -> List[CallChainFunction]:
         """
         模板容器函数调用链定向搜索：
-        仅使用“模板实参 + 成员变量名”去定位调用点，不做裸方法名全仓扫描。
+        仅使用"模板实参 + 成员变量名"去定位调用点，不做裸方法名全仓扫描。
         """
         parsed = self._parse_template_container_function(crash_function_name)
         if not parsed:
@@ -5709,157 +5635,21 @@ class CodeContentProvider:
         crash_function_name: str,
         code_roots: List[str],
         stack_priority_files: Optional[List[str]] = None,
+        crash_local_files: Optional[List[str]] = None,
+        owner_class: Optional[str] = None,
+        owner_member_fields: Optional[List[str]] = None,
+        owner_definition_files: Optional[List[str]] = None,
     ) -> List[VariableFunction]:
-        """
-        根据给定的共享变量名集合，在全项目中查找使用这些变量的所有函数（含崩溃函数本身），
-        用于构建 use_shared_var 边。崩溃函数也会被包含，以便图中展示“崩溃函数使用哪些共享变量”。
-        若提供 stack_priority_files，则先在这些堆栈相关源文件中扫描，再扫描全仓（去重，顺序上堆栈命中在前）。
-        """
-        import time
-        start_time = time.time()
-        if not shared_vars:
-            return []
-        logger.info(f"按共享变量查找相关函数: {shared_vars}")
-        unique_functions: Dict[tuple, VariableFunction] = {}
-        files_scanned_before = self.search_stats["files_scanned"]
-        files_read_before = self.search_stats["files_read"]
-
-        stack_norm: List[str] = []
-        if stack_priority_files:
-            for raw in stack_priority_files:
-                if not raw:
-                    continue
-                try:
-                    ap = os.path.abspath(raw)
-                except Exception:
-                    ap = raw
-                if os.path.isfile(ap) and self._is_supported_file(ap):
-                    stack_norm.append(ap)
-        stack_set = set(stack_norm)
-        if stack_norm:
-            logger.info(
-                f"共享变量扫描：堆栈优先 {len(stack_norm)} 个源文件，随后全仓补充（去重）"
-            )
-
-        def _scan_file_paths(file_paths: List[str]) -> None:
-            for file_path in file_paths:
-                cr = self._pick_code_root_for_file(file_path, code_roots)
-                self.search_stats["files_scanned"] += 1
-                if self._should_skip_file(file_path, cr):
-                    continue
-                try:
-                    self.search_stats["files_read"] += 1
-                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read()
-                    lines = content.split("\n")
-                    for i, line in enumerate(lines, 1):
-                        for var in shared_vars:
-                            if not self._contains_variable_usage(line, var):
-                                continue
-                            if not self._is_variable_usage_line(line, var):
-                                continue
-                            function_name = self._extract_function_name_at_line(lines, i)
-                            if not function_name:
-                                continue
-                            function_code = self._extract_full_function_code(
-                                lines, i - 1, target_function_name=function_name
-                            )
-                            if not function_code:
-                                continue
-                            relation = self._determine_variable_relation(line, var)
-                            function_snippet = [
-                                ln.rstrip() for ln in function_code.split("\n") if ln.strip()
-                            ]
-                            if self.max_code_length > 0:
-                                function_snippet = self._truncate_snippet(function_snippet)
-                            var_func = VariableFunction(
-                                variable=var,
-                                relation=relation,
-                                name=function_name,
-                                file=file_path,
-                                snippet=function_snippet,
-                            )
-                            key = (function_name, file_path, var, relation)
-                            if key not in unique_functions:
-                                unique_functions[key] = var_func
-                                logger.debug(
-                                    f"变量相关函数: {function_name} 使用 {var} ({relation}) @ {file_path}:{i}"
-                                )
-                except Exception as e:
-                    logger.debug(f"分析文件失败 {file_path}: {e}")
-                    continue
-
-        if stack_norm:
-            _scan_file_paths(stack_norm)
-
-        for code_root in code_roots or []:
-            for root, dirs, files in os.walk(code_root):
-                dirs[:] = [d for d in dirs if not self._should_skip_directory(d)]
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    try:
-                        ap = os.path.abspath(file_path)
-                    except Exception:
-                        ap = file_path
-                    if stack_set and ap in stack_set:
-                        continue
-                    self.search_stats["files_scanned"] += 1
-                    if self._should_skip_file(file_path, code_root):
-                        continue
-                    try:
-                        self.search_stats["files_read"] += 1
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                            content = f.read()
-                        lines = content.split("\n")
-                        for i, line in enumerate(lines, 1):
-                            for var in shared_vars:
-                                if not self._contains_variable_usage(line, var):
-                                    continue
-                                if not self._is_variable_usage_line(line, var):
-                                    continue
-                                function_name = self._extract_function_name_at_line(lines, i)
-                                if not function_name:
-                                    continue
-                                function_code = self._extract_full_function_code(
-                                    lines, i - 1, target_function_name=function_name
-                                )
-                                if not function_code:
-                                    continue
-                                relation = self._determine_variable_relation(line, var)
-                                function_snippet = [
-                                    ln.rstrip() for ln in function_code.split("\n") if ln.strip()
-                                ]
-                                if self.max_code_length > 0:
-                                    function_snippet = self._truncate_snippet(function_snippet)
-                                var_func = VariableFunction(
-                                    variable=var,
-                                    relation=relation,
-                                    name=function_name,
-                                    file=file_path,
-                                    snippet=function_snippet,
-                                )
-                                key = (function_name, file_path, var, relation)
-                                if key not in unique_functions:
-                                    unique_functions[key] = var_func
-                                    logger.debug(
-                                        f"变量相关函数: {function_name} 使用 {var} ({relation}) @ {file_path}:{i}"
-                                    )
-                    except Exception as e:
-                        logger.debug(f"分析文件失败 {file_path}: {e}")
-                        continue
-
-        variable_functions = list(unique_functions.values())
-        elapsed_time = time.time() - start_time
-        self.search_stats["search_time"] += elapsed_time
-        files_scanned_this = self.search_stats["files_scanned"] - files_scanned_before
-        files_read_this = self.search_stats["files_read"] - files_read_before
-        logger.info(
-            f"共享变量函数搜索完成: 扫描 {files_scanned_this} 个文件, "
-            f"读取 {files_read_this} 个文件, 找到 {len(variable_functions)} 条函数-变量关系, "
-            f"耗时 {elapsed_time:.2f}秒"
+        """查找使用共享变量的函数，委托给 CodeLocatorService。"""
+        return self._locator.find_variable_usages(
+            shared_vars, crash_function_name, code_roots,
+            stack_priority_files=stack_priority_files,
+            crash_local_files=crash_local_files,
+            owner_class=owner_class,
+            owner_member_fields=owner_member_fields,
+            owner_definition_files=owner_definition_files,
         )
-        return variable_functions
-    
+
     def _extract_variables_from_line(self, line: str) -> List[str]:
         """从代码行中提取变量"""
         variables = []
@@ -5955,6 +5745,7 @@ class CodeContentProvider:
 
     def _ts_collect_identifiers_in_declarator(self, node, source_text: str) -> List[str]:
         """从 declarator 子树中提取变量名（identifier）。"""
+        source_bytes = source_text.encode("utf-8", errors="ignore")
         out: List[str] = []
         stack = [node]
         while stack:
@@ -5962,7 +5753,7 @@ class CodeContentProvider:
             if cur is None:
                 continue
             if cur.type == "identifier":
-                name = source_text[cur.start_byte:cur.end_byte].strip()
+                name = source_bytes[cur.start_byte:cur.end_byte].decode("utf-8", errors="replace").strip()
                 if name:
                     out.append(name)
                 continue
@@ -6121,7 +5912,7 @@ class CodeContentProvider:
 
     def _collect_member_or_global_candidates(self, lines: List[str]) -> set:
         """
-        只提取“可能为成员变量/全局变量”的候选：
+        只提取"可能为成员变量/全局变量"的候选：
         - this->member 取 member
         - scope::var 取 var（命名空间/全局样式）
         - 变量名前有作用域解析符 ::var
@@ -6321,6 +6112,157 @@ class CodeContentProvider:
             out |= self._parse_field_names_from_shallow_class_body(shallow)
         return out
 
+    def _build_owner_class_context_snapshot(
+        self,
+        resolved_function: str,
+        crash_file: str,
+        code_roots: List[str],
+        *,
+        max_excerpt_lines: int = 48,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        当崩溃点为类成员时，提取所属类型的声明摘录与成员字段名（供 LLM 理解 m_state 等成员）。
+        同时生成精简的类骨架（函数签名列表+成员变量声明），用于 fix_plan 阶段。
+        """
+        cls = self._extract_class_name_from_resolved(resolved_function or "")
+        if not cls or not crash_file:
+            return None
+        actual = self._find_source_file(crash_file, code_roots) or crash_file
+        if not actual or not os.path.isfile(actual):
+            return None
+        fields = sorted(self._collect_outer_class_field_names(cls, actual, code_roots))
+        excerpt: List[str] = []
+        skeleton_lines: List[str] = []
+        definition_file = os.path.abspath(actual)
+        try:
+            text = Path(actual).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return {
+                "class_name": cls,
+                "definition_file": definition_file,
+                "member_fields": fields,
+                "class_body_excerpt": excerpt,
+                "skeleton": skeleton_lines,
+            }
+        m = re.search(rf"\b(?:class|struct)\s+{re.escape(cls)}\b", text)
+        if m:
+            start_line = text[: m.start()].count("\n")
+            lines = text.splitlines()
+            from_ln = max(0, start_line)
+            to_ln = min(len(lines), from_ln + max(1, max_excerpt_lines))
+            shallow = self._extract_shallow_class_body_text(text, cls)
+            if shallow.strip():
+                excerpt = lines[from_ln:to_ln]
+            else:
+                excerpt = lines[from_ln : min(len(lines), from_ln + 24)]
+            # 构建类骨架：提取类声明头 + 成员变量 + 函数签名（不含函数体）
+            skeleton_lines = self._build_class_skeleton_lines(text, cls, m.start())
+        return {
+            "class_name": cls,
+            "definition_file": definition_file,
+            "member_fields": fields,
+            "class_body_excerpt": [ln.rstrip() for ln in excerpt if ln is not None],
+            "skeleton": skeleton_lines,
+        }
+
+    def _build_class_skeleton_lines(self, full_text: str, class_name: str, class_start_pos: int) -> List[str]:
+        """
+        构建精简类骨架：类声明头 + 成员变量声明 + 函数签名（不含函数体）。
+        目标是让 AI 看到完整的类结构但不需传输所有函数体（通常 15-50 行）。
+        """
+        lines = full_text.splitlines()
+        class_start_line = full_text[:class_start_pos].count("\n")
+        # 找到类开花括号
+        brace_pos = full_text.find("{", class_start_pos)
+        if brace_pos < 0:
+            return []
+        # 找类的结束位置（匹配花括号）
+        depth = 0
+        end_pos = -1
+        i = brace_pos
+        n = len(full_text)
+        while i < n:
+            c = full_text[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end_pos = i
+                    break
+            i += 1
+        if end_pos < 0:
+            return []
+        class_end_line = full_text[:end_pos].count("\n")
+        # 遍历类体行，提取骨架
+        skeleton: List[str] = []
+        # 添加类声明头（可能多行，如带继承）
+        header_end_line = full_text[:brace_pos].count("\n")
+        for ln_idx in range(class_start_line, min(header_end_line + 1, len(lines))):
+            skeleton.append(lines[ln_idx].rstrip())
+        body_depth = 0
+        skip_body = False
+        # 遍历类体行（不含类关闭行 };）
+        for ln_idx in range(header_end_line + 1, min(class_end_line, len(lines))):
+            raw_line = lines[ln_idx]
+            stripped = raw_line.strip()
+            # 跟踪花括号深度（类体内的嵌套深度）
+            open_count = raw_line.count("{")
+            close_count = raw_line.count("}")
+            if body_depth == 0:
+                # 最外层：判断是函数体开始还是成员声明
+                if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
+                    # 跳过注释（不影响骨架阅读）
+                    pass
+                elif re.match(r"^(public|private|protected)\s*:", stripped):
+                    skeleton.append(raw_line.rstrip())
+                elif stripped.endswith(";") or stripped == "":
+                    # 成员变量声明、using、typedef、forward decl 等
+                    if stripped:
+                        skeleton.append(raw_line.rstrip())
+                elif "{" in stripped:
+                    # 可能是内联函数定义或 enum 定义 — 仅保留签名，跳过内部
+                    if open_count == close_count:
+                        # 单行闭合（如 void Cancel(){ m_cancel = true; }）
+                        sig_part = raw_line.split("{", 1)[0].rstrip()
+                        if sig_part.strip():
+                            # 判断是否为 enum/struct 等类型定义（保留声明即可）
+                            if re.match(r"\s*enum\b", raw_line):
+                                skeleton.append(sig_part + " { ... };")
+                            else:
+                                skeleton.append(sig_part + ";  // inline")
+                    else:
+                        # 多行体开始 — 只保留签名
+                        sig_part = raw_line.split("{", 1)[0].rstrip()
+                        if sig_part.strip():
+                            if re.match(r"\s*enum\b", raw_line):
+                                skeleton.append(sig_part + " { ... };")
+                            else:
+                                skeleton.append(sig_part + ";  // inline, body omitted")
+                        body_depth = open_count - close_count
+                else:
+                    # 可能是多行签名的一部分
+                    skeleton.append(raw_line.rstrip())
+            else:
+                # 在嵌套体中，跳过
+                body_depth += open_count - close_count
+                if body_depth <= 0:
+                    body_depth = 0
+                    skip_body = False
+        skeleton.append("};")
+        return skeleton
+
+    @staticmethod
+    def _scoped_var_key(var_name: str, owner_class: Optional[str] = None) -> str:
+        """成员变量图节点键：有 owner 时用 Owner::field，避免跨类同名字段（如 m_state）混淆。"""
+        v = str(var_name or "").strip()
+        if not v:
+            return ""
+        oc = str(owner_class or "").strip()
+        if oc and "::" not in v:
+            return f"{oc}::{v}"
+        return v
+
     def _merge_class_field_usage_into_shared_vars(
         self,
         base_shared: List[str],
@@ -6356,9 +6298,121 @@ class CodeContentProvider:
             merged.add(tok)
         return sorted(merged)
 
+    def _extract_caller_deref_vars(
+        self,
+        callers: List[CallChainFunction],
+        crash_function_name: str,
+        existing_vars: List[str],
+        add2line_data: Optional[Dict[str, Any]] = None,
+        stack_priority_files: Optional[List[str]] = None,
+    ) -> List[str]:
+        """从调用方 snippet 中提取通过指针解引用调用崩溃函数（或同类方法）的成员变量。
+
+        例如调用方代码含 m_pclRoute->GetID()，崩溃函数为 CRoute::GetLegSize，
+        则提取 m_pclRoute 作为补充共享变量候选（因为 m_pclRoute 是 CRoute* 类型）。
+        """
+        # 崩溃函数的短名和类名
+        short_name = crash_function_name or ""
+        crash_class = ""
+        if "::" in short_name:
+            parts = short_name.split("::")
+            short_name = parts[-1]
+            if len(parts) >= 2:
+                crash_class = parts[-2]
+        if "(" in short_name:
+            short_name = short_name.split("(")[0]
+        short_name = short_name.strip()
+        crash_class = crash_class.strip()
+        if not short_name:
+            return []
+
+        existing_set = set(existing_vars)
+        found_static: List[str] = []
+        found_add2line: List[str] = []
+
+        def _extract_from_lines(lines: List[str], target_list: List[str]) -> None:
+            """从代码行中提取 xxx->Method( 模式的 xxx 变量。"""
+            # 匹配 xxx->CrashFunc( 模式
+            pat_direct = re.compile(
+                rf"\b([A-Za-z_]\w*)\s*->\s*{re.escape(short_name)}\s*\("
+            )
+            for line in lines:
+                for m in pat_direct.finditer(line):
+                    var = m.group(1)
+                    if var not in existing_set and var not in self._SHARED_VAR_BLOCKLIST and len(var) > 1:
+                        target_list.append(var)
+                        existing_set.add(var)
+
+        # 1. 从静态调用方 snippet 中提取
+        for caller in callers:
+            _extract_from_lines(caller.snippet or [], found_static)
+
+        # 2. 从 add2line 栈第 2 帧（直接调用方）的源文件中提取
+        #    场景：HandleDataFail 调用 m_pclRoute->GetID()（同类不同方法），
+        #    静态分析找不到它调用 GetLegSize，但运行时栈表明它是调用方。
+        if add2line_data and stack_priority_files and crash_class:
+            frames = (add2line_data.get("resolved_frames") or [])
+            # 取栈第 2~3 帧（第 1 帧是崩溃函数自身）
+            caller_func_names: List[str] = []
+            for fr in frames[1:3]:
+                fn = fr.get("function", "") if isinstance(fr, dict) else ""
+                if not fn:
+                    continue
+                # 提取调用方的类名，排除与崩溃函数同类的情况
+                fr_parts = fn.split("::")
+                fr_class = fr_parts[-2] if len(fr_parts) >= 2 else ""
+                if fr_class == crash_class:
+                    continue
+                caller_func_names.append(fr_parts[-1] if len(fr_parts) > 1 else fn)
+            if caller_func_names:
+                # 在 stack_priority_files 中搜索调用方函数，提取其中的 ->Method( 模式
+                # 其中 Method 是崩溃类的任意方法
+                pat_any_method = re.compile(
+                    rf"\b([A-Za-z_]\w*)\s*->\s*\w+\s*\("
+                )
+                for fp in stack_priority_files[:5]:
+                    try:
+                        content = self._locator._ctx.read_file_cached(fp) if hasattr(self, '_locator') else None
+                        if not content:
+                            continue
+                        lines = content.split("\n")
+                        in_caller = False
+                        for line in lines:
+                            # 简单启发式：检测是否在调用方函数体内
+                            for cfn in caller_func_names:
+                                if cfn in line and ("(" in line or "{" in line):
+                                    in_caller = True
+                                    break
+                            if in_caller:
+                                for m in pat_any_method.finditer(line):
+                                    var = m.group(1)
+                                    # 只取 m_ 前缀的成员变量（高置信度）
+                                    if var.startswith("m_") and var not in existing_set and var not in self._SHARED_VAR_BLOCKLIST:
+                                        found_add2line.append(var)
+                                        existing_set.add(var)
+                                if "}" in line and line.strip() == "}":
+                                    in_caller = False
+                    except Exception:
+                        continue
+        # add2line 派生的变量优先（更可能是实际崩溃路径上的指针）
+        return found_add2line + found_static
+
+    def _extract_class_from_function_name(self, func_name: str) -> str:
+        """从函数全名中提取类名，如 'CPanoramaRouteDataFactory::HandleDataFail' -> 'CPanoramaRouteDataFactory'。"""
+        if "::" not in (func_name or ""):
+            return ""
+        parts = func_name.split("::")
+        if len(parts) >= 2:
+            cls = parts[-2].strip()
+            # 去掉返回类型前缀
+            if " " in cls:
+                cls = cls.split()[-1]
+            return cls
+        return ""
+
     def _extract_shared_variables_from_code(self, code_text: str) -> List[str]:
         """
-        从代码片段中提取“共享变量”候选集合（仅类成员/全局变量），不包含函数参数与局部变量。
+        从代码片段中提取"共享变量"候选集合（仅类成员/全局变量），不包含函数参数与局部变量。
         用于精确行时输入为崩溃行；用于 from_log_deduce 时输入为整个函数片段。
         返回去重且排序的变量名列表。
         """
@@ -6428,7 +6482,7 @@ class CodeContentProvider:
         code_roots: List[str],
     ) -> List[CallChainFunction]:
         """
-        查找与崩溃函数同处一个入口函数体内、且在崩溃函数调用之前执行的“前置环境函数”。
+        查找与崩溃函数同处一个入口函数体内、且在崩溃函数调用之前执行的"前置环境函数"。
         这些函数作为 pre_call_fun_in_same_parent_fun 返回，并在 parent_fun 字段中标记所属的直接调用者。
         """
         pre_call_fun_in_same_parent_functions: List[CallChainFunction] = []
@@ -6533,7 +6587,7 @@ class CodeContentProvider:
         self, flines: List[str], start_idx: int, n: int
     ) -> Optional[int]:
         """
-        从 start_idx 起扫描，找到与首个“使深度由 0 变为正”的 { 配对的 } 所在行（0-based）。
+        从 start_idx 起扫描，找到与首个"使深度由 0 变为正"的 { 配对的 } 所在行（0-based）。
         用于省略片段时定位函数体结束行，避免误匹配内层 } 或文件后部重复行。
         """
         depth = 0
@@ -6558,14 +6612,13 @@ class CodeContentProvider:
     ) -> Optional[List[str]]:
         if file_path in cache:
             return cache[file_path]
-        try:
-            if not os.path.isfile(file_path):
-                return None
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                cache[file_path] = f.read().splitlines()
-            return cache[file_path]
-        except Exception:
+        # 委托给全局文件缓存，避免重复磁盘读取
+        content = self._read_file_cached(file_path)
+        if content is None:
             return None
+        lines = content.splitlines()
+        cache[file_path] = lines
+        return lines
 
     def _locate_snippet_lines_in_file(
         self,
@@ -6651,6 +6704,79 @@ class CodeContentProvider:
                     break
         return start_1, end_idx + 1
 
+    @staticmethod
+    def _build_graph_evidence_summary(
+        edges_list: List[Any],
+        crash_node_id: str,
+    ) -> Dict[str, Any]:
+        """汇总图边类型，供 prompt 与自动改码门禁使用（通用规则，非业务硬编码）。"""
+        cf_norm = str(crash_node_id or "").rstrip().rstrip("{").rstrip()
+
+        def _norm_fid(raw: Any) -> str:
+            return str(raw or "").rstrip().rstrip("{").rstrip()
+
+        def _write_like(rel: Any) -> bool:
+            r = str(rel or "").strip().lower()
+            return r in ("write", "assign", "delete")
+
+        has_direct = False
+        has_stack = False
+        has_to_crash = False
+        has_sv = False
+        proven_caller_norm: Set[str] = set()
+        for e in edges_list or []:
+            if not isinstance(e, dict):
+                continue
+            et = str(e.get("type") or "")
+            if et in ("calls_direct", "calls_to_crash_site"):
+                if _norm_fid(e.get("to_id")) == cf_norm:
+                    fid = _norm_fid(e.get("from_id"))
+                    if fid:
+                        proven_caller_norm.add(fid)
+            if et == "calls_direct":
+                has_direct = True
+            elif et == "calls_stack_order":
+                has_stack = True
+            elif et == "calls_to_crash_site":
+                has_to_crash = True
+
+        sv_write_upstream = False
+        for e in edges_list or []:
+            if not isinstance(e, dict):
+                continue
+            if str(e.get("type") or "") != "use_shared_var":
+                continue
+            has_sv = True
+            if not _write_like(e.get("relation")):
+                continue
+            fid = _norm_fid(e.get("from_id"))
+            if fid and fid != cf_norm and fid in proven_caller_norm:
+                sv_write_upstream = True
+
+        auto_ok = bool(has_direct or has_to_crash or sv_write_upstream)
+        block_reason = ""
+        if not auto_ok:
+            parts: List[str] = []
+            if has_stack:
+                parts.append("存在 calls_stack_order（栈序关联，非源码证明的调用）")
+            if not has_direct and not has_to_crash:
+                parts.append("无 calls_direct / calls_to_crash_site")
+            if not sv_write_upstream:
+                parts.append("无崩溃点外共享变量写路径")
+            block_reason = (
+                "；".join(parts)
+                + "。仅允许输出调查假设，禁止自动改码。"
+            )
+        return {
+            "has_calls_direct": has_direct,
+            "has_calls_stack_order": has_stack,
+            "has_calls_to_crash_site": has_to_crash,
+            "has_use_shared_var": has_sv,
+            "has_shared_var_write_upstream": sv_write_upstream,
+            "auto_fix_allowed": auto_ok,
+            "auto_fix_block_reason": block_reason or None,
+        }
+
     def _format_graph_edges_empty_reason(
         self,
         *,
@@ -6689,6 +6815,151 @@ class CodeContentProvider:
             return "未生成任何边；原因未单独记录。"
         return " ".join(parts)
 
+    def _crash_func_snippet_usable(self, crash_func: CrashFunction) -> bool:
+        """崩溃函数片段是否可用于自动改码（排除超时占位文本）。"""
+        snippet = getattr(crash_func, "snippet", None) or []
+        if not isinstance(snippet, list) or not snippet:
+            return False
+        if getattr(crash_func, "snippet_scope", None) == "error":
+            return False
+        joined = "\n".join(str(x) for x in snippet)
+        if "未完成源码提取" in joined or "整阶段超时" in joined:
+            return False
+        return True
+
+    def _build_degraded_crash_graph_on_phase_timeout(
+        self,
+        *,
+        crash_file: str,
+        crash_func: CrashFunction,
+        add2line_data: Dict[str, Any],
+        timeout_message: str,
+    ) -> CrashGraph:
+        """
+        整阶段超时且未完成完整图构建时的降级图：
+        - 至少保留崩溃函数节点（供 code_modifier 替换）
+        - 按 add2line 栈序为相邻工程帧补 calls_to_crash_site（不做全仓 find_function）
+        """
+        if not self._crash_func_snippet_usable(crash_func):
+            return CrashGraph(
+                nodes=[],
+                edges=[],
+                call_chain_from_code=[],
+                call_chain_from_add2line=[],
+                edges_empty_reason=timeout_message,
+            )
+
+        def _normalize_signature(sig: Optional[str], fallback_name: str) -> str:
+            key = sig or fallback_name or ""
+            key = key.rstrip()
+            if key.endswith("{"):
+                key = key[:-1].rstrip()
+            return key
+
+        def func_node_id(name: str, file: Optional[str], signature: Optional[str] = None) -> str:
+            key = _normalize_signature(signature, name)
+            return f"func|{(file or '')}|{key}"
+
+        nodes: Dict[str, GraphNode] = {}
+        edges: List[GraphEdge] = []
+        code_roots: List[str] = list(getattr(self, "current_code_roots", []) or [])
+        if not code_roots and getattr(self, "current_code_root", None):
+            code_roots = [str(self.current_code_root)]
+
+        norm_cf_sig = _normalize_signature(crash_func.signature, crash_func.name)
+        cf_id = func_node_id(crash_func.name, crash_file, norm_cf_sig)
+        nodes[cf_id] = GraphNode(
+            id=cf_id,
+            type="function",
+            name=crash_func.name,
+            file=crash_file,
+            signature=norm_cf_sig,
+            snippet=crash_func.snippet,
+            snippet_start_line=getattr(crash_func, "snippet_start_line", None),
+            snippet_end_line=getattr(crash_func, "snippet_end_line", None),
+        )
+        stack_ids: List[str] = []
+
+        for frame in add2line_data.get("resolved_frames") or []:
+            if not isinstance(frame, dict):
+                continue
+            rfile = str(frame.get("resolved_file") or "").strip()
+            try:
+                rline = int(frame.get("resolved_line") or 0)
+            except (TypeError, ValueError):
+                rline = 0
+            rfunc = str(frame.get("resolved_function") or "").strip()
+            if not rfile or rline <= 0 or not rfunc:
+                continue
+            actual = self._find_source_file(rfile, code_roots) if code_roots else rfile
+            if not actual or not os.path.isfile(actual):
+                continue
+            if code_roots:
+                try:
+                    if not _file_under_any_project_root(Path(actual), code_roots):
+                        continue
+                except (OSError, ValueError):
+                    continue
+            simple = self._extract_function_name_from_resolved(rfunc)
+            if not simple:
+                continue
+            try:
+                self._code_context_phase_check("degraded_graph_add2line_frame")
+            except _CodeContextPhaseTimeout:
+                logger.warning("降级图构建因阶段超时提前结束（已保留已收集节点）")
+                break
+            cf_stack = self._extract_crash_function(rfunc, actual, rline, code_roots)
+            if cf_stack is None or not cf_stack.snippet:
+                continue
+            sig = _normalize_signature(cf_stack.signature, simple)
+            nid = func_node_id(simple, actual, sig)
+            if nid not in nodes:
+                nodes[nid] = GraphNode(
+                    id=nid,
+                    type="function",
+                    name=simple,
+                    file=actual,
+                    signature=sig,
+                    snippet=cf_stack.snippet,
+                    snippet_start_line=getattr(cf_stack, "snippet_start_line", None),
+                    snippet_end_line=getattr(cf_stack, "snippet_end_line", None),
+                )
+            stack_ids.append(nid)
+
+        seen_stack: set = set()
+        ordered: List[str] = []
+        for nid in stack_ids:
+            if nid in seen_stack:
+                continue
+            seen_stack.add(nid)
+            ordered.append(nid)
+        for i in range(len(ordered) - 1):
+            caller_id, callee_id = ordered[i + 1], ordered[i]
+            if caller_id in nodes and callee_id in nodes:
+                edges.append(
+                    GraphEdge(
+                        from_id=caller_id,
+                        to_id=callee_id,
+                        type="calls_to_crash_site",
+                    )
+                )
+
+        call_chain_from_add2line: List[Dict[str, Any]] = []
+        if ordered:
+            call_chain_from_add2line.append(
+                {"thread_id": "unknown", "nodes": ordered, "source_positions": list(range(1, len(ordered) + 1))}
+            )
+        reason = timeout_message
+        if not edges:
+            reason = f"{timeout_message}（已保留崩溃函数节点，但未从 add2line 栈补全调用边）"
+        return CrashGraph(
+            nodes=list(nodes.values()),
+            edges=edges,
+            call_chain_from_code=[],
+            call_chain_from_add2line=call_chain_from_add2line,
+            edges_empty_reason=reason,
+        )
+
     def _build_crash_graph(
         self,
         crash_summary: CrashSummary,
@@ -6719,11 +6990,13 @@ class CodeContentProvider:
             - 优先使用 signature；若为空则退回到函数名
             - 去掉尾部的大括号 '{' 及其后面的空白，避免同一函数因是否带 '{' 被当成不同节点
             """
+            from services.code_fixer import sanitize_function_signature
+
             key = sig or fallback_name or ""
             key = key.rstrip()
             if key.endswith("{"):
                 key = key[:-1].rstrip()
-            return key
+            return sanitize_function_signature(key)
 
         def func_node_id(name: str, file: Optional[str], signature: Optional[str] = None) -> str:
             """构造函数节点 ID：func|file|normalized_signature_or_name，避免重载函数仅按名称冲突。"""
@@ -6731,6 +7004,39 @@ class CodeContentProvider:
             return f"func|{(file or '')}|{key}"
 
         _graph_file_lines_cache: Dict[str, List[str]] = {}
+
+        # 对崩溃函数做一次最终“强一致”重提取，避免上游降级片段（line_window）混入相邻函数。
+        if crash_file and os.path.isfile(crash_file):
+            try:
+                crash_lines = self._read_file_lines_cached(crash_file, _graph_file_lines_cache) or []
+                anchor_line = int(
+                    getattr(crash_summary, "crash_line_number", None)
+                    or getattr(crash_func, "crash_line_number", None)
+                    or 0
+                )
+                if crash_lines and anchor_line > 0:
+                    target_name = self._extract_function_name_from_resolved(crash_func.signature or crash_func.name)
+                    refined = self._extract_full_function_code(
+                        crash_lines,
+                        max(0, anchor_line - 1),
+                        target_function_name=target_name or None,
+                    )
+                    if refined:
+                        refined_lines = [ln for ln in refined.splitlines()]
+                        while refined_lines and not refined_lines[-1].strip():
+                            refined_lines.pop()
+                        loc = self._locate_snippet_in_file(crash_lines, refined_lines, anchor_line)
+                        if loc:
+                            rs_line, re_line = loc
+                            crash_func = replace(
+                                crash_func,
+                                snippet=refined_lines,
+                                snippet_scope="full_function",
+                                snippet_start_line=rs_line,
+                                snippet_end_line=re_line,
+                            )
+            except Exception:
+                pass
 
         # 1. 函数节点：崩溃函数本身
         norm_cf_sig = _normalize_signature(crash_func.signature, crash_func.name)
@@ -6743,6 +7049,17 @@ class CodeContentProvider:
             )
             if loc_ss is not None:
                 ss_cf, se_cf = loc_ss, loc_se
+        if crash_func.snippet and crash_file:
+            refined_snippet, refined_ss, refined_se = self._refine_function_snippet_bounds(
+                crash_file,
+                crash_func.snippet,
+                norm_cf_sig,
+                ss_cf,
+                se_cf,
+            )
+            if refined_snippet:
+                crash_func.snippet = refined_snippet
+                ss_cf, se_cf = refined_ss, refined_se
         nodes[cf_id] = GraphNode(
             id=cf_id,
             type="function",
@@ -6762,6 +7079,9 @@ class CodeContentProvider:
             if snippet and file:
                 ss, se = self._locate_snippet_lines_in_file(
                     file, snippet, _graph_file_lines_cache
+                )
+                snippet, ss, se = self._refine_function_snippet_bounds(
+                    file, snippet, norm_sig or signature, ss, se
                 )
             if nid not in nodes:
                 nodes[nid] = GraphNode(
@@ -6792,7 +7112,7 @@ class CodeContentProvider:
             # 隐式构造成员子对象：snippet 首行常为 struct/class 定义
             if re.match(r"^\s*(?:template\s*<[^>]+>\s*)?(?:struct|class)\s+\w+", s):
                 return True
-            # 过滤明显“语句级误命中”
+            # 过滤明显"语句级误命中"
             if ";" in s and "(" in s and ")" in s and "::" not in s:
                 return False
             if "(" not in s or ")" not in s:
@@ -6840,10 +7160,15 @@ class CodeContentProvider:
             for f in effective_direct_callers:
                 sig = f.snippet[0].strip() if f.snippet else None
                 if not _is_plausible_function_signature(sig):
+                    sig = str(f.name or sig or "").strip() or None
+                if not _is_plausible_function_signature(sig):
                     continue
                 if not code_roots_for_graph:
                     nid = ensure_func_node(f.name, f.file, sig, f.snippet)
                     edges.append(GraphEdge(from_id=nid, to_id=cf_id, type="calls_direct"))
+                    edges.append(
+                        GraphEdge(from_id=nid, to_id=cf_id, type="calls_to_crash_site")
+                    )
                     pk = (nid, cf_id)
                     if pk not in seen_path_keys:
                         seen_path_keys.add(pk)
@@ -6858,7 +7183,10 @@ class CodeContentProvider:
                         path_index += 1
                     continue
 
-                ensure_func_node(f.name, f.file, sig, f.snippet)
+                nid = ensure_func_node(f.name, f.file, sig, f.snippet)
+                edges.append(
+                    GraphEdge(from_id=nid, to_id=cf_id, type="calls_to_crash_site")
+                )
                 ancestors = self._expand_static_call_chain_prepend(
                     f, code_roots_for_graph, max_nodes_including_crash=max_n, layer_cache=layer_cache
                 )
@@ -6870,6 +7198,18 @@ class CodeContentProvider:
                     aid = ensure_func_node(anc.name, anc.file, s0, anc.snippet)
                     path_ids.append(aid)
                 if not path_ids:
+                    pk = (nid, cf_id)
+                    if pk not in seen_path_keys:
+                        seen_path_keys.add(pk)
+                        call_chain_from_code.append(
+                            ExecutionPath(
+                                id=f"path_{path_index}",
+                                thread_id="unknown",
+                                nodes=[nid, cf_id],
+                                description=None,
+                            )
+                        )
+                        path_index += 1
                     continue
                 full_chain = path_ids + [cf_id]
                 if len(full_chain) < min_n:
@@ -6916,8 +7256,14 @@ class CodeContentProvider:
         # 变量声明缓存：var_name -> (file, signature_line)
         var_decl_cache: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
 
+        owner_cls_for_var = ""
+        octx_var = getattr(self, "_cc_owner_class_context", None)
+        if isinstance(octx_var, dict):
+            owner_cls_for_var = str(octx_var.get("class_name") or "").strip()
+
         def var_node_id(var_name: str) -> str:
-            return f"var|{var_name}"
+            key = self._scoped_var_key(var_name, owner_cls_for_var or None)
+            return f"var|{key}"
 
         merged_use_shared: Dict[Tuple[str, str], str] = {}
         for vf in use_same_var_related_fun:
@@ -7046,11 +7392,27 @@ class CodeContentProvider:
                                     sig = _normalize_signature(cand0, simple_name)
                                 else:
                                     # cand0 若是注释/右花括号等无效行，则退回 resolved_function，
-                                    # 避免在 05 中出现“/// 注释”或“}”这类伪函数签名。
+                                    # 避免在 05 中出现"/// 注释"或"}"这类伪函数签名。
                                     sig = _normalize_signature(
                                         frame_detail.get("resolved_function", fn), simple_name
                                     )
                             snippet = cf_stack.snippet
+
+                    # 优先：C++ 限定名严格定位（避免 simple_name 误命中）
+                    if not (file_path and snippet):
+                        loc_q = self._find_cpp_qualified_definition_location(
+                            fn, code_roots_for_graph
+                        )
+                        if loc_q:
+                            cf_q = self._extract_crash_function(
+                                fn, loc_q[0], loc_q[1], code_roots_for_graph
+                            )
+                            if cf_q is not None and cf_q.snippet:
+                                file_path = self._find_source_file(
+                                    loc_q[0], code_roots_for_graph
+                                ) or loc_q[0]
+                                sig = _normalize_signature(cf_q.signature, simple_name)
+                                snippet = cf_q.snippet
 
                     # 回退：全仓按符号名搜索定义（历史逻辑）
                     if not (file_path and snippet):
@@ -7092,17 +7454,25 @@ class CodeContentProvider:
                     inner_node = nodes.get(inner_id)
                     if not outer_node or not inner_node:
                         continue
-                    if not self._verify_stack_caller_resolves_call_to_callee(outer_node, inner_node):
-                        continue
-                    verified_stack_pairs.add((outer_id, inner_id))
-                    edges.append(
-                        GraphEdge(
-                            from_id=outer_id,
-                            to_id=inner_id,
-                            type="calls_direct",
-                            thread_id=tid,
+                    if self._verify_stack_caller_resolves_call_to_callee(outer_node, inner_node):
+                        verified_stack_pairs.add((outer_id, inner_id))
+                        edges.append(
+                            GraphEdge(
+                                from_id=outer_id,
+                                to_id=inner_id,
+                                type="calls_direct",
+                                thread_id=tid,
+                            )
                         )
-                    )
+                    else:
+                        edges.append(
+                            GraphEdge(
+                                from_id=outer_id,
+                                to_id=inner_id,
+                                type="calls_stack_order",
+                                thread_id=tid,
+                            )
+                        )
 
         # 5c. 静态未产出 calls_direct 时，call_chain_from_code 与 5b 一致：仅包含已通过校验的相邻 hop，
         #     从崩溃端向前取最长后缀（避免未校验的外层帧混进路径）。
@@ -7137,8 +7507,31 @@ class CodeContentProvider:
                 stack_path_idx += 1
             if extended_paths:
                 call_chain_from_code = extended_paths
+            else:
+                stack_fallback_paths: List[ExecutionPath] = []
+                stack_path_idx = 0
+                for item in call_chain_from_add2line:
+                    tnodes = item.get("nodes") or []
+                    if not isinstance(tnodes, list) or len(tnodes) < 2:
+                        continue
+                    kept = [n for n in tnodes if isinstance(n, str) and n in nodes]
+                    if len(kept) < 2:
+                        continue
+                    tid_raw = item.get("thread_id")
+                    tid_str = "unknown" if tid_raw is None else str(tid_raw)
+                    stack_fallback_paths.append(
+                        ExecutionPath(
+                            id=f"path_stack_order_{stack_path_idx}",
+                            thread_id=tid_str,
+                            nodes=kept,
+                            description="inferred_from_add2line_stack_order",
+                        )
+                    )
+                    stack_path_idx += 1
+                if stack_fallback_paths:
+                    call_chain_from_code = stack_fallback_paths
 
-        # 6. 基于代码的调用路径：优先第 2 步静态结果；若仅由 5c 从栈补全，则为 add2line 推导链路
+        # 6. 基于代码的调用路径：优先第 2 步静态结果；若仅由 5c/栈序回退补全，则为 add2line 推导链路
 
         # 7. 对 edges 去重：基于 (from_id, to_id, type) 三元组
         deduped_edges: List[GraphEdge] = []
@@ -7371,7 +7764,7 @@ class CodeContentProvider:
         except Exception:
             return None
         
-        # 在文件中查找第一个符合“声明”特征的行
+        # 在文件中查找第一个符合"声明"特征的行
         def _looks_like_function_proto(line: str, name: str) -> bool:
             idx = line.find(name)
             if idx == -1:
@@ -7428,7 +7821,7 @@ class CodeContentProvider:
         if line_number <= 0 or line_number > len(lines):
             return None
 
-        # tree-sitter 路径：直接定位“该行所属函数定义”，再从签名里提取函数名 token。
+        # tree-sitter 路径：直接定位"该行所属函数定义"，再从签名里提取函数名 token。
         if self.code_parser_backend == "tree_sitter" and self._ts_parser is not None:
             src = "\n".join(lines or [])
             sig, _ = self._ts_extract_signature_and_body(src, line_number - 1, None)
@@ -7517,6 +7910,56 @@ class CodeContentProvider:
             ))
 
         return thread_contexts
+
+    def _enrich_resolved_frames_symbol_locations(
+        self,
+        resolved_frames: List[Dict[str, Any]],
+        code_roots: List[str],
+        *,
+        max_frames: int = 8,
+    ) -> None:
+        """
+        为栈顶若干帧补齐 file:line（已符号化但无 addr2line 行号时），
+        保证 call_chain_from_add2line 与 prompt 栈序源码稳定可复现。
+        """
+        if not resolved_frames or not code_roots:
+            return
+        cap = max(2, min(int(max_frames), 16))
+        attempts = 0
+        max_attempts = max(cap * 3, 6)
+        for fi in range(min(len(resolved_frames), cap)):
+            if attempts >= max_attempts:
+                break
+            frame = resolved_frames[fi]
+            if not isinstance(frame, dict):
+                continue
+            rfile = str(frame.get("resolved_file") or "").strip()
+            try:
+                rline = int(frame.get("resolved_line") or 0)
+            except (TypeError, ValueError):
+                rline = 0
+            if rfile and rline > 0:
+                continue
+            rf = str(frame.get("resolved_function") or frame.get("function") or "").strip()
+            if not rf:
+                continue
+            module_c = (frame.get("module") or "").strip()
+            if self._is_probably_system_module_name(module_c):
+                continue
+            attempts += 1
+            loc = self._find_cpp_qualified_definition_location(rf, code_roots)
+            if not loc:
+                simple = self._extract_function_name_from_resolved(rf)
+                if simple and not self._extract_cpp_qualified_parts(rf):
+                    loc = self._find_function_definition_location(simple, code_roots)
+            if not loc:
+                continue
+            guessed_file, guessed_line = loc
+            frame["resolved_function"] = rf
+            frame["resolved_file"] = guessed_file
+            frame["resolved_line"] = guessed_line
+            frame["crash_location_source"] = frame.get("crash_location_source") or "from_log_deduce"
+            frame["rescue_reason"] = frame.get("rescue_reason") or "symbol_only_stack_frame"
     
     def _find_thread_functions(self, resolved_frames: List[Dict[str, Any]]) -> List[str]:
         """查找线程相关函数"""
@@ -7728,6 +8171,9 @@ class CodeContentProvider:
                 cs["node_id"] = f"func|{file_path}|{func_str}"
                 cs.pop("file", None)
                 cs.pop("function", None)
+            owner_ctx = getattr(self, "_cc_owner_class_context", None)
+            if isinstance(owner_ctx, dict) and owner_ctx.get("class_name"):
+                cs["owner_class_context"] = owner_ctx
             result_dict["crash_summary"] = cs
             result_dict.pop("crash_func", None)
 
@@ -7755,12 +8201,28 @@ class CodeContentProvider:
 
         for path in call_chain_from_code:
             try:
-                path.pop("description", None)
+                desc = path.pop("description", None)
+                if desc:
+                    path["inference"] = desc
             except AttributeError:
                 continue
 
         call_chain_from_code_res = "ok" if call_chain_from_code else "not_found"
         graph_dict["call_chain_from_code_res"] = call_chain_from_code_res
+
+        # 注入类骨架节点：让 AI 看到完整类结构（成员变量 + 函数签名）
+        owner_ctx = cs.get("owner_class_context") if isinstance(cs, dict) else None
+        if isinstance(owner_ctx, dict):
+            skel_lines = owner_ctx.get("skeleton")
+            if isinstance(skel_lines, list) and skel_lines:
+                skel_node_id = f"class_skeleton|{owner_ctx.get('definition_file', '')}|{owner_ctx.get('class_name', '')}"
+                nodes_list.append({
+                    "id": skel_node_id,
+                    "type": "class_skeleton",
+                    "class_name": owner_ctx.get("class_name", ""),
+                    "file": owner_ctx.get("definition_file", ""),
+                    "skeleton": "\n".join(skel_lines),
+                })
 
         graph_dict["nodes"] = nodes_list
         graph_dict["edges"] = edges_list
@@ -7772,6 +8234,10 @@ class CodeContentProvider:
             graph_dict.pop("edges_empty_reason", None)
         elif not graph_dict.get("edges_empty_reason"):
             graph_dict["edges_empty_reason"] = "未生成任何边；原因未单独记录。"
+        crash_nid = str(cs.get("node_id") or "") if isinstance(cs, dict) else ""
+        graph_dict["evidence_summary"] = self._build_graph_evidence_summary(
+            edges_list, crash_nid
+        )
         result_dict["graph"] = graph_dict
         result_dict["code_parser_backend"] = self.code_parser_backend
         result_dict["code_context_options"] = {
@@ -7781,6 +8247,23 @@ class CodeContentProvider:
             ),
             "min_key_read_related_functions": int(
                 getattr(self, "min_key_read_related_functions", 2) or 0
+            ),
+            "max_prompt_stack_frame_functions": (
+                max(
+                    3,
+                    min(
+                        len(getattr(self, "_stack_kept_original_indices", []) or []) + 2,
+                        16,
+                    ),
+                )
+                if getattr(self, "_stack_kept_original_indices", None)
+                else 8
+            ),
+            "max_functions_in_prompt": 12,
+            "max_stack_frames_symbol_enrich": 8,
+            "max_stack_frames_in_prompt": 6,
+            "max_crash_caller_search_files": int(
+                getattr(self, "max_crash_caller_search_files", 600) or 600
             ),
         }
         if extra_top_level:
@@ -7800,19 +8283,95 @@ class CodeContentProvider:
 
         return json_result
 
+    def _select_topmost_locatable_crash_frame(
+        self,
+        resolved_frames: List[Dict[str, Any]],
+        code_roots: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        从栈顶向下选取第一个能在 code_roots 中定位的 C++ 帧（与主路径崩溃函数策略一致）。
+        """
+        if not resolved_frames or not code_roots:
+            return None
+        symbol_only_rescue_attempts = 0
+        max_symbol_only_rescues = int(getattr(self, "max_symbol_only_rescues", 5))
+        for candidate in resolved_frames:
+            rf = (candidate.get("resolved_function") or "").strip()
+            raw_fn = (candidate.get("function") or "").strip()
+            rf_or_raw = rf or raw_fn
+            if not rf_or_raw or not self._is_cpp_native_symbol(rf_or_raw):
+                continue
+            module_c = (candidate.get("module") or "").strip()
+            rfile = (candidate.get("resolved_file") or "").strip()
+            try:
+                rline_int = int(candidate.get("resolved_line") or 0)
+            except (TypeError, ValueError):
+                rline_int = 0
+            if rfile and rline_int > 0:
+                actual = self._find_source_file(rfile, code_roots)
+                if actual:
+                    try:
+                        if _file_under_any_project_root(Path(actual), code_roots):
+                            out = dict(candidate)
+                            out["resolved_file"] = actual
+                            out["resolved_line"] = rline_int
+                            out["crash_location_source"] = "from_add2line"
+                            return out
+                    except (OSError, ValueError):
+                        out = dict(candidate)
+                        out["resolved_file"] = actual
+                        out["resolved_line"] = rline_int
+                        out["crash_location_source"] = "from_add2line"
+                        return out
+            if symbol_only_rescue_attempts >= max_symbol_only_rescues:
+                continue
+            if self._is_probably_system_module_name(module_c):
+                continue
+            if self._is_standard_library_cpp_symbol(rf_or_raw):
+                continue
+            loc = None
+            cpp_qualified = self._extract_cpp_qualified_parts(rf_or_raw)
+            symbol_only_rescue_attempts += 1
+            if cpp_qualified:
+                loc = self._find_cpp_qualified_definition_location(rf_or_raw, code_roots)
+            simple_name = self._extract_function_name_from_resolved(rf_or_raw)
+            if (not cpp_qualified) and (not loc) and simple_name:
+                loc = self._find_function_definition_location(simple_name, code_roots)
+            if not loc:
+                continue
+            guessed_file, guessed_line = loc
+            out = dict(candidate)
+            out["resolved_function"] = rf_or_raw
+            out["resolved_file"] = guessed_file
+            out["resolved_line"] = guessed_line
+            out["crash_location_source"] = "from_log_deduce"
+            out["rescue_reason"] = "symbol_only_function_locate"
+            return out
+        return None
+
     def _minimal_code_context_on_phase_timeout(
-        self, add2line_data: Dict[str, Any], detail: str
+        self,
+        add2line_data: Dict[str, Any],
+        detail: str,
+        code_roots: Optional[List[str]] = None,
     ) -> str:
         """超时发生在崩溃摘要/函数提取之前时的降级 JSON。"""
         frames = add2line_data.get("resolved_frames") or []
-        f0 = frames[0] if frames else {}
-        rf = (f0.get("resolved_function") or "unknown").strip() or "unknown"
+        roots = list(code_roots or getattr(self, "current_code_roots", None) or [])
+        picked = self._select_topmost_locatable_crash_frame(frames, roots) if roots else None
+        f0 = picked or (frames[0] if frames else {})
+        rf = (f0.get("resolved_function") or f0.get("function") or "unknown").strip() or "unknown"
         rfile = (f0.get("resolved_file") or "").strip()
         try:
             rline = int(f0.get("resolved_line") or 0)
         except (TypeError, ValueError):
             rline = 0
         addr = str(f0.get("address") or "")
+        note = "代码上下文整阶段超时，崩溃帧信息可能不完整。"
+        if picked:
+            note += " 已按栈顶向下首个可定位 C++ 帧选取崩溃函数。"
+        elif frames and not self._is_cpp_native_symbol(rf):
+            note += " 未能在 code_root 定位 C++ 帧，当前为栈顶回退帧。"
         crash_summary = CrashSummary(
             file=rfile or "N/A",
             function=rf,
@@ -7820,8 +8379,8 @@ class CodeContentProvider:
             stack_address=addr,
             error_type="SIGSEGV",
             thread_id="unknown",
-            crash_location_source="from_add2line",
-            crash_line_note="代码上下文整阶段超时，崩溃帧信息可能不完整。",
+            crash_location_source=str(f0.get("crash_location_source") or "from_add2line"),
+            crash_line_note=note,
             crash_line_code=None,
         )
         fn_token = self._extract_function_name_from_resolved(rf) or "unknown"
@@ -7892,13 +8451,21 @@ class CodeContentProvider:
             
             # 解析add2line输出
             add2line_data = json.loads(add2line_json)
-            
+
             # 检查必要字段
             if "resolved_frames" not in add2line_data:
                 raise ValueError("JSON中缺少resolved_frames字段")
             
             resolved_frames = add2line_data["resolved_frames"]
             os_type = add2line_data.get("os_type", "unknown")
+
+            for frame in resolved_frames:
+                if not isinstance(frame, dict):
+                    continue
+                for key in ("function", "resolved_function"):
+                    val = frame.get(key)
+                    if isinstance(val, str) and val.strip():
+                        frame[key] = sanitize_stack_symbol(val)
             
             # 检查代码根目录（统一解析为绝对路径，后续所有扫描/索引统一使用绝对路径，避免相对/绝对混用导致重复节点）
             code_roots_abs_strs = _normalize_code_roots_arg(code_root)
@@ -7913,12 +8480,14 @@ class CodeContentProvider:
             # 记录当前代码根目录（绝对路径），供后续图构建/查找函数定义时使用
             self.current_code_roots = list(code_roots_abs_strs)
             self.current_code_root = code_roots_abs_strs[0]
+            self._ensure_ctags_index(code_roots_abs_strs)
 
             logger.info(f"代码根目录(共 {len(code_roots_abs_strs)} 个): {code_roots_abs_strs}")
             logger.info(f"检测到 {len(resolved_frames)} 个解析后的堆栈帧")
 
             self._cc_stage_crash_summary = None
             self._cc_stage_crash_func = None
+            self._cc_owner_class_context = None
             self._session_reset_timeouts_for_code_content_phase()
             self._code_context_phase_start()
             
@@ -7957,7 +8526,9 @@ class CodeContentProvider:
                     if actual_file_path:
                         # 找到实际文件路径，检查是否在代码根目录下
                         try:
-                            actual_path = Path(actual_file_path).resolve()
+                            # 勿对 actual_file_path 先 resolve()：code_root 内符号链接（如 src/vi -> engine-vi）
+                            # 展开后会落到兄弟目录，被误判为"不在 code_root 下"。
+                            actual_path = Path(actual_file_path)
                             try:
                                 if not _file_under_any_project_root(actual_path, code_roots_abs_strs):
                                     raise ValueError("not under project roots")
@@ -8023,7 +8594,7 @@ class CodeContentProvider:
                     logger.info(f"已过滤 {skipped_count} 个不在代码目录中的堆栈帧（剩余 {len(filtered_frames)} 个）")
                 
                 # 若真实崩溃帧（栈顶 frame 0）被过滤掉（atos 常将用户库首帧错误解析为系统符号如 sstream），
-                # 则用 mangled 名在源码中按函数名定位，补回为“真实崩溃帧”，避免误用后续帧。
+                # 则用 mangled 名在源码中按函数名定位，补回为"真实崩溃帧"，避免误用后续帧。
                 if original_first_frame and (
                     not filtered_frames or filtered_frames[0].get("address") != original_first_frame.get("address")
                 ):
@@ -8150,11 +8721,15 @@ class CodeContentProvider:
                     if self._is_probably_system_module_name(module_c):
                         extraction_warnings.append(f"帧[{fi}] 系统库帧且缺少 file:line，跳过兜底")
                         continue
+                    if self._is_standard_library_cpp_symbol(rf_or_raw):
+                        extraction_warnings.append(f"帧[{fi}] 标准库符号且缺少 file:line，跳过兜底")
+                        continue
                     # 兜底：当 02 只有符号（无 file:line）时，尝试按函数名在 code_roots 中定位定义行
                     # 常见于「已符号化日志 + 未提供/不可用库目录」场景。
                     loc = None
                     # native-only 模式：禁用 ObjC 兜底定位，避免 selector 触发 code_root 大范围检索。
                     cpp_qualified = self._extract_cpp_qualified_parts(rf_or_raw)
+                    symbol_only_rescue_attempts += 1
                     if (not loc) and cpp_qualified:
                         loc = self._find_cpp_qualified_definition_location(rf_or_raw, code_roots_abs_strs)
                     simple_name = self._extract_function_name_from_resolved(rf_or_raw)
@@ -8163,7 +8738,6 @@ class CodeContentProvider:
                     if (not objc_info) and (not cpp_qualified) and (not loc) and simple_name:
                         loc = self._find_function_definition_location(simple_name, code_roots_abs_strs)
                     if loc and simple_name:
-                        symbol_only_rescue_attempts += 1
                         if loc:
                             guessed_file, guessed_line = loc
                             guessed_rf = rf_or_raw or simple_name
@@ -8299,6 +8873,16 @@ class CodeContentProvider:
             if not all([address, resolved_function, resolved_file, resolved_line]):
                 raise ValueError("崩溃帧信息不完整")
 
+            crash_local_source = self._resolve_local_source_path(
+                resolved_file, code_roots_abs_strs
+            )
+            if crash_local_source:
+                try:
+                    setattr(crash_func, "file", crash_local_source)
+                except Exception:
+                    pass
+                crash_frame["resolved_file_local"] = crash_local_source
+
             logger.info(f"分析崩溃帧: {resolved_function} 在 {resolved_file}:{resolved_line}")
 
             # 1. 构建崩溃摘要（若源码侧重选了展示行，使行号与 crash_line 文本对齐）
@@ -8378,7 +8962,7 @@ class CodeContentProvider:
                 )
 
             crash_summary = CrashSummary(
-                file=resolved_file,
+                file=crash_local_source or resolved_file,
                 function=resolved_function,
                 crash_line_number=eff_crash_line_no,
                 stack_address=address,
@@ -8388,14 +8972,13 @@ class CodeContentProvider:
                 crash_line_note=crash_line_note,
             )
             self._cc_stage_crash_summary = crash_summary
+            self._cc_owner_class_context = self._build_owner_class_context_snapshot(
+                resolved_function,
+                crash_local_source or resolved_file,
+                code_roots_abs_strs,
+            )
 
-            # 2. 提取崩溃函数信息（已在上方完成）
-            try:
-                # 保留前序阶段已定位到的工程源码文件，避免被外部符号文件（如系统/生成头）覆盖。
-                if not getattr(crash_func, "file", None):
-                    setattr(crash_func, "file", resolved_file)
-            except Exception:
-                pass
+            # 2. 提取崩溃函数信息（已在上方完成）；file 使用本地映射路径，勿回写 CI 构建机路径
             if is_rescue_frame:
                 crash_func = CrashFunction(
                     name=crash_func.name,
@@ -8432,6 +9015,9 @@ class CodeContentProvider:
                 stack_priority_files = self._collect_stack_priority_source_files(
                     add2line_data, code_roots_abs_strs
                 )
+                if self.seed_callsite_files:
+                    merged_priority = list(dict.fromkeys(stack_priority_files + self.seed_callsite_files))
+                    stack_priority_files = merged_priority
 
                 # 3. 查找直接调用崩溃函数的上层函数
                 template_info = self._parse_template_container_function(resolved_function)
@@ -8439,40 +9025,313 @@ class CodeContentProvider:
                 is_template_generic_crash = bool(
                     template_info and template_info.get("method") in template_generic_methods
                 )
-                try:
-                    direct_call_crash_fun = self._find_call_chain_functions(
-                        resolved_function, code_roots_abs_strs, stack_priority_files=stack_priority_files
-                    )
-                except _CodeContextPhaseTimeout:
-                    raise
-                except Exception as e:
-                    logger.warning(f"查找调用链失败，已跳过: {e}")
-                    extraction_warnings.append(f"调用链分析失败: {e}")
-                logger.info(f"找到 {len(direct_call_crash_fun)} 个直接调用崩溃函数的上层函数（call_expression 扫描）")
-                try:
-                    implicit_callers = self._find_implicit_ctor_usage_callers(
-                        resolved_function, code_roots_abs_strs
-                    )
-                    if implicit_callers:
-                        existing_keys = {(c.name, c.file) for c in direct_call_crash_fun}
-                        for ic in implicit_callers:
-                            if (ic.name, ic.file) not in existing_keys:
-                                direct_call_crash_fun.append(ic)
-                                existing_keys.add((ic.name, ic.file))
-                        logger.info(
-                            f"合并隐式构造使用点后，共 {len(direct_call_crash_fun)} 个调用链候选"
-                        )
-                except _CodeContextPhaseTimeout:
-                    raise
-                except Exception as e:
-                    logger.warning(f"隐式构造调用链补充失败，已跳过: {e}")
-                    extraction_warnings.append(f"隐式构造调用链补充失败: {e}")
 
-                if len(direct_call_crash_fun) > self.max_direct_callers:
-                    direct_call_crash_fun = direct_call_crash_fun[: self.max_direct_callers]
-                    logger.info(
-                        f"直接调用崩溃函数的静态候选已截断为最多 {self.max_direct_callers} 个（防止输出膨胀）"
+                # ========== 并行加速：调用链搜索 与 共享变量搜索 独立并发 ==========
+                def _call_chain_task() -> List[CallChainFunction]:
+                    """Thread A: 调用链搜索"""
+                    results: List[CallChainFunction] = []
+                    try:
+                        results = self._find_call_chain_functions(
+                            resolved_function, code_roots_abs_strs, stack_priority_files=stack_priority_files
+                        )
+                        site_callers = self._find_callers_of_crash_site(
+                            resolved_function,
+                            code_roots_abs_strs,
+                            stack_priority_files=stack_priority_files,
+                        )
+                        if site_callers:
+                            results = self._merge_call_chain_function_lists(results, site_callers)
+                    except _CodeContextPhaseTimeout:
+                        raise
+                    except Exception as e:
+                        logger.warning(f"查找调用链失败，已跳过: {e}")
+                    try:
+                        implicit_callers = self._find_implicit_ctor_usage_callers(
+                            resolved_function, code_roots_abs_strs
+                        )
+                        if implicit_callers:
+                            existing_keys = {(c.name, c.file) for c in results}
+                            for ic in implicit_callers:
+                                if (ic.name, ic.file) not in existing_keys:
+                                    results.append(ic)
+                                    existing_keys.add((ic.name, ic.file))
+                    except _CodeContextPhaseTimeout:
+                        raise
+                    except Exception as e:
+                        logger.warning(f"隐式构造调用链补充失败，已跳过: {e}")
+                    return results
+
+                def _shared_var_task() -> Tuple[List[str], List[VariableFunction]]:
+                    """Thread B: 共享变量提取 + 搜索"""
+                    _shared_vars: List[str] = []
+                    _var_funs: List[VariableFunction] = []
+                    if is_template_generic_crash:
+                        return _shared_vars, _var_funs
+
+                    crash_location_source = getattr(crash_func, "crash_location_source", None) or getattr(
+                        crash_summary, "crash_location_source", None
                     )
+                    if crash_location_source != "from_log_deduce":
+                        _shared_vars = self._extract_shared_variables_from_code(crash_func.crash_line or "")
+                        if not _shared_vars and crash_func.snippet:
+                            _shared_vars = self._extract_shared_variables_from_code("\n".join(crash_func.snippet))
+                    else:
+                        code_for_vars = "\n".join(crash_func.snippet) if crash_func.snippet else (crash_func.crash_line or "")
+                        _shared_vars = self._extract_shared_variables_from_code(code_for_vars)
+
+                    if not is_template_generic_crash:
+                        merge_src_parts: List[str] = []
+                        if crash_func.crash_line:
+                            merge_src_parts.append(str(crash_func.crash_line))
+                        if crash_func.snippet:
+                            merge_src_parts.append("\n".join(crash_func.snippet))
+                        merge_src = "\n".join(merge_src_parts)
+                        merge_resolved_function = str(resolved_function or "").strip()
+                        crash_sig_for_merge = str(getattr(crash_func, "signature", None) or "").strip()
+                        crash_name_for_merge = str(getattr(crash_func, "name", None) or "").strip()
+                        if "::" not in merge_resolved_function and "::" in crash_sig_for_merge:
+                            merge_resolved_function = crash_sig_for_merge
+                        if not merge_resolved_function:
+                            merge_resolved_function = crash_sig_for_merge or crash_name_for_merge
+                        merge_crash_file = self._resolve_merge_crash_file(
+                            crash_func,
+                            resolved_file,
+                            resolved_line,
+                            code_roots_abs_strs,
+                        )
+                        _shared_vars = self._merge_class_field_usage_into_shared_vars(
+                            _shared_vars,
+                            merge_src,
+                            merge_resolved_function,
+                            merge_crash_file,
+                            code_roots_abs_strs,
+                        )
+
+                    if _shared_vars:
+                        crash_local_scan_files: List[str] = []
+                        if crash_local_source:
+                            crash_local_scan_files.append(crash_local_source)
+                            crash_local_scan_files.extend(
+                                self._collect_crash_adjacent_source_files(
+                                    crash_local_source, code_roots_abs_strs
+                                )
+                            )
+                        owner_cls_sv = ""
+                        owner_fields_sv: List[str] = []
+                        owner_def_sv: List[str] = []
+                        octx_sv = getattr(self, "_cc_owner_class_context", None)
+                        if isinstance(octx_sv, dict):
+                            owner_cls_sv = str(octx_sv.get("class_name") or "")
+                            owner_fields_sv = list(octx_sv.get("member_fields") or [])
+                            if octx_sv.get("definition_file"):
+                                owner_def_sv.append(str(octx_sv.get("definition_file")))
+                        _var_funs = self._find_variable_functions_for_vars(
+                            _shared_vars,
+                            resolved_function,
+                            code_roots_abs_strs,
+                            stack_priority_files=stack_priority_files,
+                            crash_local_files=crash_local_scan_files,
+                            owner_class=owner_cls_sv or None,
+                            owner_member_fields=owner_fields_sv,
+                            owner_definition_files=owner_def_sv,
+                        )
+                    return _shared_vars, _var_funs
+
+                # 启动并行执行
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                _parallel_executor = ThreadPoolExecutor(max_workers=2)
+                _future_call_chain = _parallel_executor.submit(_call_chain_task)
+                _future_shared_var = _parallel_executor.submit(_shared_var_task)
+
+                try:
+                    # 等待调用链结果
+                    direct_call_crash_fun = _future_call_chain.result()
+                    logger.info(f"找到 {len(direct_call_crash_fun)} 个直接调用崩溃函数的上层函数（call_expression 扫描）")
+                    if len(direct_call_crash_fun) > self.max_direct_callers:
+                        direct_call_crash_fun = direct_call_crash_fun[: self.max_direct_callers]
+                        logger.info(
+                            f"直接调用崩溃函数的静态候选已截断为最多 {self.max_direct_callers} 个（防止输出膨胀）"
+                        )
+
+                    # 等待共享变量结果
+                    shared_vars, use_same_var_related_fun = _future_shared_var.result()
+                except _CodeContextPhaseTimeout:
+                    _parallel_executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+                except Exception as e:
+                    _parallel_executor.shutdown(wait=False, cancel_futures=True)
+                    # 检查是否内含 _CodeContextPhaseTimeout
+                    if isinstance(e.__cause__, _CodeContextPhaseTimeout) or isinstance(e.__context__, _CodeContextPhaseTimeout):
+                        raise _CodeContextPhaseTimeout("并行分析阶段超时") from e
+                    logger.warning(f"并行分析阶段异常: {e}")
+                    extraction_warnings.append(f"并行分析阶段异常: {e}")
+                finally:
+                    _parallel_executor.shutdown(wait=False, cancel_futures=True)
+
+                # 共享变量结果后处理：去重、截断
+                if use_same_var_related_fun:
+                    _vf_merge: Dict[Tuple[str, str, str], VariableFunction] = {}
+                    for vf in use_same_var_related_fun:
+                        mk = (str(vf.name or ""), str(vf.file or ""), str(vf.variable or ""))
+                        cur = _vf_merge.get(mk)
+                        if cur is None or _use_shared_var_edge_relation_strength(
+                            vf.relation
+                        ) > _use_shared_var_edge_relation_strength(cur.relation):
+                            _vf_merge[mk] = vf
+                    use_same_var_related_fun = list(_vf_merge.values())
+                    # 截断时**始终保留崩溃函数**的全部 (函数, 变量) 关系，再对其余条目按"写优先 + 关键读保底"填充预算。
+                    cap = int(self.max_shared_var_related_functions)
+                    key_read_floor = int(getattr(self, "min_key_read_related_functions", 2) or 0)
+                    crash_fn_name = str(getattr(crash_func, "name", None) or "").strip()
+                    crash_fn_file = str(
+                        crash_local_source
+                        or getattr(crash_func, "file", None)
+                        or resolved_file
+                        or ""
+                    ).strip()
+                    pri: List[VariableFunction] = []
+                    rest: List[VariableFunction] = []
+                    for vf in use_same_var_related_fun:
+                        vf_file = str(getattr(vf, "file", "") or "")
+                        same_file = False
+                        try:
+                            if crash_fn_file and vf_file:
+                                same_file = os.path.normpath(vf_file) == os.path.normpath(
+                                    crash_fn_file
+                                )
+                        except Exception:
+                            same_file = bool(crash_fn_file and vf_file and crash_fn_file == vf_file)
+                        vn = str(getattr(vf, "name", "") or "")
+                        name_hit = bool(crash_fn_name) and (
+                            crash_fn_name in vn
+                            or vn in crash_fn_name
+                            or crash_fn_name.split("::")[-1] == vn.split("::")[-1]
+                        )
+                        if same_file and name_hit:
+                            pri.append(vf)
+                        else:
+                            rest.append(vf)
+
+                    def _is_write_like(vf: VariableFunction) -> bool:
+                        return _use_shared_var_edge_relation_strength(getattr(vf, "relation", "")) >= 2
+
+                    def _looks_like_key_read_func_name(name: str) -> bool:
+                        n = str(name or "").lower()
+                        return any(
+                            kw in n
+                            for kw in (
+                                "get",
+                                "read",
+                                "fetch",
+                                "query",
+                                "find",
+                                "lookup",
+                                "scan",
+                                "walk",
+                                "traverse",
+                                "visit",
+                                "modify",
+                                "update",
+                                "access",
+                            )
+                        )
+
+                    def _is_key_read(vf: VariableFunction) -> bool:
+                        rel = _use_shared_var_edge_relation_strength(getattr(vf, "relation", ""))
+                        return rel == 1 and _looks_like_key_read_func_name(getattr(vf, "name", ""))
+
+                    def _vf_sort_key(vf: VariableFunction) -> Tuple[int, str, str]:
+                        return (
+                            _use_shared_var_edge_relation_strength(vf.relation),
+                            str(vf.name or ""),
+                            str(vf.variable or ""),
+                        )
+
+                    rest_write: List[VariableFunction] = []
+                    rest_key_read: List[VariableFunction] = []
+                    rest_other: List[VariableFunction] = []
+                    for vf in rest:
+                        if _is_write_like(vf):
+                            rest_write.append(vf)
+                        elif _is_key_read(vf):
+                            rest_key_read.append(vf)
+                        else:
+                            rest_other.append(vf)
+
+                    rest_write.sort(key=_vf_sort_key, reverse=True)
+                    rest_key_read.sort(key=_vf_sort_key, reverse=True)
+                    rest_other.sort(key=_vf_sort_key, reverse=True)
+
+                    remaining = max(0, cap - len(pri))
+                    key_quota = min(max(0, key_read_floor), len(rest_key_read), remaining)
+                    write_quota = max(0, remaining - key_quota)
+
+                    chosen_write = rest_write[:write_quota]
+                    chosen_key = rest_key_read[:key_quota]
+
+                    used_ids: Set[int] = set()
+                    for _vf in chosen_write + chosen_key:
+                        used_ids.add(id(_vf))
+
+                    remain_slots = max(0, remaining - len(chosen_write) - len(chosen_key))
+                    tail_pool: List[VariableFunction] = []
+                    for _vf in rest_write[write_quota:] + rest_key_read[key_quota:] + rest_other:
+                        if id(_vf) in used_ids:
+                            continue
+                        tail_pool.append(_vf)
+                    tail_pool.sort(key=_vf_sort_key, reverse=True)
+                    tail_pick = tail_pool[:remain_slots]
+
+                    use_same_var_related_fun = pri + chosen_write + chosen_key + tail_pick
+                    if len(pri) + len(rest) > cap:
+                        logger.info(
+                            f"共享变量相关函数已截断为最多 {cap} 条（保留崩溃函数命中 {len(pri)} 条；"
+                            f"其余写类优先，关键读保底 {key_quota} 条）"
+                        )
+                logger.info(f"共享变量候选 {len(shared_vars)} 个，找到 {len(use_same_var_related_fun)} 条函数-变量关系")
+
+                # 3b. 补充：从调用方的调用点提取指针解引用变量作为额外共享变量候选
+                # 场景：崩溃在 GetLegSize()，但真正的问题指针 m_pclRoute 在调用方
+                # HandleDataFail 中（m_pclRoute->GetLegSize()）。
+                if not is_template_generic_crash and (direct_call_crash_fun or add2line_data):
+                    caller_ptr_vars = self._extract_caller_deref_vars(
+                        direct_call_crash_fun, resolved_function, shared_vars,
+                        add2line_data=add2line_data,
+                        stack_priority_files=stack_priority_files,
+                    )
+                    logger.info(f"[3b] 调用方指针解引用变量提取结果: {caller_ptr_vars}")
+                    if caller_ptr_vars:
+                        logger.info(f"从调用方调用点补充共享变量候选: {caller_ptr_vars}")
+                        shared_vars = list(dict.fromkeys(shared_vars + caller_ptr_vars))
+                        # 补充搜索：逐变量搜索，确保每个变量都能找到其写入函数
+                        supp_scan_files: List[str] = []
+                        if crash_local_source:
+                            supp_scan_files.append(crash_local_source)
+                            supp_scan_files.extend(
+                                self._collect_crash_adjacent_source_files(
+                                    crash_local_source, code_roots_abs_strs
+                                )
+                            )
+                        existing_keys = {
+                            (str(vf.name), str(vf.file), str(vf.variable))
+                            for vf in use_same_var_related_fun
+                        }
+                        try:
+                            for ptr_var in caller_ptr_vars:
+                                supp_var_funs = self._find_variable_functions_for_vars(
+                                    [ptr_var],
+                                    resolved_function,
+                                    code_roots_abs_strs,
+                                    stack_priority_files=stack_priority_files,
+                                    crash_local_files=supp_scan_files or None,
+                                )
+                                for vf in supp_var_funs:
+                                    k = (str(vf.name), str(vf.file), str(vf.variable))
+                                    if k not in existing_keys:
+                                        use_same_var_related_fun.append(vf)
+                                        existing_keys.add(k)
+                        except Exception as e:
+                            logger.warning(f"调用方指针变量补充搜索失败: {e}")
 
                 # 4. 查找与直接调用者同一入口函数内、在崩溃调用之前执行的前置环境函数
                 pre_call_fun_in_same_parent_fun: List[CallChainFunction] = []
@@ -8489,184 +9348,6 @@ class CodeContentProvider:
                         logger.warning(f"查找前置环境函数失败，已跳过: {e}")
                         extraction_warnings.append(f"前置环境函数分析失败: {e}")
                 logger.info(f"找到 {len(pre_call_fun_in_same_parent_fun)} 个 pre_call_fun_in_same_parent_fun（前置环境函数）")
-
-                # 5. 共享变量与 use_shared_var
-                crash_location_source = getattr(crash_func, "crash_location_source", None) or getattr(
-                    crash_summary, "crash_location_source", None
-                )
-                shared_vars: List[str] = []
-                use_same_var_related_fun: List[VariableFunction] = []
-                try:
-                    if is_template_generic_crash:
-                        shared_vars = []
-                    else:
-                        if crash_location_source != "from_log_deduce":
-                            shared_vars = self._extract_shared_variables_from_code(crash_func.crash_line or "")
-                            if not shared_vars and crash_func.snippet:
-                                shared_vars = self._extract_shared_variables_from_code("\n".join(crash_func.snippet))
-                                logger.info("精确行未提取到共享变量，回退到整个函数片段抽取")
-                        else:
-                            code_for_vars = "\n".join(crash_func.snippet) if crash_func.snippet else (crash_func.crash_line or "")
-                            shared_vars = self._extract_shared_variables_from_code(code_for_vars)
-                    if not is_template_generic_crash:
-                        merge_src_parts: List[str] = []
-                        if crash_func.crash_line:
-                            merge_src_parts.append(str(crash_func.crash_line))
-                        if crash_func.snippet:
-                            merge_src_parts.append("\n".join(crash_func.snippet))
-                        merge_src = "\n".join(merge_src_parts)
-                        merge_resolved_function = str(resolved_function or "").strip()
-                        crash_sig_for_merge = str(getattr(crash_func, "signature", None) or "").strip()
-                        crash_name_for_merge = str(getattr(crash_func, "name", None) or "").strip()
-                        # from_log_deduce 场景中 resolved_function 可能退化成 add_data()，
-                        # 此时优先回退到 crash_func.signature（通常保留 Class::method 形态）。
-                        if "::" not in merge_resolved_function and "::" in crash_sig_for_merge:
-                            merge_resolved_function = crash_sig_for_merge
-                        if not merge_resolved_function:
-                            merge_resolved_function = crash_sig_for_merge or crash_name_for_merge
-                        merge_crash_file = str(getattr(crash_func, "file", None) or "").strip() or str(resolved_file or "")
-                        if not (merge_crash_file and os.path.isfile(merge_crash_file)):
-                            simple_fn = self._extract_simple_function_name(
-                                merge_resolved_function or str(getattr(crash_func, "name", None) or "")
-                            )
-                            if simple_fn:
-                                loc = self._find_function_definition_location(simple_fn, code_roots_abs_strs)
-                                if loc and loc[0]:
-                                    merge_crash_file = loc[0]
-                        shared_vars = self._merge_class_field_usage_into_shared_vars(
-                            shared_vars,
-                            merge_src,
-                            merge_resolved_function,
-                            merge_crash_file,
-                            code_roots_abs_strs,
-                        )
-                    if shared_vars:
-                        use_same_var_related_fun = self._find_variable_functions_for_vars(
-                            shared_vars,
-                            resolved_function,
-                            code_roots_abs_strs,
-                            stack_priority_files=stack_priority_files,
-                        )
-                        # 同一 (函数, 文件, 变量) 只保留关系强度最高的一条。
-                        _vf_merge: Dict[Tuple[str, str, str], VariableFunction] = {}
-                        for vf in use_same_var_related_fun:
-                            mk = (str(vf.name or ""), str(vf.file or ""), str(vf.variable or ""))
-                            cur = _vf_merge.get(mk)
-                            if cur is None or _use_shared_var_edge_relation_strength(
-                                vf.relation
-                            ) > _use_shared_var_edge_relation_strength(cur.relation):
-                                _vf_merge[mk] = vf
-                        use_same_var_related_fun = list(_vf_merge.values())
-                        # 截断时**始终保留崩溃函数**的全部 (函数, 变量) 关系，再对其余条目按“写优先 + 关键读保底”填充预算。
-                        cap = int(self.max_shared_var_related_functions)
-                        key_read_floor = int(getattr(self, "min_key_read_related_functions", 2) or 0)
-                        crash_fn_name = str(getattr(crash_func, "name", None) or "").strip()
-                        crash_fn_file = str(resolved_file or "").strip()
-                        pri: List[VariableFunction] = []
-                        rest: List[VariableFunction] = []
-                        for vf in use_same_var_related_fun:
-                            vf_file = str(getattr(vf, "file", "") or "")
-                            same_file = False
-                            try:
-                                if crash_fn_file and vf_file:
-                                    same_file = os.path.normpath(vf_file) == os.path.normpath(
-                                        crash_fn_file
-                                    )
-                            except Exception:
-                                same_file = bool(crash_fn_file and vf_file and crash_fn_file == vf_file)
-                            vn = str(getattr(vf, "name", "") or "")
-                            name_hit = bool(crash_fn_name) and (
-                                crash_fn_name in vn
-                                or vn in crash_fn_name
-                                or crash_fn_name.split("::")[-1] == vn.split("::")[-1]
-                            )
-                            if same_file and name_hit:
-                                pri.append(vf)
-                            else:
-                                rest.append(vf)
-
-                        def _is_write_like(vf: VariableFunction) -> bool:
-                            return _use_shared_var_edge_relation_strength(getattr(vf, "relation", "")) >= 2
-
-                        def _looks_like_key_read_func_name(name: str) -> bool:
-                            n = str(name or "").lower()
-                            return any(
-                                kw in n
-                                for kw in (
-                                    "get",
-                                    "read",
-                                    "fetch",
-                                    "query",
-                                    "find",
-                                    "lookup",
-                                    "scan",
-                                    "walk",
-                                    "traverse",
-                                    "visit",
-                                    "modify",
-                                    "update",
-                                    "access",
-                                )
-                            )
-
-                        def _is_key_read(vf: VariableFunction) -> bool:
-                            rel = _use_shared_var_edge_relation_strength(getattr(vf, "relation", ""))
-                            return rel == 1 and _looks_like_key_read_func_name(getattr(vf, "name", ""))
-
-                        def _vf_sort_key(vf: VariableFunction) -> Tuple[int, str, str]:
-                            return (
-                                _use_shared_var_edge_relation_strength(vf.relation),
-                                str(vf.name or ""),
-                                str(vf.variable or ""),
-                            )
-
-                        rest_write: List[VariableFunction] = []
-                        rest_key_read: List[VariableFunction] = []
-                        rest_other: List[VariableFunction] = []
-                        for vf in rest:
-                            if _is_write_like(vf):
-                                rest_write.append(vf)
-                            elif _is_key_read(vf):
-                                rest_key_read.append(vf)
-                            else:
-                                rest_other.append(vf)
-
-                        rest_write.sort(key=_vf_sort_key, reverse=True)
-                        rest_key_read.sort(key=_vf_sort_key, reverse=True)
-                        rest_other.sort(key=_vf_sort_key, reverse=True)
-
-                        remaining = max(0, cap - len(pri))
-                        key_quota = min(max(0, key_read_floor), len(rest_key_read), remaining)
-                        write_quota = max(0, remaining - key_quota)
-
-                        chosen_write = rest_write[:write_quota]
-                        chosen_key = rest_key_read[:key_quota]
-
-                        used_ids: Set[int] = set()
-                        for _vf in chosen_write + chosen_key:
-                            used_ids.add(id(_vf))
-
-                        remain_slots = max(0, remaining - len(chosen_write) - len(chosen_key))
-                        tail_pool: List[VariableFunction] = []
-                        for _vf in rest_write[write_quota:] + rest_key_read[key_quota:] + rest_other:
-                            if id(_vf) in used_ids:
-                                continue
-                            tail_pool.append(_vf)
-                        tail_pool.sort(key=_vf_sort_key, reverse=True)
-                        tail_pick = tail_pool[:remain_slots]
-
-                        use_same_var_related_fun = pri + chosen_write + chosen_key + tail_pick
-                        if len(pri) + len(rest) > cap:
-                            logger.info(
-                                f"共享变量相关函数已截断为最多 {cap} 条（保留崩溃函数命中 {len(pri)} 条；"
-                                f"其余写类优先，关键读保底 {key_quota} 条）"
-                            )
-                except _CodeContextPhaseTimeout:
-                    raise
-                except Exception as e:
-                    logger.warning(f"共享变量分析失败，已跳过: {e}")
-                    extraction_warnings.append(f"共享变量分析失败: {e}")
-                logger.info(f"共享变量候选 {len(shared_vars)} 个，找到 {len(use_same_var_related_fun)} 条函数-变量关系")
 
                 # 6. 查找同一类中的兄弟函数
                 name_for_related = resolved_function
@@ -8690,9 +9371,14 @@ class CodeContentProvider:
                     logger.info("同类兄弟成员函数扫描已关闭（max_sibling_member_functions=0），跳过 _find_related_functions_in_class")
                 logger.info(f"找到 {len(sibling_member_func_in_same_class)} 个同一类中的兄弟函数或其他关联函数")
 
-                # 7. 分析线程上下文
+                # 7. 分析线程上下文（先为栈顶帧补齐源码位置，避免 call_chain 误匹配无关同名函数）
                 thread_context: List[ThreadContext] = []
                 try:
+                    _rf_list = add2line_data.get("resolved_frames")
+                    if isinstance(_rf_list, list):
+                        self._enrich_resolved_frames_symbol_locations(
+                            _rf_list, code_roots_abs_strs, max_frames=8
+                        )
                     thread_context = self._analyze_thread_context(add2line_data)
                 except _CodeContextPhaseTimeout:
                     raise
@@ -8734,14 +9420,28 @@ class CodeContentProvider:
                 msg = f"代码上下文整阶段超时（{capt:.0f}s），已截断静态分析: {e}"
                 logger.warning(msg)
                 extraction_warnings.append(msg)
-                if graph is None:
-                    graph = CrashGraph(
-                        nodes=[],
-                        edges=[],
-                        call_chain_from_code=[],
-                        call_chain_from_add2line=[],
-                        edges_empty_reason=msg,
+                if graph is None or not getattr(graph, "nodes", None):
+                    degraded = self._build_degraded_crash_graph_on_phase_timeout(
+                        crash_file=resolved_file,
+                        crash_func=crash_func,
+                        add2line_data=add2line_data,
+                        timeout_message=msg,
                     )
+                    if degraded.nodes:
+                        graph = degraded
+                        logger.info(
+                            "超时降级：已保留 %d 个图节点（含崩溃函数），%d 条边",
+                            len(degraded.nodes),
+                            len(degraded.edges),
+                        )
+                    elif graph is None:
+                        graph = CrashGraph(
+                            nodes=[],
+                            edges=[],
+                            call_chain_from_code=[],
+                            call_chain_from_add2line=[],
+                            edges_empty_reason=msg,
+                        )
 
             assert graph is not None
 
@@ -8761,7 +9461,12 @@ class CodeContentProvider:
         except _CodeContextPhaseTimeout as e:
             detail = str(e) or "unknown"
             logger.warning("代码上下文整阶段超时（静态分析前）: %s", detail)
-            return self._minimal_code_context_on_phase_timeout(add2line_data, detail)
+            roots = getattr(self, "current_code_roots", None) or _normalize_code_roots_arg(
+                code_root
+            )
+            return self._minimal_code_context_on_phase_timeout(
+                add2line_data, detail, code_roots=roots
+            )
             
         except json.JSONDecodeError as e:
             logger.error(f"JSON解析错误: {e}")
@@ -8968,6 +9673,10 @@ class CodeContentProviderTool(BaseTool):
                 "properties": {
                     "resolved_stack": {"type": "string", "description": "解析后的堆栈信息 JSON"},
                     "code_roots": {"type": "array", "description": "代码根目录列表"},
+                    "_candidate_callsite_files": {
+                        "type": "array",
+                        "description": "外部轻量召回得到的候选调用点文件（内部参数）",
+                    },
                     "backend": {"type": "string", "description": "解析后端: tree-sitter/native", "default": "tree-sitter"},
                     "max_sibling_member_functions": {
                         "type": "integer",
@@ -9038,6 +9747,35 @@ class CodeContentProviderTool(BaseTool):
             _v = _maybe_float(input_data, _k)
             if _v is not None:
                 prov_kw[_k] = _v
+        _mnm = _maybe_int(input_data, "max_nearby_module_scan_files")
+        if _mnm is not None:
+            prov_kw["max_nearby_module_scan_files"] = _mnm
+        _mcs = _maybe_int(input_data, "max_crash_caller_search_files")
+        if _mcs is not None:
+            prov_kw["max_crash_caller_search_files"] = _mcs
+        seed_files = input_data.get("_candidate_callsite_files")
+        if isinstance(seed_files, list) and seed_files:
+            prov_kw["seed_callsite_files"] = [str(x) for x in seed_files if str(x).strip()]
+
+        code_index_service = input_data.get("_code_index_service")
+        if code_index_service is None and code_roots:
+            if os.environ.get("STABILITY_AGENT_DISABLE_CODE_ACCELERATION", "").strip().lower() not in {
+                "1",
+                "true",
+                "yes",
+            }:
+                try:
+                    from services.code_index_service import get_code_index_for_roots
+
+                    code_index_service = get_code_index_for_roots(code_roots)
+                except Exception as exc:
+                    _tool_logger.debug("CodeIndex 初始化失败: %s", exc)
+        if code_index_service is not None:
+            prov_kw["code_index_service"] = code_index_service
+
+        # use_ctags_index: bool pass-through
+        if input_data.get("use_ctags_index"):
+            prov_kw["use_ctags_index"] = True
 
         provider = CodeContentProvider(**prov_kw)
         result = provider.code_content_provider(

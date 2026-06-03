@@ -172,6 +172,12 @@ def generate_crash_analysis_prompt(crash_data: dict) -> str:
     prompt_parts.append("- 重点检查线程函数的锁保护情况")
     prompt_parts.append("- 禁止使用'未知'、'假设'、'示例'等词汇")
     prompt_parts.append("")
+    prompt_parts.append("## 修复代码格式要求（严格遵守）")
+    prompt_parts.append("- 每个修复函数必须使用独立的 ```cpp 围栏包裹")
+    prompt_parts.append("- 函数体必须完整，禁止用 ... 或省略号代替任何代码")
+    prompt_parts.append("- 禁止使用缩进格式代替代码围栏")
+    prompt_parts.append("- 保留原始函数签名（包括返回值、参数列表、修饰符）")
+    prompt_parts.append("")
     
     return '\n'.join(prompt_parts)
 
@@ -246,6 +252,7 @@ def generate_crash_repair_prompt(crash_data: dict) -> str:
     prompt_parts.append("- 修复代码必须完整且可编译")
     prompt_parts.append("- 保持原有函数签名和接口")
     prompt_parts.append("- 重点检查线程函数的锁保护情况")
+    prompt_parts.append("- 每个修复函数必须使用独立的 ```cpp 围栏包裹，禁止用 ... 省略代码")
     prompt_parts.append("")
     
     return '\n'.join(prompt_parts)

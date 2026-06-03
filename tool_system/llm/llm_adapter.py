@@ -99,6 +99,11 @@ class DirectLLMAdapter(BaseLLMAdapter):
         self._request_format = str(config.get("request_format") or "openai_chat_completions_compatible").strip().lower()
         self._auth_header = str(config.get("auth_header") or "Authorization").strip() or "Authorization"
         self._auth_prefix = str(config.get("auth_prefix") or "")
+        self._stream_options_supported: Optional[bool] = None  # 缓存 stream_options 兼容性
+        # 是否使用流式调用（默认 True，可通过配置关闭）
+        self._use_stream = config.get("stream", True)
+        if isinstance(self._use_stream, str):
+            self._use_stream = self._use_stream.lower() not in ("false", "0", "no")
         if self._request_format in ("anthropic_messages_compatible", "openai_responses_compatible"):
             self.client = None
             return
@@ -125,7 +130,23 @@ class DirectLLMAdapter(BaseLLMAdapter):
                     else "https://open.bigmodel.cn/api/paas/v4"
                 )
                 base_url = config.get("base_url") or config.get("openai_base_url") or default_base_url
-                self.client = OpenAI(api_key=api_key, base_url=base_url)
+                # 使用 httpx.Timeout 实现细粒度超时：
+                # - connect: 连接超时（快速检测网络不通）
+                # - read: 读取超时（流式时为 chunk 间隔，需要足够长以容纳 TTFT）
+                # 对流式调用：首 token 可能需要较长等待（复杂 prompt 时 LLM 思考时间长），
+                # 但建立连接应该很快。
+                raw_timeout = float(self.timeout or 180)
+                try:
+                    import httpx
+                    client_timeout = httpx.Timeout(
+                        connect=min(30.0, raw_timeout),
+                        read=max(raw_timeout, 300.0),  # 读取至少 300s，防止大 prompt TTFT 超时
+                        write=30.0,
+                        pool=30.0,
+                    )
+                except ImportError:
+                    client_timeout = raw_timeout
+                self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=client_timeout)
                 logger.info(f"Initialized {provider} client: {base_url}")
             except ImportError:
                 logger.warning("openai package not installed, DirectLLMAdapter will not work")
@@ -133,9 +154,21 @@ class DirectLLMAdapter(BaseLLMAdapter):
         elif provider == "deepseek":
             try:
                 from openai import OpenAI
+                raw_timeout = float(self.timeout or 180)
+                try:
+                    import httpx
+                    client_timeout = httpx.Timeout(
+                        connect=min(30.0, raw_timeout),
+                        read=max(raw_timeout, 300.0),
+                        write=30.0,
+                        pool=30.0,
+                    )
+                except ImportError:
+                    client_timeout = raw_timeout
                 self.client = OpenAI(
                     api_key=config.get("deepseek_api_key"),
-                    base_url=config.get("deepseek_base_url", "https://api.deepseek.com/v1")
+                    base_url=config.get("deepseek_base_url", "https://api.deepseek.com/v1"),
+                    timeout=client_timeout,
                 )
             except ImportError:
                 self.client = None
@@ -202,17 +235,34 @@ class DirectLLMAdapter(BaseLLMAdapter):
         if not normalized_messages:
             normalized_messages = [{"role": "user", "content": "pong"}]
 
-        body = {
+        body: Dict[str, Any] = {
             "model": self.model,
             "messages": normalized_messages,
             "max_tokens": int(kwargs.get("max_tokens", self.max_tokens) or 1024),
         }
+        # Thinking 模型需要更大的 max_tokens 预算（thinking + text 共用）
+        if "thinking" in (self.model or "").lower():
+            body["max_tokens"] = max(body["max_tokens"], 32000)
         if system_parts:
             body["system"] = "\n\n".join(system_parts)
         if kwargs.get("temperature") is not None:
             body["temperature"] = float(kwargs["temperature"])
         elif self.temperature is not None:
             body["temperature"] = float(self.temperature)
+        # Thinking 模型或经网关转发的 Anthropic 请求：使用非流式调用更可靠
+        # 1. thinking 模型流式调用时 thinking 阶段长时间无数据，网关可能导致 socket read timeout
+        # 2. 非流式让服务端完整生成后返回，避免中间超时
+        # 3. 对 anthropic_messages_compatible 默认非流式（除非 config 显式设 stream=true），
+        #    因为 Anthropic 非流式延迟本身合理，而网关流式转发有兼容性风险
+        is_thinking_model = "thinking" in (self.model or "").lower()
+        # 只有在配置显式设置 stream 且不是 thinking 模型时才用流式
+        explicit_stream = self.config.get("stream")  # None 表示未显式配置
+        use_stream_for_this_request = (
+            (explicit_stream is True or (isinstance(explicit_stream, str) and explicit_stream.lower() in ("true", "1", "yes")))
+            and not is_thinking_model
+        )
+        if use_stream_for_this_request:
+            body["stream"] = True
 
         req = urllib.request.Request(
             url=url,
@@ -220,13 +270,97 @@ class DirectLLMAdapter(BaseLLMAdapter):
             method="POST",
             headers=headers,
         )
+        # 流式调用只需等首个 chunk，但 thinking 模型 TTFT 可能很长（数分钟思考后才出首 token）
+        base_timeout = max(float(self.timeout or 180), 300.0)
+        if "thinking" in (self.model or "").lower():
+            http_timeout = max(base_timeout, 600.0)
+        else:
+            http_timeout = base_timeout
         try:
-            with urllib.request.urlopen(req, timeout=float(self.timeout or 120)) as resp:
-                raw = resp.read().decode("utf-8", errors="ignore")
+            resp = urllib.request.urlopen(req, timeout=http_timeout)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore").strip()
             raise RuntimeError(f"LLM call failed: Error code: {exc.code} - {detail or exc.reason}") from exc
 
+        if self._use_stream and body.get("stream"):
+            return self._parse_anthropic_sse(resp)
+        else:
+            raw = resp.read().decode("utf-8", errors="ignore")
+            resp.close()
+            return self._parse_anthropic_response(raw)
+
+    def _parse_anthropic_sse(self, resp) -> LLMResponse:
+        """解析 Anthropic Messages SSE 流式响应。
+
+        支持 Claude thinking 模型：先输出 thinking content_block，再输出 text content_block。
+        如果 text 为空但 thinking 有内容，使用 thinking 作为 fallback。
+        """
+        content_parts: List[str] = []
+        thinking_parts: List[str] = []
+        usage_dict = None
+        try:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="ignore").rstrip("\n\r")
+                if not line.startswith("data: "):
+                    continue
+                payload = line[6:]
+                if payload.strip() == "[DONE]":
+                    break
+                try:
+                    event = json.loads(payload)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                event_type = event.get("type", "")
+                # Anthropic 原生格式
+                if event_type == "content_block_delta":
+                    delta = event.get("delta", {})
+                    delta_type = delta.get("type", "")
+                    if delta_type == "text_delta":
+                        content_parts.append(delta.get("text", ""))
+                    elif delta_type == "thinking_delta":
+                        thinking_parts.append(delta.get("thinking", ""))
+                elif event_type == "message_delta":
+                    usage_info = event.get("usage")
+                    if isinstance(usage_info, dict):
+                        usage_dict = {
+                            "prompt_tokens": usage_info.get("input_tokens", 0),
+                            "completion_tokens": usage_info.get("output_tokens", 0),
+                        }
+                # OpenAI 兼容网关格式（OneAPI 等）
+                elif "choices" in event:
+                    choices = event.get("choices", [])
+                    if choices and isinstance(choices[0], dict):
+                        delta = choices[0].get("delta", {})
+                        text = delta.get("content", "")
+                        if text:
+                            content_parts.append(text)
+                    # usage
+                    if event.get("usage"):
+                        u = event["usage"]
+                        usage_dict = {
+                            "prompt_tokens": u.get("prompt_tokens", 0),
+                            "completion_tokens": u.get("completion_tokens", 0),
+                        }
+        finally:
+            resp.close()
+        content = "".join(content_parts)
+        if not content.strip() and thinking_parts:
+            # thinking 模型的 text 为空说明 max_tokens 被 thinking 消耗殆尽，
+            # 不能用 thinking 内容替代（它是内部推理，非结构化输出）。
+            # 记录 warning，返回空内容让调用方重试。
+            logger.warning(
+                "[LLM] thinking model text output is empty (thinking used %d chars). "
+                "Consider increasing max_tokens or using non-thinking model.",
+                len("".join(thinking_parts)),
+            )
+        return LLMResponse(
+            content=content,
+            usage=usage_dict,
+            metadata={"provider": self.config.get("provider", "openai"), "request_format": self._request_format},
+        )
+
+    def _parse_anthropic_response(self, raw: str) -> LLMResponse:
+        """解析 Anthropic Messages 非流式响应。"""
         data = json.loads(raw) if raw else {}
         if isinstance(data, dict):
             err_text = self._extract_meaningful_error(data.get("error"))
@@ -234,6 +368,7 @@ class DirectLLMAdapter(BaseLLMAdapter):
                 raise RuntimeError(f"LLM call failed: {err_text}")
 
         content = ""
+        usage_dict = None
         if isinstance(data, dict):
             blocks = data.get("content")
             if isinstance(blocks, list):
@@ -248,10 +383,17 @@ class DirectLLMAdapter(BaseLLMAdapter):
                     msg = ch0.get("message") or {}
                     if isinstance(msg, dict):
                         content = str(msg.get("content") or "")
+            # 提取 usage
+            usage_info = data.get("usage")
+            if isinstance(usage_info, dict):
+                usage_dict = {
+                    "prompt_tokens": usage_info.get("input_tokens", 0) or usage_info.get("prompt_tokens", 0),
+                    "completion_tokens": usage_info.get("output_tokens", 0) or usage_info.get("completion_tokens", 0),
+                }
 
         return LLMResponse(
             content=content,
-            usage=None,
+            usage=usage_dict,
             metadata={"provider": self.config.get("provider", "openai"), "request_format": self._request_format},
         )
 
@@ -284,7 +426,7 @@ class DirectLLMAdapter(BaseLLMAdapter):
             headers=headers,
         )
         try:
-            with urllib.request.urlopen(req, timeout=float(self.timeout or 120)) as resp:
+            with urllib.request.urlopen(req, timeout=max(float(self.timeout or 180), 300.0)) as resp:
                 raw = resp.read().decode("utf-8", errors="ignore")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore").strip()
@@ -339,19 +481,72 @@ class DirectLLMAdapter(BaseLLMAdapter):
             "max_tokens": kwargs.get("max_tokens", self.max_tokens),
         }
 
-        # 如果有工具定义但不使用（Direct 模式），仅作为参考
-        # Direct 模式通常直接把工具能力体现在 prompt 中
+        # 根据配置选择流式或非流式调用
+        if not self._use_stream:
+            return self._chat_non_stream(request_params)
 
+        request_params["stream"] = True
+        # 使用流式调用拼接完整响应：
+        # - 大部分 provider 的流式响应比非流式更快完成（减少序列化开销）
+        # - 与 provider Web UI 行为一致
         try:
-            response = self.client.chat.completions.create(**request_params)
-            content = response.choices[0].message.content or ""
+            # stream_options 兼容性检测（只在首次调用时探测）
+            if self._stream_options_supported is not False:
+                try:
+                    params_with_usage = {**request_params, "stream_options": {"include_usage": True}}
+                    response = self.client.chat.completions.create(**params_with_usage)
+                    self._stream_options_supported = True
+                except Exception:
+                    self._stream_options_supported = False
+                    response = self.client.chat.completions.create(**request_params)
+            else:
+                response = self.client.chat.completions.create(**request_params)
+
+            chunks: list = []
+            usage_info = None
+            for chunk in response:
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage_info = chunk.usage
+                if chunk.choices and chunk.choices[0].delta.content:
+                    chunks.append(chunk.choices[0].delta.content)
+            content = "".join(chunks)
+
+            usage_dict = None
+            if usage_info:
+                usage_dict = {
+                    "prompt_tokens": getattr(usage_info, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(usage_info, "completion_tokens", 0) or 0,
+                }
+            elif chunks:
+                # 无 usage 信息时粗估
+                usage_dict = {
+                    "prompt_tokens": 0,
+                    "completion_tokens": len(content) // 4,
+                }
 
             return LLMResponse(
                 content=content,
-                usage={
-                    "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-                    "completion_tokens": response.usage.completion_tokens if response.usage else 0,
-                },
+                usage=usage_dict,
+                metadata={"provider": self.config.get("provider", "openai")}
+            )
+        except Exception as e:
+            logger.error(f"LLM call failed: {e}")
+            raise RuntimeError(f"LLM call failed: {e}")
+
+    def _chat_non_stream(self, request_params: Dict[str, Any]) -> LLMResponse:
+        """非流式调用（用户可通过 stream=false 配置选择此路径）。"""
+        try:
+            response = self.client.chat.completions.create(**request_params)
+            content = response.choices[0].message.content if response.choices else ""
+            usage_dict = None
+            if hasattr(response, "usage") and response.usage:
+                usage_dict = {
+                    "prompt_tokens": getattr(response.usage, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(response.usage, "completion_tokens", 0) or 0,
+                }
+            return LLMResponse(
+                content=content or "",
+                usage=usage_dict,
                 metadata={"provider": self.config.get("provider", "openai")}
             )
         except Exception as e:

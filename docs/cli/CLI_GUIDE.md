@@ -10,6 +10,13 @@
   - 向量库运维命令（初始化、统计、导入导出、反馈、衰减、GC）
   - 插件扩展（`--plugin-module`）
 
+## 安装依赖
+
+- **核心**（解析 / 符号化 / LLM）：`pip install stability-analysis-agent`
+- **含向量库 RAG**：`pip install "stability-analysis-agent[rag]"`
+
+未安装 `[rag]` 时，崩溃分析主流程仍可用，相似案例向量检索会自动跳过。ML 栈导入失败、SSL、`nn` 未定义等见 [INSTALL_TROUBLESHOOTING.md](./INSTALL_TROUBLESHOOTING.md)。
+
 ## 快速开始
 
 ### 1) 完整分析

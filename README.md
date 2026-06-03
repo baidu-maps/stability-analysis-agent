@@ -132,9 +132,14 @@ Crash Log → Parse → Symbolize → Extract Code
 # Install (for Mainland China, add -i https://pypi.tuna.tsinghua.edu.cn/simple)
 pip install stability-analysis-agent
 
+# With vector DB / similar-case RAG (recommended for full experience)
+pip install "stability-analysis-agent[rag]"
+
 # Open the interactive wizard
 sa-agent
 ```
+
+See [docs/cli/INSTALL_TROUBLESHOOTING.md](./docs/cli/INSTALL_TROUBLESHOOTING.md) for SSL, `transformers` / `nn` errors, etc.
 
 > The UX is intentionally Claude CLI-like: arrow-key menus, grouped "More options", clear back paths, and concise confirmations.  
 > In most cases, you can finish configuration + analysis + AI fix flow directly in the terminal.

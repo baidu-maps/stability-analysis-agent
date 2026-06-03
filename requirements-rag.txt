@@ -1,0 +1,12 @@
+# RAG / 向量库可选依赖（与 pyproject.toml [project.optional-dependencies] rag 保持一致）
+# 用法: pip install -r requirements-rag.txt
+# 推荐: pip install "stability-analysis-agent[rag]"
+
+numpy>=1.24,<2
+chromadb>=0.4
+chroma-hnswlib
+posthog
+torch>=2.4.0
+transformers>=4.36.0,<4.52.0
+sentence-transformers>=2.2.2,<3.0.0
+accelerate>=0.26.0

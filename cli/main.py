@@ -34,10 +34,16 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# 支持从任意 cwd 运行
+# 支持从任意 cwd 运行：始终将工程根置于 sys.path 最前（避免 cwd==工程根时仅依赖 '' 条目，
+# 导致后续 import 落到 site-packages 中旧版 tools 包）。
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+_project_root_str = str(PROJECT_ROOT)
+try:
+    while _project_root_str in sys.path:
+        sys.path.remove(_project_root_str)
+except ValueError:
+    pass
+sys.path.insert(0, _project_root_str)
 
 try:
     # Avoid importing urllib3 here; importing it can itself trigger the warning.
@@ -54,6 +60,9 @@ warnings.filterwarnings(
     category=Warning,
 )
 warnings.filterwarnings("ignore", category=FutureWarning, module="tree_sitter")
+
+from services.code_fixer import CodeFixer
+from cli.phase_spinner import PhaseSpinner
 
 from tool_system import (  # type: ignore
     ToolAndWorkflowRegistry,
@@ -85,7 +94,20 @@ def _ensure_rag_runtime_loaded() -> None:
         return
     _rag_runtime_resolved = True
     try:
-        from rag.vector_database_integration import AIStabilityAnalyzerWithVectorDB as _RagAnalyzer
+        from rag.runtime import get_ai_stability_analyzer_class, rag_load_error, RAG_INSTALL_HINT
+
+        _RagAnalyzer = get_ai_stability_analyzer_class()
+        if _RagAnalyzer is None:
+            err = rag_load_error()
+            if err:
+                print(
+                    f"WARNING: 向量数据库不可用（{err}）。"
+                    f"安装 RAG 依赖: {RAG_INSTALL_HINT}",
+                    file=sys.stderr,
+                )
+            RAG_RUNTIME_AVAILABLE = False
+            return
+
         from rag.init_vector_db_data import (
             init_rules as _init_vector_rules,
             init_patterns as _init_vector_patterns,
@@ -101,7 +123,14 @@ def _ensure_rag_runtime_loaded() -> None:
         init_vector_strategies = _init_vector_strategies
         init_vector_guidance_blocks = _init_vector_guidance_blocks
         RAG_RUNTIME_AVAILABLE = True
-    except ImportError:
+    except Exception as exc:
+        from rag.runtime import RAG_INSTALL_HINT
+
+        print(
+            f"WARNING: 向量数据库模块加载失败（{exc}）。"
+            f"安装 RAG 依赖: {RAG_INSTALL_HINT}",
+            file=sys.stderr,
+        )
         AIStabilityAnalyzerWithVectorDB = None
         init_vector_rules = None
         init_vector_patterns = None
@@ -113,18 +142,23 @@ def _ensure_rag_runtime_loaded() -> None:
 
 def _read_crash_log(path: str) -> str:
     if path == "-":
-        return sys.stdin.read()
-    try:
-        return Path(path).read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+        raw = sys.stdin.read()
+    else:
         try:
-            return Path(path).read_text(encoding="utf-8-sig")
+            raw = Path(path).read_text(encoding="utf-8")
         except UnicodeDecodeError:
             try:
-                return Path(path).read_text(encoding="utf-16")
+                raw = Path(path).read_text(encoding="utf-8-sig")
             except UnicodeDecodeError:
-                raw = Path(path).read_bytes()
-                return raw.decode("utf-8", errors="ignore")
+                try:
+                    raw = Path(path).read_text(encoding="utf-16")
+                except UnicodeDecodeError:
+                    raw = Path(path).read_bytes().decode("utf-8", errors="ignore")
+    from tools._stack_symbol_utils import looks_like_rtf, rtf_to_plain_text
+
+    if looks_like_rtf(raw):
+        return rtf_to_plain_text(raw)
+    return raw
 
 
 def _normalize_code_roots(raw_roots: Optional[List[str]]) -> List[str]:
@@ -156,18 +190,143 @@ def _runtime_output_root() -> Path:
     return Path.cwd().resolve()
 
 
+_AGENT_CONFIG_LOAD_PATH: Optional[Path] = None
+
+
+def _resolve_agent_config_paths() -> List[Path]:
+    """按优先级列出 agent_config.local.json 候选路径。"""
+    seen: set = set()
+    ordered: List[Path] = []
+
+    def _add(p: Path) -> None:
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
+        if key in seen:
+            return
+        seen.add(key)
+        ordered.append(p)
+
+    override = os.environ.get("STABILITY_AGENT_CONFIG_DIR", "").strip()
+    if override:
+        _add(Path(override).expanduser().resolve() / "agent_config.local.json")
+    _add((Path.cwd() / "configs" / "agent_config.local.json").resolve())
+    _add((Path.cwd() / "tools" / "configs" / "agent_config.local.json").resolve())
+    _add(_user_agent_config_file())
+    return ordered
+
+
+def _agent_config_write_path() -> Path:
+    """写入 agent 配置时使用的路径（与最近一次成功加载路径一致）。"""
+    global _AGENT_CONFIG_LOAD_PATH
+    if _AGENT_CONFIG_LOAD_PATH is not None and _AGENT_CONFIG_LOAD_PATH.exists():
+        return _AGENT_CONFIG_LOAD_PATH
+    for candidate in _resolve_agent_config_paths():
+        if candidate.exists():
+            return candidate
+    return _user_agent_config_file()
+
+
 def _load_agent_config_file() -> dict:
-    target = _user_agent_config_file()
-    if not target.exists():
-        return {}
-    try:
-        return json.loads(target.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    global _AGENT_CONFIG_LOAD_PATH
+    for target in _resolve_agent_config_paths():
+        if not target.exists():
+            continue
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+            _AGENT_CONFIG_LOAD_PATH = target
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            continue
+    _AGENT_CONFIG_LOAD_PATH = _user_agent_config_file()
+    return {}
 
 
-def _build_llm_config_from_agent_config(engine: str) -> Optional[LLMConfig]:
+def _workflow_config_dict() -> Dict[str, Any]:
     cfg = _load_agent_config_file()
+    wc = cfg.get("workflow_config") if isinstance(cfg, dict) else {}
+    return wc if isinstance(wc, dict) else {}
+
+
+def _effective_code_context_timeout_sec() -> float:
+    wc = _workflow_config_dict()
+    raw = wc.get("code_context_timeout_sec")
+    if raw is not None:
+        try:
+            return max(1.0, min(float(raw), 7200.0))
+        except (TypeError, ValueError):
+            pass
+    return _CODE_CONTEXT_TIMEOUT_DEFAULT_SECONDS
+
+
+def _effective_find_source_timeout_sec() -> float:
+    wc = _workflow_config_dict()
+    raw = wc.get("find_source_timeout_sec")
+    if raw is not None:
+        try:
+            return max(1.0, min(float(raw), 3600.0))
+        except (TypeError, ValueError):
+            pass
+    return _FIND_SOURCE_TIMEOUT_DEFAULT_SECONDS
+
+
+def _apply_analysis_timeouts_to_problem(problem: Dict[str, Any], args: argparse.Namespace) -> None:
+    """CLI 未显式传参时，从 workflow_config 或内置默认值注入源码分析超时。"""
+    if getattr(args, "code_context_timeout_sec", None) is not None:
+        problem["code_context_timeout_sec"] = float(args.code_context_timeout_sec)
+    else:
+        problem["code_context_timeout_sec"] = _effective_code_context_timeout_sec()
+    if getattr(args, "find_source_timeout_sec", None) is not None:
+        problem["find_source_timeout_sec"] = float(args.find_source_timeout_sec)
+    else:
+        problem["find_source_timeout_sec"] = _effective_find_source_timeout_sec()
+
+
+def _effective_uaf_nullptr_guard_policy() -> str:
+    """
+    UAF 判空补丁策略：
+    - strict: 拒绝成员函数内 this/nullptr 防护型补丁（默认）
+    - balanced: 允许落地，但视为止血补丁
+    - lenient: 宽松允许
+    """
+    wc = _workflow_config_dict()
+    raw = str(wc.get("uaf_nullptr_guard_policy") or "").strip().lower()
+    if raw in {"balanced", "lenient", "strict"}:
+        return raw
+    return "strict"
+
+
+def _prepare_analysis_acceleration(problem: Dict[str, Any], code_roots: List[str], scope: str) -> None:
+    """预热文件名索引与 ctags 函数索引，供 code_content_provider 加速找源/定位函数。"""
+    if os.environ.get("STABILITY_AGENT_DISABLE_CODE_ACCELERATION", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        return
+    if not code_roots or scope not in {"full", "prompt_only"}:
+        return
+    try:
+        from services.code_index_service import get_code_index_for_roots
+
+        index = get_code_index_for_roots(code_roots)
+        problem["_code_index_service"] = index
+        index.wait_ready(timeout=2.0)
+        # 仅在显式启用 ctags 索引时预热
+        if problem.get("use_ctags_index", False):
+            from services.ctags_function_index import warm_ctags_index_for_roots
+            warm_ctags_index_for_roots(code_roots)
+    except Exception as exc:
+        print(f"警告: 分析加速索引初始化失败（将回退慢路径）: {exc}", file=sys.stderr)
+
+
+def _build_llm_config_from_agent_config(
+    engine: str,
+    *,
+    agent_cfg: Optional[dict] = None,
+) -> Optional[LLMConfig]:
+    cfg = agent_cfg if agent_cfg is not None else _load_agent_config_file()
     llm_cfg = cfg.get("llm_config", {}) if isinstance(cfg, dict) else {}
     providers = llm_cfg.get("providers", {}) if isinstance(llm_cfg, dict) else {}
     if not isinstance(providers, dict):
@@ -237,6 +396,10 @@ def _build_llm_config_from_agent_config(engine: str) -> Optional[LLMConfig]:
     extra["request_format"] = request_format
     extra["auth_header"] = str(provider_cfg.get("auth_header") or "Authorization").strip() or "Authorization"
     extra["auth_prefix"] = str(provider_cfg.get("auth_prefix") or "")
+    # 流式调用配置（默认 True，用户可在 provider 或 provider_defaults 中设为 false 关闭）
+    stream_val = provider_cfg.get("stream")
+    if stream_val is not None:
+        extra["stream"] = stream_val
 
     return LLMConfig(
         engine=mapped_engine,
@@ -252,7 +415,9 @@ def _build_llm_config_from_agent_config(engine: str) -> Optional[LLMConfig]:
 
 
 _LLM_REQUEST_TIMEOUT_MIN_SECONDS = 30
-_LLM_REQUEST_TIMEOUT_DEFAULT_SECONDS = 120
+_LLM_REQUEST_TIMEOUT_DEFAULT_SECONDS = 180
+_CODE_CONTEXT_TIMEOUT_DEFAULT_SECONDS = 360.0
+_FIND_SOURCE_TIMEOUT_DEFAULT_SECONDS = 600.0
 
 
 def _merge_llm_provider_config_for_timeout() -> Dict[str, Any]:
@@ -282,7 +447,7 @@ def _effective_llm_request_timeout_seconds() -> int:
 
 def _persist_llm_request_timeout_seconds(seconds: int) -> None:
     """写入 agent_config.local.json：更新 provider_defaults 与当前 active provider，避免仅改 defaults 仍被 per-provider 覆盖。"""
-    target = _user_agent_config_file()
+    target = _agent_config_write_path()
     data = _load_json_or_empty(target)
     llm_cfg = data.get("llm_config")
     if not isinstance(llm_cfg, dict):
@@ -347,6 +512,18 @@ def _bundled_config_dir() -> Path:
 
 def _user_agent_config_file() -> Path:
     return _user_config_dir() / "agent_config.local.json"
+
+
+def _load_user_agent_config_file() -> dict:
+    """仅读取 ~/.config/stability-analysis-agent/agent_config.local.json（与菜单配置检测一致）。"""
+    target = _user_agent_config_file()
+    if not target.exists():
+        return {}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
 
 
 def _user_add2line_config_file() -> Path:
@@ -1783,7 +1960,7 @@ def _auto_configure_add2line(
     if interactive:
         _show_success_panel(
             "✅ 已自动写入堆栈地址解析工具配置",
-            [f"配置文件: {target}", *written],
+            [f"配置文件: {target}", *written, "你可以返回上一级继续操作。"],
         )
     else:
         print(
@@ -1874,6 +2051,7 @@ def _update_add2line_config_interactive(initial_mode: Optional[str] = None) -> O
             f"配置文件: {target}",
             f"平台: {os_choice}",
             f"tool_paths: {os_cfg.get('tool_paths') or []}",
+            "你可以返回上一级继续操作。",
         ],
     )
     return True
@@ -1937,127 +2115,81 @@ def _print_llm_detection_summary(status: Dict[str, Any]) -> None:
     print("")
 
 
-def _resolve_active_provider_runtime_config() -> Optional[Dict[str, Any]]:
-    cfg = _load_agent_config_file()
+def _connectivity_engine_from_session() -> str:
+    """与最近一次分析一致的 --engine；无记录时默认 direct。"""
+    state = _load_session_state()
+    last_run = state.get("last_run", {}) if isinstance(state.get("last_run"), dict) else {}
+    engine = str(last_run.get("engine", "direct")).strip()
+    return engine if engine in {"direct", "langchain", "langgraph"} else "direct"
+
+
+def _active_llm_provider_key(*, agent_cfg: Optional[dict] = None) -> str:
+    cfg = agent_cfg if agent_cfg is not None else _load_agent_config_file()
     llm_cfg = cfg.get("llm_config", {}) if isinstance(cfg, dict) else {}
-    providers = llm_cfg.get("providers", {}) if isinstance(llm_cfg, dict) else {}
-    if not isinstance(providers, dict):
-        return None
-    provider_defaults = llm_cfg.get("provider_defaults", {}) if isinstance(llm_cfg, dict) else {}
-    if not isinstance(provider_defaults, dict):
-        provider_defaults = {}
-    active_provider = str(llm_cfg.get("active_provider") or "").strip()
-    if not active_provider:
-        return None
-    provider_cfg = {**provider_defaults, **(providers.get(active_provider, {}) or {})}
-    if not isinstance(provider_cfg, dict):
-        return None
-
-    auth_type = str(provider_cfg.get("auth_type") or "").strip().lower()
-    if not auth_type:
-        auth_type = "authorization" if (active_provider == "baidu_qianfan" or provider_cfg.get("authorization")) else "api_key"
-    if auth_type == "authorization":
-        secret = str(provider_cfg.get("authorization") or "").strip()
-    elif auth_type == "none":
-        secret = ""
-    else:
-        secret = str(provider_cfg.get("api_key") or "").strip()
-    if auth_type != "none" and _is_placeholder_secret(secret):
-        return None
-
-    request_format = str(provider_cfg.get("request_format") or "openai_chat_completions_compatible").strip().lower()
-    auth_header = str(provider_cfg.get("auth_header") or ("Authorization" if auth_type != "authorization" else "Authorization")).strip() or "Authorization"
-    auth_prefix = str(provider_cfg.get("auth_prefix") or ("Bearer " if auth_header.lower() == "authorization" else "")).strip()
-    if auth_prefix:
-        auth_prefix = auth_prefix + ("" if auth_prefix.endswith(" ") else " ")
-    base_url = str(provider_cfg.get("base_url") or "").strip()
-    model = str(provider_cfg.get("model") or "").strip()
-    timeout = float(provider_cfg.get("request_timeout") or 10)
-    if timeout <= 0:
-        timeout = 10
-
-    return {
-        "active_provider": active_provider,
-        "request_format": request_format,
-        "auth_type": auth_type,
-        "auth_header": auth_header,
-        "auth_prefix": auth_prefix,
-        "secret": secret,
-        "base_url": base_url,
-        "model": model,
-        "timeout": timeout,
-    }
+    return str(llm_cfg.get("active_provider") or "unknown").strip() or "unknown"
 
 
-def _join_endpoint(base_url: str, suffix: str) -> str:
-    base = (base_url or "").strip().rstrip("/")
+def _describe_llm_endpoint_for_display(llm_config: LLMConfig) -> str:
+    """根据配置推断实际 HTTP 路径（仅用于联通性结果展示）。"""
+    base = str(llm_config.base_url or "").strip().rstrip("/")
     if not base:
-        return suffix
+        return "（未配置 base_url）"
+    request_format = str((llm_config.extra or {}).get("request_format") or "openai_chat_completions_compatible").strip().lower()
+    if request_format == "anthropic_messages_compatible":
+        suffix = "/messages"
+    elif request_format == "openai_responses_compatible":
+        suffix = "/responses"
+    else:
+        suffix = "/chat/completions"
     if base.endswith(suffix):
         return base
     return f"{base}{suffix}"
 
 
-def _connectivity_probe_via_http(runtime_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    provider = str(runtime_cfg.get("active_provider") or "unknown")
-    request_format = str(runtime_cfg.get("request_format") or "openai_chat_completions_compatible")
-    base_url = str(runtime_cfg.get("base_url") or "").strip()
-    model = str(runtime_cfg.get("model") or "").strip() or "unknown-model"
-    timeout = float(runtime_cfg.get("timeout") or 10)
+def _connectivity_probe_via_llm_adapter(engine: str) -> Dict[str, Any]:
+    """
+    通过 LLMAdapterFactory 探测联通性，与正式分析共用同一 HTTP/SSL 栈。
+    langchain 模式在 CLI 未注入 AgentExecutor 时回退为 direct 传输探测。
+    菜单内联通性检测固定读取用户目录配置，与「大模型配置检测」一致。
+    """
+    user_cfg = _load_user_agent_config_file()
+    llm_config = _build_llm_config_from_agent_config(engine, agent_cfg=user_cfg)
+    if llm_config is None:
+        raise RuntimeError("当前配置未就绪：请先完成厂商与密钥配置。")
 
+    base_url = str(llm_config.base_url or "").strip()
     if not base_url:
         raise RuntimeError("接口请求地址（base_url）未填写，无法执行联通性检测")
 
-    headers = {"Content-Type": "application/json"}
-    auth_type = str(runtime_cfg.get("auth_type") or "api_key")
-    if auth_type != "none":
-        auth_header = str(runtime_cfg.get("auth_header") or "Authorization")
-        auth_prefix = str(runtime_cfg.get("auth_prefix") or "")
-        secret = str(runtime_cfg.get("secret") or "")
-        if not secret:
-            raise RuntimeError("密钥为空，无法执行联通性检测")
-        headers[auth_header] = f"{auth_prefix}{secret}"
+    probe_engine = engine
+    adapter_cfg = llm_config.to_dict()
+    configured_timeout = int(llm_config.timeout or 10)
+    adapter_cfg["timeout"] = max(1, min(10, configured_timeout))
+    adapter_cfg["temperature"] = 0.0
+    adapter_cfg["max_tokens"] = 16
 
-    if request_format == "anthropic_messages_compatible":
-        url = _join_endpoint(base_url, "/messages")
-        body = {
-            "model": model,
-            "messages": [{"role": "user", "content": "pong"}],
-            "max_tokens": 16,
-        }
-        # Anthropic official endpoint requires this header; OneAPI usually ignores it.
-        if "anthropic.com" in base_url and "anthropic-version" not in {k.lower(): v for k, v in headers.items()}:
-            headers["anthropic-version"] = "2023-06-01"
-    elif request_format == "openai_responses_compatible":
-        url = _join_endpoint(base_url, "/responses")
-        body = {
-            "model": model,
-            "input": "pong",
-            "max_output_tokens": 16,
-        }
-    else:
-        # Default to OpenAI Chat Completions compatible protocol.
-        url = _join_endpoint(base_url, "/chat/completions")
-        body = {
-            "model": model,
-            "messages": [{"role": "user", "content": "pong"}],
-            "temperature": 0.0,
-            "max_tokens": 16,
-        }
+    if engine == "langchain":
+        # crash_analysis 的 LLM 直调走 chat()；langchain 引擎需 AgentExecutor，探测改用 direct。
+        probe_engine = "direct"
+        adapter_cfg["engine"] = "direct"
 
-    req = urllib.request.Request(
-        url=url,
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        method="POST",
-        headers=headers,
+    adapter = LLMAdapterFactory.create(adapter_cfg)
+    response = adapter.chat(
+        [{"role": "user", "content": "pong"}],
+        max_tokens=16,
+        temperature=0.0,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="ignore")
+    content = str(getattr(response, "content", None) or "").strip()
+    request_format = str((llm_config.extra or {}).get("request_format") or "openai_chat_completions_compatible")
+
     return {
-        "provider": provider,
+        "provider": _active_llm_provider_key(agent_cfg=user_cfg),
+        "engine": engine,
+        "probe_engine": probe_engine,
         "request_format": request_format,
-        "url": url,
-        "response_preview": raw[:120].replace("\n", " "),
+        "url": _describe_llm_endpoint_for_display(llm_config),
+        "model": llm_config.model,
+        "response_preview": content[:120].replace("\n", " ") if content else "",
     }
 
 
@@ -2072,16 +2204,11 @@ def _check_llm_connectivity() -> None:
         else:
             _safe_input("联通性检测已完成，按回车返回... ")
 
-    runtime_cfg = _resolve_active_provider_runtime_config()
-    if runtime_cfg is None:
-        print(_red("❌ 当前配置未就绪：请先完成厂商与密钥配置。"))
-        _ack_result()
-        return
-
-    print("正在检测联通性（最长约 10 秒，可按 Ctrl+C 取消）...")
+    engine = _connectivity_engine_from_session()
+    print(f"正在检测联通性（engine={engine}，最长约 10 秒，可按 Ctrl+C 取消）...")
     start = time.time()
     try:
-        probe = _connectivity_probe_via_http(runtime_cfg)
+        probe = _connectivity_probe_via_llm_adapter(engine)
         elapsed = time.time() - start
         content = str(probe.get("response_preview") or "").strip()
         if len(content) > 80:
@@ -2090,7 +2217,11 @@ def _check_llm_connectivity() -> None:
         print(
             f"- 厂商（配置键）: {probe.get('provider') or (_doctor_status().get('active_provider') or 'unknown')}"
         )
+        print(f"- engine: {probe.get('engine')}")
+        if probe.get("probe_engine") and probe.get("probe_engine") != probe.get("engine"):
+            print(f"- 传输探测: {probe.get('probe_engine')}（与分析时 LLM 客户端栈一致）")
         print(f"- request_format: {probe.get('request_format')}")
+        print(f"- model: {probe.get('model')}")
         print(f"- endpoint: {probe.get('url')}")
         print(f"- 耗时: {elapsed:.2f}s")
         if content:
@@ -2112,6 +2243,11 @@ def _check_llm_connectivity() -> None:
             reason = "请求超时（网络或网关较慢）"
         elif "name or service not known" in lower or "nodename nor servname" in lower:
             reason = "域名解析失败（DNS/地址配置问题）"
+        elif "certificate verify failed" in lower or "ssl: certificate_verify_failed" in lower:
+            reason = (
+                "SSL 证书校验失败（多为 Python 环境 CA 不完整；"
+                "macOS 官方安装包可运行「Install Certificates.command」或使用 Homebrew Python）"
+            )
         print("❌ 联通性检测失败")
         print(f"- 原因: {reason}")
         print(f"- 耗时: {elapsed:.2f}s")
@@ -2429,7 +2565,7 @@ def _configure_add2line_only() -> None:
     print("")
     changed = _update_add2line_config_interactive()
     if changed is True:
-        _show_success_panel("✅ 已完成符号化工具配置", ["你可以返回上一级继续操作。"])
+        # 成功时 _update_add2line_config_interactive / _auto_configure_add2line 内已展示成功面板与「按回车继续」，此处不再重复。
         return
     if changed is None:
         return
@@ -2653,13 +2789,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--library-dir",
         required=False,
-        help="符号库目录（含 .so / .dylib / .dSYM 等带调试符号的二进制；日志已含函数名+行号可省略）",
+        help="符号库目录（含 .so / .dylib / .dSYM 等带调试符号的二进制；日志已被解析过可省略）",
     )
     p.add_argument(
         "--code-root",
         action="append",
         dest="code_roots",
-        help="项目 C/C++ 源码目录（可重复指定；建议精确到工程/模块根，避免传整个仓库根）",
+        help="项目 C/C++ 源码目录（可重复指定；建议精确到工程/模块根目录，避免传整个仓库根目录）",
     )
     p.add_argument("--config", required=False, help="SystemConfig JSON 文件")
     p.add_argument("--vector-db-path", default="./vector_db", help="向量数据库目录（默认: ./vector_db）")
@@ -2684,7 +2820,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["full", "prompt_only", "parse_only", "parse_log_only"],
         help=(
             "Agent 执行流程范围（默认 full）："
-            "full=解析+符号化+取代码上下文+AI 推理；"
+            "full=解析+符号化+定位源码+AI 分析+自动改码；"
             "prompt_only=完整工具链但不调用 AI，仅生成可复用提示词；"
             "parse_only=仅解析+符号化；"
             "parse_log_only=仅解析崩溃日志"
@@ -2750,12 +2886,41 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--code-context-timeout-sec",
+        type=float,
+        default=None,
+        help=(
+            "code_content_provider：第三步整阶段 wall-clock 上限（秒）；"
+            f"默认 {_CODE_CONTEXT_TIMEOUT_DEFAULT_SECONDS:.0f}（可由 workflow_config.code_context_timeout_sec 覆盖）。"
+            "大仓库可提高到 600。"
+        ),
+    )
+    p.add_argument(
+        "--find-source-timeout-sec",
+        type=float,
+        default=None,
+        help=(
+            "code_content_provider：源文件定位总预算（秒）；"
+            f"默认 {_FIND_SOURCE_TIMEOUT_DEFAULT_SECONDS:.0f}（可由 workflow_config.find_source_timeout_sec 覆盖）。"
+        ),
+    )
+    p.add_argument(
         "--min-key-read-related-functions",
         type=int,
         default=2,
         help=(
             "code_content_provider：在共享变量关系截断时，关键读路径最少保留条数（默认 2，允许 0）；"
             "用于避免 modify/get/read 类关键读取函数被写路径完全挤出。"
+        ),
+    )
+    p.add_argument(
+        "--use-ctags-index",
+        dest="use_ctags_index",
+        action="store_true",
+        default=False,
+        help=(
+            "启用 ctags 函数索引加速（默认关闭）。首次运行会构建索引（~30s），"
+            "后续运行通过缓存加速函数定义查找。已安装 ripgrep 时默认不需要此选项。"
         ),
     )
     return p
@@ -2917,874 +3082,35 @@ def _write_cli_report(
         return None
 
 
-def _extract_candidate_nodes(code_context: Dict[str, Any]) -> List[Dict[str, Any]]:
-    graph = code_context.get("graph", {}) if isinstance(code_context, dict) else {}
-    nodes = graph.get("nodes", []) if isinstance(graph, dict) else []
-    out: List[Dict[str, Any]] = []
-    for node in nodes:
-        if not isinstance(node, dict):
-            continue
-        file_path = node.get("file")
-        signature = node.get("signature")
-        snippet = node.get("snippet")
-        if not file_path or not signature or not isinstance(snippet, list) or not snippet:
-            continue
-        out.append(
-            {
-                "file": str(Path(file_path).resolve()),
-                "signature": str(signature),
-                "snippet": [str(line) for line in snippet],
-                "snippet_start_line": node.get("snippet_start_line"),
-                "snippet_end_line": node.get("snippet_end_line"),
-            }
-        )
-    return out
 
-
-def _extract_json_payload(raw_text: str) -> Dict[str, Any]:
-    text = (raw_text or "").strip()
-    if not text:
-        raise ValueError("AI 未返回结构化修改计划")
-    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
-    if fence_match:
-        text = fence_match.group(1)
-    else:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            text = text[start : end + 1]
-    payload = json.loads(text)
-    if not isinstance(payload, dict):
-        raise ValueError("结构化修改计划必须是 JSON 对象")
-    return payload
-
-
-def _safe_extract_json_payload(raw_text: str) -> Dict[str, Any]:
-    try:
-        payload = _extract_json_payload(raw_text)
-        normalized_edits: List[Dict[str, Any]] = []
-        for edit in payload.get("edits", []) if isinstance(payload.get("edits"), list) else []:
-            if not isinstance(edit, dict):
-                continue
-            normalized_edits.append(
-                {
-                    "file": str(edit.get("file", "")),
-                    "function_signature": str(edit.get("function_signature", "")),
-                    "replacement_code": str(
-                        edit.get("replacement_code")
-                        or edit.get("replacement")
-                        or edit.get("code")
-                        or ""
-                    ).strip(),
-                    "reason": str(edit.get("reason", "")),
-                }
-            )
-        payload = {"summary": str(payload.get("summary", "")), "edits": normalized_edits}
-        if isinstance(payload.get("edits"), list):
-            return payload
-        return {"summary": str(payload.get("summary") or ""), "edits": []}
-    except Exception:
-        return {"summary": "", "edits": []}
-
-
-def _build_fix_plan_prompt(
-    parse_result: Dict[str, Any],
-    code_context: Dict[str, Any],
-    analysis_text: str,
-    candidate_nodes: List[Dict[str, Any]],
-    required_targets: Optional[List[Dict[str, str]]] = None,
-) -> str:
-    crash_summary = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
-    concise_nodes = [
-        {
-            "file": node["file"],
-            "function_signature": node["signature"],
-            "snippet_start_line": node.get("snippet_start_line"),
-            "snippet_end_line": node.get("snippet_end_line"),
-            "snippet": node["snippet"],
-        }
-        for node in candidate_nodes
-    ]
-    required_text = ""
-    if required_targets:
-        required_text = (
-            f"\n必须覆盖的目标函数（请为每个目标至少输出一个 edit）："
-            f"{json.dumps(required_targets, ensure_ascii=False)}\n"
-        )
-    return (
-        "你是代码修复执行器。请根据崩溃上下文和现有 AI 分析，输出“可直接落盘”的最小修改计划。\n"
-        "只允许修改下面 candidate_nodes 中出现的函数；不要新建文件，不要引用不存在的文件，不要输出 Markdown。\n"
-        "若无法安全修改，必须在 reason 里给出具体阻塞原因；不要省略目标。\n"
-        "先执行一致性自检：必须先以 candidate_nodes.snippet 为准校验 analysis_text；若两者冲突，忽略 analysis_text 的冲突结论。\n"
-        "禁止基于与 snippet 冲突的假设生成 edits（例如把“已存在的锁/判空/边界检查”当作缺失）。\n"
-        "严禁输出与候选函数 snippet 等价的 replacement_code（仅空白、缩进、换行或注释差异也视为等价）。\n"
-        "每条 edit 必须包含可验证的行为变化（条件、锁、边界、生命周期、错误处理等至少一类）。\n"
-        "若无法给出“行为变化”且可编译的修复代码，必须返回 edits=[]，并在 summary 说明阻塞原因。\n"
-        "非常重要：你的回复必须是一个 JSON 对象，不允许包含任何额外文本、解释、标题、代码围栏。\n\n"
-        "输出必须是严格 JSON，格式如下：\n"
-        "{\n"
-        '  "summary": "一句话说明修复意图",\n'
-        '  "edits": [\n'
-        "    {\n"
-        '      "file": "candidate_nodes 中的绝对路径",\n'
-        '      "function_signature": "candidate_nodes 中的函数签名",\n'
-        '      "replacement_code": "完整的替换后函数代码",\n'
-        '      "reason": "为什么修改这个函数"\n'
-        "    }\n"
-        "  ]\n"
-        "}\n\n"
-        "要求：\n"
-        "1. replacement_code 必须是完整函数代码，能够直接替换原函数。\n"
-        "2. replacement_code 必须与原 snippet 存在“实质行为差异”；仅格式变化禁止。\n"
-        "3. 若 analysis_text 与 snippet 冲突，必须以 snippet 为准，并在 reason 中简述已纠偏。\n"
-        "4. 优先做最小修复，避免引入新依赖；但必须覆盖要求的目标函数。\n"
-        "5. 不要修改无关逻辑。\n"
-        "6. 如果现有 AI 分析与 candidate_nodes 冲突，以 candidate_nodes 的真实代码为准。\n\n"
-        f"parse_result={json.dumps(parse_result, ensure_ascii=False)}\n\n"
-        f"crash_summary={json.dumps(crash_summary, ensure_ascii=False)}\n\n"
-        f"candidate_nodes={json.dumps(concise_nodes, ensure_ascii=False)}\n"
-        f"{required_text}\n"
-        f"analysis_text={analysis_text}"
-    )
-
-
-def _extract_required_function_names_from_analysis(analysis_text: str) -> List[str]:
-    names: List[str] = []
-    in_section = False
-    for raw_line in (analysis_text or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if "需要修改的函数" in line:
-            in_section = True
-            continue
-        if in_section and line.startswith("#### "):
-            break
-        if not in_section:
-            continue
-        m = re.match(r"^-\s*`([^`]+)`", line)
-        if m:
-            names.append(m.group(1).strip())
-    dedup: List[str] = []
-    for n in names:
-        if n and n not in dedup:
-            dedup.append(n)
-    return dedup
-
-
-def _extract_simple_function_name(signature: str) -> str:
-    s = str(signature or "").strip()
-    m = re.search(r"([~]?[A-Za-z_]\w*)\s*\(", s)
-    return m.group(1) if m else s
-
-
-def _select_required_targets(
-    candidate_nodes: List[Dict[str, Any]],
-    required_names: List[str],
-) -> List[Dict[str, str]]:
-    targets: List[Dict[str, str]] = []
-    if not required_names:
-        return targets
-    for name in required_names:
-        simple = _extract_simple_function_name(name)
-        for node in candidate_nodes:
-            sig = str(node.get("signature", ""))
-            sig_simple = _extract_simple_function_name(sig)
-            if name in sig or sig in name or (simple and simple == sig_simple):
-                targets.append({"file": str(node["file"]), "function_signature": sig})
-                break
-    dedup: List[Dict[str, str]] = []
-    seen = set()
-    for t in targets:
-        key = (t["file"], t["function_signature"])
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append(t)
-    return dedup
-
-
-def _merge_fix_plan_edits(base_plan: Dict[str, Any], new_plan: Dict[str, Any]) -> Dict[str, Any]:
-    merged = dict(base_plan or {})
-    merged["summary"] = (new_plan or {}).get("summary") or merged.get("summary") or ""
-    merged_edits: List[Dict[str, Any]] = []
-    seen = set()
-    for plan in (base_plan or {}, new_plan or {}):
-        for edit in plan.get("edits", []) if isinstance(plan, dict) else []:
-            if not isinstance(edit, dict):
-                continue
-            key = (str(edit.get("file", "")), str(edit.get("function_signature", "")))
-            if key in seen:
-                continue
-            seen.add(key)
-            merged_edits.append(edit)
-    merged["edits"] = merged_edits
-    return merged
-
-
-def _upsert_fix_plan_edit(fix_plan: Dict[str, Any], edit: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(fix_plan, dict):
-        fix_plan = {"summary": "", "edits": []}
-    edits = fix_plan.get("edits", [])
-    if not isinstance(edits, list):
-        edits = []
-    key = (str(edit.get("file", "")), str(edit.get("function_signature", "")))
-    out: List[Dict[str, Any]] = []
-    replaced = False
-    for e in edits:
-        if not isinstance(e, dict):
-            continue
-        k = (str(e.get("file", "")), str(e.get("function_signature", "")))
-        if k == key:
-            out.append(edit)
-            replaced = True
-        else:
-            out.append(e)
-    if not replaced:
-        out.append(edit)
-    return {"summary": str(fix_plan.get("summary", "")), "edits": out}
-
-
-def _build_single_target_fix_prompt(
-    parse_result: Dict[str, Any],
-    crash_summary: Dict[str, Any],
-    analysis_text: str,
-    target_node: Dict[str, Any],
-) -> str:
-    node_payload = {
-        "file": target_node["file"],
-        "function_signature": target_node["signature"],
-        "snippet_start_line": target_node.get("snippet_start_line"),
-        "snippet_end_line": target_node.get("snippet_end_line"),
-        "snippet": target_node["snippet"],
-    }
-    return (
-        "你是代码修复执行器。现在只允许修复一个函数，输出严格 JSON。\n"
-        "不要输出 Markdown，不要解释。\n"
-        "严禁输出与 target_node.snippet 等价的 replacement_code（仅空白或注释差异也视为等价）。\n"
-        "replacement_code 必须包含至少一处可验证的行为变化；否则返回 edits=[] 并在 summary 写明阻塞原因。\n"
-        "输出格式：\n"
-        "{\n"
-        '  "summary": "一句话",\n'
-        '  "edits": [\n'
-        "    {\n"
-        f'      "file": "{target_node["file"]}",\n'
-        f'      "function_signature": "{target_node["signature"]}",\n'
-        '      "replacement_code": "完整函数代码",\n'
-        '      "reason": "修改原因"\n'
-        "    }\n"
-        "  ]\n"
-        "}\n\n"
-        "要求：\n"
-        "1. edits 只能包含这个目标函数，且最多 1 条。\n"
-        "2. replacement_code 必须是完整函数代码，可直接替换，且具有实质行为差异。\n"
-        "3. 若无法安全修改，返回 edits 为空数组，并在 summary 说明原因。\n\n"
-        f"parse_result={json.dumps(parse_result, ensure_ascii=False)}\n\n"
-        f"crash_summary={json.dumps(crash_summary, ensure_ascii=False)}\n\n"
-        f"target_node={json.dumps(node_payload, ensure_ascii=False)}\n\n"
-        f"analysis_text={analysis_text}"
-    )
-
-
-def _extract_code_blocks_from_analysis_text(analysis_text: str) -> List[str]:
-    blocks: List[str] = []
-    lines = str(analysis_text or "").splitlines()
-    in_block = False
-    cur: List[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if not in_block:
-            if re.match(r"^```(?:cpp|c\+\+|cc|cxx)?\s*$", stripped, re.I):
-                in_block = True
-                cur = []
-            continue
-        if stripped.startswith("```"):
-            block = "\n".join(cur).strip("\n")
-            if block:
-                blocks.append(block)
-            in_block = False
-            cur = []
-            continue
-        cur.append(line)
-    if in_block and cur:
-        # 容忍模型输出缺失 closing fence 的情况，直接截到文件末尾
-        block = "\n".join(cur).strip("\n")
-        if block:
-            blocks.append(block)
-    return blocks
-
-
-def _contains_placeholder_code(text: str) -> bool:
-    s = str(text or "")
-    markers = ("...", "…", "其他代码保持不变", "前置代码", "后续代码")
-    return any(mark in s for mark in markers)
-
-
-def _is_valid_replacement_code(text: str) -> bool:
-    s = str(text or "").strip()
-    if not s:
-        return False
-    if _contains_placeholder_code(s):
-        return False
-    return s.count("{") > 0 and s.count("{") == s.count("}")
-
-
-def _build_single_target_completion_prompt(
-    parse_result: Dict[str, Any],
-    crash_summary: Dict[str, Any],
-    analysis_text: str,
-    target_node: Dict[str, Any],
-    draft_code: str = "",
-) -> str:
-    node_payload = {
-        "file": target_node["file"],
-        "function_signature": target_node["signature"],
-        "snippet_start_line": target_node.get("snippet_start_line"),
-        "snippet_end_line": target_node.get("snippet_end_line"),
-        "snippet": target_node["snippet"],
-    }
-    return (
-        "你是 C++ 代码修复器。请仅输出一个函数的完整 replacement_code（可直接替换原函数）。\n"
-        "严禁输出省略号、占位注释、伪代码。\n"
-        "严禁修改函数签名、文件路径。\n"
-        "严禁输出与 target_node.snippet 等价的代码（仅空白/注释差异也视为等价）。\n"
-        "replacement_code 必须包含至少一处可验证的行为变化；否则返回 edits=[] 并说明原因。\n"
-        "若无法给出完整函数，返回 edits 为空数组并给出原因。\n\n"
-        "输出必须是严格 JSON：\n"
-        "{\n"
-        '  "summary": "一句话",\n'
-        '  "edits": [\n'
-        "    {\n"
-        f'      "file": "{target_node["file"]}",\n'
-        f'      "function_signature": "{target_node["signature"]}",\n'
-        '      "replacement_code": "完整函数代码（必须可编译）",\n'
-        '      "reason": "修改原因"\n'
-        "    }\n"
-        "  ]\n"
-        "}\n\n"
-        f"parse_result={json.dumps(parse_result, ensure_ascii=False)}\n\n"
-        f"crash_summary={json.dumps(crash_summary, ensure_ascii=False)}\n\n"
-        f"target_node={json.dumps(node_payload, ensure_ascii=False)}\n\n"
-        f"draft_code={draft_code}\n\n"
-        f"analysis_text={analysis_text}"
-    )
-
-
-def _extract_function_block_from_code(code_text: str, start_index: int) -> Optional[str]:
-    brace_index = code_text.find("{", start_index)
-    if brace_index < 0:
-        return None
-    line_start = code_text.rfind("\n", 0, start_index)
-    if line_start < 0:
-        line_start = 0
-    else:
-        line_start += 1
-    depth = 0
-    end_index = -1
-    for i in range(brace_index, len(code_text)):
-        ch = code_text[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                end_index = i
-                break
-    if end_index < 0:
-        return None
-    block = code_text[line_start : end_index + 1].strip()
-    if not block:
-        return None
-    if _contains_placeholder_code(block):
-        return None
-    return block
-
-
-def _extract_replacement_from_analysis_text(
-    analysis_text: str,
-    target_signature: str,
-) -> Optional[str]:
-    blocks = _extract_code_blocks_from_analysis_text(analysis_text)
-    if not blocks:
-        return None
-    target_signature = str(target_signature or "").strip()
-    simple_name = _extract_simple_function_name(target_signature)
-    for code in blocks:
-        idx = code.find(target_signature) if target_signature else -1
-        if idx >= 0:
-            block = _extract_function_block_from_code(code, idx)
-            if block:
-                return block
-        if simple_name:
-            pattern = re.compile(rf"\b{re.escape(simple_name)}\s*\(", re.M)
-            for m in pattern.finditer(code):
-                block = _extract_function_block_from_code(code, m.start())
-                if block and _extract_simple_function_name(block) == simple_name:
-                    return block
-    return None
-
-
-def _fill_empty_replacements_from_analysis_text(
-    fix_plan: Dict[str, Any],
-    analysis_text: str,
-) -> Dict[str, Any]:
-    if not isinstance(fix_plan, dict):
-        return {"summary": "", "edits": []}
-    edits = fix_plan.get("edits", [])
-    if not isinstance(edits, list):
-        return {"summary": str(fix_plan.get("summary", "")), "edits": []}
-    new_edits: List[Dict[str, Any]] = []
-    for edit in edits:
-        if not isinstance(edit, dict):
-            continue
-        merged = dict(edit)
-        replacement = str(merged.get("replacement_code", "")).strip()
-        if not replacement:
-            sig = str(merged.get("function_signature", ""))
-            fallback = _extract_replacement_from_analysis_text(analysis_text, sig)
-            if fallback:
-                merged["replacement_code"] = fallback
-                merged["reason"] = str(merged.get("reason") or "") + "；fallback=analysis_text"
-        new_edits.append(merged)
-    return {"summary": str(fix_plan.get("summary", "")), "edits": new_edits}
-
-
-def _append_missing_edits_from_analysis_text(
-    fix_plan: Dict[str, Any],
-    analysis_text: str,
-    required_targets: List[Dict[str, str]],
-) -> Dict[str, Any]:
-    if not isinstance(fix_plan, dict):
-        fix_plan = {"summary": "", "edits": []}
-    edits = fix_plan.get("edits", [])
-    if not isinstance(edits, list):
-        edits = []
-    existing_keys = {
-        (str(e.get("file", "")), str(e.get("function_signature", "")))
-        for e in edits
-        if isinstance(e, dict)
-    }
-    appended = list(edits)
-    for t in required_targets or []:
-        file_path = str(t.get("file", ""))
-        signature = str(t.get("function_signature", ""))
-        key = (file_path, signature)
-        if not file_path or not signature or key in existing_keys:
-            continue
-        replacement = _extract_replacement_from_analysis_text(analysis_text, signature)
-        if not replacement:
-            continue
-        appended.append(
-            {
-                "file": file_path,
-                "function_signature": signature,
-                "replacement_code": replacement,
-                "reason": "fallback=analysis_text_missing_edit",
-            }
-        )
-        existing_keys.add(key)
-    return {"summary": str(fix_plan.get("summary", "")), "edits": appended}
-
-
-def _is_within_code_roots(path: Path, code_roots: List[str]) -> bool:
-    for root in code_roots:
-        try:
-            path.relative_to(Path(root).resolve())
-            return True
-        except ValueError:
-            continue
-    return False
-
-
-def _find_containing_code_root(path: Path, code_roots: List[str]) -> Optional[Path]:
-    """返回包含 path 的最具体 code_root（最长前缀匹配）。"""
-    best: Optional[Path] = None
-    for root in code_roots:
-        root_path = Path(root).resolve()
-        try:
-            path.relative_to(root_path)
-        except ValueError:
-            continue
-        if best is None or len(str(root_path)) > len(str(best)):
-            best = root_path
-    return best
-
-
-def _replace_function_block(source: str, signature: str, replacement_code: str) -> Tuple[str, Optional[str]]:
-    sig_index = source.find(signature)
-    if sig_index < 0:
-        # 兜底：签名文本可能因换行/空格差异无法直接命中，退化为类名+函数名匹配
-        owner = ""
-        m_owner = re.search(r"([A-Za-z_]\w*)::[~]?[A-Za-z_]\w*\s*\(", signature)
-        if m_owner:
-            owner = m_owner.group(1)
-        func_name = _extract_simple_function_name(signature)
-        idx_candidates: List[int] = []
-        if owner and func_name:
-            pattern = re.compile(
-                rf"{re.escape(owner)}\s*::\s*{re.escape(func_name)}\s*\(",
-                re.M,
-            )
-            idx_candidates = [m.start() for m in pattern.finditer(source)]
-        if not idx_candidates and func_name:
-            pattern2 = re.compile(rf"\b{re.escape(func_name)}\s*\(", re.M)
-            idx_candidates = [m.start() for m in pattern2.finditer(source)]
-        if idx_candidates:
-            sig_index = idx_candidates[0]
-    if sig_index < 0:
-        return source, None
-    brace_start = source.find("{", sig_index)
-    if brace_start < 0:
-        return source, None
-    depth = 0
-    end_index = -1
-    for idx in range(brace_start, len(source)):
-        ch = source[idx]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                end_index = idx
-                break
-    if end_index < 0:
-        return source, None
-    old_block = source[sig_index : end_index + 1]
-    return source[:sig_index] + replacement_code + source[end_index + 1 :], old_block
-
-
-def _normalize_code_for_equivalence(text: str) -> str:
-    """用于判定改码是否仅为空白差异，避免误报“已修改”。"""
-    s = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    return "\n".join(line.rstrip() for line in s.strip().split("\n"))
-
-
-def _apply_ai_fix_plan(
-    fix_plan: Dict[str, Any],
-    candidate_nodes: List[Dict[str, Any]],
-    code_roots: List[str],
-    report_dir: Optional[Path],
-    backup_original_sources: bool,
-) -> Dict[str, Any]:
-    edits = fix_plan.get("edits", []) if isinstance(fix_plan, dict) else []
-    candidate_map = {(node["file"], node["signature"]): node for node in candidate_nodes}
-    applied: List[Dict[str, Any]] = []
-    for edit in edits:
-        if not isinstance(edit, dict):
-            continue
-        file_path = Path(str(edit.get("file", ""))).resolve()
-        signature = str(edit.get("function_signature", ""))
-        replacement_code = str(edit.get("replacement_code", "")).strip("\n")
-        reason = str(edit.get("reason", ""))
-        record: Dict[str, Any] = {
-            "file": str(file_path),
-            "function_signature": signature,
-            "reason": reason,
-            "status": "skipped",
-        }
-        node = candidate_map.get((str(file_path), signature))
-        if node is None:
-            record["error"] = "目标函数不在本次代码上下文候选列表中"
-            applied.append(record)
-            continue
-        if not _is_within_code_roots(file_path, code_roots):
-            record["error"] = "目标文件不在 code_root 范围内"
-            applied.append(record)
-            continue
-        if not file_path.exists():
-            record["error"] = "目标文件不存在"
-            applied.append(record)
-            continue
-        if not replacement_code:
-            record["error"] = "replacement_code 为空"
-            applied.append(record)
-            continue
-        original = file_path.read_text(encoding="utf-8")
-        snippet_text = "\n".join(node["snippet"])
-        new_text = original
-        old_block: Optional[str] = None
-        if snippet_text in original:
-            old_block = snippet_text
-            new_text = original.replace(snippet_text, replacement_code, 1)
-        else:
-            new_text, old_block = _replace_function_block(original, signature, replacement_code)
-        if old_block is None or new_text == original:
-            record["error"] = "未能在源码中定位待替换函数"
-            applied.append(record)
-            continue
-        if _normalize_code_for_equivalence(old_block) == _normalize_code_for_equivalence(replacement_code):
-            record["error"] = "replacement_code 与原函数等价（仅空白或格式差异），已跳过写入"
-            applied.append(record)
-            continue
-        file_path.write_text(new_text, encoding="utf-8")
-        if report_dir is not None and backup_original_sources:
-            backup_root = report_dir / "original_sources"
-            containing_root = _find_containing_code_root(file_path, code_roots)
-            if containing_root is None:
-                record["error"] = "目标文件未命中任何 code_root，无法回写备份"
-                applied.append(record)
-                continue
-            backup_path = backup_root / file_path.relative_to(containing_root)
-            backup_path.parent.mkdir(parents=True, exist_ok=True)
-            if not backup_path.exists():
-                backup_path.write_text(original, encoding="utf-8")
-            record["backup_path"] = str(backup_path)
-        record["status"] = "applied"
-        record["replaced_preview"] = old_block
-        applied.append(record)
-    return {
-        "success": any(item.get("status") == "applied" for item in applied),
-        "summary": fix_plan.get("summary") if isinstance(fix_plan, dict) else "",
-        "applied": applied,
-    }
-
-
-def _maybe_apply_ai_fixes(
-    llm_adapter: Any,
-    result: Dict[str, Any],
-    code_roots: List[str],
-    report_dir: Optional[Path],
-    backup_original_sources: bool,
-) -> Optional[Dict[str, Any]]:
-    if llm_adapter is None or not code_roots:
-        return {
-            "success": False,
-            "error": "缺少 LLM 或 code_root，无法应用 AI 修复",
-            "applied": [],
-        }
-    analysis_text = str(result.get("analysis") or "").strip()
-    code_context = result.get("code_context", {}) or {}
-    parse_result = result.get("parse_result", {}) or {}
-    if not analysis_text or not isinstance(code_context, dict):
-        return {
-            "success": False,
-            "error": "缺少 analysis/code_context，无法应用 AI 修复",
-            "applied": [],
-        }
-    candidate_nodes = _extract_candidate_nodes(code_context)
-    if not candidate_nodes:
-        return {
-            "success": False,
-            "error": "代码上下文未提供可替换的函数候选",
-            "applied": [],
-        }
-    required_names = _extract_required_function_names_from_analysis(analysis_text)
-    required_targets = _select_required_targets(candidate_nodes, required_names)
-    prompt = _build_fix_plan_prompt(
-        parse_result,
-        code_context,
-        analysis_text,
-        candidate_nodes,
-        required_targets=required_targets,
-    )
-    try:
-        first_response_preview = ""
-        response = llm_adapter.chat(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是代码修复计划生成器。"
-                        "只允许输出一个 JSON 对象。"
-                        "禁止输出 markdown、解释文本、代码围栏。"
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.1,
-        )
-        first_response_preview = str(response.content or "")[:500].replace("\n", " ")
-        fix_plan = _safe_extract_json_payload(response.content)
-        if required_targets:
-            target_keys = {(x["file"], x["function_signature"]) for x in required_targets}
-            for _ in range(2):
-                got_keys = {
-                    (str(e.get("file", "")), str(e.get("function_signature", "")))
-                    for e in fix_plan.get("edits", [])
-                    if isinstance(e, dict) and str(e.get("replacement_code", "")).strip()
-                }
-                missing = [x for x in required_targets if (x["file"], x["function_signature"]) not in got_keys]
-                if not missing:
-                    break
-                retry_prompt = (
-                    "你上一次返回的 edits 未覆盖全部必改目标。"
-                    "请仅补充 missing_targets 的 edits，严格 JSON 输出。\n"
-                    f"missing_targets={json.dumps(missing, ensure_ascii=False)}\n"
-                    f"candidate_nodes={json.dumps([{'file': n['file'], 'function_signature': n['signature'], 'snippet': n['snippet']} for n in candidate_nodes], ensure_ascii=False)}\n"
-                    f"analysis_text={analysis_text}"
-                )
-                retry_resp = llm_adapter.chat(
-                    [
-                        {"role": "system", "content": "你输出严格 JSON，不要输出 Markdown 代码块以外的解释。"},
-                        {"role": "user", "content": retry_prompt},
-                    ],
-                    temperature=0.1,
-                )
-                retry_plan = _safe_extract_json_payload(retry_resp.content)
-                fix_plan = _merge_fix_plan_edits(fix_plan, retry_plan)
-            # 后半段兜底：仍有缺失时，按函数逐个请求 replacement_code，提升多函数落盘成功率
-            got_keys = {
-                (str(e.get("file", "")), str(e.get("function_signature", "")))
-                for e in fix_plan.get("edits", [])
-                if isinstance(e, dict) and str(e.get("replacement_code", "")).strip()
-            }
-            missing = [x for x in required_targets if (x["file"], x["function_signature"]) not in got_keys]
-            if missing:
-                crash_summary = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
-                node_map = {(str(n["file"]), str(n["signature"])): n for n in candidate_nodes}
-                for target in missing:
-                    node = node_map.get((target["file"], target["function_signature"]))
-                    if node is None:
-                        continue
-                    single_prompt = _build_single_target_fix_prompt(
-                        parse_result=parse_result,
-                        crash_summary=crash_summary,
-                        analysis_text=analysis_text,
-                        target_node=node,
-                    )
-                    single_plan: Dict[str, Any] = {"summary": "", "edits": []}
-                    for attempt in range(2):
-                        prompt_text = single_prompt
-                        if attempt > 0:
-                            prompt_text = (
-                                single_prompt
-                                + "\n\n再次强调：edits 必须只包含该函数，且 replacement_code 必须为非空完整函数代码。"
-                            )
-                        single_resp = llm_adapter.chat(
-                            [
-                                {
-                                    "role": "system",
-                                    "content": "你输出严格 JSON，不要输出 Markdown 代码块以外的解释。",
-                                },
-                                {"role": "user", "content": prompt_text},
-                            ],
-                            temperature=0.1,
-                        )
-                        parsed_plan = _safe_extract_json_payload(single_resp.content)
-                        single_plan = parsed_plan
-                        if any(
-                            isinstance(e, dict) and str(e.get("replacement_code", "")).strip()
-                            for e in parsed_plan.get("edits", [])
-                        ):
-                            break
-                    fix_plan = _merge_fix_plan_edits(fix_plan, single_plan)
-        # 兜底补齐：若 fix_plan 中还没有某些 required_target，直接尝试从 06_ai_res 追加新 edit
-        fix_plan = _append_missing_edits_from_analysis_text(fix_plan, analysis_text, required_targets)
-        # 最终兜底：直接从 06_ai_res 文本代码块提取完整函数体，回填空 replacement_code
-        fix_plan = _fill_empty_replacements_from_analysis_text(fix_plan, analysis_text)
-        # 强制补全：对于仍缺失或包含占位符的目标函数，逐函数二次请求完整 replacement_code
-        if required_targets:
-            crash_summary = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
-            node_map = {(str(n["file"]), str(n["signature"])): n for n in candidate_nodes}
-            current_edits = fix_plan.get("edits", []) if isinstance(fix_plan.get("edits"), list) else []
-            edit_map = {
-                (str(e.get("file", "")), str(e.get("function_signature", ""))): e
-                for e in current_edits
-                if isinstance(e, dict)
-            }
-            for target in required_targets:
-                key = (target["file"], target["function_signature"])
-                node = node_map.get(key)
-                if node is None:
-                    continue
-                existing = edit_map.get(key, {})
-                existing_code = str(existing.get("replacement_code", "")) if isinstance(existing, dict) else ""
-                if _is_valid_replacement_code(existing_code):
-                    continue
-                completion_prompt = _build_single_target_completion_prompt(
-                    parse_result=parse_result,
-                    crash_summary=crash_summary,
-                    analysis_text=analysis_text,
-                    target_node=node,
-                    draft_code=existing_code,
-                )
-                completed_edit: Optional[Dict[str, Any]] = None
-                for attempt in range(2):
-                    prompt_text = completion_prompt
-                    if attempt > 0:
-                        prompt_text += "\n\n再次强调：replacement_code 必须是完整函数体，不能出现 ... 或“其他代码”。"
-                    comp_resp = llm_adapter.chat(
-                        [
-                            {"role": "system", "content": "你输出严格 JSON，不要输出 Markdown 代码块以外的解释。"},
-                            {"role": "user", "content": prompt_text},
-                        ],
-                        temperature=0.1,
-                    )
-                    comp_plan = _safe_extract_json_payload(comp_resp.content)
-                    edits = comp_plan.get("edits", []) if isinstance(comp_plan.get("edits"), list) else []
-                    if not edits:
-                        continue
-                    first = edits[0] if isinstance(edits[0], dict) else None
-                    if not first:
-                        continue
-                    new_code = str(first.get("replacement_code", ""))
-                    if _is_valid_replacement_code(new_code):
-                        completed_edit = {
-                            "file": target["file"],
-                            "function_signature": target["function_signature"],
-                            "replacement_code": new_code.strip(),
-                            "reason": str(first.get("reason", "")) or "forced_single_target_completion",
-                        }
-                        break
-                if completed_edit is not None:
-                    fix_plan = _upsert_fix_plan_edit(fix_plan, completed_edit)
-        apply_result = _apply_ai_fix_plan(
-            fix_plan, candidate_nodes, code_roots, report_dir, backup_original_sources
-        )
-        if not apply_result.get("success"):
-            applied_items = apply_result.get("applied", [])
-            if not applied_items:
-                edits = fix_plan.get("edits", []) if isinstance(fix_plan.get("edits"), list) else []
-                if not edits:
-                    apply_result["error"] = (
-                        "AI 未返回可执行的结构化 edits（空 edits）。"
-                        "请在模型输出中确保返回严格 JSON，且 edits 至少包含 1 个包含 replacement_code 的条目。"
-                    )
-                else:
-                    apply_result["error"] = (
-                        "AI 返回了 edits，但没有可应用项。"
-                        "请检查 file/function_signature 是否与 candidate_nodes 精确匹配，"
-                        "以及 replacement_code 是否为完整函数代码。"
-                    )
-                if first_response_preview:
-                    apply_result["model_response_preview"] = first_response_preview
-            elif not apply_result.get("error"):
-                first_err = next(
-                    (
-                        str(item.get("error"))
-                        for item in applied_items
-                        if isinstance(item, dict) and item.get("error")
-                    ),
-                    "",
-                ).strip()
-                if first_err:
-                    apply_result["error"] = f"未应用修改: {first_err}"
-        return apply_result
-    except Exception as exc:
-        return {
-            "success": False,
-            "error": f"生成或应用 AI 修复计划失败: {exc}",
-            "applied": [],
-        }
-
-
-def _print_execution_plan(state: Dict[str, Any]) -> None:
+def _print_execution_plan(state: Dict[str, Any], *, apply_ai_fixes: bool = True) -> None:
     print(_yellow("【执行计划】"))
     scope = str(state.get("scope", "full")).strip() or "full"
     if scope == "parse_log_only":
-        print("  步骤 1/1：仅解析崩溃日志")
+        print("  步骤 1/1：解析崩溃日志")
         return
     if scope == "parse_only":
         print("  步骤 1/2：解析崩溃日志")
-        print("  步骤 2/2：符号化堆栈地址")
+        print("  步骤 2/2：堆栈符号化")
         return
-    print("  步骤 1/4：解析崩溃日志")
-    print("  步骤 2/4：符号化堆栈地址")
-    print("  步骤 3/4：提取源码上下文")
     if scope == "prompt_only":
-        print("  步骤 4/4：不调用 AI（仅生成可复用提示词）")
+        print("  步骤 1/4：解析崩溃日志")
+        print("  步骤 2/4：堆栈符号化")
+        print("  步骤 3/4：定位崩溃源码")
+        print("  步骤 4/4：生成可复用提示词（不调用 AI）")
+        return
+    # full scope
+    if apply_ai_fixes:
+        print("  步骤 1/5：解析崩溃日志")
+        print("  步骤 2/5：堆栈符号化")
+        print("  步骤 3/5：定位崩溃源码")
+        print("  步骤 4/5：AI 分析根因")
+        print("  步骤 5/5：应用代码修复")
     else:
-        print("  步骤 4/4：进行 AI 推理与修复建议")
+        print("  步骤 1/4：解析崩溃日志")
+        print("  步骤 2/4：堆栈符号化")
+        print("  步骤 3/4：定位崩溃源码")
+        print("  步骤 4/4：AI 分析根因")
 
 
 def _print_user_parameter_confirmation(
@@ -3836,12 +3162,20 @@ def _print_tty_markdown_brief_summary(
     report_dir: Path,
     applied_fix_result: Optional[Dict[str, Any]],
     apply_ai_fixes_enabled: bool,
+    total_elapsed: Optional[float] = None,
 ) -> None:
     """终端会话下仅展示阶段结果摘要与关键产物路径。"""
     ok = result.get("status") == "success"
     print("")
     if ok:
-        print(_green("【结果】✓ 分析完成"))
+        elapsed_str = ""
+        if total_elapsed is not None:
+            if total_elapsed < 60:
+                elapsed_str = f"  耗时 {total_elapsed:.1f}s"
+            else:
+                m, s = divmod(int(total_elapsed), 60)
+                elapsed_str = f"  耗时 {m}m{s}s"
+        print(_green(f"【结果】✓ 分析完成{elapsed_str}"))
     else:
         print(_red("【结果】✗ 分析未成功"))
 
@@ -3863,47 +3197,95 @@ def _print_tty_markdown_brief_summary(
             print("【改码】未启用自动改码")
         elif not isinstance(applied_fix_result, dict):
             print("【改码】未生成改码结果")
-        elif applied_fix_result.get("success"):
+        else:
             applied_items = applied_fix_result.get("applied", []) or []
-            file_list: List[str] = []
+            missing_required = applied_fix_result.get("missing_required", []) or []
+            applied_files: List[str] = []
+            skipped_items: List[Dict[str, Any]] = []
             backup_list: List[str] = []
             seen = set()
             seen_backup = set()
             for item in applied_items:
-                if not isinstance(item, dict) or item.get("status") != "applied":
+                if not isinstance(item, dict):
                     continue
+                status = str(item.get("status") or "")
                 fp = str(item.get("file") or "").strip()
-                if not fp:
-                    continue
-                abs_fp = str(Path(fp).expanduser().resolve())
-                if abs_fp in seen:
-                    continue
-                seen.add(abs_fp)
-                file_list.append(abs_fp)
+                if status == "applied" and fp:
+                    abs_fp = str(Path(fp).expanduser().resolve())
+                    if abs_fp not in seen:
+                        seen.add(abs_fp)
+                        applied_files.append(abs_fp)
+                elif status == "skipped":
+                    skipped_items.append(item)
                 backup_path = str(item.get("backup_path") or "").strip()
                 if backup_path:
                     abs_backup = str(Path(backup_path).expanduser().resolve())
                     if abs_backup not in seen_backup:
                         seen_backup.add(abs_backup)
                         backup_list.append(abs_backup)
-            if file_list:
-                print(f"【改码】{_green(f'已修改 {len(file_list)} 个文件')}")
-                for idx, fp in enumerate(file_list, start=1):
-                    print(f"  {idx}. {fp}")
-                if backup_list:
-                    print("【回退保障】待修改的文件备份列表（修改前源码）")
-                    for idx, bp in enumerate(backup_list, start=1):
-                        print(f"  {idx}. {bp}")
-                    print("  可直接从以上备份路径恢复修改前源码。")
+
+            if applied_fix_result.get("success"):
+                if applied_files:
+                    print(f"【改码】{_green(f'已修改 {len(applied_files)} 个文件')}")
+                    for idx, fp in enumerate(applied_files, start=1):
+                        print(f"  {idx}. {fp}")
                 else:
-                    print("【回退保障】未生成“待修改的文件”备份（当前可能关闭了源码备份）")
+                    print("【改码】未检测到已修改文件")
             else:
-                print("【改码】未检测到已修改文件")
-        else:
-            reason = str(applied_fix_result.get("error") or "未知原因").strip()
-            print("【改码】未应用修改")
-            if reason:
-                print(_yellow(f"  原因: {reason}"))
+                print("【改码】未应用修改")
+                reason = str(applied_fix_result.get("error") or "").strip()
+                if reason:
+                    print(_yellow(f"  原因: {reason}"))
+
+            locate_failed_items: List[Dict[str, Any]] = []
+            validation_failed_items: List[Dict[str, Any]] = []
+            for item in skipped_items:
+                err_text = str(item.get("error") or "").strip()
+                # 纯等价/无变化属于 no-op，不对用户提示“未写入”。
+                if (
+                    "replacement_code 与原函数等价" in err_text
+                    or "old_text 与 new_text 相同" in err_text
+                    or "old_text 或 new_text 为空" in err_text
+                    or "include 已存在" in err_text
+                    or "无需修改" in err_text
+                ):
+                    continue
+                if (
+                    "无法定位" in err_text
+                    or "未能在源码中定位" in err_text
+                    or "目标函数不在" in err_text
+                    or "目标文件不存在" in err_text
+                    or "old_text 未能在文件中精确匹配" in err_text
+                    or "不在 code_root 范围内" in err_text
+                ):
+                    locate_failed_items.append(item)
+                else:
+                    validation_failed_items.append(item)
+            if locate_failed_items:
+                print(_yellow(f"【改码】另有 {len(locate_failed_items)} 项无法定位，已跳过"))
+                for idx, item in enumerate(locate_failed_items[:5], start=1):
+                    target = str(item.get("function_signature") or item.get("edit_type") or item.get("file") or "unknown")
+                    err_text = str(item.get("error") or "").strip() or "未提供原因"
+                    print(_yellow(f"  {idx}. {target}: {err_text}"))
+            if validation_failed_items:
+                print(_yellow(f"【改码】另有 {len(validation_failed_items)} 项校验未通过，已跳过"))
+                for idx, item in enumerate(validation_failed_items[:5], start=1):
+                    target = str(item.get("function_signature") or item.get("edit_type") or item.get("file") or "unknown")
+                    err_text = str(item.get("error") or "").strip() or "未提供原因"
+                    print(_yellow(f"  {idx}. {target}: {err_text}"))
+            if isinstance(missing_required, list) and missing_required:
+                print(_yellow(f"【改码】另有 {len(missing_required)} 项未能从 AI 输出中提取完整可替换代码，已跳过"))
+                for idx, item in enumerate(missing_required[:5], start=1):
+                    if not isinstance(item, dict):
+                        continue
+                    target = str(item.get("function_signature") or item.get("file") or "unknown")
+                    print(_yellow(f"  {idx}. {target}: 请检查 06_ai_res.txt 是否给出完整函数定义，不能是函数体片段或含省略占位。"))
+
+            if applied_files and backup_list:
+                print("【回退保障】待修改的文件备份列表（修改前源码）")
+                for idx, bp in enumerate(backup_list, start=1):
+                    print(f"  {idx}. {bp}")
+                print("  可直接从以上备份路径恢复修改前源码。")
 
     if not ok:
         err = result.get("error")
@@ -3983,10 +3365,10 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
         print("[主流程参数]")
         print("1) --crash-log PATH：崩溃日志路径（支持 '-' 从 stdin 读取）")
         print("2) --library-dir DIR：符号库目录（含 .so / .dylib / .dSYM；日志已含函数名+行号可省略）")
-        print("3) --code-root DIR：项目 C/C++ 源码目录（可重复指定；建议精确到工程/模块根，避免传整个仓库根）")
+        print("3) --code-root DIR：项目 C/C++ 源码目录（可重复指定；建议精确到工程/模块根目录，避免传整个仓库根目录）")
         print("4) --config PATH：指定 SystemConfig JSON（不填则使用内置默认工具链与工作流）")
         print("5) --scope {full|prompt_only|parse_only|parse_log_only}：Agent 执行流程范围")
-        print("   - full（默认）：解析+符号化+取代码上下文+AI 推理")
+        print("   - full（默认）：解析+符号化+定位源码+AI 分析+自动改码")
         print("   - prompt_only：完整工具链但不调用 AI，仅生成可复用提示词")
         print("   - parse_only：仅解析+符号化")
         print("   - parse_log_only：仅解析崩溃日志")
@@ -4054,7 +3436,7 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
         return engine_choice
 
     scope_options = [
-        ("full", "完整分析（解析+符号化+取代码上下文+AI 推理与改码）"),
+        ("full", "完整分析（解析+符号化+定位源码+AI 分析+自动改码）"),
         ("prompt_only", "完整工具链，仅生成提示词，不调用 AI"),
         ("parse_only", "仅解析+符号化"),
         ("parse_log_only", "仅解析崩溃日志"),
@@ -4120,6 +3502,14 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                                     "llm_timeout",
                                     f"调整大模型请求超时时间（当前: {_effective_llm_request_timeout_seconds()} 秒）",
                                 ),
+                                (
+                                    "code_timeouts_info",
+                                    (
+                                        "查看源码分析超时（workflow_config；当前: "
+                                        f"code_context={_effective_code_context_timeout_sec():.0f}s, "
+                                        f"find_source={_effective_find_source_timeout_sec():.0f}s）"
+                                    ),
+                                ),
                                 ("engine", f"调整 AI 推理模式（当前: {preferred_engine}）"),
                                 (
                                     "scope",
@@ -4140,6 +3530,23 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                             continue
                         if adv == "llm_timeout":
                             _configure_llm_request_timeout_interactive()
+                            print("")
+                            continue
+                        if adv == "code_timeouts_info":
+                            wc_path = _agent_config_write_path()
+                            print("")
+                            print(_yellow("源码分析超时（当前生效值）"))
+                            print(
+                                f"- code_context_timeout_sec: {_effective_code_context_timeout_sec():.0f} 秒"
+                            )
+                            print(
+                                f"- find_source_timeout_sec: {_effective_find_source_timeout_sec():.0f} 秒"
+                            )
+                            print(
+                                "说明：可在 agent_config.local.json 的 workflow_config 中设置；"
+                                "命令行 --code-context-timeout-sec / --find-source-timeout-sec 可临时覆盖。"
+                            )
+                            print(f"配置文件: {wc_path}")
                             print("")
                             continue
                         if adv == "engine":
@@ -4396,7 +3803,7 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
             print(_yellow("提示："))
             print(f"- {title_prefix}C/C++ 源码目录{_yellow('（必填）')}：与崩溃二进制对应的本地源码所在目录")
             print("  · 多个目录用中文或英文逗号分隔，例：~/code/MyApp/src, ~/code/MySDK/src")
-            print(_yellow("  · 建议精确到工程/模块根，太大的目录（如 ~/code 整个仓库根）可能会拖慢源文件定位"))
+            print(_yellow("  · 建议精确到工程/模块根目录，太大的目录（如 ~/code 整个仓库根目录）可能会拖慢源文件定位"))
             input_prompt = f"请输入{input_prefix}C/C++ 源码目录（支持输入多个目录，可用中文或英文逗号分隔，直接回车返回上一级）: "
             while True:
                 raw = _safe_input(input_prompt).strip()
@@ -4478,6 +3885,7 @@ def execute_analysis(args: argparse.Namespace) -> int:
         "code_roots": code_roots,
         "engine": args.engine,
         "scope": scope,
+        "apply_ai_fixes": bool(args.apply_ai_fixes),
         "vector_db_path": args.vector_db_path,
         "vector_db_max_results": args.vector_db_max_results,
         "rule_confidence_threshold": args.rule_confidence_threshold,
@@ -4488,7 +3896,10 @@ def execute_analysis(args: argparse.Namespace) -> int:
         "min_key_read_related_functions": int(
             getattr(args, "min_key_read_related_functions", 2) or 0
         ),
+        "use_ctags_index": bool(getattr(args, "use_ctags_index", False)),
     }
+    _apply_analysis_timeouts_to_problem(problem, args)
+    _prepare_analysis_acceleration(problem, code_roots, scope)
 
     registry = ToolAndWorkflowRegistry()
     register_all_tools_and_workflows(registry)
@@ -4505,6 +3916,7 @@ def execute_analysis(args: argparse.Namespace) -> int:
             tool_entries.append(ToolConfig(name="add2line_resolver", enabled=True))
         if scope in {"full", "prompt_only"}:
             tool_entries.append(ToolConfig(name="code_content_provider", enabled=True))
+            tool_entries.append(ToolConfig(name="symbol_callsite_finder", enabled=True))
         config = SystemConfig(
             tools=tool_entries,
             workflows=[WorkflowConfig(name="crash_analysis", enabled=True)],
@@ -4530,15 +3942,22 @@ def execute_analysis(args: argparse.Namespace) -> int:
                 print(f"警告: LLM 适配器初始化失败，将继续执行工具链。错误: {exc}", file=sys.stderr)
 
     executor = ConfigDrivenExecutor(registry, config, llm_adapter)
+    _analysis_start_time = time.time()
     result = executor.execute_workflow("crash_analysis", problem)
     report_dir = _build_report_dir(args)
     applied_fix_result: Optional[Dict[str, Any]] = None
 
     if args.apply_ai_fixes and result.get("status") == "success" and scope == "full":
-        applied_fix_result = _maybe_apply_ai_fixes(
-            llm_adapter, result, code_roots, report_dir, args.backup_original_sources
-        )
-        result["applied_ai_fixes"] = applied_fix_result
+        with PhaseSpinner("应用代码修复", step=5, total_steps=5):
+            fixer = CodeFixer(llm_adapter, uaf_nullptr_guard_policy=_effective_uaf_nullptr_guard_policy())
+            fix_result = fixer.generate_and_apply(
+                result=result,
+                code_roots=code_roots,
+                report_dir=report_dir,
+                backup_original_sources=args.backup_original_sources,
+            )
+            applied_fix_result = fix_result.to_dict()
+            result["applied_ai_fixes"] = applied_fix_result
 
     if args.output_format == "json":
         output = json.dumps(result, ensure_ascii=False, indent=2)
@@ -4651,6 +4070,7 @@ def execute_analysis(args: argparse.Namespace) -> int:
             report_dir=report_dir,
             applied_fix_result=applied_fix_result,
             apply_ai_fixes_enabled=bool(args.apply_ai_fixes),
+            total_elapsed=time.time() - _analysis_start_time,
         )
     else:
         print(output)

@@ -183,8 +183,7 @@ void setup_crash_handler() {
 // 崩溃函数实现
 void crash_nullptr() {
     std::cout << "触发空指针崩溃..." << std::endl;
-    int* p = nullptr;
-    *p = 42;  // 空指针写操作
+    throw std::runtime_error("空指针访问");
 }
 
 void crash_dangling() {

@@ -10,7 +10,8 @@
       "auth_header",
       "auth_prefix",
       "request_timeout",
-      "request_format"
+      "request_format",
+      "stream"
     ],
     "request_format_enum": [
       "openai_chat_completions_compatible",
@@ -25,7 +26,8 @@
       "anthropic_messages_compatible": "请求体为 model+messages(+system)，典型路径: /v1/messages；通常使用 x-api-key 且 auth_prefix 为空字符串",
       "openai_responses_compatible": "请求体为 model+input，典型路径: /v1/responses",
       "minimax_text_chatcompletion_v2_compatible": "按 OpenAI Chat Completions 兼容方式发送，通常用于 MiniMax 网关兼容路由"
-    }
+    },
+    "stream_notes": "true（默认）使用 SSE 流式调用，与厂商 Web UI 相同的响应速度；设为 false 使用非流式调用。所有 openai_chat_completions_compatible 厂商（OpenAI/DeepSeek/GLM/千帆/通义千问/Kimi/MiniMax）均支持流式；anthropic_messages_compatible 和 openai_responses_compatible 不受此参数影响（使用各自的 HTTP 调用）。"
   },
   "llm_config": {
     "active_provider": "openai",
@@ -35,7 +37,8 @@
       "auth_header": "Authorization",
       "auth_prefix": "Bearer ",
       "adapter_provider": "openai",
-      "request_timeout": 120
+      "request_timeout": 180,
+      "stream": true
     },
     "providers": {
       "openai": {
@@ -102,6 +105,8 @@
     }
   },
   "workflow_config": {
-    "streaming_response": true
+    "streaming_response": true,
+    "code_context_timeout_sec": 600,
+    "find_source_timeout_sec": 600
   }
 }

@@ -82,8 +82,15 @@ AI_STABILITY_TEST_FAST=1 python3 test/llm/test_vscode_simulation.py
 
 ```bash
 # Install as editable package (required before first run)
-pip install -e .
+pip install -e ".[rag]"
+
+# PyPI: core only vs with vector/RAG stack
+pip install stability-analysis-agent
+pip install "stability-analysis-agent[rag]"
 ```
+
+Install troubleshooting: `docs/cli/INSTALL_TROUBLESHOOTING.md`  
+RAG ML pins: `requirements-rag.txt` / `[rag]` extra (`numpy<2`, `torch>=2.4`, `transformers<4.52`, etc.)
 
 ### Demo (no LLM key required)
 

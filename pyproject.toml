@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stability-analysis-agent"
-version = "1.2.5"
+version = "1.2.6"
 description = "Stability Analysis Agent: AI-assisted crash log analysis toolchain (CLI, daemon, analyzers, agent)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -25,16 +25,24 @@ dependencies = [
     "langgraph",
     "langchain",
     "langchain-openai",
-    "numpy",
-    "sentence-transformers",
-    "chromadb",
-    "chroma-hnswlib",
-    "posthog",
     "tree-sitter>=0.21,<0.22",
-    "tree-sitter-languages"
+    "tree-sitter-languages",
+    "ripgrep>=14.0",
 ]
 
 [project.optional-dependencies]
+# 向量库 / 相似案例检索（ChromaDB + 可选 SentenceTransformer 嵌入）
+# 版本区间与 torch/transformers/numpy ABI 对齐，避免 pip 解析出 torch 2.2 + numpy 2.x + 新 transformers 的组合
+rag = [
+    "numpy>=1.24,<2",
+    "chromadb>=0.4",
+    "chroma-hnswlib",
+    "posthog",
+    "torch>=2.4.0",
+    "transformers>=4.36.0,<4.52.0",
+    "sentence-transformers>=2.2.2,<3.0.0",
+    "accelerate>=0.26.0",
+]
 test = ["pytest", "mock"]
 
 [project.scripts]
@@ -48,7 +56,7 @@ Changelog = "https://github.com/baidu-maps/stability-analysis-agent/blob/main/CH
 # 项目根目录平铺结构：agent/ tools/ rag/ workflows/ daemon/ tool_system/ protocol/ prompts/ cli/ 均为顶级子包
 # pip install -e . 后可直接 from agent.xxx / from tools.xxx 等导入
 [tool.hatch.build.targets.wheel]
-packages = ["agent", "tools", "rag", "workflows", "daemon", "tool_system", "protocol", "prompts", "cli"]
+packages = ["agent", "tools", "rag", "workflows", "daemon", "tool_system", "protocol", "prompts", "cli", "services"]
 output-dir = "output/dist"
 
 [tool.hatch.build.targets.sdist]

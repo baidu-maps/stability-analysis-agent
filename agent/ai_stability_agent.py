@@ -62,14 +62,11 @@ except ImportError:
     CodeModifier = None   # type: ignore
     CodeChecker = None    # type: ignore
     ReportGenerator = None  # type: ignore
-# 向量数据库（可选）
-try:
-    from rag.vector_database_integration import AIStabilityAnalyzerWithVectorDB  # type: ignore
-    VECTOR_DB_AVAILABLE = True
-except Exception as e:
-    VECTOR_DB_AVAILABLE = False
-    AIStabilityAnalyzerWithVectorDB = None  # type: ignore
-    print(f"WARNING: 向量数据库模块导入失败，将禁用RAG: {e}", file=sys.stderr)
+# 向量数据库（可选，延迟加载，避免 transformers/sentence-transformers 导入失败阻断主流程）
+from rag.runtime import get_ai_stability_analyzer_class
+
+AIStabilityAnalyzerWithVectorDB = get_ai_stability_analyzer_class()  # type: ignore
+VECTOR_DB_AVAILABLE = AIStabilityAnalyzerWithVectorDB is not None
 
 
 class CrashAnalysisState(TypedDict):

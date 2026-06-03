@@ -22,6 +22,10 @@ from .code_content_provider_tool import (
     CodeContentProvider,
     CodeContentProviderWithPrompts,
 )
+from .symbol_callsite_finder_tool import SymbolCallsiteFinderTool
+from .snippet_extractor_tool import SnippetExtractorTool
+from .fix_code_extractor_tool import FixCodeExtractorTool
+from .fix_code_applier_tool import FixCodeApplierTool
 
 __all__ = [
     # Tool classes
@@ -35,6 +39,10 @@ __all__ = [
     "add2line_resolver",
     "CodeContentProvider",
     "CodeContentProviderWithPrompts",
+    "SymbolCallsiteFinderTool",
+    "SnippetExtractorTool",
+    "FixCodeExtractorTool",
+    "FixCodeApplierTool",
     # Registration helper
     "register_all_tools",
 ]
@@ -66,6 +74,38 @@ def register_all_tools(registry=None):
     registry.register(
         "code_content_provider",
         CodeContentProviderTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    registry.register(
+        "symbol_callsite_finder",
+        SymbolCallsiteFinderTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    registry.register(
+        "snippet_extractor",
+        SnippetExtractorTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    registry.register(
+        "fix_code_extractor",
+        FixCodeExtractorTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    registry.register(
+        "fix_code_applier",
+        FixCodeApplierTool(),
         priority=Priority.BUILTIN,
         force_override=False,
         is_tool=True,

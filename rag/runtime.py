@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Optional RAG / vector stack — lazy import with broad failure handling.
+
+Avoids pulling sentence-transformers / transformers at workflow registration time
+when the stack is missing or broken (e.g. NameError inside transformers).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional, Type
+
+logger = logging.getLogger(__name__)
+
+_RAG_LOAD_ATTEMPTED = False
+_RAG_ANALYZER_CLASS: Optional[Type[Any]] = None
+_RAG_LOAD_ERROR: Optional[str] = None
+
+RAG_INSTALL_HINT = (
+    "pip install 'stability-analysis-agent[rag]' "
+    "(needs numpy<2, torch>=2.4, transformers<4.52, sentence-transformers<3, accelerate>=0.26)"
+)
+
+
+def get_ai_stability_analyzer_class() -> Optional[Type[Any]]:
+    """Return AIStabilityAnalyzerWithVectorDB class, or None if the vector stack is unavailable."""
+    global _RAG_LOAD_ATTEMPTED, _RAG_ANALYZER_CLASS, _RAG_LOAD_ERROR
+    if _RAG_LOAD_ATTEMPTED:
+        return _RAG_ANALYZER_CLASS
+    _RAG_LOAD_ATTEMPTED = True
+    try:
+        from rag.vector_database_integration import AIStabilityAnalyzerWithVectorDB
+
+        _RAG_ANALYZER_CLASS = AIStabilityAnalyzerWithVectorDB
+    except Exception as exc:
+        _RAG_LOAD_ERROR = str(exc)
+        logger.warning(
+            "RAG vector stack unavailable (%s). Similar-case retrieval disabled; "
+            "parse / symbolize / LLM analysis still work. Install with: %s",
+            exc,
+            RAG_INSTALL_HINT,
+        )
+    return _RAG_ANALYZER_CLASS
+
+
+def rag_stack_available() -> bool:
+    return get_ai_stability_analyzer_class() is not None
+
+
+def rag_load_error() -> Optional[str]:
+    get_ai_stability_analyzer_class()
+    return _RAG_LOAD_ERROR

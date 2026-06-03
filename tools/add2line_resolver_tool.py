@@ -16,6 +16,11 @@ from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+from tools._stack_symbol_utils import (
+    sanitize_stack_symbol,
+    should_keep_frame_for_cpp_stack_output,
+)
+
 from ._library_frame_whitelist import find_library_files_in_dir, match_libraries_for_module
 
 # 配置日志
@@ -1139,11 +1144,34 @@ class Add2lineResolver:
         except (ValueError, TypeError):
             return None
 
+    @staticmethod
+    def _filter_cpp_native_output_frames(
+        frames: List["ResolvedFrame"],
+        crash_info: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List["ResolvedFrame"], int]:
+        """02 输出：仅保留带 C++ native 符号的帧（丢弃 ObjC、无符号空帧等）。"""
+        del crash_info  # 崩溃地址见 01，不在 02 重复占位
+        kept: List[ResolvedFrame] = []
+        dropped = 0
+        for rf in frames:
+            frame_dict = {
+                "address": rf.address,
+                "function": rf.function,
+                "resolved_function": rf.resolved_function,
+                "module": rf.module,
+            }
+            if should_keep_frame_for_cpp_stack_output(frame_dict):
+                kept.append(rf)
+            else:
+                dropped += 1
+        return kept, dropped
+
     def _json_ios_log_symbolicated(
         self,
         stack_frames: List[Dict[str, Any]],
         meta_info: Dict[str, Any],
         library_dir_display: str,
+        crash_info: Optional[Dict[str, Any]] = None,
     ) -> str:
         """无库符号时，从已符号化日志回填与 02 同构结果（iOS 额外做噪音裁剪）。"""
         resolved_frames: List[ResolvedFrame] = []
@@ -1191,8 +1219,8 @@ class Add2lineResolver:
             has_symbol = bool((rf.resolved_function or "").strip() or (rf.function or "").strip())
             has_source = bool((rf.resolved_file or "").strip()) or (rf.resolved_line is not None)
             module_str = rf.module if isinstance(rf.module, str) else None
-            should_filter_noise = (not has_symbol and not has_source)
-            # iOS 场景下再额外裁剪「无源码定位 + 无符号」的系统库空帧
+            should_filter_noise = not has_symbol and not has_source
+            # iOS：无符号且无 file:line 的帧不写入 02（含 AGXMetal 等仅地址崩溃点）
             if os_type == "ios":
                 should_filter_noise = should_filter_noise or (
                     _is_probably_system_module(module_str) and not has_source and not has_symbol
@@ -1204,6 +1232,15 @@ class Add2lineResolver:
             resolved_frames.append(rf)
             if has_symbol or has_source:
                 success_count += 1
+
+        resolved_frames, cpp_filtered = self._filter_cpp_native_output_frames(
+            resolved_frames, crash_info=crash_info
+        )
+        if cpp_filtered:
+            filtered_count += cpp_filtered
+            logger.info(
+                "log_symbolicated_passthrough 过滤非 C++/前端帧: %s", cpp_filtered
+            )
 
         result = Add2lineResult(
             resolved_frames=resolved_frames,
@@ -1227,7 +1264,8 @@ class Add2lineResolver:
         无库目录直通场景下，对部分 C++ 包装符号做轻量语义提取，提升可读性。
         当前覆盖：std::__function::__func<Owner::foo()::$_0, ...>::operator()()
         """
-        s = (function_name or "").strip()
+        s = sanitize_stack_symbol(function_name) or ""
+        s = s.strip()
         if not s:
             return function_name
         m = re.search(
@@ -1240,10 +1278,10 @@ class Add2lineResolver:
                 s,
             )
         if not m:
-            return function_name
+            return s
         inner = m.group(1).strip()
         if not inner:
-            return function_name
+            return s
         inner = re.sub(r"::\$_\d+\b", "::<lambda>", inner)
         # 若是外层函数中的 lambda 包装帧，优先回落到外层函数本身，便于在源码中定位。
         if "::<lambda>" in inner:
@@ -1319,7 +1357,12 @@ class Add2lineResolver:
                     self._emit_progress(
                         "📋 [add2line_resolver] 无有效库目录：检测到已符号化堆栈，从日志回填解析结果"
                     )
-                    return self._json_ios_log_symbolicated(stack_frames, meta_info, lib_norm or lib_arg)
+                    return self._json_ios_log_symbolicated(
+                        stack_frames,
+                        meta_info,
+                        lib_norm or lib_arg,
+                        crash_info=crash_data.get("crash_info") or {},
+                    )
                 return json.dumps(
                     {
                         "error": "库路径不存在或未提供",
@@ -1471,10 +1514,10 @@ class Add2lineResolver:
                 # 策略2: 偏移量估算
                 if function and offset:
                     demangled_function = self._demangle_cpp_symbol(function)
-                    file_name = self._normalize_resolved_file_name(
-                        self._infer_file_name_from_symbol(function)
-                    )
-                    line_number = self._calculate_precise_line_number(address, function, offset, module, module_base_addresses)
+                    # 文件名和行号的精确定位由 Phase 3 (code_content_provider) 完成；
+                    # resolver 阶段仅做轻量推断，不做耗时的全工作区扫描。
+                    file_name = None
+                    line_number = None
                     resolved = ResolvedFrame(
                         address=address,
                         function=function,
@@ -1534,7 +1577,7 @@ class Add2lineResolver:
                 return {"skip": False, "filtered": False, "resolved": unresolved, "error": f"无法解析地址: {address}"}
 
             workers = min(max(1, (os.cpu_count() or 4) * 2), max(1, len(stack_frames)), 16)
-            serial_threshold = 12
+            serial_threshold = 4
             env_workers = os.environ.get("MAP_SDK_CRASH_AGENT_ADD2LINE_THREADS")
             if env_workers:
                 try:
@@ -1566,6 +1609,13 @@ class Add2lineResolver:
                         success_count += 1
                 if res.get("error"):
                     errors.append(str(res["error"]))
+
+            resolved_frames, cpp_filtered = self._filter_cpp_native_output_frames(
+                resolved_frames, crash_info=crash_data.get("crash_info") or {}
+            )
+            if cpp_filtered:
+                filtered_count += cpp_filtered
+                logger.info("add2line 过滤非 C++/前端帧: %s", cpp_filtered)
             
             # 构建结果
             # 记录最终选定的解析工具及其路径，方便后续问题回溯与环境对比
@@ -2618,16 +2668,22 @@ quit
             return None
 
     def _find_function_definition_in_workspace(self, function_name: str) -> Optional[Tuple[str, int]]:
-        """在工作区内查找函数定义（返回 文件绝对路径, 1-based行号）。"""
+        """在工作区内查找函数定义（返回 文件绝对路径, 1-based行号）。
+
+        注意：该函数会遍历工作区源文件，开销较大。在 quick_mode 下跳过。
+        """
+        if self.quick_mode:
+            return None
         if function_name in self._function_location_cache:
             return self._function_location_cache[function_name]
         try:
             workspace_root = str(Path(__file__).resolve().parents[1])
-            skip_dirs = {".git", ".venv", "node_modules", "dist", "build", "cli_reports"}
+            skip_dirs = {".git", "node_modules", "dist", "build", "cli_reports"}
+            skip_prefixes = (".venv", "__pycache__")
             source_exts = {".c", ".cc", ".cpp", ".cxx", ".m", ".mm", ".h", ".hh", ".hpp", ".hxx"}
 
             for root, dirs, files in os.walk(workspace_root):
-                dirs[:] = [d for d in dirs if d not in skip_dirs]
+                dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(skip_prefixes)]
                 for name in files:
                     if Path(name).suffix.lower() not in source_exts:
                         continue

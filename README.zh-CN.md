@@ -132,9 +132,14 @@
 # 安装（中国大陆可加 -i https://pypi.tuna.tsinghua.edu.cn/simple）
 pip install stability-analysis-agent
 
+# 含向量库 / 相似案例 RAG（推荐完整体验）
+pip install "stability-analysis-agent[rag]"
+
 # 进入交互向导
 sa-agent
 ```
+
+安装排错（SSL、`transformers`/`nn` 报错等）见 [docs/cli/INSTALL_TROUBLESHOOTING.md](./docs/cli/INSTALL_TROUBLESHOOTING.md)。
 
 > 交互体验对标 Claude CLI：支持上下键菜单、分组化“设置 / 帮助”、可返回路径和关键步骤确认。  
 > 大多数场景可在终端向导内完成“配置 + 分析 + AI 修复建议”全流程。

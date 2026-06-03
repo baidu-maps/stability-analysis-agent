@@ -14,19 +14,26 @@ from typing import Any, Dict, List, Optional
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 os.environ["CHROMA_TELEMETRY"] = "False"
 
+logger = logging.getLogger(__name__)
+
 VECTOR_DB_AVAILABLE = False
+_np: Any = None
+_chromadb: Any = None
+_Settings: Any = None
+
 try:
-    import numpy as np
-    from sentence_transformers import SentenceTransformer
-    import chromadb
-    from chromadb.config import Settings
+    import numpy as _np
+    import chromadb as _chromadb
+    from chromadb.config import Settings as _Settings
+
     VECTOR_DB_AVAILABLE = True
     warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
-except ImportError as e:
-    print(f"向量数据库依赖导入失败: {e}")
-    print("请安装依赖: pip install sentence-transformers chromadb chroma-hnswlib numpy")
-
-logger = logging.getLogger(__name__)
+except Exception as e:
+    logger.warning(
+        "向量数据库依赖导入失败（%s）。相似案例检索将不可用；"
+        "可安装: pip install 'stability-analysis-agent[rag]'",
+        e,
+    )
 
 
 class PatternIndex:
@@ -36,7 +43,7 @@ class PatternIndex:
         self.embedding_model = None
         self.client = None
         self.collection = None
-        if not VECTOR_DB_AVAILABLE:
+        if not VECTOR_DB_AVAILABLE or _chromadb is None or _Settings is None:
             logger.warning("向量数据库依赖不可用，将使用模拟模式（简单哈希嵌入）")
             return
         try:
@@ -55,6 +62,8 @@ class PatternIndex:
                 os.environ.setdefault("HF_HUB_DISABLE_EXPERIMENTAL_WARNING", "1")
                 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
                 try:
+                    from sentence_transformers import SentenceTransformer
+
                     with warnings.catch_warnings():
                         warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
                         warnings.filterwarnings("ignore", message=".*Connection.*")
@@ -75,9 +84,9 @@ class PatternIndex:
 
             # 显式使用纯 Python 的 SegmentAPI，而不是默认的 RustBindingsAPI，
             # 以避免在未安装 Rust 扩展或打包环境下导入 chromadb.api.rust 失败。
-            self.client = chromadb.PersistentClient(
+            self.client = _chromadb.PersistentClient(
                 path=str(self.db_path),
-                settings=Settings(
+                settings=_Settings(
                     anonymized_telemetry=False,
                     chroma_api_impl="chromadb.api.segment.SegmentAPI",
                 ),
@@ -117,10 +126,25 @@ class PatternIndex:
             return self._simple_hash_embedding(text)
 
     def _simple_hash_embedding(self, text: str) -> List[float]:
-        np.random.seed(abs(hash(text)) % (2**32))
-        vector = np.random.rand(384)
-        vector = vector / np.linalg.norm(vector)
-        return vector.tolist()
+        if _np is not None:
+            _np.random.seed(abs(hash(text)) % (2**32))
+            vector = _np.random.rand(384)
+            vector = vector / _np.linalg.norm(vector)
+            return vector.tolist()
+        # 无 numpy 时的纯 Python 回退（384 维）
+        import hashlib
+        import struct
+
+        digest = hashlib.sha256(text.encode("utf-8")).digest()
+        floats: List[float] = []
+        while len(floats) < 384:
+            for i in range(0, len(digest) - 3, 4):
+                floats.append(struct.unpack("!f", digest[i : i + 4])[0])
+                if len(floats) >= 384:
+                    break
+            digest = hashlib.sha256(digest).digest()
+        norm = sum(x * x for x in floats) ** 0.5 or 1.0
+        return [x / norm for x in floats]
 
     def add_pattern(self, pattern_id: str, pattern_summary: str, crash_signature: str, metadata: Dict[str, Any]) -> bool:
         if not self.collection:

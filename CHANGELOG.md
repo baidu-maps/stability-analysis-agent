@@ -4,6 +4,14 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.2.6] - 2026-06-03
+
+### Changed
+
+- **PyPI 依赖**：核心包不再捆绑 RAG/ML 栈；向量检索与相似案例能力改为可选 extra `pip install "stability-analysis-agent[rag]"`（版本区间与 `requirements-rag.txt` 对齐）。
+- **打包**：wheel/sdist 纳入 `services` 子包；核心依赖新增 `ripgrep`。
+- **Interactive CLI（符号化工具）**：从「设置 → 配置堆栈地址解析工具」完成手动路径或自动写入后，仅保留一次「按回车继续」，避免与内层保存成功面板重复。
+
 ## [1.2.5] - 2026-05-14
 
 ### Changed

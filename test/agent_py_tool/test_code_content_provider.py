@@ -93,9 +93,266 @@ class TestBuildPromptFinalTip(unittest.TestCase):
         text = wf._build_prompt_final_tip({}, resolved, code_ctx, problem={})
         self.assertIn("### 共享成员与写路径交叉（崩溃点关联）", text)
         self.assertIn("head", text)
-        self.assertIn("### 函数源码（按函数唯一输出）", text)
+        self.assertIn("### 函数源码（按置信度筛选", text)
         self.assertIn("- 来源:", text)
         self.assertIn("void Foo::baz()", text)
+
+    def test_add2line_stack_frames_included_in_final_tip(self):
+        crash_id = "func|/tmp/Crash.h|bool Crash::hit() const"
+        stack_b = "func|/tmp/Caller.cpp|void Caller::run()"
+        stack_c = "func|/tmp/Util.h|void Util::cleanup()"
+        code_ctx = {
+            "crash_summary": {
+                "node_id": crash_id + " {",
+                "crash_line_number": 10,
+                "crash_line_code": "return flag;",
+                "error_type": "SIGSEGV",
+            },
+            "graph": {
+                "nodes": [
+                    {
+                        "id": crash_id,
+                        "type": "function",
+                        "signature": "bool Crash::hit() const",
+                        "file": "/tmp/Crash.h",
+                        "snippet": ["bool Crash::hit() const { return flag; }"],
+                    },
+                    {
+                        "id": stack_b,
+                        "type": "function",
+                        "signature": "void Caller::run()",
+                        "file": "/tmp/Caller.cpp",
+                        "snippet": ["void Caller::run() {", "  hit();", "}"],
+                    },
+                    {
+                        "id": stack_c,
+                        "type": "function",
+                        "signature": "void Util::cleanup()",
+                        "file": "/tmp/Util.h",
+                        "snippet": ["void Util::cleanup() {", "  run();", "}"],
+                    },
+                ],
+                "edges": [],
+                "call_chain_from_code": [
+                    {
+                        "id": "path_0",
+                        "nodes": [crash_id],
+                        "description": "inferred_from_add2line_stack_order",
+                    }
+                ],
+                "call_chain_from_add2line": [
+                    {
+                        "thread_id": "t1",
+                        "nodes": [crash_id, stack_b, stack_c],
+                    }
+                ],
+                "stack_kept_original_indices": [0, 1, 2],
+            },
+        }
+        resolved = {
+            "resolved_frames": [
+                {"resolved_function": "Crash::hit()", "resolved_file": "Crash.h", "resolved_line": 10},
+                {"resolved_function": "Caller::run()", "resolved_file": "Caller.cpp", "resolved_line": 2},
+                {"resolved_function": "Util::cleanup()", "resolved_file": "Util.h", "resolved_line": 1},
+            ]
+        }
+        wf = iOSCrashAnalyzeWorkflow()
+        text = wf._build_prompt_final_tip({}, resolved, code_ctx, problem={})
+        self.assertIn("void Caller::run()", text)
+        self.assertIn("void Util::cleanup()", text)
+        self.assertIn("堆栈帧", text)
+
+    def test_evidence_gate_message_in_final_tip(self):
+        crash_id = "func|/tmp/Crash.h|void Crash::hit()"
+        stack_b = "func|/tmp/Caller.cpp|void Caller::run()"
+        code_ctx = {
+            "crash_summary": {"node_id": crash_id + " {", "crash_line_number": 10},
+            "graph": {
+                "nodes": [
+                    {
+                        "id": crash_id,
+                        "type": "function",
+                        "signature": "void Crash::hit()",
+                        "file": "/tmp/Crash.h",
+                        "snippet": ["void Crash::hit() { x=1; }"],
+                    },
+                    {
+                        "id": stack_b,
+                        "type": "function",
+                        "signature": "void Caller::run()",
+                        "file": "/tmp/Caller.cpp",
+                        "snippet": ["void Caller::run() { hit(); }"],
+                    },
+                ],
+                "edges": [
+                    {"type": "calls_stack_order", "from_id": stack_b, "to_id": crash_id},
+                ],
+                "evidence_summary": {
+                    "auto_fix_allowed": False,
+                    "has_calls_stack_order": True,
+                    "auto_fix_block_reason": "test block",
+                },
+                "call_chain_from_code": [
+                    {
+                        "nodes": [crash_id, stack_b],
+                        "inference": "inferred_from_add2line_stack_order",
+                    }
+                ],
+                "call_chain_from_add2line": [{"thread_id": "t", "nodes": [crash_id, stack_b]}],
+            },
+        }
+        wf = iOSCrashAnalyzeWorkflow()
+        text = wf._build_prompt_final_tip({}, {"resolved_frames": []}, code_ctx)
+        self.assertIn("auto_fix_allowed", text)
+        self.assertIn("auto_fix_allowed=false", text)
+        self.assertIn("calls_stack_order", text)
+
+    def test_symbol_only_prompt_omits_crash_line_number_and_suspicious_snippet(self):
+        crash_id = "func|/tmp/mtl.mm|void MTLVertexBuffer::createPrivateBuffer()"
+        code_ctx = {
+            "crash_summary": {
+                "node_id": crash_id + " {",
+                "crash_line_number": 9,
+                "crash_line_code": '#include "mtl.h"',
+                "error_type": "SIGSEGV",
+                "crash_location_source": "from_log_deduce",
+                "crash_line_note": "启发式展示，不是指令级精确崩溃位置。",
+            },
+            "graph": {
+                "nodes": [
+                    {
+                        "id": crash_id,
+                        "type": "function",
+                        "signature": "void MTLVertexBuffer::createPrivateBuffer()",
+                        "file": "/tmp/mtl.mm",
+                        "snippet": ["void MTLVertexBuffer::createPrivateBuffer() {", "}"],
+                    }
+                ],
+                "edges": [],
+            },
+        }
+        resolved = {
+            "resolved_frames": [
+                {
+                    "resolved_function": "MTLVertexBuffer::createPrivateBuffer()",
+                    "resolved_file": None,
+                    "resolved_line": None,
+                }
+            ]
+        }
+        wf = iOSCrashAnalyzeWorkflow()
+        text = wf._build_prompt_final_tip({}, resolved, code_ctx, problem={})
+        self.assertNotIn("crash_line_number:", text)
+        self.assertNotIn("crash_location_source:", text)
+        self.assertNotIn("crash_line_note:", text)
+        self.assertNotIn("## 可疑代码片段", text)
+        self.assertNotIn("可疑崩溃代码行", text)
+        self.assertNotIn("#include", text)
+        self.assertIn("## 崩溃点定位", text)
+        self.assertIn("结论：未精确定位到 file:line 级崩溃行", text)
+        self.assertNotIn("启发式展示，不是指令级精确崩溃位置。", text)
+        self.assertNotIn("自栈顶向下优先", text)
+
+    def test_add2line_prompt_includes_suspicious_snippet_without_summary_line_number(self):
+        crash_id = "func|/tmp/Crash.cpp|void Crash::hit()"
+        code_ctx = {
+            "crash_summary": {
+                "node_id": crash_id + " {",
+                "crash_line_number": 42,
+                "crash_line_code": "*ptr = 0;",
+                "error_type": "SIGSEGV",
+                "crash_location_source": "from_add2line",
+            },
+            "graph": {
+                "nodes": [
+                    {
+                        "id": crash_id,
+                        "type": "function",
+                        "signature": "void Crash::hit()",
+                        "file": "/tmp/Crash.cpp",
+                        "snippet": ["void Crash::hit() {", "  *ptr = 0;", "}"],
+                    }
+                ],
+                "edges": [],
+            },
+        }
+        resolved = {
+            "resolved_frames": [
+                {
+                    "resolved_function": "Crash::hit()",
+                    "resolved_file": "/tmp/Crash.cpp",
+                    "resolved_line": 42,
+                }
+            ]
+        }
+        wf = iOSCrashAnalyzeWorkflow()
+        text = wf._build_prompt_final_tip({}, resolved, code_ctx, problem={})
+        self.assertNotIn("- crash_line_number:", text)
+        self.assertNotIn("crash_location_source:", text)
+        self.assertIn("## 崩溃点定位", text)
+        self.assertIn("/tmp/Crash.cpp:42", text)
+        self.assertIn("*ptr = 0;", text)
+        self.assertIn("结论：崩溃点已通过符号化堆栈关联到具体源码行", text)
+        self.assertNotIn("## 可疑代码片段", text)
+
+    def test_owner_class_context_not_in_prompt_summary(self):
+        crash_id = "func|/tmp/mtl.mm|void MTLVertexBuffer::createPrivateBuffer()"
+        code_ctx = {
+            "crash_summary": {
+                "node_id": crash_id + " {",
+                "error_type": "SIGSEGV",
+                "owner_class_context": {
+                    "class_name": "MTLVertexBuffer",
+                    "definition_file": "/tmp/mtl_render_vertex_buffer.mm",
+                    "member_fields": ["VertexFormatInvalid", "_buffer"],
+                    "class_body_excerpt": [],
+                    "skeleton": [],
+                },
+            },
+            "graph": {
+                "nodes": [
+                    {
+                        "id": crash_id,
+                        "type": "function",
+                        "signature": "void MTLVertexBuffer::createPrivateBuffer()",
+                        "file": "/tmp/mtl.mm",
+                        "snippet": ["void MTLVertexBuffer::createPrivateBuffer() {", "}"],
+                    }
+                ],
+                "edges": [],
+            },
+        }
+        wf = iOSCrashAnalyzeWorkflow()
+        text = wf._build_prompt_final_tip({}, {"resolved_frames": []}, code_ctx, problem={})
+        self.assertNotIn("### 崩溃所属类型/类上下文", text)
+        self.assertNotIn("definition_file:", text)
+        self.assertNotIn("member_fields:", text)
+        self.assertNotIn("- class_name:", text)
+
+    def test_fix_output_prompt_omits_no_change_optional_sections(self):
+        crash_id = "func|/tmp/Crash.cpp|void Crash::hit()"
+        code_ctx = {
+            "crash_summary": {"node_id": crash_id + " {", "error_type": "SIGSEGV"},
+            "graph": {
+                "nodes": [
+                    {
+                        "id": crash_id,
+                        "type": "function",
+                        "signature": "void Crash::hit()",
+                        "file": "/tmp/Crash.cpp",
+                        "snippet": ["void Crash::hit() {", "}"],
+                    }
+                ],
+                "edges": [],
+            },
+        }
+        wf = iOSCrashAnalyzeWorkflow()
+        text = wf._build_prompt_final_tip({}, {"resolved_frames": []}, code_ctx, problem={})
+        self.assertNotIn("**可选提供**", text)
+        self.assertNotIn("无需修改但与根因相关", text)
+        self.assertNotIn("#### 无需修改但关键相关的函数", text)
+        self.assertIn("「需要修改的函数」与「修复代码」必须一一对应", text)
+        self.assertIn("**禁止**单独列出「无需修改的函数」章节", text)
 
 
 class TestCodeContentProviderV2(unittest.TestCase):
@@ -218,6 +475,50 @@ class TestCodeContentProviderV2(unittest.TestCase):
         )
         self.assertIn("head", merged)
         self.assertIn("tail", merged)
+
+    def test_objc_mm_function_snippet_excludes_namespace_macro(self):
+        """readlines + 函数体提取不应产生双换行，snippet 不得从 NAMESPACE 宏起跨函数。"""
+        mm = self.code_root / "mtl_render_vertex_buffer.mm"
+        mm.write_text(
+            '#include "mtl_render_vertex_buffer.h"\n\n'
+            "NAMESPACE_BAIDU_VI_BEGIN\n\n"
+            "void MTLVertexBuffer::createPrivateBuffer(id<MTLDevice> device, id<MTLCommandQueue> commandQueue, id<MTLBuffer> sharedBuffer)\n"
+            "{\n"
+            "    @autoreleasepool\n"
+            "    {\n"
+            "        id<MTLCommandBuffer> cmd_buffer = [commandQueue commandBuffer];\n"
+            "    }\n"
+            "}\n\n"
+            "MTLVertexBuffer::MTLVertexBuffer(id<MTLDevice> device, size_t len, StorageMode type)\n"
+            "{\n"
+            "    if (device) {\n"
+            "        _buffer = nil;\n"
+            "    }\n"
+            "}\n\n"
+            "NAMESPACE_BAIDU_VI_END\n",
+            encoding="utf-8",
+        )
+        sig = (
+            "void MTLVertexBuffer::createPrivateBuffer(id<MTLDevice> device, "
+            "id<MTLCommandQueue> commandQueue, id<MTLBuffer> sharedBuffer)"
+        )
+        p = CodeContentProvider(code_parser_backend="regex")
+        p.current_code_roots = [str(self.code_root.resolve())]
+        cf = p._extract_crash_function(sig, str(mm.resolve()), 5, [str(self.code_root.resolve())])
+        self.assertIsNotNone(cf)
+        self.assertEqual(cf.snippet_start_line, 5)
+        self.assertEqual(cf.snippet_end_line, 11)
+        self.assertTrue(cf.snippet[0].startswith("void MTLVertexBuffer::createPrivateBuffer"))
+        self.assertFalse(any("NAMESPACE_BAIDU_VI_BEGIN" in ln for ln in cf.snippet))
+        self.assertFalse(any("size_t len" in ln for ln in cf.snippet))
+        self.assertEqual(len(cf.snippet), cf.snippet_end_line - cf.snippet_start_line + 1)
+
+        refined_snippet, ss, se = p._refine_function_snippet_bounds(
+            str(mm.resolve()), cf.snippet, sig, cf.snippet_start_line, cf.snippet_end_line
+        )
+        self.assertEqual(ss, 5)
+        self.assertEqual(se, 11)
+        self.assertEqual(refined_snippet[0], cf.snippet[0])
 
 
 if __name__ == "__main__":

@@ -24,12 +24,15 @@
 ### 1) 安装依赖
 
 ```bash
-pip install chromadb chroma-hnswlib sentence-transformers numpy
+pip install "stability-analysis-agent[rag]"
+# 或源码：pip install -e ".[rag]"
 ```
 
 说明：
-- 若你的环境里已有这些包，可跳过。
-- 仓库文档里提到 `requirements_vector_db.txt`，若你本地不存在该文件，请按上面命令手动安装。
+- 核心包默认不强制安装 ChromaDB / sentence-transformers，避免 ML 栈导入失败阻断基础分析。
+- 默认使用简单哈希嵌入，**无需**下载 HuggingFace 模型；预训练嵌入需设置 `AI_STABILITY_ANALYZER_ENABLE_SENTENCE_MODEL=1`。
+- ML 栈版本：`numpy<2`、`torch>=2.4`、`transformers<4.52`、`sentence-transformers<3`、`accelerate>=0.26`（见 `pyproject.toml` 的 `[rag]` 或 `requirements-rag.txt`）。
+- 版本冲突排错见 [../cli/INSTALL_TROUBLESHOOTING.md](../cli/INSTALL_TROUBLESHOOTING.md)。
 
 ### 2) 初始化本地向量库
 
