@@ -18,7 +18,6 @@ from services.code_locator import (
 from services.code_fixer import (
     CodeFixer,
     FixResult,
-    FixPlanGenerator,
     extract_candidate_nodes,
     graph_auto_fix_allowed,
     signatures_match,
@@ -46,7 +45,6 @@ __all__ = [
     "CodeContextPhaseTimeout",
     "CodeFixer",
     "FixResult",
-    "FixPlanGenerator",
     "extract_candidate_nodes",
     "graph_auto_fix_allowed",
     "signatures_match",

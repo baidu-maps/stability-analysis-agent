@@ -197,10 +197,10 @@ sa-agent
 
 | 参数 | 必须 | 说明 |
 |------|------|------|
-| `--crash-log` | 是 | 崩溃日志文件路径 |
+| `--crash-log` | 是 | 崩溃日志文件路径（不限后缀，按内容识别格式，见 [崩溃日志格式说明](./docs/tools/CRASH_LOG_FORMATS.zh-CN.md)） |
 | `--library-dir` | 是* | 库文件目录，包含 `.dylib`/`.so` 及调试符号（`.dSYM`） |
 | `--code-root` | 否 | 源码根目录，用于提取崩溃点代码上下文 |
-| `--scope <value>` | 否 | Agent 执行流程范围（默认 `full`），取值 `full` / `prompt_only` / `parse_only` / `parse_log_only`，详见下方。 |
+| `--scope <value>` | 否 | Agent 执行流程范围（默认 `full`），取值 `full` / `gen_prompt_only` / `parse_stack_only` / `parse_log_only`，详见下方。 |
 | `--daemon <url>` | 否 | 委托给运行中的 Daemon 实例 |
 
 \* 使用 `--scope parse_log_only` 时不需要。
@@ -210,9 +210,27 @@ sa-agent
 | 取值 | 行为 |
 |------|------|
 | `full`（默认） | 解析 + 符号化 + 取代码上下文 + AI 推理（含可选自动改码）。 |
-| `prompt_only` | 完整工具链，但不调用 LLM，仅生成可复用的提示词文件。 |
-| `parse_only` | 仅解析 + 符号化，无需 `--code-root`。 |
+| `gen_prompt_only` | 完整工具链，但不调用 LLM，仅生成可复用的提示词文件。 |
+| `parse_stack_only` | 仅解析 + 符号化，无需 `--code-root`。 |
 | `parse_log_only` | 仅解析崩溃日志，`--library-dir` 与 `--code-root` 都可省略。 |
+
+### 支持的崩溃日志文件与平台导出
+
+**文件后缀：** 不做白名单限制 — `.crash`、`.txt`、`.log`、`.json` 或无后缀均可，关键看**文件内容**是否匹配已知格式；也支持 `--crash-log -` 从 stdin 读取。RTF 导出会先转为纯文本。
+
+**文本类（示例）：** Apple `.crash`、iOS 卡顿/Mach 导出、Android logcat/tombstone、Harmony `Stacktrace:` / `Tid:` dump、native 文本栈 `#NN pc 0x地址 /path/lib.so`。
+
+**JSON 类导出：**
+
+| 平台 / 形态 | `01` 报告中的 `log_format` |
+|-------------|---------------------------|
+| Harmony 崩溃平台（`crashDiagnosis:` / `crashDiagnsis:` + JSON，含 `body.stacks[].call_stack` 的 `#NN pc`） | `harmony_crash_diagnosis_json` |
+| [Sentry](https://sentry.io/) 事件 JSON | `sentry_event_json` |
+| [Firebase Crashlytics](https://firebase.google.com/docs/crashlytics) 事件 JSON | `firebase_crashlytics_json` |
+| [Bugsnag](https://www.bugsnag.com/) 事件 JSON | `bugsnag_event_json` |
+| Bugly / 友盟 / 自建 APM 等（`frames` / `stack_frames` 常见字段） | `generic_json_stack_export` |
+
+完整列表、解析器优先级与扩展方式：**[docs/tools/CRASH_LOG_FORMATS.zh-CN.md](./docs/tools/CRASH_LOG_FORMATS.zh-CN.md)** · [English](./docs/tools/CRASH_LOG_FORMATS.md)
 
 ## Daemon 模式
 
@@ -275,8 +293,8 @@ sa-agent
 若你偏好手动编辑，也可直接修改以上配置文件。
 
 高级可选模式（通过 `--scope`）：
-- `--scope prompt_only`（完整工具链，跳过 LLM，仅生成提示词）
-- `--scope parse_only`（仅解析 + 符号化）
+- `--scope gen_prompt_only`（完整工具链，跳过 LLM，仅生成提示词）
+- `--scope parse_stack_only`（仅解析 + 符号化）
 - `--scope parse_log_only`（仅解析日志）
 
 ### 高级：add2line 配置路径覆盖
@@ -324,6 +342,7 @@ stability-analysis-agent/
 | Workflow 系统 | [docs/workflows/WORKFLOWS.md](./docs/workflows/WORKFLOWS.md) |
 | RAG 向量数据库 | [docs/rag/README.md](./docs/rag/README.md) |
 | 崩溃示例 | [docs/crash_cases/README.md](./docs/crash_cases/README.md) |
+| 崩溃日志格式与平台支持 | [docs/tools/CRASH_LOG_FORMATS.zh-CN.md](./docs/tools/CRASH_LOG_FORMATS.zh-CN.md) |
 
 ## 测试
 
@@ -353,7 +372,7 @@ python3 test/agent_py_tool/test_vector_db.py
 确保 `--code-root` 指向的源码目录包含符号化堆栈中引用的文件。
 
 **Q：不配置 LLM Key 能用吗？**
-可以。使用 `--scope prompt_only` 即可运行完整工具链（解析 + 符号化 + 代码提取），跳过 LLM 调用并生成可复用提示词，结构化 JSON 输出本身就对问题定位很有帮助。
+可以。使用 `--scope gen_prompt_only` 即可运行完整工具链（解析 + 符号化 + 代码提取），跳过 LLM 调用并生成可复用提示词，结构化 JSON 输出本身就对问题定位很有帮助。
 
 ## 贡献
 

@@ -53,7 +53,8 @@ def parse_threads_android_harmony_tid(
             ThreadStack(
                 tid=None,
                 name=None,
-                role="primary",
+                is_crash_thread=True,
+                is_main_thread=None,
                 frames=stack_frames,
                 thread_index=None,
                 **_thread_layer_summary(stack_frames),
@@ -67,7 +68,13 @@ def parse_threads_android_harmony_tid(
     max_background_frames = opts.max_background_frames
 
     def _append_thread(
-        thread_tid: str, thread_name: str, role: str, block_start: int, block_end: int
+        thread_tid: str,
+        thread_name: str,
+        *,
+        is_crash_thread: bool,
+        is_main_thread: Optional[bool],
+        block_start: int,
+        block_end: int,
     ) -> None:
         if max_threads > 0 and len(threads) >= max_threads:
             return
@@ -75,16 +82,17 @@ def parse_threads_android_harmony_tid(
         frames = extract_stack_frames(block, debug, base_raw_log_line=block_start + 1)
         if not frames:
             return
-        if role == "primary" and max_primary_frames > 0 and len(frames) > max_primary_frames:
+        if is_crash_thread and max_primary_frames > 0 and len(frames) > max_primary_frames:
             frames = frames[:max_primary_frames]
-        if role != "primary" and max_background_frames > 0 and len(frames) > max_background_frames:
+        if not is_crash_thread and max_background_frames > 0 and len(frames) > max_background_frames:
             frames = frames[:max_background_frames]
         threads.append(
             ThreadStack(
                 tid=thread_tid,
                 name=thread_name,
                 thread_index=None,
-                role=role,
+                is_crash_thread=is_crash_thread,
+                is_main_thread=is_main_thread,
                 frames=frames,
                 **_thread_layer_summary(frames),
             )
@@ -125,7 +133,13 @@ def parse_threads_android_harmony_tid(
                 if marker_idx is not None and marker_idx > start_idx:
                     end_candidates.append(marker_idx)
             primary_end_idx = min(end_candidates)
-            _append_thread(tid, name, "primary", start_idx, primary_end_idx)
+            _append_thread(
+                tid, name,
+                is_crash_thread=True,
+                is_main_thread=True,
+                block_start=start_idx,
+                block_end=primary_end_idx,
+            )
             structured_split_used = bool(threads)
 
     background_entries = []
@@ -137,15 +151,27 @@ def parse_threads_android_harmony_tid(
             next_start = (
                 background_entries[i + 1][0] if i + 1 < len(background_entries) else len(lines)
             )
-            _append_thread(tid, name, "background", start_idx, next_start)
+            _append_thread(
+                tid, name,
+                is_crash_thread=False,
+                is_main_thread=False,
+                block_start=start_idx,
+                block_end=next_start,
+            )
 
     if not threads:
         for i, (start_idx, tid, name) in enumerate(tid_indices):
             if max_threads > 0 and len(threads) >= max_threads:
                 break
             end_idx = tid_indices[i + 1][0] if i + 1 < len(tid_indices) else len(lines)
-            role = "primary" if i == 0 else "background"
-            _append_thread(tid, name, role, start_idx, end_idx)
+            is_crash = i == 0
+            _append_thread(
+                tid, name,
+                is_crash_thread=is_crash,
+                is_main_thread=True if is_crash else False,
+                block_start=start_idx,
+                block_end=end_idx,
+            )
 
     if crash_seg_req > 1:
         logger.warning(
@@ -185,7 +211,8 @@ def parse_threads_ios(
             tid=None,
             name=None,
             thread_index=ios_thread_index,
-            role="primary",
+            is_crash_thread=True,
+            is_main_thread=None,
             frames=stack_frames,
             **_thread_layer_summary(stack_frames),
         )
@@ -221,7 +248,8 @@ def parse_threads_single_block(
         ThreadStack(
             tid=None,
             name=None,
-            role="primary",
+            is_crash_thread=True,
+            is_main_thread=None,
             frames=stack_frames,
             thread_index=None,
             **_thread_layer_summary(stack_frames),

@@ -132,7 +132,10 @@ class CrashLogParserTool(BaseTool):
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="crash_log_parser",
-            description="解析崩溃日志，提取堆栈地址、异常类型、崩溃原因等信息。支持 iOS/Android/鸿蒙等平台。",
+            description=(
+                "解析崩溃日志，从原始文本提取堆栈地址、异常类型、崩溃原因、关键线程等结构化信息。"
+                "支持 iOS/Android/鸿蒙等平台。（对外唯一日志解析工具；历史名称 log_filter 已废弃）"
+            ),
             input_schema={
                 "type": "object",
                 "properties": {

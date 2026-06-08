@@ -9,6 +9,14 @@ from dataclasses import replace
 from typing import List, Optional
 
 from tools.crash_parser.core import parse_crash_core
+from tools.crash_parser.harmony_crash_diagnosis import (
+    is_harmony_crash_diagnosis_json,
+    parse_harmony_crash_diagnosis,
+)
+from tools.crash_parser.platform_json_exports import (
+    is_platform_json_export,
+    parse_platform_json_export,
+)
 from tools.crash_parser.format_detect import (
     _detect_apple_ios_freeze_report,
     _detect_apple_ios_truncated_crash,
@@ -140,6 +148,45 @@ class AndroidHarmonyTidCrashParser(BaseCrashParser):
         return self._annotate(parse_crash_core(content, os_type=os_type, debug=debug, options=options))
 
 
+class HarmonyCrashDiagnosisJsonParser(BaseCrashParser):
+    """Harmony ``crashDiagnosis: { ... }`` 单行 JSON（body.attributed_stack.stack_frames）。"""
+
+    format_id = "harmony_crash_diagnosis_json"
+
+    def can_handle(self, content: str, os_type: str) -> bool:
+        return is_harmony_crash_diagnosis_json(content)
+
+    def parse(
+        self,
+        content: str,
+        os_type: str,
+        debug: bool = False,
+        options: Optional[CrashParseOptions] = None,
+    ) -> CrashAnalysisResult:
+        return self._annotate(
+            parse_harmony_crash_diagnosis(content, debug, options=options)
+        )
+
+
+class PlatformJsonExportParser(BaseCrashParser):
+    """Sentry / Crashlytics / Bugsnag / 通用 JSON 栈导出。"""
+
+    format_id = "platform_json_export"
+
+    def can_handle(self, content: str, os_type: str) -> bool:
+        return is_platform_json_export(content)
+
+    def parse(
+        self,
+        content: str,
+        os_type: str,
+        debug: bool = False,
+        options: Optional[CrashParseOptions] = None,
+    ) -> CrashAnalysisResult:
+        # parse_platform_json_export 会写入更精确的 adapter log_format。
+        return parse_platform_json_export(content, debug, options=options)
+
+
 class HarmonyStacktraceCrashParser(BaseCrashParser):
     """OpenHarmony 单 Stacktrace: 块（无 Tid:）。"""
 
@@ -212,6 +259,8 @@ PARSERS: List[BaseCrashParser] = [
     IosMachExportCrashParser(),
     IosAppleCrashParser(),
     IosFreezeReportParser(),
+    HarmonyCrashDiagnosisJsonParser(),
+    PlatformJsonExportParser(),
     AndroidHarmonyTidCrashParser(),
     HarmonyStacktraceCrashParser(),
     AndroidLogcatCrashParser(),

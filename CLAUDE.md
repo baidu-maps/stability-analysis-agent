@@ -23,15 +23,15 @@ Stability Analysis Agent is an AI-driven crash log analysis toolchain with a mul
 python3 cli/main.py \
   --crash-log <path> --library-dir <path> --code-root <path>
 
-# prompt_only: full toolchain but skip LLM, generate prompt file only (no LLM key required)
+# gen_prompt_only: full toolchain but skip LLM, generate prompt file only (no LLM key required)
 python3 cli/main.py \
   --crash-log <path> --library-dir <path> --code-root <path> \
-  --scope prompt_only
+  --scope gen_prompt_only
 
-# parse_only: parse log + addr2line only (no code-root required)
+# parse_stack_only: parse log + addr2line only (no code-root required)
 python3 cli/main.py \
   --crash-log <path> --library-dir <path> \
-  --scope parse_only
+  --scope parse_stack_only
 
 # parse_log_only: parse crash log only
 python3 cli/main.py \
@@ -48,8 +48,8 @@ python3 cli/main.py --daemon http://127.0.0.1:8765 \
 `--scope` controls how deep the agent runs (default `full`):
 
 - `full`: parse + symbolize + extract code context + LLM analysis (and optional auto-fix).
-- `prompt_only`: full toolchain, but skip LLM call; produces a reusable prompt file.
-- `parse_only`: only parse + symbolize.
+- `gen_prompt_only`: full toolchain, but skip LLM call; produces a reusable prompt file.
+- `parse_stack_only`: only parse + symbolize.
 - `parse_log_only`: only parse the crash log.
 
 ### Start Daemon
@@ -100,8 +100,9 @@ python3 cli/main.py \
   --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
   --code-root examples/crash_cases/demo_basic/code_dir \
-  --scope prompt_only
-# Output: cli_reports/<timestamp>/01~03 JSON + round_0/05_ai_final_tip.txt
+  --scope gen_prompt_only
+# Output: cli_reports/<timestamp>/01~03 (+ optional 03b/04) JSON + round_0/05_ai_prompt.md
+# 03b = 03b_code_location_trace.json（03 代码定位审计，非 repo_search）
 ```
 
 ## Architecture
@@ -123,6 +124,18 @@ python3 cli/main.py \
 - `prompts/` - Prompt templates
 - `examples/` - Demo crash cases (mac / ios / multithread)
 - `test/` - Test suite
+
+### `05_ai_prompt.md` generation (do not change without explicit request)
+
+**Unless the user’s task or prompt explicitly asks to change it, do not modify how `round_0/05_ai_prompt.md` is built.** Keep the current assembly logic; do not inject new sections or extra content into this file from new tools, sidecar reports, or ad-hoc prompt appendices.
+
+- **Producer**: `workflows/crash_analysis_workflow.py` → `_build_prompt_final_tip()`; CLI writes `result["final_tip"]` via `cli/main.py` → `_write_cli_report()`.
+- **Inputs today**: structured content from `01` / `02` / `03` (parse, symbolize, code context) using the existing section order and wording in `_build_prompt_final_tip`.
+- **Optional merge into `05`**: only `memory_context` from `04_memory_context.json` when non-empty (from `vector_memory_retriever`). If `memory_context` is empty, do not add a “规则与经验模式参考” block.
+- **Do not merge into `05`**: `03b_code_location_trace.json`、LangGraph `repo_search_results`，或其它工具旁路产出，除非用户明确要求写入提示词。
+- **Sidecar artifacts**（`03b_code_location_trace.json` 等）仅供调试与二次消费；不得默认 alter `05`。
+
+When adding features (new tools, RAG, repo search, LangGraph nodes), wire them to separate report files or state/TOOL_OUTPUT—not into `05`—unless the user clearly asks to change `05`’s structure or contents.
 
 ### Configuration
 - `tools/configs/agent_config.json` - LLM provider template (no keys, safe to commit)

@@ -96,6 +96,13 @@ def detect_os_type(content: str) -> str:
     """检测操作系统类型"""
     content_lower = content.lower()
 
+    # Harmony crashDiagnosis JSON 单行导出（platform 字段或前缀）
+    if content.lstrip().lower().startswith("crashdiag"):
+        if re.search(r'"platform"\s*:\s*"(?:Harmony|HarmonyOS|OpenHarmony)"', content, re.I):
+            return "harmonyos"
+        if '"attributed_stack"' in content and '"stack_frames"' in content:
+            return "harmonyos"
+
     # 项目内自定义：中文「平台: mac」
     if "平台: mac" in content:
         return "macos"

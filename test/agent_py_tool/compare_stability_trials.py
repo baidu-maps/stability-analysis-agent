@@ -20,8 +20,8 @@ def _load_json(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def _load_fix_plan(tdir: Path) -> Optional[Dict[str, Any]]:
-    """从合并后的 06_fix_extract_debug.json 读取 fix_plan；兼容旧 trial 的 06_fix_plan_debug.json。"""
-    extract = _load_json(tdir / "06_fix_extract_debug.json")
+    """从合并后的 07b_fix_extract_debug.json.json 读取 fix_plan；兼容旧 trial 的 06_fix_plan_debug.json。"""
+    extract = _load_json(tdir / "07b_fix_extract_debug.json.json")
     if isinstance(extract, dict):
         plan = extract.get("fix_plan")
         if isinstance(plan, dict):
@@ -78,7 +78,7 @@ def main() -> int:
     trials: List[Dict[str, Any]] = []
     for i in range(1, 4):
         tdir = base / f"trial_{i}"
-        apply = _load_json(tdir / "06_apply_ai_fixes.json")
+        apply = _load_json(tdir / "07_apply_ai_fixes.json")
         plan = _load_fix_plan(tdir)
         report = (tdir / "report_dir.txt").read_text(encoding="utf-8").strip() if (tdir / "report_dir.txt").is_file() else ""
         trials.append(
@@ -130,7 +130,7 @@ def main() -> int:
 
     if not stable_fp:
         lines.append("## 差异说明")
-        lines.append("各轮 `06_fix_extract_debug.json` 中 fix_plan 的 replacement 哈希不同，LLM 输出存在波动。")
+        lines.append("各轮 `07b_fix_extract_debug.json.json` 中 fix_plan 的 replacement 哈希不同，LLM 输出存在波动。")
     if stable_fp and stable_success:
         lines.append("## 结论")
         lines.append("三轮 fix_plan 与 apply 结果一致，当前链路下 AI 改码方案**稳定**。")

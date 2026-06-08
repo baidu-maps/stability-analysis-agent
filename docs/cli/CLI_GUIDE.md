@@ -2,6 +2,8 @@
 
 本指南覆盖 `cli/main.py` 命令行入口的常见用法。完整参数列表见 [CLI_COMMANDS_REFERENCE.md](./CLI_COMMANDS_REFERENCE.md)。
 
+`--crash-log` 不限文件后缀，支持 Apple `.crash`、Android/Harmony 文本栈、Harmony `crashDiagnosis` JSON、Sentry/Crashlytics/Bugsnag 等 JSON 导出；详见 [崩溃日志格式说明](../tools/CRASH_LOG_FORMATS.zh-CN.md)。
+
 ## 入口与定位
 
 - **权威入口**：`cli/main.py`
@@ -33,15 +35,43 @@ python3 cli/main.py \
 > 交互首屏不做自动环境检测；配置大模型/配置 addr2line 工具时会先做对应检测并展示结论。`2) 设置` 提供 **配置大模型 / 配置堆栈地址解析工具 / 高级选项（手动编辑配置文件、AI 推理模式切换、Agent 执行流程切换等）**；`3) 帮助` 提供 **全部命令参考（完整参数手册）/ 命令快速示例（最小可运行）**，方便随时查阅；`1) 快速开始分析` 路径保持精简。
 > 参数采集完成后会直接执行，不再二次确认；执行前会提示“运行中按 `Ctrl+C` 可终止当前任务”。
 
-### 2) prompt_only 模式（推荐回归测试）
+### 2) gen_prompt_only 模式（推荐回归测试）
 
 ```bash
 python3 cli/main.py \
   --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
   --code-root examples/crash_cases/demo_basic/code_dir \
-  --scope prompt_only
+  --scope gen_prompt_only
 ```
+
+默认生成的 `round_0/05_ai_prompt.md` 使用 `--prompt-mode analysis`：提示词偏证据分析、置信度判断和“不足以定位时说明缺失证据”，不会强制模型必须输出修复代码。若需要回到补丁导向提示词，可显式指定：
+
+```bash
+python3 cli/main.py \
+  --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
+  --library-dir examples/crash_cases/demo_basic/lib/mac \
+  --code-root examples/crash_cases/demo_basic/code_dir \
+  --scope gen_prompt_only \
+  --prompt-mode fix
+```
+
+`--prompt-mode` 只控制提示词内容，不控制是否自动应用修复。`--scope full` 下是否尝试回写源码仍由 `--apply-ai-fixes` / `--no-apply-ai-fixes` 决定；如果模型没有输出可提取的完整修复代码，自动改码会自然跳过。
+
+在弱归因或源码上下文不足的 case 中，可以启用轻量多轮上下文补充。该能力和 `--engine` 解耦，`direct` / `langchain` / `langgraph` 都可使用：
+
+```bash
+python3 cli/main.py \
+  --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
+  --library-dir examples/crash_cases/demo_basic/lib/mac \
+  --code-root examples/crash_cases/demo_basic/code_dir \
+  --scope full \
+  --prompt-mode analysis \
+  --agent-loop context_loop \
+  --max-agent-rounds 3
+```
+
+`context_loop` 首轮仍使用 `round_0/05_ai_prompt.md`。如果模型输出 `need_more_context=true` 和 `context_requests[]`，Agent 会按请求补充函数源码并生成 `round_1/05_ai_prompt.md` 继续询问。每轮输出保存在对应 `round_N/06_ai_gen_res.md`。
 
 ### 3) 解析模式
 
@@ -50,7 +80,7 @@ python3 cli/main.py \
 python3 cli/main.py \
   --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
-  --scope parse_only
+  --scope parse_stack_only
 
 # 只解析崩溃日志
 python3 cli/main.py \

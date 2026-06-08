@@ -106,8 +106,10 @@ class SymbolCallsiteFinderTool(BaseTool):
     def _infer_symbol_from_stack(self, resolved_stack_json: str) -> str:
         try:
             data = json.loads(resolved_stack_json or "{}")
-            frames = data.get("resolved_frames") or []
-            if not isinstance(frames, list):
+            from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
+            frames = flatten_resolved_frames_from_stack(data)
+            if not frames:
                 return ""
             for fr in frames:
                 if not isinstance(fr, dict):

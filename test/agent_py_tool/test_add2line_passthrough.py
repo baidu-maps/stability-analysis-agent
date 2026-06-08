@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 
 from tools.add2line_resolver_tool import add2line_resolver
 from tools.crash_log_parser_tool import crash_log_parser
+from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
 
 SAMPLE = """\
 * SIGSEGV: 0x000000024c911b04 A28FFCAD-5B21-3D66-91E4-C7573948C36A + 9874169856
@@ -26,11 +27,12 @@ class TestAdd2linePassthrough(unittest.TestCase):
         parsed = json.loads(crash_log_parser(SAMPLE))
         result = json.loads(add2line_resolver(json.dumps(parsed), library_dir=None))
         self.assertEqual(result.get("resolution_source"), "log_symbolicated_passthrough")
-        addrs = [f.get("address") for f in result.get("resolved_frames", [])]
+        flat = flatten_resolved_frames_from_stack(result)
+        addrs = [f.get("address") for f in flat]
         self.assertNotIn("0x000000024c911b04", addrs)
         symbols = [
             (f.get("resolved_function") or f.get("function") or "")
-            for f in result["resolved_frames"]
+            for f in flat
         ]
         self.assertNotIn("-[CKCrashReporter recordCrashWithSignal:]", symbols)
         self.assertIn(

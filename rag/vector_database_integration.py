@@ -117,6 +117,8 @@ class StabilityMemorySystem:
         query_text: str,
         n_results: int = 5,
         filters: Optional[Dict[str, Any]] = None,
+        *,
+        record_usage: bool = False,
     ) -> List[Dict[str, Any]]:
         where = filters or None
         hits = self.pattern_index.query(query_text, n_results=n_results, where=where)
@@ -153,8 +155,9 @@ class StabilityMemorySystem:
                 }
             )
         out.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        for item in out:
-            self.meta_store.update_usage(item["pattern_id"], hit_inc=1)
+        if record_usage:
+            for item in out:
+                self.meta_store.update_usage(item["pattern_id"], hit_inc=1)
         return out
 
     # ========== Evidence & Strategy ==========
@@ -341,8 +344,12 @@ class AIStabilityAnalyzerWithVectorDB:
         query_text: str,
         n_results: int = 5,
         filters: Optional[Dict[str, Any]] = None,
+        *,
+        record_usage: bool = False,
     ) -> List[Dict[str, Any]]:
-        return self.memory.retrieve_patterns(query_text, n_results=n_results, filters=filters)
+        return self.memory.retrieve_patterns(
+            query_text, n_results=n_results, filters=filters, record_usage=record_usage
+        )
 
     def get_evidence(self, pattern_id: str) -> List[Dict[str, Any]]:
         return self.memory.get_evidence(pattern_id)

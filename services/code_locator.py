@@ -179,6 +179,49 @@ class LocatorContext:
         # Ctags index (lazy)
         self._ctags_index = None
 
+        # Location trace — 03 代码定位审计（供 03b 落盘）
+        self.location_trace: List[Dict[str, Any]] = []
+        self._location_trace_dedupe: Dict[str, int] = {}
+        self._location_trace_truncated: bool = False
+        self._location_trace_max_entries: int = 400
+
+    # ------------------------------------------------------------------
+    # Location trace
+    # ------------------------------------------------------------------
+
+    def record_location(
+        self,
+        kind: str,
+        *,
+        dedupe_key: Optional[str] = None,
+        **fields: Any,
+    ) -> None:
+        """记录一次代码定位步骤（03 生成过程审计）。"""
+        if dedupe_key is not None:
+            existing = self._location_trace_dedupe.get(dedupe_key)
+            if existing is not None:
+                entry = self.location_trace[existing]
+                entry["repeat_count"] = int(entry.get("repeat_count") or 1) + 1
+                return
+        if len(self.location_trace) >= self._location_trace_max_entries:
+            self._location_trace_truncated = True
+            return
+        entry: Dict[str, Any] = {"kind": kind, **fields}
+        if dedupe_key is not None:
+            self._location_trace_dedupe[dedupe_key] = len(self.location_trace)
+        self.location_trace.append(entry)
+
+    def export_location_trace(self) -> Dict[str, Any]:
+        return {
+            "source": "code_content_provider",
+            "steps": list(self.location_trace),
+            "stats": {
+                "steps_recorded": len(self.location_trace),
+                "steps_truncated": self._location_trace_truncated,
+                "search_stats": dict(self.search_stats),
+            },
+        }
+
     # ------------------------------------------------------------------
     # Timeout management
     # ------------------------------------------------------------------
@@ -246,6 +289,9 @@ class LocatorContext:
             'files_read': 0,
             'search_time': 0.0,
         }
+        self.location_trace = []
+        self._location_trace_dedupe = {}
+        self._location_trace_truncated = False
 
     # ------------------------------------------------------------------
     # Shared utilities
@@ -576,7 +622,15 @@ class FileLocator:
         resolved_file = str(resolved_file).strip()
         if not resolved_file:
             return None
+        dedupe_key = f"find_source:{resolved_file}"
         if self._ctx.is_external_path(resolved_file, code_roots):
+            self._ctx.record_location(
+                "find_source_file",
+                dedupe_key=dedupe_key,
+                resolved_file=resolved_file,
+                success=False,
+                reason="external_path",
+            )
             return None
 
         self._ctx.find_source_deadline_begin()
@@ -590,18 +644,22 @@ class FileLocator:
                 # Tier 1: Direct hit
                 hit = self._try_direct_hit(resolved_file, code_root_abs)
                 if hit:
+                    self._record_source_hit(resolved_file, hit, "direct_hit", dedupe_key)
                     return hit
                 # Tier 2: Code root dirname anchor
                 hit = self._try_suffix_after_code_root_dirname(resolved_file, code_root_abs)
                 if hit:
+                    self._record_source_hit(resolved_file, hit, "suffix_after_code_root", dedupe_key)
                     return hit
                 # Tier 3: Tail path concatenation
                 hit = self._try_tail_path_concatenation(resolved_file, code_root_abs)
                 if hit:
+                    self._record_source_hit(resolved_file, hit, "tail_path_concat", dedupe_key)
                     return hit
                 # Tier 4: Parent dir + filename glob
                 hit = self._try_parent_dir_filename_match(resolved_file, code_root_abs)
                 if hit:
+                    self._record_source_hit(resolved_file, hit, "parent_dir_glob", dedupe_key)
                     return hit
 
             # Tier 5: CodeIndexService lookup
@@ -612,13 +670,22 @@ class FileLocator:
                 if candidates:
                     if len(candidates) == 1:
                         if self._ctx.is_file_readable(candidates[0]):
+                            self._record_source_hit(
+                                resolved_file, candidates[0], "code_index_single", dedupe_key
+                            )
                             return candidates[0]
                     else:
                         best = self._select_best_candidate(candidates, resolved_file)
                         if best:
+                            self._record_source_hit(
+                                resolved_file, best, "code_index_best", dedupe_key
+                            )
                             return best
                         for c in candidates:
                             if self._ctx.is_file_readable(c):
+                                self._record_source_hit(
+                                    resolved_file, c, "code_index_fallback", dedupe_key
+                                )
                                 return c
 
             # Tier 6/7: Fallback search
@@ -629,14 +696,45 @@ class FileLocator:
                     continue
                 hit = self._fallback_search(resolved_file, code_root_abs)
                 if hit:
+                    self._record_source_hit(resolved_file, hit, "fallback_search", dedupe_key)
                     return hit
 
+            self._ctx.record_location(
+                "find_source_file",
+                dedupe_key=dedupe_key,
+                resolved_file=resolved_file,
+                success=False,
+                reason="not_found",
+            )
             return None
         except FindSourceFileTimeout:
             logger.debug("find_source_file timeout: %s", resolved_file)
+            self._ctx.record_location(
+                "find_source_file",
+                dedupe_key=dedupe_key,
+                resolved_file=resolved_file,
+                success=False,
+                reason="timeout",
+            )
             return None
         finally:
             self._ctx.find_source_deadline_clear()
+
+    def _record_source_hit(
+        self,
+        resolved_file: str,
+        result_file: str,
+        strategy_tier: str,
+        dedupe_key: str,
+    ) -> None:
+        self._ctx.record_location(
+            "find_source_file",
+            dedupe_key=dedupe_key,
+            resolved_file=resolved_file,
+            result_file=result_file,
+            strategy_tier=strategy_tier,
+            success=True,
+        )
 
     def _try_direct_hit(self, resolved_file: str, code_root_abs: str) -> Optional[str]:
         """Tier 1: Check if resolved path directly exists within code root."""
@@ -807,8 +905,10 @@ class FileLocator:
         """Extract source file paths from addr2line resolved frames."""
         if not add2line_data or not isinstance(add2line_data, dict):
             return []
-        frames = add2line_data.get("resolved_frames") or []
-        if not isinstance(frames, list):
+        from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
+        frames = flatten_resolved_frames_from_stack(add2line_data)
+        if not frames:
             return []
         out: List[str] = []
         seen: Set[str] = set()
@@ -940,10 +1040,14 @@ class SymbolLocator:
         """
         if not simple_name or not code_roots:
             return None
+        dedupe_key = f"funcdef:{simple_name}"
         # Check cache
         cache_key = f"__funcdef__:{simple_name}"
         cached = self._ctx._function_def_cache.get(cache_key)
         if cached is not None:
+            self._record_function_def(
+                simple_name, cached[0], cached[1], "cache", dedupe_key, success=True
+            )
             return cached
         # Try ctags index (only if enabled)
         self._ctx.ensure_ctags_index(code_roots)
@@ -951,6 +1055,9 @@ class SymbolLocator:
             result = self._ctx._ctags_index.lookup(simple_name, code_roots)
             if result is not None:
                 self._ctx._function_def_cache[cache_key] = result
+                self._record_function_def(
+                    simple_name, result[0], result[1], "ctags", dedupe_key, success=True
+                )
                 return result
         # Try rg-based search (fast path). When rg runs successfully but finds no
         # definition, do not repeat the same text search with an os.walk fallback.
@@ -961,7 +1068,18 @@ class SymbolLocator:
                 if self.is_function_definition_line(line_text):
                     result = (fp, line_no)
                     self._ctx._function_def_cache[cache_key] = result
+                    self._record_function_def(
+                        simple_name, fp, line_no, "rg", dedupe_key, success=True
+                    )
                     return result
+            self._ctx.record_location(
+                "find_function_definition",
+                dedupe_key=dedupe_key,
+                symbol=simple_name,
+                strategy="rg",
+                success=False,
+                reason="no_definition_match",
+            )
             return None
         # Fallback: os.walk + regex (slow path, only if rg unavailable)
         pattern = re.compile(rf"\b{re.escape(simple_name)}\s*\(")
@@ -989,8 +1107,39 @@ class SymbolLocator:
                         if pattern.search(line) and self.is_function_definition_line(line):
                             result = (fp, idx)
                             self._ctx._function_def_cache[cache_key] = result
+                            self._record_function_def(
+                                simple_name, fp, idx, "walk", dedupe_key, success=True
+                            )
                             return result
+        self._ctx.record_location(
+            "find_function_definition",
+            dedupe_key=dedupe_key,
+            symbol=simple_name,
+            strategy="walk",
+            success=False,
+            reason="not_found",
+        )
         return None
+
+    def _record_function_def(
+        self,
+        symbol: str,
+        file_path: str,
+        line_no: int,
+        strategy: str,
+        dedupe_key: str,
+        *,
+        success: bool,
+    ) -> None:
+        self._ctx.record_location(
+            "find_function_definition",
+            dedupe_key=dedupe_key,
+            symbol=symbol,
+            strategy=strategy,
+            success=success,
+            file=file_path,
+            line=line_no,
+        )
 
     def _find_function_def_via_rg(
         self, simple_name: str, code_roots: List[str]
@@ -1076,6 +1225,12 @@ class SymbolLocator:
 
     def extract_function_name_at_line(self, lines: List[str], line_number: int) -> Optional[str]:
         """Find the enclosing function name at given line number."""
+        from tools.function_snippet_utils import (
+            is_control_flow_source_line,
+            is_plausible_function_name,
+            strip_leading_close_braces,
+        )
+
         if not lines or line_number < 1:
             return None
         target_idx = line_number - 1
@@ -1091,17 +1246,17 @@ class SymbolLocator:
             line = lines[i].strip()
             if not line or line.startswith("//") or line.startswith("/*") or line.startswith("*"):
                 continue
-            # Skip control flow
-            if re.match(r"^\s*(if|else|for|while|switch|case|do|return|try|catch)\b", line):
+            if is_control_flow_source_line(line):
                 continue
-            m = pattern.search(line)
+            m = pattern.search(strip_leading_close_braces(line))
             if m and self.is_function_definition_line(line):
                 name = m.group(1)
                 # Remove class prefix for simple name
                 if "::" in name:
                     parts = name.split("::")
-                    return parts[-1] if parts[-1] else name
-                return name
+                    name = parts[-1] if parts[-1] else name
+                if is_plausible_function_name(name):
+                    return name
         return None
 
     def extract_simple_function_name(self, full_function_name: str) -> str:
@@ -1145,19 +1300,15 @@ class SymbolLocator:
 
     def is_function_definition_line(self, line: str) -> bool:
         """Check if a line is a function definition (not control flow)."""
+        from tools.function_snippet_utils import is_control_flow_source_line
+
         stripped = line.strip()
         if not stripped:
             return False
+        if is_control_flow_source_line(stripped):
+            return False
         # 明确排除函数声明/原型（以 ';' 收尾且不含函数体起始）。
         if stripped.endswith(";") and "{" not in stripped:
-            return False
-        # Exclude control flow
-        control_keywords = (
-            'if', 'else', 'for', 'while', 'switch', 'case', 'default',
-            'do', 'return', 'try', 'catch', 'throw', 'goto', 'break', 'continue',
-        )
-        first_word = re.match(r"(\w+)", stripped)
-        if first_word and first_word.group(1) in control_keywords:
             return False
         # Must have function-like pattern: name(
         if not re.search(r"\w+\s*\(", stripped):
@@ -1444,7 +1595,21 @@ class CallerLocator:
             "CallerLocator: searching %d files for calls to '%s' (budget=%d)",
             len(search_files), simple_name, budget,
         )
-        return self._regex_scan_callers(simple_name, search_files, code_roots)
+        results = self._regex_scan_callers(simple_name, search_files, code_roots)
+        matches = [
+            {"file": c.file, "caller": c.name, "origin": c.chain_origin}
+            for c in results[:20]
+        ]
+        self._ctx.record_location(
+            "find_callers",
+            target_function=crash_function_name,
+            simple_name=simple_name,
+            files_searched=len(search_files),
+            callers_found=len(results),
+            matches=matches,
+            success=bool(results),
+        )
+        return results
 
     def _extract_call_target_name(self, crash_function_name: str) -> str:
         """Extract simple function name from resolved/mangled crash function name."""
@@ -1814,8 +1979,18 @@ class VariableLocator:
                         func_name = self._symbol.extract_function_name_at_line(lines, i)
                         if not func_name:
                             continue
+                        from tools.function_snippet_utils import (
+                            is_plausible_function_signature,
+                        )
+
                         code = self._symbol.extract_full_function_code(lines, i - 1, func_name)
                         if not code:
+                            continue
+                        snippet_probe = next(
+                            (ln.strip() for ln in code.split("\n") if ln.strip()),
+                            "",
+                        )
+                        if not is_plausible_function_signature(snippet_probe):
                             continue
                         relation = self.determine_variable_relation(line, var)
                         snippet = [ln.rstrip() for ln in code.split("\n") if ln.strip()]
@@ -2090,3 +2265,7 @@ class CodeLocatorService:
             stack_priority_files, crash_local_files,
             owner_class, owner_member_fields, owner_definition_files,
         )
+
+    def export_location_trace(self) -> Dict[str, Any]:
+        """导出 03 代码定位审计轨迹（供 03b 落盘）。"""
+        return self._ctx.export_location_trace()

@@ -32,9 +32,14 @@ class PhaseSpinner:
         self._start_time: float = 0.0
         self._input_tokens: Optional[int] = None
         self._output_tokens: Optional[int] = None
+        self._partial_failure: bool = False
         self._is_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
     # ---- public API ----
+
+    def set_partial_failure(self, failed: bool = True) -> None:
+        """阶段内业务失败但未抛异常时，结束行显示 ✗ 而非 ✓。"""
+        self._partial_failure = bool(failed)
 
     def set_tokens(self, input_tokens: Optional[int] = None, output_tokens: Optional[int] = None):
         """设置 token 统计（在阶段结束前调用）。"""
@@ -61,7 +66,8 @@ class PhaseSpinner:
         if self._thread:
             self._thread.join(timeout=2)
         elapsed = time.time() - self._start_time
-        self._print_done(elapsed, error=exc_type is not None)
+        failed = exc_type is not None or self._partial_failure
+        self._print_done(elapsed, error=failed)
         return False  # 不吞异常
 
     # ---- internal ----

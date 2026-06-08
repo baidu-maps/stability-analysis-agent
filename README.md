@@ -197,10 +197,10 @@ sa-agent
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--crash-log` | Yes | Path to the crash log file |
+| `--crash-log` | Yes | Path to the crash log file (any extension; content-based parsing — see [Crash log formats](./docs/tools/CRASH_LOG_FORMATS.md)) |
 | `--library-dir` | Yes* | Directory with libraries (`.dylib`/`.so`) and debug symbols (`.dSYM`) |
 | `--code-root` | No | Source code root for extracting code context |
-| `--scope <value>` | No | Agent run scope (default `full`). One of `full` / `prompt_only` / `parse_only` / `parse_log_only`. See below. |
+| `--scope <value>` | No | Agent run scope (default `full`). One of `full` / `gen_prompt_only` / `parse_stack_only` / `parse_log_only`. See below. |
 | `--daemon <url>` | No | Delegate to a running daemon instance |
 
 \* Not required when using `--scope parse_log_only`.
@@ -210,9 +210,27 @@ sa-agent
 | Value | Behavior |
 |-------|----------|
 | `full` (default) | Parse + symbolize + extract code context + LLM analysis (with optional auto-fix). |
-| `prompt_only` | Run the full toolchain but skip the LLM call; emit a reusable prompt file. |
-| `parse_only` | Only parse + symbolize. `--code-root` not needed. |
+| `gen_prompt_only` | Run the full toolchain but skip the LLM call; emit a reusable prompt file. |
+| `parse_stack_only` | Only parse + symbolize. `--code-root` not needed. |
 | `parse_log_only` | Only parse the crash log. Neither `--library-dir` nor `--code-root` is needed. |
+
+### Supported crash log files and platforms
+
+**File extensions:** not restricted — `.crash`, `.txt`, `.log`, `.json`, or no suffix all work if the **content** matches a known format. You can also pass `-` for stdin. RTF exports are converted to plain text automatically.
+
+**Text reports (examples):** Apple `.crash`, iOS freeze/Mach exports, Android logcat/tombstone, Harmony `Stacktrace:` / `Tid:` dumps, native `#NN pc` stacks.
+
+**JSON exports:**
+
+| Platform / shape | `log_format` (in `01` report) |
+|------------------|-------------------------------|
+| Harmony crash platform (`crashDiagnosis:` / `crashDiagnsis:` + JSON, incl. `#NN pc` in `body.stacks`) | `harmony_crash_diagnosis_json` |
+| [Sentry](https://sentry.io/) event JSON | `sentry_event_json` |
+| [Firebase Crashlytics](https://firebase.google.com/docs/crashlytics) event JSON | `firebase_crashlytics_json` |
+| [Bugsnag](https://www.bugsnag.com/) event JSON | `bugsnag_event_json` |
+| Other dashboards (Bugly-like, custom APM) with `frames` / `stack_frames` arrays | `generic_json_stack_export` |
+
+Full matrix, parser priority, and how to add adapters: **[docs/tools/CRASH_LOG_FORMATS.md](./docs/tools/CRASH_LOG_FORMATS.md)** · [中文版](./docs/tools/CRASH_LOG_FORMATS.zh-CN.md)
 
 ## Daemon Mode
 
@@ -275,8 +293,8 @@ Default local config directory:
 If you prefer manual editing, edit these files directly in that directory.
 
 Optional advanced run modes (via `--scope`):
-- `--scope prompt_only` (full toolchain, skip LLM, emit prompt file)
-- `--scope parse_only` (parse + symbolize only)
+- `--scope gen_prompt_only` (full toolchain, skip LLM, emit prompt file)
+- `--scope parse_stack_only` (parse + symbolize only)
 - `--scope parse_log_only` (parse log only)
 
 ### Advanced: add2line config override
@@ -324,6 +342,7 @@ stability-analysis-agent/
 | Workflow System | [docs/workflows/WORKFLOWS.md](./docs/workflows/WORKFLOWS.md) |
 | RAG Vector Database | [docs/rag/README.md](./docs/rag/README.md) |
 | Crash Demos | [docs/crash_cases/README.md](./docs/crash_cases/README.md) |
+| Crash log formats & platforms | [docs/tools/CRASH_LOG_FORMATS.md](./docs/tools/CRASH_LOG_FORMATS.md) |
 
 ## Testing
 
@@ -353,7 +372,7 @@ Verify your API key is set correctly. Quick check: `python3 test/llm/test_llm_co
 Ensure `--code-root` points to the source directory that contains the files listed in the symbolized stack trace.
 
 **Q: Can I use this without an LLM key?**
-Yes. Use `--scope prompt_only` to run the full toolchain (parse + symbolize + extract code) without calling the LLM. The structured JSON output is useful on its own for triage and debugging.
+Yes. Use `--scope gen_prompt_only` to run the full toolchain (parse + symbolize + extract code) without calling the LLM. The structured JSON output is useful on its own for triage and debugging.
 
 ## Contributing
 

@@ -149,16 +149,102 @@ class ResolvedFrame:
     resolved_function: Optional[str] = None
     resolved_file: Optional[str] = None
     resolved_line: Optional[int] = None
+    # 多线程 01 对齐字段（P0）
+    thread_tid: Optional[str] = None
+    thread_name: Optional[str] = None
+    thread_index: Optional[int] = None
+    thread_is_crash_thread: Optional[bool] = None
+    thread_is_main_thread: Optional[bool] = None
+    # addr2line | log_symbol（崩溃线程沿用 01 符号）| offset_estimate | unresolved
+    resolution_kind: Optional[str] = None
+
+
+@dataclass
+class ResolvedThreadStack:
+    """按线程分组的符号化结果（与 01 threads[] 对齐）"""
+    tid: Optional[str]
+    name: Optional[str]
+    thread_index: Optional[int]
+    is_crash_thread: bool
+    frames: List[ResolvedFrame]
+    is_main_thread: Optional[bool] = None
+    success_count: int = 0
+    total_count: int = 0
+
+
+_HARMONY_PLATFORM_MODULE_MARKERS = (
+    "libace_compatible",
+    "libace_napi",
+    "libmmi-client",
+    "libeventhandler",
+    "libappkit_native",
+    "libappspawn",
+    "libbegetutil",
+    "libark_jsruntime",
+    "libffrt",
+    "ld-musl-aarch64",
+    "libarkweb_engine",
+    "libc++_shared",
+    "libhermes",
+)
+
+
+def _is_harmony_platform_module(module: Optional[str]) -> bool:
+    if not module or not isinstance(module, str):
+        return False
+    m = module.strip().lower()
+    if not m:
+        return False
+    if m.endswith(".z.so"):
+        return True
+    return any(marker in m for marker in _HARMONY_PLATFORM_MODULE_MARKERS)
+
+
+def _frame_targets_library_dir(
+    module: Optional[str],
+    library_files: List[Path],
+) -> bool:
+    if not library_files:
+        return False
+    mod = module if isinstance(module, str) else None
+    return bool(match_libraries_for_module(mod, library_files))
+
+
+def _should_emit_frame_in_02_output(
+    rf: ResolvedFrame,
+    library_files: List[Path],
+) -> bool:
+    """
+    配置了 ``library_dir`` 时，02 仅输出目录内 so 可解析的帧。
+    系统/Ace/平台库与崩溃线程 ``log_symbol`` 透传帧不写入 02。
+    """
+    if not library_files:
+        return True
+    mod = rf.module if isinstance(rf.module, str) else None
+    if _frame_targets_library_dir(mod, library_files):
+        return rf.resolution_kind in ("addr2line", "offset_estimate", "unresolved", None)
+    if _is_probably_system_module(mod) or _is_harmony_platform_module(mod):
+        return False
+    if rf.resolution_kind == "log_symbol":
+        return False
+    return False
+
 
 @dataclass
 class Add2lineResult:
-    """add2line解析结果"""
-    resolved_frames: List[ResolvedFrame]
+    """add2line解析结果（堆栈帧仅通过 ``resolved_threads[]`` 输出）"""
+    resolved_threads: List[ResolvedThreadStack]
     os_type: str
     library_path: str
     success_count: int
     total_count: int
     errors: List[str]
+    crash_thread_id: Optional[str] = None
+    crash_thread_name: Optional[str] = None
+    crash_thread_is_main_thread: Optional[bool] = None
+    crash_thread_has_business_frames: Optional[bool] = None
+    frame_count_total: Optional[int] = None
+    frame_count_resolvable: Optional[int] = None
     # 新增字段：记录本次解析实际使用的堆栈地址解析工具，便于回溯与对比环境
     tool_name: Optional[str] = None          # 例如: "atos" / "addr2line" / "llvm-addr2line"
                                               # 注：当系统仅有 llvm-symbolizer（缺少 llvm-addr2line / addr2line）时，
@@ -1242,8 +1328,16 @@ class Add2lineResolver:
                 "log_symbolicated_passthrough 过滤非 C++/前端帧: %s", cpp_filtered
             )
 
+        resolved_threads = self._wrap_frames_as_resolved_threads(
+            resolved_frames,
+            is_crash_thread=True,
+            is_main_thread=None,
+            tid=str(meta_info.get("crash_thread_id") or "") or None,
+            name=str(meta_info.get("crash_thread_name") or "").strip() or None,
+            thread_index=0,
+        )
         result = Add2lineResult(
-            resolved_frames=resolved_frames,
+            resolved_threads=resolved_threads,
             os_type=meta_info.get("os_type", "unknown"),
             library_path=library_dir_display or "",
             success_count=success_count,
@@ -1253,6 +1347,10 @@ class Add2lineResolver:
             tool_path=None,
             tools_available=self.resolver_tools or None,
             resolution_source="log_symbolicated_passthrough",
+            crash_thread_id=str(meta_info.get("crash_thread_id") or "") or None,
+            crash_thread_name=str(meta_info.get("crash_thread_name") or "").strip() or None,
+            crash_thread_is_main_thread=None,
+            crash_thread_has_business_frames=bool(resolved_frames),
         )
         if filtered_count > 0:
             logger.info("log_symbolicated_passthrough 过滤噪音帧: %s", filtered_count)
@@ -1289,6 +1387,476 @@ class Add2lineResolver:
             if outer:
                 return outer
         return f"{inner}::operator()"
+
+    @staticmethod
+    def _wrap_frames_as_resolved_threads(
+        frames: List[ResolvedFrame],
+        *,
+        is_crash_thread: bool = True,
+        is_main_thread: Optional[bool] = None,
+        tid: Optional[str] = None,
+        name: Optional[str] = None,
+        thread_index: Optional[int] = 0,
+    ) -> List[ResolvedThreadStack]:
+        """将扁平帧列表包装为单条 ``resolved_threads`` 记录（单栈路径）。"""
+        if not frames:
+            return []
+        success = sum(1 for f in frames if Add2lineResolver._frame_has_usable_output(f))
+        return [
+            ResolvedThreadStack(
+                tid=str(tid) if tid is not None else None,
+                name=str(name).strip() if name else None,
+                thread_index=thread_index,
+                is_crash_thread=bool(is_crash_thread),
+                is_main_thread=is_main_thread,
+                frames=frames,
+                success_count=success,
+                total_count=len(frames),
+            )
+        ]
+
+    @staticmethod
+    def _thread_meta_from_parse_thread(t: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "tid": t.get("tid"),
+            "name": t.get("name"),
+            "thread_index": t.get("thread_index"),
+            "is_crash_thread": bool(t.get("is_crash_thread")),
+            "is_main_thread": t.get("is_main_thread"),
+        }
+
+    @staticmethod
+    def _frame_has_usable_output(rf: ResolvedFrame) -> bool:
+        if (rf.resolved_function or "").strip() or (rf.function or "").strip():
+            return True
+        if (rf.resolved_file or "").strip():
+            return True
+        if rf.resolved_line is not None and int(rf.resolved_line or 0) > 0:
+            return True
+        return False
+
+    def _passthrough_resolved_frame(
+        self,
+        frame: Dict[str, Any],
+        meta: Dict[str, Any],
+        *,
+        resolution_kind: str = "log_symbol",
+    ) -> ResolvedFrame:
+        fn = frame.get("function")
+        demangled = self._demangle_cpp_symbol(fn) if fn else None
+        semantic = self._normalize_passthrough_function_symbol(demangled if demangled else fn)
+        return ResolvedFrame(
+            address=str(frame.get("address") or ""),
+            function=fn,
+            file=frame.get("file"),
+            line=Add2lineResolver._coerce_frame_line(frame.get("line")),
+            raw_log_line=Add2lineResolver._coerce_frame_line(frame.get("raw_log_line")),
+            module=frame.get("module"),
+            resolved_function=semantic,
+            resolved_file=self._normalize_resolved_file_name(frame.get("file")),
+            resolved_line=Add2lineResolver._coerce_frame_line(frame.get("line")),
+            thread_tid=str(meta["tid"]) if meta.get("tid") is not None else None,
+            thread_name=str(meta["name"]).strip() if meta.get("name") else None,
+            thread_index=meta.get("thread_index"),
+            thread_is_crash_thread=meta.get("is_crash_thread"),
+            thread_is_main_thread=meta.get("is_main_thread"),
+            resolution_kind=resolution_kind,
+        )
+
+    def _ordered_thread_frame_jobs(
+        self,
+        threads: List[Dict[str, Any]],
+        library_files: List[Path],
+    ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """P2：崩溃线程 → 含 library_dir 库帧的线程 → 其余线程。"""
+        crash_t: Optional[Dict[str, Any]] = None
+        app_threads: List[Dict[str, Any]] = []
+        other_threads: List[Dict[str, Any]] = []
+        for t in threads:
+            if not isinstance(t, dict):
+                continue
+            frames = t.get("frames") or []
+            if t.get("is_crash_thread"):
+                crash_t = t
+                continue
+            has_lib = any(
+                match_libraries_for_module(
+                    f.get("module") if isinstance(f, dict) else None,
+                    library_files,
+                )
+                for f in frames
+                if isinstance(f, dict)
+            )
+            if has_lib:
+                app_threads.append(t)
+            else:
+                other_threads.append(t)
+        ordered: List[Dict[str, Any]] = []
+        if crash_t:
+            ordered.append(crash_t)
+        ordered.extend(app_threads)
+        ordered.extend(other_threads)
+        jobs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        for t in ordered:
+            meta = self._thread_meta_from_parse_thread(t)
+            for f in t.get("frames") or []:
+                if isinstance(f, dict):
+                    jobs.append((meta, f))
+        return jobs
+
+    def _resolve_single_frame_for_thread(
+        self,
+        frame: Dict[str, Any],
+        meta: Dict[str, Any],
+        *,
+        library_files: List[Path],
+        crash_os_type: str,
+        selected_tool: Optional[str],
+        module_base_addresses: Dict[str, Any],
+        library_dir: str,
+        attempt_addr2line: bool,
+    ) -> Tuple[ResolvedFrame, bool, Optional[str]]:
+        """
+        解析单帧。返回 (ResolvedFrame, counted_success, error_msg)。
+        attempt_addr2line=False 时仅回填日志已有符号（崩溃线程）或保留未解析帧。
+        """
+        address = frame.get("address")
+        function = frame.get("function")
+        offset = frame.get("offset")
+        module = frame.get("module")
+        module_str = module if isinstance(module, str) else ""
+        is_crash_thread = bool(meta.get("is_crash_thread"))
+
+        base_kw = dict(
+            address=str(address or ""),
+            function=function,
+            file=frame.get("file"),
+            line=Add2lineResolver._coerce_frame_line(frame.get("line")),
+            raw_log_line=Add2lineResolver._coerce_frame_line(frame.get("raw_log_line")),
+            module=module,
+            thread_tid=str(meta["tid"]) if meta.get("tid") is not None else None,
+            thread_name=str(meta["name"]).strip() if meta.get("name") else None,
+            thread_index=meta.get("thread_index"),
+            thread_is_crash_thread=is_crash_thread,
+            thread_is_main_thread=meta.get("is_main_thread"),
+        )
+
+        if not address:
+            return (
+                ResolvedFrame(**base_kw, resolution_kind="unresolved"),
+                False,
+                None,
+            )
+
+        target_library_files = match_libraries_for_module(
+            module_str if module_str else None, library_files,
+        )
+
+        if is_crash_thread and not target_library_files:
+            rf = self._passthrough_resolved_frame(frame, meta, resolution_kind="log_symbol")
+            return rf, self._frame_has_usable_output(rf), None
+
+        if not target_library_files:
+            return (
+                ResolvedFrame(**base_kw, resolution_kind="unresolved"),
+                False,
+                None,
+            )
+
+        if not attempt_addr2line:
+            rf = self._passthrough_resolved_frame(frame, meta, resolution_kind="skipped_budget")
+            if is_crash_thread:
+                return rf, self._frame_has_usable_output(rf), None
+            return rf, False, None
+
+        # --- 以下与 resolve_stack_trace 内 _resolve_one_frame 策略一致 ---
+        if (not self.quick_mode) and crash_os_type == "macos" and module_str and not (
+            module_str.startswith("libsystem_") or module_str.startswith("libc.") or module_str.startswith("libobjc.")
+        ):
+            dylib_path = f"{library_dir}/{module_str}"
+            dsym_path = f"{library_dir}/{module_str}.dSYM/Contents/Resources/DWARF/{module_str}"
+            if os.path.exists(dylib_path) or os.path.exists(dsym_path):
+                atos_result = self._resolve_with_atos_precise(
+                    address, function, module_str, module_base_addresses, library_dir,
+                )
+                if atos_result:
+                    rf = ResolvedFrame(
+                        **base_kw,
+                        resolved_function=atos_result.get("function", function),
+                        resolved_file=self._normalize_resolved_file_name(atos_result.get("file")),
+                        resolved_line=atos_result.get("line", None),
+                        resolution_kind="addr2line",
+                    )
+                    return rf, self._frame_has_usable_output(rf), None
+
+        if function and offset:
+            demangled_function = self._demangle_cpp_symbol(function)
+            rf = ResolvedFrame(
+                **base_kw,
+                resolved_function=demangled_function,
+                resolved_file=None,
+                resolved_line=None,
+                resolution_kind="offset_estimate",
+            )
+            return rf, self._frame_has_usable_output(rf), None
+
+        address_to_use = address
+        if offset and module:
+            try:
+                if isinstance(offset, str) and (offset.startswith("0x") or offset.startswith("0X")):
+                    address_to_use = offset
+                elif isinstance(offset, str):
+                    offset_int = (
+                        int(offset, 16)
+                        if all(c in "0123456789abcdefABCDEF" for c in offset)
+                        else int(offset)
+                    )
+                    address_to_use = f"0x{offset_int:x}"
+            except (ValueError, AttributeError, TypeError):
+                address_to_use = address
+
+        resolved: Optional[ResolvedFrame] = None
+        for lib_file in target_library_files:
+            if selected_tool:
+                tool_path = (
+                    self.resolver_tools.get(selected_tool)
+                    if isinstance(selected_tool, str)
+                    else selected_tool
+                )
+                if tool_path:
+                    resolved = self._resolve_address_with_tool(
+                        address_to_use, str(lib_file), selected_tool,
+                    )
+                    if resolved and (resolved.resolved_function or resolved.resolved_file):
+                        break
+            if not resolved:
+                for tool_name in self.resolver_tools:
+                    if tool_name != selected_tool:
+                        resolved = self._resolve_address_with_tool(
+                            address_to_use, str(lib_file), tool_name,
+                        )
+                        if resolved and (resolved.resolved_function or resolved.resolved_file):
+                            break
+            if resolved and (resolved.resolved_function or resolved.resolved_file):
+                break
+
+        if resolved:
+            return (
+                ResolvedFrame(
+                    **base_kw,
+                    resolved_function=resolved.resolved_function,
+                    resolved_file=resolved.resolved_file,
+                    resolved_line=resolved.resolved_line,
+                    resolution_kind="addr2line",
+                ),
+                True,
+                None,
+            )
+
+        unresolved = ResolvedFrame(**base_kw, resolution_kind="unresolved")
+        return unresolved, False, f"无法解析地址: {address}"
+
+    def _resolve_stack_trace_by_threads(
+        self,
+        crash_data: Dict[str, Any],
+        meta_info: Dict[str, Any],
+        library_dir: str,
+        library_files: List[Path],
+        selected_tool: Optional[str],
+        max_frames: Optional[int] = None,
+    ) -> str:
+        """多线程 01 → 按线程输出 02（P0–P2）。"""
+        threads_in = crash_data.get("threads") or []
+        crash_os_type = meta_info.get("os_type", "unknown")
+        module_base_addresses = meta_info.get("module_base_addresses") or {}
+        jobs = self._ordered_thread_frame_jobs(threads_in, library_files)
+
+        frame_count_total = len(jobs)
+        frame_count_resolvable = 0
+        for _meta, fr in jobs:
+            mod = fr.get("module") if isinstance(fr, dict) else None
+            if _meta.get("is_crash_thread") or match_libraries_for_module(mod, library_files):
+                frame_count_resolvable += 1
+
+        budget = max_frames if max_frames is not None and max_frames > 0 else None
+        if budget is not None:
+            self._emit_progress(
+                f"📊 [add2line_resolver] 多线程模式: 总帧 {frame_count_total}，"
+                f"可符号化 {frame_count_resolvable}，预算 {budget}（按崩溃线程→业务库线程优先）"
+            )
+        else:
+            self._emit_progress(
+                f"📊 [add2line_resolver] 多线程模式: 总帧 {frame_count_total}，可符号化 {frame_count_resolvable}"
+            )
+
+        resolved_by_thread: Dict[Tuple[Any, Any, Any, Any], ResolvedThreadStack] = {}
+        order_keys: List[Tuple[Any, Any, Any, Any]] = []
+        errors: List[str] = []
+        success_count = 0
+        filtered_count = 0
+        attempts_used = 0
+
+        for job_idx, (meta, frame) in enumerate(jobs):
+            mod = frame.get("module") if isinstance(frame, dict) else None
+            can_resolve = bool(
+                meta.get("is_crash_thread")
+                or match_libraries_for_module(mod, library_files)
+            )
+            attempt = can_resolve and (budget is None or attempts_used < budget)
+            if can_resolve and attempt:
+                attempts_used += 1
+
+            rf, ok, err = self._resolve_single_frame_for_thread(
+                frame,
+                meta,
+                library_files=library_files,
+                crash_os_type=crash_os_type,
+                selected_tool=selected_tool,
+                module_base_addresses=module_base_addresses,
+                library_dir=library_dir,
+                attempt_addr2line=attempt,
+            )
+            if err:
+                errors.append(err)
+            if ok:
+                success_count += 1
+            elif rf.resolution_kind == "unresolved" and can_resolve and not attempt:
+                filtered_count += 1
+
+            key = (
+                meta.get("tid"),
+                meta.get("name"),
+                meta.get("thread_index"),
+                meta.get("is_crash_thread"),
+                meta.get("is_main_thread"),
+            )
+            if key not in resolved_by_thread:
+                order_keys.append(key)
+                resolved_by_thread[key] = ResolvedThreadStack(
+                    tid=str(meta["tid"]) if meta.get("tid") is not None else None,
+                    name=str(meta["name"]).strip() if meta.get("name") else None,
+                    thread_index=meta.get("thread_index"),
+                    is_crash_thread=bool(meta.get("is_crash_thread")),
+                    is_main_thread=meta.get("is_main_thread"),
+                    frames=[],
+                    success_count=0,
+                    total_count=0,
+                )
+            bucket = resolved_by_thread[key]
+            bucket.frames.append(rf)
+            bucket.total_count += 1
+            if self._frame_has_usable_output(rf):
+                bucket.success_count += 1
+
+        resolved_threads_raw = [resolved_by_thread[k] for k in order_keys]
+
+        resolved_threads: List[ResolvedThreadStack] = []
+        resolved_frames_flat: List[ResolvedFrame] = []
+        output_success_count = 0
+        for rt in resolved_threads_raw:
+            kept: List[ResolvedFrame] = []
+            for rf in rt.frames:
+                if not _should_emit_frame_in_02_output(rf, library_files):
+                    filtered_count += 1
+                    continue
+                kept.append(rf)
+            if not kept:
+                continue
+            t_success = sum(1 for f in kept if self._frame_has_usable_output(f))
+            resolved_threads.append(
+                ResolvedThreadStack(
+                    tid=rt.tid,
+                    name=rt.name,
+                    thread_index=rt.thread_index,
+                    is_crash_thread=rt.is_crash_thread,
+                    is_main_thread=rt.is_main_thread,
+                    frames=kept,
+                    success_count=t_success,
+                    total_count=len(kept),
+                )
+            )
+            for rf in kept:
+                if rf.resolution_kind in ("addr2line", "offset_estimate") and self._frame_has_usable_output(
+                    rf
+                ):
+                    resolved_frames_flat.append(rf)
+                    if rf.resolution_kind == "addr2line":
+                        output_success_count += 1
+                elif rf.resolution_kind == "offset_estimate" and self._frame_has_usable_output(rf):
+                    resolved_frames_flat.append(rf)
+
+        resolved_frames_flat, cpp_filtered = self._filter_cpp_native_output_frames(
+            resolved_frames_flat, crash_info=crash_data.get("crash_info") or {},
+        )
+        if cpp_filtered:
+            filtered_count += cpp_filtered
+
+        success_count = output_success_count if output_success_count else sum(
+            1 for rf in resolved_frames_flat if (rf.resolved_function or rf.resolved_file)
+        )
+        threads_out = len(resolved_threads)
+        frame_count_resolvable_out = sum(rt.total_count for rt in resolved_threads)
+
+        crash_thread_id = meta_info.get("crash_thread_id")
+        crash_thread_name = meta_info.get("crash_thread_name")
+        crash_thread_is_main_thread: Optional[bool] = None
+        crash_thread_has_business_frames = False
+        for t in threads_in:
+            if not isinstance(t, dict):
+                continue
+            tid = t.get("tid")
+            matches_crash = bool(t.get("is_crash_thread")) or (
+                crash_thread_id is not None and tid is not None and str(tid) == str(crash_thread_id)
+            )
+            if not matches_crash:
+                continue
+            if isinstance(t.get("is_main_thread"), bool):
+                crash_thread_is_main_thread = bool(t.get("is_main_thread"))
+            for fr in t.get("frames") or []:
+                if isinstance(fr, dict) and match_libraries_for_module(fr.get("module"), library_files):
+                    crash_thread_has_business_frames = True
+                    break
+            break
+        if not crash_thread_id:
+            for rt in resolved_threads:
+                if rt.is_crash_thread:
+                    crash_thread_id = rt.tid
+                    crash_thread_name = rt.name
+                    break
+
+        selected_tool_name: Optional[str] = None
+        selected_tool_path: Optional[str] = None
+        if isinstance(selected_tool, str):
+            selected_tool_name = selected_tool
+            selected_tool_path = self.resolver_tools.get(selected_tool)
+
+        total_count = frame_count_resolvable_out if frame_count_resolvable_out > 0 else 0
+
+        result = Add2lineResult(
+            resolved_threads=resolved_threads,
+            os_type=crash_os_type,
+            library_path=library_dir,
+            success_count=success_count,
+            total_count=total_count,
+            errors=errors,
+            tool_name=selected_tool_name,
+            tool_path=selected_tool_path,
+            tools_available=self.resolver_tools or None,
+            crash_thread_id=str(crash_thread_id) if crash_thread_id is not None else None,
+            crash_thread_name=str(crash_thread_name).strip() if crash_thread_name else None,
+            crash_thread_is_main_thread=crash_thread_is_main_thread,
+            crash_thread_has_business_frames=crash_thread_has_business_frames,
+            frame_count_total=frame_count_total,
+            frame_count_resolvable=frame_count_resolvable,
+        )
+        logger.info(
+            "多线程解析完成: success=%s total(02输出)=%s threads=%s "
+            "(已按 library_dir 过滤系统/平台库帧)",
+            success_count,
+            total_count,
+            threads_out,
+        )
+        return json.dumps(asdict(result), ensure_ascii=False, indent=2)
 
     def resolve_stack_trace(
         self, crash_json: str, library_dir: Optional[str] = None, max_frames: Optional[int] = None
@@ -1462,6 +2030,19 @@ class Add2lineResolver:
                     "os_type": crash_os_type,
                     "suggestion": "请确保系统安装了addr2line（Linux）或atos（macOS）工具，对于HarmonyOS请安装llvm-addr2line"
                 }, ensure_ascii=False, indent=2)
+
+            threads_multi = crash_data.get("threads")
+            if isinstance(threads_multi, list) and any(
+                isinstance(t, dict) and (t.get("frames") or []) for t in threads_multi
+            ):
+                return self._resolve_stack_trace_by_threads(
+                    crash_data,
+                    meta_info,
+                    library_dir,
+                    library_files,
+                    selected_tool,
+                    max_frames=max_frames,
+                )
             
             # 解析每个堆栈帧（并行执行，按输入顺序汇总结果）
             resolved_frames = []
@@ -1633,8 +2214,18 @@ class Add2lineResolver:
                     selected_tool_name = str(selected_tool)
                     selected_tool_path = None
 
+            parse_threads = crash_data.get("threads") or []
+            thread0 = parse_threads[0] if parse_threads and isinstance(parse_threads[0], dict) else {}
+            flat_threads = self._wrap_frames_as_resolved_threads(
+                resolved_frames,
+                is_crash_thread=bool(thread0.get("is_crash_thread", True)),
+                is_main_thread=thread0.get("is_main_thread"),
+                tid=thread0.get("tid"),
+                name=thread0.get("name"),
+                thread_index=thread0.get("thread_index") if thread0.get("thread_index") is not None else 0,
+            )
             result = Add2lineResult(
-                resolved_frames=resolved_frames,
+                resolved_threads=flat_threads,
                 os_type=meta_info.get('os_type', 'unknown'),
                 library_path=library_dir,
                 success_count=success_count,
@@ -1642,7 +2233,15 @@ class Add2lineResolver:
                 errors=errors,
                 tool_name=selected_tool_name,
                 tool_path=selected_tool_path,
-                tools_available=self.resolver_tools or None
+                tools_available=self.resolver_tools or None,
+                crash_thread_id=str(meta_info.get("crash_thread_id") or "") or None,
+                crash_thread_name=str(meta_info.get("crash_thread_name") or "").strip() or None,
+                crash_thread_is_main_thread=(
+                    thread0.get("is_main_thread")
+                    if isinstance(thread0.get("is_main_thread"), bool)
+                    else None
+                ),
+                crash_thread_has_business_frames=bool(resolved_frames),
             )
             
             logger.info(f"解析完成: {success_count}/{len(stack_frames)} 个地址成功解析（其中跳过 {filtered_count} 个不在 library_dir 中的库帧）")
@@ -2844,7 +3443,7 @@ def add2line_resolver(
         
     Returns:
         str: JSON格式的解析结果，包含：
-            - resolved_frames: 解析后的堆栈帧列表
+            - resolved_threads: 按线程分组的解析后堆栈帧
             - os_type: 操作系统类型
             - library_path: 库目录路径
             - success_count: 成功解析的地址数量
@@ -2953,7 +3552,7 @@ class Add2LineResolverTool(BaseTool):
             output_schema={
                 "type": "object",
                 "properties": {
-                    "resolved_frames": {"type": "array"},
+                    "resolved_threads": {"type": "array"},
                 },
             },
             category="resolver",

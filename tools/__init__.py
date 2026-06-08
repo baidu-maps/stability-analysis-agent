@@ -26,6 +26,8 @@ from .symbol_callsite_finder_tool import SymbolCallsiteFinderTool
 from .snippet_extractor_tool import SnippetExtractorTool
 from .fix_code_extractor_tool import FixCodeExtractorTool
 from .fix_code_applier_tool import FixCodeApplierTool
+from .vector_memory_retriever_tool import VectorMemoryRetrieverTool
+from .repo_search_tool import RepoSearchTool
 
 __all__ = [
     # Tool classes
@@ -43,6 +45,8 @@ __all__ = [
     "SnippetExtractorTool",
     "FixCodeExtractorTool",
     "FixCodeApplierTool",
+    "VectorMemoryRetrieverTool",
+    "RepoSearchTool",
     # Registration helper
     "register_all_tools",
 ]
@@ -106,6 +110,22 @@ def register_all_tools(registry=None):
     registry.register(
         "fix_code_applier",
         FixCodeApplierTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    registry.register(
+        "vector_memory_retriever",
+        VectorMemoryRetrieverTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    registry.register(
+        "repo_search",
+        RepoSearchTool(),
         priority=Priority.BUILTIN,
         force_override=False,
         is_tool=True,

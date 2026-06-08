@@ -157,29 +157,15 @@ self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=float(self.time
 
 ## Phase 5：应用代码修复（21s → 0.01s）
 
-### 瓶颈定位
+### Fast-Path 提取（仅依赖 Phase 4 输出）
 
-Phase 4 的 LLM 输出通常已包含完整的修复代码（带 ```cpp 围栏），但 Phase 5 仍会发起一次新的 LLM 调用来生成 fix_plan JSON。对简单案例这完全冗余。
+为了减少额外的 LLM 调用，当前自动改码阶段**只依赖 Phase 4 的分析输出文本**来提取修复代码，不再在 Phase 5 再次向大模型请求 JSON 形式的修复计划。
 
-### 优化措施：Fast-Path 提取
-
-在 `CodeFixer.generate_and_apply` 中，先尝试直接从 Phase 4 的分析文本中提取修复代码：
-
-```python
-# services/code_fixer.py
-fast_fix_plan = self._try_extract_fix_plan_from_analysis(
-    analysis_text, candidate_nodes, required_targets
-)
-if fast_fix_plan is not None:
-    fix_plan = fast_fix_plan  # 跳过 LLM 调用
-else:
-    generator = FixPlanGenerator(self._llm)
-    fix_plan = generator.generate(...)  # fallback: 调 LLM
-```
+在 `CodeFixer.generate_and_apply` 中，始终通过 `_try_extract_fix_plan_from_analysis()` 和 `FixCodeExtractorTool` 从 `analysis_text` 中扫描代码块、匹配函数签名并构造 `fix_plan`。如果提取失败，则直接跳过自动改码，让人工根据 `06_ai_res` 与源码判断是否需要手动修改。
 
 ### 提取鲁棒性增强
 
-Fast-path 依赖从 LLM 输出中准确提取修复代码。针对 3 类提取失败场景做了增强：
+基于 Phase 4 文本提取依赖 LLM 输出的格式与内容质量。针对 3 类提取失败场景做了增强：
 
 #### 场景 1：注释中的 `...` 被误判为占位符
 
@@ -281,7 +267,7 @@ done
 如果 Phase 5 耗时 > 1s，说明 fast-path 未命中，fallback 到了 LLM 调用。可能原因：
 
 1. Phase 4 输出被 max_tokens 截断（检查输出 tokens 是否接近 max_tokens）
-2. 修复代码未使用 ```cpp 围栏（检查 `06_ai_res.txt`）
+2. 修复代码未使用 ```cpp 围栏（检查 `06_ai_gen_res.md`）
 3. 代码中包含 `...` 占位符（检查 `_contains_placeholder_code` 判定）
 4. candidate_nodes 中无目标函数匹配（检查 `03_code_content_provider.json`）
 
@@ -290,7 +276,7 @@ done
 ```bash
 python3 -c "
 from services.code_fixer import _extract_code_blocks, _extract_replacement_from_analysis
-text = open('cli_reports/<latest>/round_0/06_ai_res.txt').read()
+text = open('cli_reports/<latest>/round_0/06_ai_gen_res.md').read()
 blocks = _extract_code_blocks(text)
 print(f'代码块数: {len(blocks)}')
 result = _extract_replacement_from_analysis(text, '<target_function>(')

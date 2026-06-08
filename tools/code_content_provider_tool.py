@@ -17,6 +17,18 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tools._stack_symbol_utils import sanitize_stack_symbol
+from tools.code_context_errors import (
+    CodeContextUserError,
+    NO_EXTRACTABLE_CONTEXT,
+    NO_FRAMES_IN_CODE_ROOT,
+)
+from tools.analysis_entry_display import should_emit_crash_location_coordinates_in_03
+from tools.crash_location_display import display_location_type
+from tools.owner_class_context import (
+    build_class_skeleton_node,
+    should_persist_owner_class_for_crash_summary_dataclass,
+    should_persist_owner_class_from_crash_summary,
+)
 try:
     from tree_sitter_languages import get_parser as _ts_get_parser
 except Exception:
@@ -25,6 +37,62 @@ except Exception:
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _drop_none_values(value: Any) -> Any:
+    """递归删除 JSON 输出中的 None，降低人工阅读噪音。"""
+    if isinstance(value, dict):
+        return {
+            k: cleaned
+            for k, v in value.items()
+            if (cleaned := _drop_none_values(v)) is not None
+        }
+    if isinstance(value, list):
+        return [_drop_none_values(v) for v in value]
+    return value
+
+
+def _build_readable_crash_summary(cs: Dict[str, Any]) -> Dict[str, Any]:
+    """将历史平铺 crash_summary 收敛为面向人工阅读的嵌套结构。"""
+    if not isinstance(cs, dict):
+        return {}
+
+    crash_location: Dict[str, Any] = {
+        "location_type": display_location_type(
+            cs.get("attributed_crash_location_status"),
+            cs.get("crash_location_source"),
+            crash_summary=cs,
+        ),
+    }
+    if should_emit_crash_location_coordinates_in_03(cs):
+        crash_location.update(
+            {
+                "file": cs.get("analysis_entry_file"),
+                "function": cs.get("analysis_entry_function"),
+                "line": cs.get("crash_line_number"),
+                "code": cs.get("crash_line_code"),
+                "source": cs.get("crash_location_source")
+                or cs.get("analysis_entry_location_source"),
+                "stack_address": cs.get("stack_address")
+                or cs.get("analysis_entry_stack_address"),
+                "node_id": cs.get("node_id") or cs.get("analysis_entry_node_id"),
+            }
+        )
+        if cs.get("owner_class_node_id"):
+            crash_location["owner_class_node_id"] = cs.get("owner_class_node_id")
+
+    out: Dict[str, Any] = {
+        "error_type": cs.get("error_type"),
+        "crash_thread": {
+            "id": cs.get("crash_thread_id"),
+            "name": cs.get("crash_thread_name"),
+            "is_main_thread": cs.get("is_main_thread_crash"),
+            "has_library_dir_business_frames": cs.get("crash_thread_has_business_frames"),
+            "attribution_source": cs.get("crash_attribution_source"),
+        },
+        "crash_location": crash_location,
+    }
+    return _drop_none_values(out)
 
 
 def _use_shared_var_edge_relation_strength(rel: Optional[str]) -> int:
@@ -67,6 +135,27 @@ class CrashSummary:
     crash_line_note: Optional[str] = None          # 说明文字，如精确行号未知时的提示
     # 可选：当前认为的崩溃行对应源码（from_add2line 时为精确行，from_log_deduce 时通常为函数定义行）
     crash_line_code: Optional[str] = None
+    crash_thread_id: Optional[str] = None
+    crash_thread_name: Optional[str] = None
+    is_main_thread_crash: Optional[bool] = None
+    crash_thread_has_business_frames: Optional[bool] = None
+    crash_attribution_source: Optional[str] = None
+    selected_analysis_thread_id: Optional[str] = None
+    selected_analysis_thread_name: Optional[str] = None
+    selected_analysis_is_crash_thread: Optional[bool] = None
+    selected_analysis_is_main_thread: Optional[bool] = None
+    selected_analysis_source: Optional[str] = None
+    selected_analysis_confidence: Optional[str] = None
+    selected_analysis_note: Optional[str] = None
+    analysis_entry_stack_address: Optional[str] = None
+    analysis_entry_file: Optional[str] = None
+    analysis_entry_function: Optional[str] = None
+    analysis_entry_line_number: Optional[int] = None
+    analysis_entry_line_code: Optional[str] = None
+    analysis_entry_location_source: Optional[str] = None
+    analysis_entry_node_id: Optional[str] = None
+    owner_class_node_id: Optional[str] = None
+    attributed_crash_location_status: Optional[str] = None
 
 @dataclass
 class CrashFunction:
@@ -111,6 +200,10 @@ class ThreadContext:
     """线程上下文信息"""
     thread_id: str
     call_chain_from_add2line: List[str]
+    thread_name: Optional[str] = None
+    is_crash_thread: Optional[bool] = None
+    is_main_thread: Optional[bool] = None
+    has_business_frames: Optional[bool] = None
     shared_vars: Optional[List[str]] = None
     sync_primitives: Optional[List[str]] = None
     # 与 call_chain_from_add2line 等长：每帧的 resolved_file / resolved_line，供图构建优先按 addr2line 定位
@@ -147,6 +240,8 @@ class GraphEdge:
     to_id: str
     type: str  # "calls_direct" | "calls_stack_order" | "calls_to_crash_site" | "use_shared_var"
     thread_id: Optional[str] = None
+    is_crash_thread: Optional[bool] = None
+    is_main_thread: Optional[bool] = None
     relation: Optional[str] = None   # 如变量读写关系等
 
 @dataclass
@@ -156,6 +251,8 @@ class ExecutionPath:
     thread_id: Optional[str]
     nodes: List[str]  # 一串 GraphNode.id
     description: Optional[str] = None
+    is_crash_thread: Optional[bool] = None
+    is_main_thread: Optional[bool] = None
 
 @dataclass
 class CrashGraph:
@@ -1286,6 +1383,15 @@ class CodeContentProvider:
         """
         return self._locator.find_source_file(resolved_file, code_roots)
 
+    def _record_location_pipeline(self, step: str, **fields: Any) -> None:
+        """记录 03 生成过程中的高层决策步骤（写入 location_trace）。"""
+        if getattr(self, "_locator", None) is not None:
+            self._locator.ctx.record_location("pipeline", step=step, **fields)
+
+    def _attach_location_trace(self, result_dict: Dict[str, Any]) -> None:
+        if getattr(self, "_locator", None) is not None:
+            result_dict["location_trace"] = self._locator.export_location_trace()
+
     def _ctor_or_dtor_class_name_from_resolved(self, resolved_function: str) -> Optional[str]:
         """
         从 demangled 符号中识别「类名::类名()」形式的构造 / 「类名::~类名」析构，返回类名。
@@ -2104,7 +2210,51 @@ class CodeContentProvider:
             return snippet, i + 1, end + 1, signature
         return None
 
-    def _extract_class_name_from_resolved(self, resolved_function: str) -> Optional[str]:
+    def _owner_is_class_or_struct_in_source(
+        self,
+        class_name: str,
+        crash_file: str,
+        code_roots: Optional[List[str]] = None,
+    ) -> bool:
+        """符号 :: 前缀须对应工程内 class/struct 定义；纯命名空间不算类成员 owner。"""
+        if not class_name or not crash_file:
+            return False
+        try:
+            actual = self._find_source_file(crash_file, code_roots or []) or crash_file
+            ap = os.path.abspath(actual)
+        except Exception:
+            ap = os.path.abspath(crash_file)
+        if not ap or not os.path.isfile(ap):
+            return False
+        dirname = os.path.dirname(ap)
+        base_noext = os.path.splitext(os.path.basename(ap))[0]
+        candidates: List[str] = []
+        for ext in (".h", ".hpp", ".hh", ".hxx"):
+            hp = os.path.join(dirname, base_noext + ext)
+            if os.path.isfile(hp):
+                candidates.append(os.path.abspath(hp))
+        candidates.append(ap)
+        seen_paths: set = set()
+        pat = re.compile(rf"\b(?:class|struct)\s+{re.escape(class_name)}\b")
+        for path in candidates:
+            if not path or path in seen_paths or not os.path.isfile(path):
+                continue
+            seen_paths.add(path)
+            try:
+                text = Path(path).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if pat.search(text):
+                return True
+        return False
+
+    def _extract_class_name_from_resolved(
+        self,
+        resolved_function: str,
+        *,
+        crash_file: Optional[str] = None,
+        code_roots: Optional[List[str]] = None,
+    ) -> Optional[str]:
         """从解析后的函数名中提取类名（处理 mangled name）"""
         # 处理 mangled name，如 _ZN11DataManager8add_dataEim
         # 尝试从 mangled name 中提取类名
@@ -2117,7 +2267,7 @@ class CodeContentProvider:
                 class_name = match.group(2)
                 logger.info(f"从 mangled name 中提取类名: {class_name}")
                 return class_name
-        
+
         # 处理正常格式：ns::Class::method 或 Class::method
         if "::" in resolved_function:
             head = resolved_function.split("(", 1)[0].strip()
@@ -2125,8 +2275,18 @@ class CodeContentProvider:
             if len(parts) >= 2:
                 owner = parts[-2].split("<", 1)[0].strip()
                 owner = owner.split()[-1] if " " in owner else owner
-                return owner or None
-        
+                if not owner:
+                    return None
+                if crash_file:
+                    if not self._owner_is_class_or_struct_in_source(
+                        owner, crash_file, code_roots
+                    ):
+                        return None
+                elif len(parts) == 2:
+                    # 无源码时无法区分 ns::func 与 Class::func
+                    return None
+                return owner
+
         return None
     
     def _calculate_crash_line_score(self, line_content: str) -> int:
@@ -2977,12 +3137,14 @@ class CodeContentProvider:
         self, add2line_data: Optional[Dict[str, Any]], code_roots: List[str]
     ) -> List[str]:
         """
-        从 add2line 的 resolved_frames 提取工程内源码路径（按堆栈帧顺序），去重。
+        从 add2line 的 resolved_threads 提取工程内源码路径（按堆栈帧顺序），去重。
         用于静态「直接调用者 / 共享变量」搜索时先于全仓扫描。
         """
+        from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
         out: List[str] = []
         seen: set = set()
-        frames = ((add2line_data or {}).get("resolved_frames")) or []
+        frames = flatten_resolved_frames_from_stack(add2line_data or {})
         roots_abs = _normalize_code_roots_arg(code_roots)
         for frame in frames:
             self._code_context_phase_check("stack_priority_source_files")
@@ -5577,11 +5739,28 @@ class CodeContentProvider:
                                     if self._is_variable_usage_line(line, var):
                                         function_name = self._extract_function_name_at_line(lines, i)
                                         if function_name and function_name != crash_function_name:
+                                            from tools.function_snippet_utils import (
+                                                is_plausible_function_name,
+                                                is_plausible_function_signature,
+                                            )
+
+                                            if not is_plausible_function_name(function_name):
+                                                continue
                                             # 提取函数的完整代码
                                             function_code = self._extract_full_function_code(
                                                 lines, i - 1, target_function_name=function_name
                                             )
                                             if function_code:
+                                                probe = next(
+                                                    (
+                                                        ln.strip()
+                                                        for ln in function_code.split("\n")
+                                                        if ln.strip()
+                                                    ),
+                                                    "",
+                                                )
+                                                if not is_plausible_function_signature(probe):
+                                                    continue
                                                 # 确定变量使用关系
                                                 relation = self._determine_variable_relation(line, var)
 
@@ -6124,7 +6303,11 @@ class CodeContentProvider:
         当崩溃点为类成员时，提取所属类型的声明摘录与成员字段名（供 LLM 理解 m_state 等成员）。
         同时生成精简的类骨架（函数签名列表+成员变量声明），用于 fix_plan 阶段。
         """
-        cls = self._extract_class_name_from_resolved(resolved_function or "")
+        cls = self._extract_class_name_from_resolved(
+            resolved_function or "",
+            crash_file=crash_file,
+            code_roots=code_roots,
+        )
         if not cls or not crash_file:
             return None
         actual = self._find_source_file(crash_file, code_roots) or crash_file
@@ -6276,7 +6459,11 @@ class CodeContentProvider:
         解决成员函数里大量 `head`/`tail` 未写 `this->` 时共享变量候选为空的问题。
         """
         merged: set = set(base_shared or [])
-        cls = self._extract_class_name_from_resolved(resolved_function or "")
+        cls = self._extract_class_name_from_resolved(
+            resolved_function or "",
+            crash_file=crash_file,
+            code_roots=code_roots,
+        )
         if not cls or not (func_code and func_code.strip()):
             return sorted(merged)
         fields = self._collect_outer_class_field_names(cls, crash_file, code_roots)
@@ -6351,7 +6538,9 @@ class CodeContentProvider:
         #    场景：HandleDataFail 调用 m_pclRoute->GetID()（同类不同方法），
         #    静态分析找不到它调用 GetLegSize，但运行时栈表明它是调用方。
         if add2line_data and stack_priority_files and crash_class:
-            frames = (add2line_data.get("resolved_frames") or [])
+            from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
+            frames = flatten_resolved_frames_from_stack(add2line_data)
             # 取栈第 2~3 帧（第 1 帧是崩溃函数自身）
             caller_func_names: List[str] = []
             for fr in frames[1:3]:
@@ -6428,6 +6617,8 @@ class CodeContentProvider:
         seen: set = set()
         for v in sorted(member_or_global):
             if v in seen or v in self._SHARED_VAR_BLOCKLIST:
+                continue
+            if v in self._CPP_TYPE_NAME_SKIP:
                 continue
             if not self._is_valid_variable_name(v):
                 continue
@@ -6880,7 +7071,9 @@ class CodeContentProvider:
         )
         stack_ids: List[str] = []
 
-        for frame in add2line_data.get("resolved_frames") or []:
+        from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
+        for frame in flatten_resolved_frames_from_stack(add2line_data):
             if not isinstance(frame, dict):
                 continue
             rfile = str(frame.get("resolved_file") or "").strip()
@@ -7103,21 +7296,9 @@ class CodeContentProvider:
             return nid
 
         def _is_plausible_function_signature(sig: Optional[str]) -> bool:
-            s = (sig or "").strip()
-            if not s:
-                return False
-            # 过滤控制流语句，避免把 "if (...)" 误当成函数签名
-            if re.match(r"^(if|for|while|switch|catch)\b", s):
-                return False
-            # 隐式构造成员子对象：snippet 首行常为 struct/class 定义
-            if re.match(r"^\s*(?:template\s*<[^>]+>\s*)?(?:struct|class)\s+\w+", s):
-                return True
-            # 过滤明显"语句级误命中"
-            if ";" in s and "(" in s and ")" in s and "::" not in s:
-                return False
-            if "(" not in s or ")" not in s:
-                return False
-            return True
+            from tools.function_snippet_utils import is_plausible_function_signature
+
+            return is_plausible_function_signature(sig)
 
         code_roots_for_graph: List[str] = list(getattr(self, "current_code_roots", []) or [])
         if not code_roots_for_graph and getattr(self, "current_code_root", None):
@@ -7267,7 +7448,18 @@ class CodeContentProvider:
 
         merged_use_shared: Dict[Tuple[str, str], str] = {}
         for vf in use_same_var_related_fun:
+            from tools.function_snippet_utils import (
+                is_plausible_function_name,
+                is_plausible_function_signature,
+            )
+
+            if not is_plausible_function_name(vf.name):
+                continue
             sig = vf.snippet[0].strip() if vf.snippet else None
+            if not is_plausible_function_signature(sig):
+                sig = _normalize_signature(vf.name, vf.name)
+            if not is_plausible_function_signature(sig):
+                continue
             fn_id = ensure_func_node(vf.name, vf.file, sig, vf.snippet)
             v_id = var_node_id(vf.variable)
             if v_id not in var_nodes:
@@ -7430,8 +7622,13 @@ class CodeContentProvider:
             call_chain_from_add2line.append(
                 {
                     "thread_id": tc.thread_id,
+                    "thread_name": tc.thread_name,
+                    "is_crash_thread": tc.is_crash_thread,
+                    "is_main_thread": tc.is_main_thread,
+                    "has_business_frames": tc.has_business_frames,
                     "nodes": thread_nodes,
                     "source_positions": source_positions,
+                    "call_order_from_add2line": list(tc.call_chain_from_add2line),
                 }
             )
 
@@ -7448,6 +7645,8 @@ class CodeContentProvider:
                 if len(tnodes) < 2:
                     continue
                 tid = item.get("thread_id")
+                item_is_crash = item.get("is_crash_thread")
+                item_is_main = item.get("is_main_thread")
                 for i in range(len(tnodes) - 1, 0, -1):
                     outer_id, inner_id = tnodes[i], tnodes[i - 1]
                     outer_node = nodes.get(outer_id)
@@ -7462,6 +7661,8 @@ class CodeContentProvider:
                                 to_id=inner_id,
                                 type="calls_direct",
                                 thread_id=tid,
+                                is_crash_thread=item_is_crash if isinstance(item_is_crash, bool) else None,
+                                is_main_thread=item_is_main if isinstance(item_is_main, bool) else None,
                             )
                         )
                     else:
@@ -7471,6 +7672,8 @@ class CodeContentProvider:
                                 to_id=inner_id,
                                 type="calls_stack_order",
                                 thread_id=tid,
+                                is_crash_thread=item_is_crash if isinstance(item_is_crash, bool) else None,
+                                is_main_thread=item_is_main if isinstance(item_is_main, bool) else None,
                             )
                         )
 
@@ -7486,6 +7689,8 @@ class CodeContentProvider:
                     continue
                 tid_raw = item.get("thread_id")
                 tid_str = "unknown" if tid_raw is None else str(tid_raw)
+                item_is_crash = item.get("is_crash_thread")
+                item_is_main = item.get("is_main_thread")
                 chain_outer_to_crash = list(reversed(tnodes))
                 verified_chain = self._longest_verified_suffix_chain(
                     chain_outer_to_crash, verified_stack_pairs
@@ -7502,6 +7707,8 @@ class CodeContentProvider:
                         thread_id=tid_str,
                         nodes=verified_chain,
                         description=None,
+                        is_crash_thread=item_is_crash if isinstance(item_is_crash, bool) else None,
+                        is_main_thread=item_is_main if isinstance(item_is_main, bool) else None,
                     )
                 )
                 stack_path_idx += 1
@@ -7519,12 +7726,16 @@ class CodeContentProvider:
                         continue
                     tid_raw = item.get("thread_id")
                     tid_str = "unknown" if tid_raw is None else str(tid_raw)
+                    item_is_crash = item.get("is_crash_thread")
+                    item_is_main = item.get("is_main_thread")
                     stack_fallback_paths.append(
                         ExecutionPath(
                             id=f"path_stack_order_{stack_path_idx}",
                             thread_id=tid_str,
                             nodes=kept,
                             description="inferred_from_add2line_stack_order",
+                            is_crash_thread=item_is_crash if isinstance(item_is_crash, bool) else None,
+                            is_main_thread=item_is_main if isinstance(item_is_main, bool) else None,
                         )
                     )
                     stack_path_idx += 1
@@ -7537,7 +7748,7 @@ class CodeContentProvider:
         deduped_edges: List[GraphEdge] = []
         seen_edge_keys: set = set()
         for e in edges:
-            key = (e.from_id, e.to_id, e.type)
+            key = (e.from_id, e.to_id, e.type, e.thread_id, e.is_crash_thread, e.is_main_thread)
             if key in seen_edge_keys:
                 continue
             seen_edge_keys.add(key)
@@ -7617,6 +7828,10 @@ class CodeContentProvider:
         for item in call_chain_from_add2line:
             thread_context.append({
                 "thread_id": item.get("thread_id") or "unknown",
+                "thread_name": item.get("thread_name"),
+                "is_crash_thread": item.get("is_crash_thread"),
+                "is_main_thread": item.get("is_main_thread"),
+                "has_business_frames": item.get("has_business_frames"),
                 "call_chain_from_add2line": item.get("call_order_from_add2line") or [],
             })
 
@@ -7855,9 +8070,16 @@ class CodeContentProvider:
             r'([A-Za-z_][A-Za-z_0-9:]*::operator[^\s(]*)\s*\(',  # CVStringHash::operator(
         ]
 
+        from tools.function_snippet_utils import (
+            is_control_flow_source_line,
+            is_plausible_function_name,
+        )
+
         for i in range(start, end - 1, -1):
             line = lines[i].strip()
             if not line or line.startswith("//") or line.startswith("/*"):
+                continue
+            if is_control_flow_source_line(line):
                 continue
             for pattern in function_patterns:
                 match = re.search(pattern, line)
@@ -7872,23 +8094,73 @@ class CodeContentProvider:
                         candidate = match.group(1)
                         if candidate in keywords:
                             continue
-                        return candidate
+                        if is_plausible_function_name(candidate):
+                            return candidate
 
         return None
     
     def _analyze_thread_context(self, add2line_data: Dict[str, Any]) -> List[ThreadContext]:
         """分析线程上下文"""
         logger.info("分析线程上下文")
-        thread_contexts = []
-        
-        # 从add2line数据中提取线程信息
-        resolved_frames = add2line_data.get("resolved_frames", [])
-        
-        # 提取崩溃线程信息（基于 add2line 符号化结果构造的简单调用链）
-        crash_thread_id = "unknown"
+        thread_contexts: List[ThreadContext] = []
+
+        resolved_threads = add2line_data.get("resolved_threads") or []
+        if isinstance(resolved_threads, list) and resolved_threads:
+            default_crash_tid = str(add2line_data.get("crash_thread_id") or "unknown")
+            for rt in resolved_threads:
+                if not isinstance(rt, dict):
+                    continue
+                tid = rt.get("tid")
+                thread_id = str(tid) if tid is not None else default_crash_tid
+                thread_name = str(rt.get("name") or "").strip() or None
+                is_crash_thread = bool(rt.get("is_crash_thread"))
+                is_main_thread = rt.get("is_main_thread")
+                has_business_frames = False
+                call_chain: List[str] = []
+                frame_details: List[Dict[str, Any]] = []
+                for frame in rt.get("frames") or []:
+                    if not isinstance(frame, dict):
+                        continue
+                    module = str(frame.get("module") or "")
+                    if module and not self._is_probably_system_module_name(module):
+                        has_business_frames = True
+                    resolved_function = (
+                        frame.get("resolved_function") or frame.get("function") or ""
+                    )
+                    if not str(resolved_function).strip():
+                        continue
+                    call_chain.append(str(resolved_function))
+                    frame_details.append(
+                        {
+                            "resolved_function": resolved_function,
+                            "resolved_file": frame.get("resolved_file", "") or "",
+                            "resolved_line": int(frame.get("resolved_line") or 0),
+                            "module": module,
+                        }
+                    )
+                if not call_chain:
+                    continue
+                thread_contexts.append(
+                    ThreadContext(
+                        thread_id=thread_id,
+                        thread_name=thread_name,
+                        is_crash_thread=is_crash_thread,
+                        is_main_thread=is_main_thread if isinstance(is_main_thread, bool) else None,
+                        has_business_frames=has_business_frames,
+                        call_chain_from_add2line=call_chain,
+                        call_chain_frame_details=frame_details if frame_details else None,
+                    )
+                )
+            if thread_contexts:
+                return thread_contexts
+
+        # 回退：扁平化（旧版 02 含 resolved_frames）
+        from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
+        resolved_frames = flatten_resolved_frames_from_stack(add2line_data)
+        crash_thread_id = str(add2line_data.get("crash_thread_id") or "unknown")
         crash_call_chain = []
-        frame_details: List[Dict[str, Any]] = []
-        
+        frame_details = []
         for frame in resolved_frames:
             resolved_function = frame.get("resolved_function", "")
             if resolved_function:
@@ -7900,16 +8172,107 @@ class CodeContentProvider:
                         "resolved_line": int(frame.get("resolved_line") or 0),
                     }
                 )
-        
-        # 创建崩溃线程上下文
         if crash_call_chain:
-            thread_contexts.append(ThreadContext(
-                thread_id=crash_thread_id,
-                call_chain_from_add2line=crash_call_chain,
-                call_chain_frame_details=frame_details if frame_details else None,
-            ))
+            thread_contexts.append(
+                ThreadContext(
+                    thread_id=crash_thread_id,
+                    is_crash_thread=True,
+                    is_main_thread=None,
+                    has_business_frames=True,
+                    call_chain_from_add2line=crash_call_chain,
+                    call_chain_frame_details=frame_details if frame_details else None,
+                )
+            )
 
         return thread_contexts
+
+    def _annotate_crash_summary_thread_attribution(
+        self,
+        crash_summary: CrashSummary,
+        add2line_data: Dict[str, Any],
+        selected_frame: Optional[Dict[str, Any]],
+    ) -> None:
+        """区分平台归因崩溃线程与当前选中的业务分析入口。"""
+        if not isinstance(add2line_data, dict):
+            add2line_data = {}
+        selected_frame = selected_frame or {}
+
+        crash_thread_id = str(add2line_data.get("crash_thread_id") or "").strip() or None
+        crash_thread_name = str(add2line_data.get("crash_thread_name") or "").strip() or None
+        crash_is_main = add2line_data.get("crash_thread_is_main_thread")
+        crash_has_business = add2line_data.get("crash_thread_has_business_frames")
+
+        selected_tid = str(selected_frame.get("thread_tid") or "").strip() or None
+        selected_name = str(selected_frame.get("thread_name") or "").strip() or None
+        selected_is_crash = selected_frame.get("thread_is_crash_thread")
+        selected_is_main = selected_frame.get("thread_is_main_thread")
+        if selected_is_crash is None and crash_thread_id and selected_tid:
+            selected_is_crash = selected_tid == crash_thread_id
+
+        crash_summary.crash_thread_id = crash_thread_id
+        crash_summary.crash_thread_name = crash_thread_name
+        crash_summary.is_main_thread_crash = crash_is_main if isinstance(crash_is_main, bool) else None
+        crash_summary.crash_thread_has_business_frames = (
+            crash_has_business if isinstance(crash_has_business, bool) else None
+        )
+        crash_summary.crash_attribution_source = "add2line_crash_thread_metadata"
+
+        crash_summary.selected_analysis_thread_id = selected_tid
+        crash_summary.selected_analysis_thread_name = selected_name
+        crash_summary.selected_analysis_is_crash_thread = (
+            selected_is_crash if isinstance(selected_is_crash, bool) else None
+        )
+        crash_summary.selected_analysis_is_main_thread = (
+            selected_is_main if isinstance(selected_is_main, bool) else None
+        )
+        if selected_is_crash is True and selected_tid:
+            crash_summary.thread_id = selected_tid
+        elif crash_thread_id:
+            crash_summary.thread_id = crash_thread_id
+
+        if selected_is_crash is True:
+            crash_summary.selected_analysis_source = "crash_thread_business_frame"
+            crash_summary.selected_analysis_confidence = "direct_crash_thread"
+            crash_summary.selected_analysis_note = "当前源码上下文来自平台归因崩溃线程中的业务库帧。"
+            crash_summary.attributed_crash_location_status = "resolved_to_business_frame"
+        elif selected_tid:
+            crash_summary.selected_analysis_source = "resolved_business_thread"
+            crash_summary.selected_analysis_confidence = "investigation_hint"
+            crash_summary.attributed_crash_location_status = "unresolved_crash_thread_no_business_frame"
+            if crash_has_business is False:
+                crash_summary.selected_analysis_note = (
+                    "归因崩溃线程的栈帧未命中库目录中的业务模块；"
+                    "当前源码上下文来自其它业务线程，仅作跨线程/异步排查线索，"
+                    "不能当作确定崩溃点。"
+                )
+            else:
+                crash_summary.selected_analysis_note = (
+                    "当前源码上下文来自非归因崩溃线程的业务库帧，应结合归因线程与跨线程关系验证。"
+                )
+        else:
+            crash_summary.selected_analysis_source = "selected_stack_frame"
+            crash_summary.selected_analysis_confidence = "investigation_hint"
+            crash_summary.attributed_crash_location_status = "unresolved_or_indirect"
+
+        self._record_location_pipeline(
+            "analysis_entry",
+            crash_thread_id=crash_thread_id,
+            crash_thread_name=crash_thread_name,
+            is_main_thread_crash=crash_summary.is_main_thread_crash,
+            crash_thread_has_business_frames=crash_summary.crash_thread_has_business_frames,
+            selected_analysis_thread_id=crash_summary.selected_analysis_thread_id,
+            selected_analysis_thread_name=crash_summary.selected_analysis_thread_name,
+            selected_analysis_source=crash_summary.selected_analysis_source,
+            selected_analysis_confidence=crash_summary.selected_analysis_confidence,
+            selected_frame_function=str(
+                selected_frame.get("resolved_function")
+                or selected_frame.get("function")
+                or ""
+            ).strip() or None,
+            selected_frame_file=str(
+                selected_frame.get("resolved_file") or selected_frame.get("file") or ""
+            ).strip() or None,
+        )
 
     def _enrich_resolved_frames_symbol_locations(
         self,
@@ -7980,7 +8343,11 @@ class CodeContentProvider:
         related_functions = []
         
         # 提取类名（支持 mangled name）
-        class_name = self._extract_class_name_from_resolved(crash_function_name)
+        class_name = self._extract_class_name_from_resolved(
+            crash_function_name,
+            crash_file=crash_file,
+            code_roots=code_roots,
+        )
         if not class_name:
             logger.debug(f"函数非类成员或无法提取类名，跳过同类函数扩展: {crash_function_name}")
             return related_functions
@@ -8167,13 +8534,42 @@ class CodeContentProvider:
                 cs["crash_line_note"] = note
             file_path = resolved_file or ""
             func_str = cf.get("signature") or resolved_function
+            selected_is_crash = cs.get("selected_analysis_is_crash_thread")
             if file_path and func_str:
-                cs["node_id"] = f"func|{file_path}|{func_str}"
+                analysis_node_id = f"func|{file_path}|{func_str}"
+                cs["analysis_entry_node_id"] = analysis_node_id
+                if selected_is_crash is not False:
+                    cs["node_id"] = analysis_node_id
                 cs.pop("file", None)
                 cs.pop("function", None)
-            owner_ctx = getattr(self, "_cc_owner_class_context", None)
-            if isinstance(owner_ctx, dict) and owner_ctx.get("class_name"):
-                cs["owner_class_context"] = owner_ctx
+            if selected_is_crash is not False:
+                cs["analysis_entry_file"] = file_path or cs.get("analysis_entry_file")
+                cs["analysis_entry_function"] = func_str or cs.get("analysis_entry_function")
+                cs["analysis_entry_line_number"] = (
+                    cf.get("crash_line_number") or cs.get("crash_line_number")
+                )
+                cs["analysis_entry_line_code"] = (
+                    cf.get("crash_line") or cs.get("crash_line_code")
+                )
+                cs["analysis_entry_stack_address"] = (
+                    cs.get("analysis_entry_stack_address") or cs.get("stack_address")
+                )
+                cs["analysis_entry_location_source"] = src
+
+            if selected_is_crash is False:
+                cs.pop("node_id", None)
+                cs["stack_address"] = None
+                cs["crash_line_number"] = None
+                cs["crash_line_code"] = None
+                cs["crash_location_source"] = "unresolved_crash_thread_no_business_frame"
+                cs["attributed_crash_location_status"] = (
+                    "unresolved_crash_thread_no_business_frame"
+                )
+                cs["crash_line_note"] = (
+                    "日志标记的崩溃线程栈帧未命中你提供的库目录，"
+                    "无法在该线程上确认崩溃源码行。"
+                )
+            cs.pop("owner_class_context", None)
             result_dict["crash_summary"] = cs
             result_dict.pop("crash_func", None)
 
@@ -8210,19 +8606,19 @@ class CodeContentProvider:
         call_chain_from_code_res = "ok" if call_chain_from_code else "not_found"
         graph_dict["call_chain_from_code_res"] = call_chain_from_code_res
 
-        # 注入类骨架节点：让 AI 看到完整类结构（成员变量 + 函数签名）
-        owner_ctx = cs.get("owner_class_context") if isinstance(cs, dict) else None
-        if isinstance(owner_ctx, dict):
-            skel_lines = owner_ctx.get("skeleton")
-            if isinstance(skel_lines, list) and skel_lines:
-                skel_node_id = f"class_skeleton|{owner_ctx.get('definition_file', '')}|{owner_ctx.get('class_name', '')}"
-                nodes_list.append({
-                    "id": skel_node_id,
-                    "type": "class_skeleton",
-                    "class_name": owner_ctx.get("class_name", ""),
-                    "file": owner_ctx.get("definition_file", ""),
-                    "skeleton": "\n".join(skel_lines),
-                })
+        # 强归因时注入 class_skeleton 节点；crash_summary 仅保留 owner_class_node_id 引用
+        owner_ctx = getattr(self, "_cc_owner_class_context", None)
+        if (
+            isinstance(cs, dict)
+            and isinstance(owner_ctx, dict)
+            and owner_ctx.get("class_name")
+            and should_persist_owner_class_from_crash_summary(cs)
+        ):
+            skel_node = build_class_skeleton_node(owner_ctx)
+            if skel_node.get("skeleton", "").strip():
+                nodes_list.append(skel_node)
+                cs["owner_class_node_id"] = skel_node["id"]
+                result_dict["crash_summary"] = cs
 
         graph_dict["nodes"] = nodes_list
         graph_dict["edges"] = edges_list
@@ -8239,8 +8635,7 @@ class CodeContentProvider:
             edges_list, crash_nid
         )
         result_dict["graph"] = graph_dict
-        result_dict["code_parser_backend"] = self.code_parser_backend
-        result_dict["code_context_options"] = {
+        code_context_options = {
             "max_sibling_member_functions": int(getattr(self, "max_sibling_member_functions", 0) or 0),
             "max_shared_var_related_functions": int(
                 getattr(self, "max_shared_var_related_functions", 20) or 20
@@ -8259,16 +8654,28 @@ class CodeContentProvider:
                 if getattr(self, "_stack_kept_original_indices", None)
                 else 8
             ),
-            "max_functions_in_prompt": 12,
+            "max_functions_in_prompt": 0,
             "max_stack_frames_symbol_enrich": 8,
-            "max_stack_frames_in_prompt": 6,
+            "max_stack_frames_in_prompt": 4,
             "max_crash_caller_search_files": int(
                 getattr(self, "max_crash_caller_search_files", 600) or 600
             ),
         }
+        diagnostics: Dict[str, Any] = {
+            "code_parser_backend": self.code_parser_backend,
+            "code_context_options": code_context_options,
+        }
+        if result_dict.get("extraction_warnings"):
+            diagnostics["extraction_warnings"] = result_dict.pop("extraction_warnings")
+        result_dict["diagnostics"] = diagnostics
+        if isinstance(cs, dict):
+            result_dict["crash_summary"] = _build_readable_crash_summary(cs)
         if extra_top_level:
             result_dict.update(extra_top_level)
 
+        self._attach_location_trace(result_dict)
+
+        result_dict = _drop_none_values(result_dict)
         json_result = json.dumps(result_dict, ensure_ascii=False, indent=2)
 
         logger.info("=" * 60)
@@ -8356,7 +8763,9 @@ class CodeContentProvider:
         code_roots: Optional[List[str]] = None,
     ) -> str:
         """超时发生在崩溃摘要/函数提取之前时的降级 JSON。"""
-        frames = add2line_data.get("resolved_frames") or []
+        from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
+        frames = flatten_resolved_frames_from_stack(add2line_data)
         roots = list(code_roots or getattr(self, "current_code_roots", None) or [])
         picked = self._select_topmost_locatable_crash_frame(frames, roots) if roots else None
         f0 = picked or (frames[0] if frames else {})
@@ -8382,6 +8791,9 @@ class CodeContentProvider:
             crash_location_source=str(f0.get("crash_location_source") or "from_add2line"),
             crash_line_note=note,
             crash_line_code=None,
+        )
+        self._annotate_crash_summary_thread_attribution(
+            crash_summary, add2line_data, f0 if isinstance(f0, dict) else None
         )
         fn_token = self._extract_function_name_from_resolved(rf) or "unknown"
         crash_func = CrashFunction(
@@ -8452,11 +8864,12 @@ class CodeContentProvider:
             # 解析add2line输出
             add2line_data = json.loads(add2line_json)
 
-            # 检查必要字段
-            if "resolved_frames" not in add2line_data:
-                raise ValueError("JSON中缺少resolved_frames字段")
-            
-            resolved_frames = add2line_data["resolved_frames"]
+            from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
+            if "resolved_threads" not in add2line_data and "resolved_frames" not in add2line_data:
+                raise ValueError("JSON中缺少 resolved_threads 字段")
+
+            resolved_frames = flatten_resolved_frames_from_stack(add2line_data)
             os_type = add2line_data.get("os_type", "unknown")
 
             for frame in resolved_frames:
@@ -8494,6 +8907,7 @@ class CodeContentProvider:
             # 如果提供了代码根目录，过滤掉不在代码目录中的堆栈帧
             # 使用 _find_source_file 来查找实际文件路径（支持索引服务）
             original_first_frame = resolved_frames[0] if resolved_frames else None
+            input_frame_count = len(resolved_frames)
             if code_roots_abs_strs:
                 filtered_frames = []
                 kept_original_indices: List[int] = []
@@ -8592,6 +9006,13 @@ class CodeContentProvider:
                 
                 if skipped_count > 0:
                     logger.info(f"已过滤 {skipped_count} 个不在代码目录中的堆栈帧（剩余 {len(filtered_frames)} 个）")
+                self._record_location_pipeline(
+                    "frame_filter",
+                    input_frames=input_frame_count,
+                    kept_frames=len(filtered_frames),
+                    skipped_frames=skipped_count,
+                    semantic_hints=len(semantic_hints),
+                )
                 
                 # 若真实崩溃帧（栈顶 frame 0）被过滤掉（atos 常将用户库首帧错误解析为系统符号如 sstream），
                 # 则用 mangled 名在源码中按函数名定位，补回为"真实崩溃帧"，避免误用后续帧。
@@ -8631,9 +9052,21 @@ class CodeContentProvider:
                             filtered_frames.insert(0, rescue_frame)
                             logger.info(f"已按 mangled 名补回真实崩溃帧: {simple_name}() 在 {file_path}:{line_no}")
                 
-                # 更新 resolved_frames 和 add2line_data
                 resolved_frames = filtered_frames
-                add2line_data["resolved_frames"] = filtered_frames
+                add2line_data.pop("resolved_frames", None)
+                _rt = add2line_data.get("resolved_threads")
+                if isinstance(_rt, list) and len(_rt) == 1 and isinstance(_rt[0], dict):
+                    _rt[0]["frames"] = filtered_frames
+                    _rt[0]["total_count"] = len(filtered_frames)
+                    _rt[0]["success_count"] = sum(
+                        1
+                        for f in filtered_frames
+                        if isinstance(f, dict)
+                        and (
+                            str(f.get("resolved_function") or "").strip()
+                            or str(f.get("resolved_file") or "").strip()
+                        )
+                    )
 
                 # 为语义提示计算挂载位置；render_order_pos 始终按原始堆栈索引（1-based）供 05 排序
                 if semantic_hints:
@@ -8676,7 +9109,10 @@ class CodeContentProvider:
             
             # 获取崩溃帧：优先用可提取源码的帧；不因单帧失败而中断
             if not resolved_frames:
-                raise ValueError("没有可用的堆栈帧（所有堆栈帧都被过滤或未解析）")
+                raise CodeContextUserError(
+                    NO_FRAMES_IN_CODE_ROOT,
+                    detail="resolved_frames empty after code_root filter",
+                )
 
             extraction_warnings: List[str] = []
             crash_func: Optional[CrashFunction] = None
@@ -8837,7 +9273,10 @@ class CodeContentProvider:
                     )
 
             if not crash_frame:
-                raise ValueError("没有可用的堆栈帧（所有堆栈帧都被过滤或未解析）")
+                raise CodeContextUserError(
+                    NO_EXTRACTABLE_CONTEXT,
+                    detail="no crash_frame after native-only filter and symbol rescue",
+                )
 
             if not crash_func:
                 crash_frame = resolved_frames[0]
@@ -8971,12 +9410,17 @@ class CodeContentProvider:
                 crash_location_source="from_log_deduce" if is_rescue_frame else "from_add2line",
                 crash_line_note=crash_line_note,
             )
-            self._cc_stage_crash_summary = crash_summary
-            self._cc_owner_class_context = self._build_owner_class_context_snapshot(
-                resolved_function,
-                crash_local_source or resolved_file,
-                code_roots_abs_strs,
+            self._annotate_crash_summary_thread_attribution(
+                crash_summary, add2line_data, crash_frame
             )
+            self._cc_stage_crash_summary = crash_summary
+            self._cc_owner_class_context = None
+            if should_persist_owner_class_for_crash_summary_dataclass(crash_summary):
+                self._cc_owner_class_context = self._build_owner_class_context_snapshot(
+                    resolved_function,
+                    crash_local_source or resolved_file,
+                    code_roots_abs_strs,
+                )
 
             # 2. 提取崩溃函数信息（已在上方完成）；file 使用本地映射路径，勿回写 CI 构建机路径
             if is_rescue_frame:
@@ -9374,8 +9818,8 @@ class CodeContentProvider:
                 # 7. 分析线程上下文（先为栈顶帧补齐源码位置，避免 call_chain 误匹配无关同名函数）
                 thread_context: List[ThreadContext] = []
                 try:
-                    _rf_list = add2line_data.get("resolved_frames")
-                    if isinstance(_rf_list, list):
+                    _rf_list = flatten_resolved_frames_from_stack(add2line_data)
+                    if _rf_list:
                         self._enrich_resolved_frames_symbol_locations(
                             _rf_list, code_roots_abs_strs, max_frames=8
                         )
@@ -9468,6 +9912,15 @@ class CodeContentProvider:
                 add2line_data, detail, code_roots=roots
             )
             
+        except CodeContextUserError as e:
+            logger.warning("code_context [%s]: %s", e.code, e.payload.get("user_message"))
+            if e.payload.get("error_detail"):
+                logger.debug("code_context detail: %s", e.payload.get("error_detail"))
+            body = dict(e.payload)
+            body["input"] = add2line_json
+            body["code_roots"] = _normalize_code_roots_arg(code_root)
+            body["code_parser_backend"] = self.code_parser_backend
+            return json.dumps(body, ensure_ascii=False, indent=2)
         except json.JSONDecodeError as e:
             logger.error(f"JSON解析错误: {e}")
             return json.dumps({
@@ -9476,7 +9929,7 @@ class CodeContentProvider:
                 "code_parser_backend": self.code_parser_backend
             }, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.error(f"生成崩溃分析数据时出错: {e}")
+            logger.error("code_context 未预期错误: %s", e)
             return json.dumps({
                 "error": str(e),
                 "input": add2line_json,
@@ -9502,18 +9955,29 @@ if __name__ == "__main__":
         # 示例add2line输出JSON
         sample_add2line_json = '''
         {
-            "resolved_frames": [
+            "resolved_threads": [
                 {
-                    "address": "0x12345678",
-                    "resolved_function": "ComplexDataStructure::add_node",
-                    "resolved_file": "src/data/complex_data.cpp",
-                    "resolved_line": 128
-                },
-                {
-                    "address": "0x87654321",
-                    "resolved_function": "worker_thread",
-                    "resolved_file": "src/thread/worker.cpp",
-                    "resolved_line": 87
+                    "tid": null,
+                    "name": null,
+                    "thread_index": 0,
+                    "is_crash_thread": true,
+                    "is_main_thread": null,
+                    "frames": [
+                        {
+                            "address": "0x12345678",
+                            "resolved_function": "ComplexDataStructure::add_node",
+                            "resolved_file": "src/data/complex_data.cpp",
+                            "resolved_line": 128
+                        },
+                        {
+                            "address": "0x87654321",
+                            "resolved_function": "worker_thread",
+                            "resolved_file": "src/thread/worker.cpp",
+                            "resolved_line": 87
+                        }
+                    ],
+                    "success_count": 2,
+                    "total_count": 2
                 }
             ],
             "os_type": "macos",
@@ -9600,7 +10064,7 @@ class CodeContentProviderWithPrompts:
     def generate_json_only(self, add2line_json: str, code_root: str) -> str:
         return self.provider.code_content_provider(add2line_json, code_root)
 
-    def generate_prompt_only(self, add2line_json: str, code_root: str,
+    def generate_gen_prompt_only(self, add2line_json: str, code_root: str,
                              prompt_type: str = "full") -> str:
         try:
             import json as _j

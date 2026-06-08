@@ -10,7 +10,9 @@ from .version import PROTOCOL_VERSION
 RunStatus = Literal["queued", "running", "done", "error", "canceled"]
 OutputFormat = Literal["json", "markdown", "text"]
 EngineType = Literal["sequential", "langgraph"]
-ScopeType = Literal["full", "prompt_only", "parse_only", "parse_log_only"]
+ScopeType = Literal["full", "gen_prompt_only", "parse_stack_only", "parse_log_only"]
+PromptModeType = Literal["analysis", "fix"]
+AgentLoopType = Literal["single", "context_loop"]
 
 
 def normalize_run_code_roots(req: "RunRequest") -> List[str]:
@@ -50,6 +52,10 @@ class RunRequest:
     output_format: OutputFormat = "markdown"
 
     scope: ScopeType = "full"
+    prompt_mode: PromptModeType = "analysis"
+    agent_loop: Optional[AgentLoopType] = None  # None=随 prompt_mode 决定（analysis→context_loop）
+    max_agent_rounds: int = 1
+    max_context_requests_per_round: int = 5
     optimized: bool = False
     streaming: bool = False
 

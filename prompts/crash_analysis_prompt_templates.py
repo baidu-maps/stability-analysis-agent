@@ -165,7 +165,7 @@ def generate_crash_analysis_prompt(crash_data: dict) -> str:
     prompt_parts.append("")
     
     # 11. 关键约束
-    prompt_parts.append("## 关键约束")
+    prompt_parts.append("## 必须遵守的规则")
     prompt_parts.append("- 必须基于实际源代码进行修复")
     prompt_parts.append("- 必须分析所有相关函数的线程安全性")
     prompt_parts.append("- 修复代码必须完整且可编译")
@@ -247,7 +247,7 @@ def generate_crash_repair_prompt(crash_data: dict) -> str:
     prompt_parts.append("")
     
     # 7. 关键约束
-    prompt_parts.append("## 关键约束")
+    prompt_parts.append("## 必须遵守的规则")
     prompt_parts.append("- 必须基于实际源代码进行修复")
     prompt_parts.append("- 修复代码必须完整且可编译")
     prompt_parts.append("- 保持原有函数签名和接口")

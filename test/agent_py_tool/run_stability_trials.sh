@@ -21,8 +21,8 @@ for i in 1 2 3; do
   LATEST=$(ls -td "$REPO"/cli_reports/*_analysis_full_direct_crash 2>/dev/null | head -1)
   TRIAL_DIR="$OUT_BASE/trial_$i"
   mkdir -p "$TRIAL_DIR"
-  cp "$LATEST/06_apply_ai_fixes.json" "$TRIAL_DIR/" 2>/dev/null || true
-  cp "$LATEST/06_fix_extract_debug.json" "$TRIAL_DIR/" 2>/dev/null || true
+  cp "$LATEST/07_apply_ai_fixes.json" "$TRIAL_DIR/" 2>/dev/null || true
+  cp "$LATEST/07b_fix_extract_debug.json.json" "$TRIAL_DIR/" 2>/dev/null || true
   cp "$LATEST/final_output.md" "$TRIAL_DIR/" 2>/dev/null || true
   echo "$LATEST" > "$TRIAL_DIR/report_dir.txt"
 

@@ -2,7 +2,6 @@
 
 主要组件：
 - CodeFixer: 主 facade，提供 generate_and_apply / apply_fix_plan
-- FixPlanGenerator: 封装 LLM 交互（多轮 retry + merge + fallback）
 - FixResult: 结果数据类
 - 模块级公共函数：extract_candidate_nodes, graph_auto_fix_allowed, signatures_match 等
 """
@@ -843,11 +842,12 @@ def _ensure_owner_class_methods_in_targets(
     required_names: List[str],
     required_targets: List[Dict[str, str]],
 ) -> List[Dict[str, str]]:
-    """基于 owner_class_context 补齐同类 inline 方法目标，避免类块输出时漏改。"""
+    """基于 owner 类上下文（graph class_skeleton 节点）补齐同类 inline 方法目标。"""
     if not required_names:
         return list(required_targets or [])
-    cs = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
-    owner = cs.get("owner_class_context", {}) if isinstance(cs, dict) else {}
+    from tools.owner_class_context import resolve_owner_class_from_code_context
+
+    owner = resolve_owner_class_from_code_context(code_context) or {}
     if not isinstance(owner, dict):
         return list(required_targets or [])
     def_file = str(owner.get("definition_file") or "").strip()
@@ -1441,8 +1441,9 @@ def _extract_member_declaration_edits(
 ) -> List[Dict[str, Any]]:
     """从AI分析文本的代码块中提取成员变量声明变更，生成 member_declaration 类型的 edit。"""
     edits: List[Dict[str, Any]] = []
-    cs = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
-    owner_ctx = cs.get("owner_class_context", {}) if isinstance(cs, dict) else {}
+    from tools.owner_class_context import resolve_owner_class_from_code_context
+
+    owner_ctx = resolve_owner_class_from_code_context(code_context) or {}
     if not isinstance(owner_ctx, dict):
         return edits
     def_file = str(owner_ctx.get("definition_file", "")).strip()
@@ -1496,8 +1497,9 @@ def _extract_include_directive_edits(
 ) -> List[Dict[str, Any]]:
     """从 AI 分析文本提取缺失的 #include，并生成 include_directive edit。"""
     edits: List[Dict[str, Any]] = []
-    cs = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
-    owner_ctx = cs.get("owner_class_context", {}) if isinstance(cs, dict) else {}
+    from tools.owner_class_context import resolve_owner_class_from_code_context
+
+    owner_ctx = resolve_owner_class_from_code_context(code_context) or {}
     if not isinstance(owner_ctx, dict):
         return edits
     def_file = str(owner_ctx.get("definition_file", "")).strip()
@@ -1607,207 +1609,6 @@ def parse_json_payload(raw_text: str) -> Dict[str, Any]:
         preview = str(raw_text or "")[:200].replace("\n", " ")
         print(f"[AI Fix] JSON 解析失败: {exc}; 原始响应前200字符: {preview}", file=sys.stderr)
         return {"summary": "", "edits": []}
-
-
-# =============================================================================
-# FixPlanGenerator（LLM 交互封装）
-# =============================================================================
-
-
-class FixPlanGenerator:
-    """封装 LLM 交互：构建 prompt、多轮 retry、merge。"""
-
-    def __init__(self, llm_adapter: Any):
-        self._llm = llm_adapter
-
-    def generate(
-        self,
-        parse_result: Dict[str, Any],
-        code_context: Dict[str, Any],
-        analysis_text: str,
-        candidate_nodes: List[Dict[str, Any]],
-        required_targets: List[Dict[str, str]],
-    ) -> Tuple[Dict[str, Any], str]:
-        """生成 fix_plan。返回 (fix_plan, first_response_preview)。"""
-        prompt = self._build_multi_target_prompt(
-            parse_result, code_context, analysis_text, candidate_nodes, required_targets
-        )
-        first_response_preview = ""
-        response = self._llm.chat(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是代码修复计划生成器。"
-                        "只允许输出一个 JSON 对象。"
-                        "禁止输出 markdown、解释文本、代码围栏。"
-                        "禁止输出 <thinking> 或任何推理过程标签。"
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
-            max_tokens=8192,
-        )
-        first_response_preview = str(response.content or "")[:500].replace("\n", " ")
-        # 调试模式：只使用第一次 LLM 返回，不再做多轮补齐。
-        fix_plan = parse_json_payload(response.content)
-        return fix_plan, first_response_preview
-
-    def _build_multi_target_prompt(
-        self,
-        parse_result: Dict[str, Any],
-        code_context: Dict[str, Any],
-        analysis_text: str,
-        candidate_nodes: List[Dict[str, Any]],
-        required_targets: Optional[List[Dict[str, str]]] = None,
-    ) -> str:
-        crash_summary = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
-        concise_nodes = [
-            {
-                "file": node["file"],
-                "function_signature": node["signature"],
-                "snippet_start_line": node.get("snippet_start_line"),
-                "snippet_end_line": node.get("snippet_end_line"),
-                "snippet": node["snippet"],
-            }
-            for node in candidate_nodes
-        ]
-        required_text = ""
-        if required_targets:
-            required_text = (
-                f"\n必须覆盖的目标函数（请为每个目标至少输出一个 edit）："
-                f"{json.dumps(required_targets, ensure_ascii=False)}\n"
-            )
-        return (
-            "你是代码修复执行器。请根据崩溃上下文和现有 AI 分析，输出【可直接落盘】的最小修改计划。\n"
-            "只允许修改下面 candidate_nodes 中出现的函数；不要新建文件，不要引用不存在的文件，不要输出 Markdown。\n"
-            "若无法安全修改，必须在 reason 里给出具体阻塞原因；不要省略目标。\n"
-            "先执行一致性自检：必须先以 candidate_nodes.snippet 为准校验 analysis_text；若两者冲突，忽略 analysis_text 的冲突结论。\n"
-            "禁止基于与 snippet 冲突的假设生成 edits（例如把【已存在的锁/判空/边界检查】当作缺失）。\n"
-            "严禁输出与候选函数 snippet 等价的 replacement_code（仅空白、缩进、换行或注释差异也视为等价）。\n"
-            "每条 edit 必须包含可验证的行为变化（条件、锁、边界、生命周期、错误处理等至少一类）。\n"
-            "若无法给出【行为变化】且可编译的修复代码，必须返回 edits=[]，并在 summary 说明阻塞原因。\n"
-            "非常重要：你的回复必须是一个 JSON 对象，不允许包含任何额外文本、解释、标题、代码围栏。\n\n"
-            "输出必须是严格 JSON，格式如下：\n"
-            "{\n"
-            '  "summary": "一句话说明修复意图",\n'
-            '  "edits": [\n'
-            "    {\n"
-            '      "file": "candidate_nodes 中的绝对路径",\n'
-            '      "function_signature": "candidate_nodes 中的函数签名",\n'
-            '      "replacement_code": "完整的替换后函数代码",\n'
-            '      "reason": "为什么修改这个函数"\n'
-            "    },\n"
-            "    {\n"
-            '      "file": "目标文件绝对路径",\n'
-            '      "edit_type": "member_declaration",\n'
-            '      "old_text": "需被替换的原始声明文本（必须能在文件中精确匹配）",\n'
-            '      "new_text": "替换后的新声明文本",\n'
-            '      "reason": "为什么修改该声明"\n'
-            "    }\n"
-            "  ]\n"
-            "}\n\n"
-            "要求：\n"
-            "1. 对于函数修改：replacement_code 必须是完整函数代码，能够直接替换原函数。\n"
-            "2. 对于成员变量声明修改（edit_type=member_declaration）：old_text 必须能在文件中精确匹配到，new_text 是替换后的文本。\n"
-            "   例如将 `volatile State m_state;` 改为 `std::atomic<State> m_state;`。\n"
-            "3. replacement_code 必须与原 snippet 存在【实质行为差异】；仅格式变化禁止。\n"
-            "4. 若 analysis_text 与 snippet 冲突，必须以 snippet 为准，并在 reason 中简述已纠偏。\n"
-            "5. 优先做最小修复，避免引入新依赖；但必须覆盖要求的目标函数。\n"
-            "6. 不要修改无关逻辑。\n"
-            "7. 如果现有 AI 分析与 candidate_nodes 冲突，以 candidate_nodes 的真实代码为准。\n"
-            "8. 禁止在非静态成员函数内使用 `if (this == nullptr)` 或 `this != nullptr &&` 作为修复手段，这是 C++ 未定义行为。\n"
-            "9. 禁止仅通过简单判空（如 `if (ptr)` / `if (ptr != nullptr)`）包裹整个函数逻辑来【止血】；"
-            "修复必须解决根因（如：加锁、原子操作、生命周期管理、所有权转移），而非仅在访问点加防御性检查。\n"
-            f"parse_result={json.dumps(parse_result, ensure_ascii=False)}\n\n"
-            f"crash_summary={json.dumps(crash_summary, ensure_ascii=False)}\n\n"
-            f"candidate_nodes={json.dumps(concise_nodes, ensure_ascii=False)}\n"
-            f"{required_text}\n"
-            f"analysis_text={analysis_text}"
-        )
-
-    def _build_single_target_prompt(
-        self,
-        parse_result: Dict[str, Any],
-        crash_summary: Dict[str, Any],
-        analysis_text: str,
-        target_node: Dict[str, Any],
-    ) -> str:
-        node_payload = {
-            "file": target_node["file"],
-            "function_signature": target_node["signature"],
-            "snippet_start_line": target_node.get("snippet_start_line"),
-            "snippet_end_line": target_node.get("snippet_end_line"),
-            "snippet": target_node["snippet"],
-        }
-        return (
-            "你是代码修复执行器。现在只允许修复一个函数，输出严格 JSON。\n"
-            "不要输出 Markdown，不要解释。\n"
-            "严禁输出与 target_node.snippet 等价的 replacement_code（仅空白或注释差异也视为等价）。\n"
-            "replacement_code 必须包含至少一处可验证的行为变化；否则返回 edits=[] 并在 summary 写明阻塞原因。\n"
-            "输出格式：\n"
-            "{\n"
-            '  "summary": "一句话",\n'
-            '  "edits": [\n'
-            "    {\n"
-            f'      "file": "{target_node["file"]}",\n'
-            f'      "function_signature": "{target_node["signature"]}",\n'
-            '      "replacement_code": "完整函数代码",\n'
-            '      "reason": "修改原因"\n'
-            "    }\n"
-            "  ]\n"
-            "}\n\n"
-            "要求：\n"
-            "1. edits 只能包含这个目标函数，且最多 1 条。\n"
-            "2. replacement_code 必须是完整函数代码，可直接替换，且具有实质行为差异。\n"
-            "3. 若无法安全修改，返回 edits 为空数组，并在 summary 说明原因。\n\n"
-            f"parse_result={json.dumps(parse_result, ensure_ascii=False)}\n\n"
-            f"crash_summary={json.dumps(crash_summary, ensure_ascii=False)}\n\n"
-            f"target_node={json.dumps(node_payload, ensure_ascii=False)}\n\n"
-            f"analysis_text={analysis_text}"
-        )
-
-    def _build_completion_prompt(
-        self,
-        parse_result: Dict[str, Any],
-        crash_summary: Dict[str, Any],
-        analysis_text: str,
-        target_node: Dict[str, Any],
-        draft_code: str = "",
-    ) -> str:
-        node_payload = {
-            "file": target_node["file"],
-            "function_signature": target_node["signature"],
-            "snippet_start_line": target_node.get("snippet_start_line"),
-            "snippet_end_line": target_node.get("snippet_end_line"),
-            "snippet": target_node["snippet"],
-        }
-        return (
-            "你是 C++ 代码修复器。请仅输出一个函数的完整 replacement_code（可直接替换原函数）。\n"
-            "严禁输出省略号、占位注释、伪代码。\n"
-            "严禁修改函数签名、文件路径。\n"
-            "严禁输出与 target_node.snippet 等价的代码（仅空白/注释差异也视为等价）。\n"
-            "replacement_code 必须包含至少一处可验证的行为变化；否则返回 edits=[] 并说明原因。\n"
-            "若无法给出完整函数，返回 edits 为空数组并给出原因。\n\n"
-            "输出必须是严格 JSON：\n"
-            "{\n"
-            '  "summary": "一句话",\n'
-            '  "edits": [\n'
-            "    {\n"
-            f'      "file": "{target_node["file"]}",\n'
-            f'      "function_signature": "{target_node["signature"]}",\n'
-            '      "replacement_code": "完整函数代码（必须可编译）",\n'
-            '      "reason": "修改原因"\n'
-            "    }\n"
-            "  ]\n"
-            "}\n\n"
-            f"parse_result={json.dumps(parse_result, ensure_ascii=False)}\n\n"
-            f"crash_summary={json.dumps(crash_summary, ensure_ascii=False)}\n\n"
-            f"target_node={json.dumps(node_payload, ensure_ascii=False)}\n\n"
-            f"draft_code={draft_code}\n\n"
-            f"analysis_text={analysis_text}"
-        )
 
 
 # =============================================================================
@@ -1977,7 +1778,7 @@ class CodeFixer:
                 return FixResult(
                     success=False,
                     error=(
-                        "未能从分析输出文本中提取可执行修复代码（通常对应 06_ai_res.txt），已跳过自动改码。"
+                        "未能从分析输出文本中提取可执行修复代码（通常对应 06_ai_gen_res.md），已跳过自动改码。"
                         "请确保分析输出包含完整函数代码块（建议 ```cpp 围栏 + 准确函数签名）。"
                     ),
                     missing_required=[x for x in missing_required if isinstance(x, dict)],
@@ -1997,7 +1798,7 @@ class CodeFixer:
             if report_dir is not None:
                 try:
                     report_dir.mkdir(parents=True, exist_ok=True)
-                    extract_debug_path = report_dir / "06_fix_extract_debug.json"
+                    extract_debug_path = report_dir / "07b_fix_extract_debug.json.json"
                     extract_debug_path.write_text(
                         json.dumps(extract_out, ensure_ascii=False, indent=2),
                         encoding="utf-8",

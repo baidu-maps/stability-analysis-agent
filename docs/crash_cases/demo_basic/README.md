@@ -288,7 +288,7 @@ python3 tools/cli/main.py \
   --crash-log crash_cases/demo_basic/logs/mac/_SIGSEGV_2025-09-10_18-06-22.crash \
   --library-dir crash_cases/demo_basic/lib/mac \
   --code-root crash_cases/demo_basic/code_dir \
-  --scope prompt_only
+  --scope gen_prompt_only
 ```
 
 #### 3) 更快：只做解析 + 地址解析（此模式不需要 code_root）
@@ -297,7 +297,7 @@ python3 tools/cli/main.py \
 python3 tools/cli/main.py \
   --crash-log crash_cases/demo_basic/logs/mac/_SIGSEGV_2025-09-10_18-06-22.crash \
   --library-dir crash_cases/demo_basic/lib/mac \
-  --scope parse_only
+  --scope parse_stack_only
 ```
 
 #### 4) 高频调试：先起 daemon，再让 CLI 走 daemon（可选）

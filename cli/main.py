@@ -63,6 +63,12 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="tree_sitter")
 
 from services.code_fixer import CodeFixer
 from cli.phase_spinner import PhaseSpinner
+from tools.code_context_errors import (
+    code_context_failure_message,
+    code_context_skip_pipeline_message,
+)
+from tools.parse_crash_errors import parse_result_skip_pipeline_message
+from tools.resolve_stack_errors import resolved_stack_skip_pipeline_message
 
 from tool_system import (  # type: ignore
     ToolAndWorkflowRegistry,
@@ -305,7 +311,7 @@ def _prepare_analysis_acceleration(problem: Dict[str, Any], code_roots: List[str
         "yes",
     }:
         return
-    if not code_roots or scope not in {"full", "prompt_only"}:
+    if not code_roots or scope not in {"full", "gen_prompt_only"}:
         return
     try:
         from services.code_index_service import get_code_index_for_roots
@@ -1423,7 +1429,7 @@ def _profile_file(name: str) -> Path:
 
 def _save_profile(name: str, data: Dict[str, Any]) -> Path:
     scope_value = str(data.get("scope") or "full").strip()
-    if scope_value not in {"full", "prompt_only", "parse_only", "parse_log_only"}:
+    if scope_value not in {"full", "gen_prompt_only", "parse_stack_only", "parse_log_only"}:
         scope_value = "full"
     profile = {
         "crash_log": data.get("crash_log") or "",
@@ -2800,6 +2806,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", required=False, help="SystemConfig JSON 文件")
     p.add_argument("--vector-db-path", default="./vector_db", help="向量数据库目录（默认: ./vector_db）")
     p.add_argument("--vector-db-max-results", type=int, default=3, help="向量检索最大返回数")
+    p.add_argument(
+        "--vector-db-record-usage",
+        action="store_true",
+        help="向量检索时累加 pattern hit_count（默认关闭，避免分析跑批污染库）",
+    )
     p.add_argument("--rule-confidence-threshold", type=float, default=0.85, help="规则高置信阈值")
     p.add_argument("--init-vector-db", action="store_true", help="初始化向量数据库（先清空再写入种子）")
     p.add_argument("--vector-db-stats", action="store_true", help="输出向量数据库统计信息")
@@ -2817,12 +2828,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--scope",
         default="full",
-        choices=["full", "prompt_only", "parse_only", "parse_log_only"],
+        choices=["full", "gen_prompt_only", "parse_stack_only", "parse_log_only"],
         help=(
             "Agent 执行流程范围（默认 full）："
             "full=解析+符号化+定位源码+AI 分析+自动改码；"
-            "prompt_only=完整工具链但不调用 AI，仅生成可复用提示词；"
-            "parse_only=仅解析+符号化；"
+            "gen_prompt_only=完整工具链但不调用 AI，仅生成可复用提示词；"
+            "parse_stack_only=仅解析+符号化；"
             "parse_log_only=仅解析崩溃日志"
         ),
     )
@@ -2832,6 +2843,40 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="是否基于 AI 建议回写源码（默认开启；仅在 --scope full 且 LLM 可用时生效，使用 --no-apply-ai-fixes 关闭）",
+    )
+    p.add_argument(
+        "--prompt-mode",
+        choices=["analysis", "fix"],
+        default="analysis",
+        help=(
+            "05 / LLM 提示词输出模式（默认 analysis）："
+            "analysis=偏证据分析与置信度判断，不强制修复代码；"
+            "fix=偏补丁输出，要求完整可替换修复代码。"
+            "该参数只控制提示词内容，不控制是否自动应用修复。"
+        ),
+    )
+    p.add_argument(
+        "--agent-loop",
+        choices=["single", "context_loop"],
+        default=None,
+        help=(
+            "Agent 编排模式（默认随 --prompt-mode：analysis=context_loop，其它=single）："
+            "single=单轮 LLM；"
+            "context_loop=允许模型请求补充函数源码，Agent 定位后继续多轮询问。"
+            "该参数独立于 --engine，direct/langchain/langgraph 均可使用。"
+        ),
+    )
+    p.add_argument(
+        "--max-agent-rounds",
+        type=int,
+        default=0,
+        help="context_loop 模式下最多 LLM 轮数（默认：analysis=3，其它=1；显式指定时以参数为准，硬上限 8）。",
+    )
+    p.add_argument(
+        "--max-context-requests-per-round",
+        type=int,
+        default=5,
+        help="context_loop 每轮最多处理的补充上下文请求数（默认 5，硬上限 16）。",
     )
     p.add_argument(
         "--backup-original-sources",
@@ -2844,7 +2889,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--engine",
         default="direct",
         choices=["direct", "langchain", "langgraph"],
-        help="AI 推理模式：direct=直调 LLM, langchain=工具编排, langgraph=多轮 Agent",
+        help="AI 推理模式：direct=直调 LLM, langchain=工具编排, langgraph=状态图编排",
     )
     p.add_argument(
         "--plugin-module",
@@ -2921,6 +2966,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "启用 ctags 函数索引加速（默认关闭）。首次运行会构建索引（~30s），"
             "后续运行通过缓存加速函数定义查找。已安装 ripgrep 时默认不需要此选项。"
+        ),
+    )
+    p.add_argument(
+        "--include-memory-in-05",
+        dest="include_memory_in_05",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "05 / LLM 提示词是否并入向量库检索的「规则与经验模式参考」（默认关闭，避免 RAG 误导；"
+            "使用 --include-memory-in-05 开启，--no-include-memory-in-05 显式关闭）"
         ),
     )
     return p
@@ -3055,24 +3110,97 @@ def _write_cli_report(
         report_dir.mkdir(parents=True, exist_ok=True)
         if result.get("parse_result") is not None:
             _write_json(report_dir / "01_crash_log_parser.json", result.get("parse_result"))
-        if scope in {"full", "prompt_only", "parse_only"} and result.get("resolved_stack") is not None:
+        if scope in {"full", "gen_prompt_only", "parse_stack_only"} and result.get("resolved_stack") is not None:
             _write_json(report_dir / "02_add2line_resolver.json", result.get("resolved_stack"))
-        if scope in {"full", "prompt_only"} and result.get("code_context") is not None:
-            _write_json(report_dir / "03_code_content_provider.json", result.get("code_context"))
+        if scope in {"full", "gen_prompt_only"} and result.get("code_context") is not None:
+            code_context = result.get("code_context")
+            location_trace = None
+            if isinstance(code_context, dict):
+                location_trace = code_context.get("location_trace")
+                code_context_write = {
+                    k: v for k, v in code_context.items() if k != "location_trace"
+                }
+                _write_json(
+                    report_dir / "03_code_content_provider.json", code_context_write
+                )
+            else:
+                _write_json(report_dir / "03_code_content_provider.json", code_context)
+            if isinstance(location_trace, dict) and location_trace.get("steps"):
+                _write_json(report_dir / "03b_code_location_trace.json", location_trace)
+        if scope in {"full", "gen_prompt_only"}:
+            memory_payload = result.get("memory_retrieval")
+            if not isinstance(memory_payload, dict):
+                memory_payload = {
+                    "success": True,
+                    "memory_context": result.get("memory_context"),
+                    "rule_hits": result.get("rule_hits"),
+                    "pattern_hits": result.get("pattern_hits"),
+                    "evidence_map": result.get("evidence_map"),
+                    "strategy_hits": result.get("strategy_hits"),
+                    "decision_trace": result.get("decision_trace"),
+                    "vector_used": result.get("vector_used"),
+                }
+            if isinstance(memory_payload, dict):
+                _write_json(report_dir / "04_memory_context.json", memory_payload)
         final_tip = result.get("final_tip")
         if final_tip is None:
             final_tip = result.get("analysis")
-        if final_tip is not None:
+        agent_rounds = result.get("agent_rounds")
+        if isinstance(agent_rounds, list) and agent_rounds:
+            rounds_summary = []
+            for idx, round_payload in enumerate(agent_rounds):
+                if not isinstance(round_payload, dict):
+                    continue
+                round_index = int(round_payload.get("round", idx) or idx)
+                round_dir = report_dir / f"round_{round_index}"
+                round_dir.mkdir(parents=True, exist_ok=True)
+                prompt_text = round_payload.get("prompt")
+                analysis_round_text = _strip_outer_fence(round_payload.get("analysis"))
+                if prompt_text is not None:
+                    (round_dir / "05_ai_prompt.md").write_text(
+                        str(prompt_text), encoding="utf-8"
+                    )
+                if analysis_round_text is not None:
+                    (round_dir / "06_ai_gen_res.md").write_text(
+                        str(analysis_round_text), encoding="utf-8"
+                    )
+                context_requests = round_payload.get("context_requests")
+                resolved_context = round_payload.get("resolved_context")
+                if context_requests or resolved_context:
+                    _write_json(
+                        round_dir / "06_context_requests.json",
+                        {
+                            "context_requests": context_requests or [],
+                            "resolved_context": resolved_context or [],
+                        },
+                    )
+                rounds_summary.append(
+                    {
+                        "round": round_index,
+                        "has_prompt": prompt_text is not None,
+                        "has_analysis": analysis_round_text is not None,
+                        "context_request_count": len(context_requests)
+                        if isinstance(context_requests, list)
+                        else 0,
+                        "resolved_context_count": len(resolved_context)
+                        if isinstance(resolved_context, list)
+                        else 0,
+                    }
+                )
+            if rounds_summary:
+                _write_json(report_dir / "agent_rounds_summary.json", rounds_summary)
+        elif final_tip is not None:
             round_dir = report_dir / "round_0"
             round_dir.mkdir(parents=True, exist_ok=True)
-            (round_dir / "05_ai_final_tip.txt").write_text(str(final_tip), encoding="utf-8")
+            (round_dir / "05_ai_prompt.md").write_text(str(final_tip), encoding="utf-8")
         analysis_text = _strip_outer_fence(result.get("analysis"))
         if analysis_text is not None:
             round_dir = report_dir / "round_0"
             round_dir.mkdir(parents=True, exist_ok=True)
-            (round_dir / "06_ai_res.txt").write_text(str(analysis_text), encoding="utf-8")
+            if not (round_dir / "06_ai_gen_res.md").exists():
+                (round_dir / "06_ai_gen_res.md").write_text(str(analysis_text), encoding="utf-8")
         if applied_fix_result is not None:
-            _write_json(report_dir / "06_apply_ai_fixes.json", applied_fix_result)
+            _write_json(report_dir / "07_apply_ai_fixes.json", applied_fix_result)
         if write_readme_output:
             final_output_text = analysis_text if analysis_text is not None else rendered_output
             (report_dir / "final_output.md").write_text(str(final_output_text), encoding="utf-8")
@@ -3089,11 +3217,11 @@ def _print_execution_plan(state: Dict[str, Any], *, apply_ai_fixes: bool = True)
     if scope == "parse_log_only":
         print("  步骤 1/1：解析崩溃日志")
         return
-    if scope == "parse_only":
+    if scope == "parse_stack_only":
         print("  步骤 1/2：解析崩溃日志")
         print("  步骤 2/2：堆栈符号化")
         return
-    if scope == "prompt_only":
+    if scope == "gen_prompt_only":
         print("  步骤 1/4：解析崩溃日志")
         print("  步骤 2/4：堆栈符号化")
         print("  步骤 3/4：定位崩溃源码")
@@ -3146,10 +3274,10 @@ def _primary_artifact_for_scope(scope: str, report_dir: Path) -> Optional[Path]:
     scope_norm = str(scope or "full").strip() or "full"
     if scope_norm == "parse_log_only":
         p = report_dir / "01_crash_log_parser.json"
-    elif scope_norm == "parse_only":
+    elif scope_norm == "parse_stack_only":
         p = report_dir / "02_add2line_resolver.json"
-    elif scope_norm == "prompt_only":
-        p = report_dir / "round_0" / "05_ai_final_tip.txt"
+    elif scope_norm == "gen_prompt_only":
+        p = report_dir / "round_0" / "05_ai_prompt.md"
     else:
         p = report_dir / "final_output.md"
     return p if p.exists() else None
@@ -3166,6 +3294,7 @@ def _print_tty_markdown_brief_summary(
 ) -> None:
     """终端会话下仅展示阶段结果摘要与关键产物路径。"""
     ok = result.get("status") == "success"
+    result_meta = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
     print("")
     if ok:
         elapsed_str = ""
@@ -3175,26 +3304,115 @@ def _print_tty_markdown_brief_summary(
             else:
                 m, s = divmod(int(total_elapsed), 60)
                 elapsed_str = f"  耗时 {m}m{s}s"
-        print(_green(f"【结果】✓ 分析完成{elapsed_str}"))
+        if result_meta.get("pipeline_skipped") or result_meta.get("llm_skipped"):
+            label = "提前终止" if result_meta.get("pipeline_skipped") else "未调用 AI"
+            print(_green(f"【结果】✓ 工具链完成（{label}）{elapsed_str}"))
+        else:
+            print(_green(f"【结果】✓ 分析完成{elapsed_str}"))
     else:
         print(_red("【结果】✗ 分析未成功"))
 
     scope_norm = str(scope or "full").strip() or "full"
+    if result_meta.get("pipeline_skip_reason") == "no_usable_parse":
+        parse_tip = str(result_meta.get("pipeline_skip_user_message") or "").strip()
+        if not parse_tip:
+            parse_tip = parse_result_skip_pipeline_message(result.get("parse_result"))
+        print(_yellow("【日志】未提取到可用崩溃信息"))
+        print(_yellow(f"  {parse_tip}"))
+
+    if result_meta.get("pipeline_skip_reason") == "no_usable_resolve":
+        resolve_tip = str(result_meta.get("pipeline_skip_user_message") or "").strip()
+        if not resolve_tip:
+            resolve_tip = resolved_stack_skip_pipeline_message(result.get("resolved_stack"))
+        print(_yellow("【符号化】未得到可用函数信息"))
+        print(_yellow(f"  {resolve_tip}"))
+
+    cc_msg: Optional[str] = None
+    if result_meta.get("pipeline_skip_reason") == "no_usable_code" and scope_norm in {
+        "full",
+        "gen_prompt_only",
+    }:
+        code_tip = str(result_meta.get("pipeline_skip_user_message") or "").strip()
+        if not code_tip:
+            code_tip = code_context_skip_pipeline_message(
+                result.get("code_context"), scope=scope_norm
+            )
+        print(_yellow("【源码】未获取到可用代码上下文"))
+        print(_yellow(f"  {code_tip}"))
+    elif scope_norm in {"full", "gen_prompt_only"}:
+        cc_msg = code_context_failure_message(result.get("code_context"))
+        if cc_msg:
+            print(_yellow("【源码】未定位到崩溃代码"))
+            print(_yellow(f"  {cc_msg}"))
+
+    _skip_reasons = ("no_usable_parse", "no_usable_resolve", "no_usable_code")
+    if (
+        result_meta.get("llm_skipped")
+        and scope_norm in {"full", "gen_prompt_only"}
+        and result_meta.get("pipeline_skip_reason") not in _skip_reasons
+    ):
+        skip_tip = str(result_meta.get("llm_skip_user_message") or "").strip()
+        print(_yellow("【AI】未调用大模型（03 无可用源码，已跳过）"))
+        if skip_tip and not cc_msg:
+            print(_yellow(f"  {skip_tip}"))
+
     artifact = _primary_artifact_for_scope(scope_norm, report_dir)
+    if artifact is None and result_meta.get("pipeline_skipped") and report_dir is not None:
+        if result_meta.get("pipeline_skip_reason") == "no_usable_resolve":
+            fallback02 = report_dir / "02_add2line_resolver.json"
+            if fallback02.exists():
+                artifact = fallback02
+        if artifact is None and result_meta.get("pipeline_skip_reason") == "no_usable_code":
+            fallback03 = report_dir / "03_code_content_provider.json"
+            if fallback03.exists():
+                artifact = fallback03
+        if artifact is None:
+            fallback01 = report_dir / "01_crash_log_parser.json"
+            if fallback01.exists():
+                artifact = fallback01
+    if artifact is None and result_meta.get("llm_skipped") and report_dir is not None:
+        fallback = report_dir / "03_code_content_provider.json"
+        if fallback.exists():
+            artifact = fallback
     if artifact is not None:
         if scope_norm == "parse_log_only":
             print("【产物】崩溃日志解析结果：")
-        elif scope_norm == "parse_only":
-            print("【产物】堆栈符号化结果：")
-        elif scope_norm == "prompt_only":
-            print("【产物】可复用提示词：")
+        elif scope_norm == "parse_stack_only":
+            label = "崩溃日志解析结果" if result_meta.get("pipeline_skipped") else "堆栈符号化结果"
+            print(f"【产物】{label}：")
+        elif scope_norm == "gen_prompt_only":
+            reason = str(result_meta.get("pipeline_skip_reason") or "")
+            if reason == "no_usable_parse":
+                label = "崩溃日志解析结果"
+            elif reason in ("no_usable_resolve", "no_usable_code"):
+                label = "阶段报告（01～03）"
+            else:
+                label = "可复用提示词"
+            print(f"【产物】{label}：")
         else:
-            print("【产物】分析报告：")
+            reason = str(result_meta.get("pipeline_skip_reason") or "")
+            if reason == "no_usable_parse":
+                label = "崩溃日志解析结果"
+            elif reason in ("no_usable_resolve", "no_usable_code"):
+                label = "阶段报告（01～03）"
+            else:
+                label = "分析报告"
+            print(f"【产物】{label}：")
         print(f"  {artifact.resolve()}")
 
     if scope_norm == "full":
         if not apply_ai_fixes_enabled:
             print("【改码】未启用自动改码")
+        elif result_meta.get("pipeline_skipped") or result_meta.get("llm_skipped"):
+            reason = str(result_meta.get("pipeline_skip_reason") or "")
+            if reason == "no_usable_parse":
+                print(_yellow("【改码】已跳过（01 无可用堆栈）"))
+            elif reason == "no_usable_resolve":
+                print(_yellow("【改码】已跳过（02 无可用符号）"))
+            elif reason == "no_usable_code":
+                print(_yellow("【改码】已跳过（03 无可用源码）"))
+            else:
+                print(_yellow("【改码】已跳过（03 无可用源码）"))
         elif not isinstance(applied_fix_result, dict):
             print("【改码】未生成改码结果")
         else:
@@ -3279,7 +3497,7 @@ def _print_tty_markdown_brief_summary(
                     if not isinstance(item, dict):
                         continue
                     target = str(item.get("function_signature") or item.get("file") or "unknown")
-                    print(_yellow(f"  {idx}. {target}: 请检查 06_ai_res.txt 是否给出完整函数定义，不能是函数体片段或含省略占位。"))
+                    print(_yellow(f"  {idx}. {target}: 请检查 06_ai_gen_res.md 是否给出完整函数定义，不能是函数体片段或含省略占位。"))
 
             if applied_files and backup_list:
                 print("【回退保障】待修改的文件备份列表（修改前源码）")
@@ -3333,7 +3551,7 @@ def _prompt_with_default(question: str, default_value: str = "") -> str:
     return raw
 
 
-_VALID_SCOPES = {"full", "prompt_only", "parse_only", "parse_log_only"}
+_VALID_SCOPES = {"full", "gen_prompt_only", "parse_stack_only", "parse_log_only"}
 
 
 def _resolve_scope_from_record(record: Dict[str, Any]) -> str:
@@ -3344,10 +3562,10 @@ def _resolve_scope_from_record(record: Dict[str, Any]) -> str:
     if raw_scope in _VALID_SCOPES:
         return raw_scope
     legacy_scope = str(record.get("run_scope", "")).strip()
-    if legacy_scope in {"parse_only", "parse_log_only"}:
+    if legacy_scope in {"parse_stack_only", "parse_log_only"}:
         return legacy_scope
     if bool(record.get("skip_ai", False)):
-        return "prompt_only"
+        return "gen_prompt_only"
     return "full"
 
 
@@ -3367,17 +3585,18 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
         print("2) --library-dir DIR：符号库目录（含 .so / .dylib / .dSYM；日志已含函数名+行号可省略）")
         print("3) --code-root DIR：项目 C/C++ 源码目录（可重复指定；建议精确到工程/模块根目录，避免传整个仓库根目录）")
         print("4) --config PATH：指定 SystemConfig JSON（不填则使用内置默认工具链与工作流）")
-        print("5) --scope {full|prompt_only|parse_only|parse_log_only}：Agent 执行流程范围")
+        print("5) --scope {full|gen_prompt_only|parse_stack_only|parse_log_only}：Agent 执行流程范围")
         print("   - full（默认）：解析+符号化+定位源码+AI 分析+自动改码")
-        print("   - prompt_only：完整工具链但不调用 AI，仅生成可复用提示词")
-        print("   - parse_only：仅解析+符号化")
+        print("   - gen_prompt_only：完整工具链但不调用 AI，仅生成可复用提示词")
+        print("   - parse_stack_only：仅解析+符号化")
         print("   - parse_log_only：仅解析崩溃日志")
-        print("6) --engine {direct|langchain|langgraph}：AI 推理模式（直调 / 工具编排 / 多轮 Agent）")
+        print("6) --engine {direct|langchain|langgraph}：AI 推理模式（直调 / 工具编排 / 状态图编排）")
         print("")
         print("[RAG 上下文参数（进入分析 problem）]")
         print("1) --vector-db-path PATH：向量数据库目录（默认 ./vector_db）")
         print("2) --vector-db-max-results INT：向量检索最大返回数（默认 3）")
-        print("3) --rule-confidence-threshold FLOAT：规则高置信阈值（默认 0.85）")
+        print("3) --vector-db-record-usage：检索时写入 hit_count（默认只读，不写库）")
+        print("4) --rule-confidence-threshold FLOAT：规则高置信阈值（默认 0.85）")
         print("")
         print("[输出与交互]")
         print("1) --output-format {markdown|json|text}：控制输出格式")
@@ -3411,8 +3630,8 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
         print("[常见组合]")
         print("1) 完整分析：--crash-log ... --library-dir ... --code-root ...")
         print("2) 只分析不改码：加 --no-apply-ai-fixes")
-        print("3) 只跑工具链不走 LLM：加 --scope prompt_only")
-        print("4) 仅解析+符号化：加 --scope parse_only")
+        print("3) 只跑工具链不走 LLM：加 --scope gen_prompt_only")
+        print("4) 仅解析+符号化：加 --scope parse_stack_only")
         print("5) 仅解析崩溃日志：加 --scope parse_log_only")
         print("6) 向量库统计：--vector-db-stats")
         print("7) 向量库初始化：--init-vector-db")
@@ -3425,7 +3644,7 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                 ("back", "返回"),
                 ("direct", "direct（默认，直调 LLM，启动快）"),
                 ("langchain", "langchain（工具编排，适合增强流程）"),
-                ("langgraph", "langgraph（多轮 Agent，适合复杂任务）"),
+                ("langgraph", "langgraph（状态图编排，适合复杂流程）"),
             ],
             default_index=(["direct", "langchain", "langgraph"].index(current_engine) + 1)
             if current_engine in {"direct", "langchain", "langgraph"}
@@ -3437,8 +3656,8 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
 
     scope_options = [
         ("full", "完整分析（解析+符号化+定位源码+AI 分析+自动改码）"),
-        ("prompt_only", "完整工具链，仅生成提示词，不调用 AI"),
-        ("parse_only", "仅解析+符号化"),
+        ("gen_prompt_only", "完整工具链，仅生成提示词，不调用 AI"),
+        ("parse_stack_only", "仅解析+符号化"),
         ("parse_log_only", "仅解析崩溃日志"),
     ]
     scope_label_map = {key: label for key, label in scope_options}
@@ -3674,7 +3893,7 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
     scope_default = preferred_scope
 
     needs_llm = scope_default == "full"
-    needs_symbol = scope_default in {"full", "prompt_only", "parse_only"}
+    needs_symbol = scope_default in {"full", "gen_prompt_only", "parse_stack_only"}
 
     if needs_llm and not status.get("llm_ok"):
         print("")
@@ -3738,7 +3957,7 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
             print("")
             print(_red("⚠ 仍未检测到可用的堆栈地址解析工具。"))
 
-    total_steps = 1 if scope_default == "parse_log_only" else (2 if scope_default == "parse_only" else 3)
+    total_steps = 1 if scope_default == "parse_log_only" else (2 if scope_default == "parse_stack_only" else 3)
 
     print("")
     print(_yellow(f"[步骤 1/{total_steps}] 崩溃日志路径"))
@@ -3793,7 +4012,7 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
             library_dir = str(p)
             break
 
-        if scope_default == "parse_only":
+        if scope_default == "parse_stack_only":
             code_roots = []
         else:
             title_prefix = "待修改的 " if scope_default == "full" else ""
@@ -3871,9 +4090,9 @@ def execute_analysis(args: argparse.Namespace) -> int:
         return 1
 
     scope = str(getattr(args, "scope", "full") or "full").strip()
-    if scope not in {"full", "prompt_only", "parse_only", "parse_log_only"}:
+    if scope not in {"full", "gen_prompt_only", "parse_stack_only", "parse_log_only"}:
         print(
-            f"错误: --scope 取值无效: {scope}（仅支持 full / prompt_only / parse_only / parse_log_only）",
+            f"错误: --scope 取值无效: {scope}（仅支持 full / gen_prompt_only / parse_stack_only / parse_log_only）",
             file=sys.stderr,
         )
         return 1
@@ -3886,18 +4105,32 @@ def execute_analysis(args: argparse.Namespace) -> int:
         "engine": args.engine,
         "scope": scope,
         "apply_ai_fixes": bool(args.apply_ai_fixes),
+        "prompt_mode": str(getattr(args, "prompt_mode", "analysis") or "analysis"),
+        # 0 表示让 workflow 按 prompt_mode 决定默认轮数
+        "max_agent_rounds": int(getattr(args, "max_agent_rounds", 0) or 0),
+        "max_context_requests_per_round": max(
+            1,
+            min(int(getattr(args, "max_context_requests_per_round", 5) or 5), 16),
+        ),
         "vector_db_path": args.vector_db_path,
         "vector_db_max_results": args.vector_db_max_results,
+        "vector_db_readonly": not bool(getattr(args, "vector_db_record_usage", False)),
         "rule_confidence_threshold": args.rule_confidence_threshold,
         "max_sibling_member_functions": int(getattr(args, "max_sibling_member_functions", 0) or 0),
         "max_shared_var_related_functions": int(
-            getattr(args, "max_shared_var_related_functions", 20) or 20
+            getattr(args, "max_shared_var_related_functions", 12) or 12
         ),
         "min_key_read_related_functions": int(
             getattr(args, "min_key_read_related_functions", 2) or 0
         ),
         "use_ctags_index": bool(getattr(args, "use_ctags_index", False)),
+        "include_memory_context_in_final_tip": bool(
+            getattr(args, "include_memory_in_05", False)
+        ),
     }
+    _explicit_agent_loop = getattr(args, "agent_loop", None)
+    if _explicit_agent_loop in {"single", "context_loop"}:
+        problem["agent_loop"] = _explicit_agent_loop
     _apply_analysis_timeouts_to_problem(problem, args)
     _prepare_analysis_acceleration(problem, code_roots, scope)
 
@@ -3912,11 +4145,13 @@ def execute_analysis(args: argparse.Namespace) -> int:
         config = SystemConfig.from_file(args.config)
     else:
         tool_entries = [ToolConfig(name="crash_log_parser", enabled=True)]
-        if scope in {"full", "prompt_only", "parse_only"}:
+        if scope in {"full", "gen_prompt_only", "parse_stack_only"}:
             tool_entries.append(ToolConfig(name="add2line_resolver", enabled=True))
-        if scope in {"full", "prompt_only"}:
+        if scope in {"full", "gen_prompt_only"}:
             tool_entries.append(ToolConfig(name="code_content_provider", enabled=True))
             tool_entries.append(ToolConfig(name="symbol_callsite_finder", enabled=True))
+            tool_entries.append(ToolConfig(name="vector_memory_retriever", enabled=True))
+            tool_entries.append(ToolConfig(name="repo_search", enabled=True))
         config = SystemConfig(
             tools=tool_entries,
             workflows=[WorkflowConfig(name="crash_analysis", enabled=True)],
@@ -3931,7 +4166,7 @@ def execute_analysis(args: argparse.Namespace) -> int:
             else:
                 print(
                     "错误: 未检测到可用 LLM 配置。请直接运行 `sa-agent` 按引导配置，"
-                    "或改用 `--scope prompt_only` 仅生成提示词。",
+                    "或改用 `--scope gen_prompt_only` 仅生成提示词。",
                     file=sys.stderr,
                 )
                 return 1
@@ -3947,7 +4182,21 @@ def execute_analysis(args: argparse.Namespace) -> int:
     report_dir = _build_report_dir(args)
     applied_fix_result: Optional[Dict[str, Any]] = None
 
-    if args.apply_ai_fixes and result.get("status") == "success" and scope == "full":
+    meta = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    pipeline_skipped = bool(meta.get("pipeline_skipped"))
+    llm_skipped = bool(meta.get("llm_skipped"))
+    analysis_text_for_fix = str(result.get("analysis") or "")
+    final_still_needs_context = bool(
+        re.search(r'"need_more_context"\s*:\s*true', analysis_text_for_fix, re.I)
+    )
+    if (
+        args.apply_ai_fixes
+        and result.get("status") == "success"
+        and scope == "full"
+        and not pipeline_skipped
+        and not llm_skipped
+        and not final_still_needs_context
+    ):
         with PhaseSpinner("应用代码修复", step=5, total_steps=5):
             fixer = CodeFixer(llm_adapter, uaf_nullptr_guard_policy=_effective_uaf_nullptr_guard_policy())
             fix_result = fixer.generate_and_apply(
@@ -3993,40 +4242,168 @@ def execute_analysis(args: argparse.Namespace) -> int:
                 "",
             ]
             resolved = result.get("resolved_stack", {}) or {}
-            frames = resolved.get("resolved_frames", []) or []
-            if frames:
-                lines.append("## 解析后的堆栈")
-                for frame in frames:
-                    lines.append(
-                        f"- {frame.get('function', 'N/A')} ({frame.get('file', 'N/A')}:{frame.get('line', 'N/A')})"
-                    )
+            resolved_threads = resolved.get("resolved_threads") or []
+            if resolved_threads:
+                lines.append("## 解析后的堆栈（按线程）")
+                sc = resolved.get("success_count")
+                tc = resolved.get("total_count")
+                ftot = resolved.get("frame_count_total")
+                if sc is not None and tc is not None:
+                    stat = f"成功 {sc}/{tc} 可符号化帧"
+                    if ftot is not None and ftot != tc:
+                        stat += f"，日志总帧 {ftot}"
+                    lines.append(f"- {stat}")
+                for rt in resolved_threads[:12]:
+                    if not isinstance(rt, dict):
+                        continue
+                    is_crash = bool(rt.get("is_crash_thread"))
+                    is_main = rt.get("is_main_thread")
+                    tid = rt.get("tid")
+                    tname = rt.get("name")
+                    tag = "crash" if is_crash else "worker"
+                    if is_main is True:
+                        tag += "+main"
+                    elif is_main is False:
+                        tag += "+bg"
+                    hdr = f"### [{tag}]"
+                    if tid is not None:
+                        hdr += f" {tid}"
+                    if tname:
+                        hdr += f" ({tname})"
+                    lines.append(hdr)
+                    shown = 0
+                    for fr in rt.get("frames") or []:
+                        if shown >= (6 if not is_crash else 4):
+                            break
+                        fn = (
+                            fr.get("resolved_function")
+                            or fr.get("function")
+                            or "N/A"
+                        )
+                        rf = fr.get("resolved_file") or fr.get("file") or "N/A"
+                        rl = fr.get("resolved_line", fr.get("line", "N/A"))
+                        lines.append(f"  - {fn} ({rf}:{rl})")
+                        shown += 1
+                    rest = len(rt.get("frames") or []) - shown
+                    if rest > 0:
+                        lines.append(f"  - … 还有 {rest} 帧")
+                if len(resolved_threads) > 12:
+                    lines.append(f"- … 还有 {len(resolved_threads) - 12} 条线程，见 02_add2line_resolver.json")
                 lines.append("")
             code_context = result.get("code_context", {}) or {}
             crash_summary = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
             graph = code_context.get("graph", {}) if isinstance(code_context, dict) else {}
             if isinstance(crash_summary, dict) and isinstance(graph, dict):
+                from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
+                stack_frames = flatten_resolved_frames_from_stack(resolved)
                 has_loc = False
-                for frame in frames:
+                for frame in stack_frames:
                     if frame.get("file") not in (None, "", "N/A") and frame.get("line") not in (None, "", "N/A"):
                         has_loc = True
                         break
                 if not has_loc:
-                    node_id = crash_summary.get("node_id")
-                    node_map = {
-                        n.get("id"): n
-                        for n in (graph.get("nodes", []) if isinstance(graph.get("nodes", []), list) else [])
-                        if isinstance(n, dict) and isinstance(n.get("id"), str)
-                    }
-                    node = node_map.get(node_id) if isinstance(node_id, str) else None
-                    if node is None and isinstance(node_id, str):
-                        node = node_map.get(node_id.rstrip().rstrip("{").rstrip())
-                    if isinstance(node, dict):
-                        lines.append("## 崩溃点源码定位（回退）")
-                        lines.append(
-                            f"- {node.get('signature', 'N/A')} "
-                            f"({node.get('file', 'N/A')}:{crash_summary.get('crash_line_number', 'N/A')})"
+                    from tools.analysis_entry_display import is_investigation_hint_attribution
+
+                    if not is_investigation_hint_attribution(crash_summary):
+                        crash_location = crash_summary.get("crash_location")
+                        if not isinstance(crash_location, dict):
+                            crash_location = {}
+                        # compat: 旧版 03 仍可能带 analysis_entry
+                        analysis_entry = crash_summary.get("analysis_entry")
+                        if not isinstance(analysis_entry, dict):
+                            analysis_entry = {}
+                        entry_thread = analysis_entry.get("thread")
+                        if not isinstance(entry_thread, dict):
+                            entry_thread = {}
+                        entry_location = analysis_entry.get("location")
+                        if not isinstance(entry_location, dict):
+                            entry_location = {}
+
+                        node_id = (
+                            crash_location.get("node_id")
+                            or analysis_entry.get("node_id")
+                            or crash_summary.get("node_id")
                         )
-                        lines.append("")
+                        node_map = {
+                            n.get("id"): n
+                            for n in (
+                                graph.get("nodes", [])
+                                if isinstance(graph.get("nodes", []), list)
+                                else []
+                            )
+                            if isinstance(n, dict) and isinstance(n.get("id"), str)
+                        }
+                        node = node_map.get(node_id) if isinstance(node_id, str) else None
+                        if node is None and isinstance(node_id, str):
+                            node = node_map.get(node_id.rstrip().rstrip("{").rstrip())
+                        if isinstance(node, dict):
+                            selected_is_crash = (
+                                entry_thread.get("is_crash_thread")
+                                if "is_crash_thread" in entry_thread
+                                else crash_summary.get("selected_analysis_is_crash_thread")
+                            )
+                            if selected_is_crash is False:
+                                lines.append("## 业务排查入口（非确定崩溃点）")
+                                entry_func = (
+                                    entry_location.get("function")
+                                    or crash_summary.get("analysis_entry_function")
+                                    or node.get("signature")
+                                    or "N/A"
+                                )
+                                entry_file = (
+                                    entry_location.get("file")
+                                    or crash_summary.get("analysis_entry_file")
+                                    or node.get("file")
+                                    or "N/A"
+                                )
+                                entry_line = (
+                                    entry_location.get("line")
+                                    or crash_summary.get("analysis_entry_line_number")
+                                )
+                                entry_code = str(
+                                    entry_location.get("code")
+                                    or crash_summary.get("analysis_entry_line_code")
+                                    or ""
+                                ).strip()
+                                loc = (
+                                    f"{entry_file}:{entry_line}"
+                                    if entry_line
+                                    else str(entry_file)
+                                )
+                                suffix = f" — `{entry_code}`" if entry_code else ""
+                                lines.append(f"- {entry_func} ({loc}){suffix}")
+                                note = (
+                                    analysis_entry.get("entry_type")
+                                    or analysis_entry.get("note")
+                                    or crash_summary.get("selected_analysis_note")
+                                )
+                                if note:
+                                    lines.append(f"- 说明: {note}")
+                                lines.append("")
+                            else:
+                                lines.append("## 崩溃点源码定位（回退）")
+                                line_no = (
+                                    crash_location.get("line")
+                                    or crash_summary.get("crash_line_number")
+                                )
+                                entry_file = (
+                                    crash_location.get("file")
+                                    or node.get("file")
+                                    or "N/A"
+                                )
+                                entry_func = (
+                                    crash_location.get("function")
+                                    or node.get("signature")
+                                    or "N/A"
+                                )
+                                loc = (
+                                    f"{entry_file}:{line_no}"
+                                    if line_no
+                                    else str(entry_file)
+                                )
+                                lines.append(f"- {entry_func} ({loc})")
+                                lines.append("")
             if result.get("analysis"):
                 lines.append("## AI 分析")
                 lines.append(str(result.get("analysis")))

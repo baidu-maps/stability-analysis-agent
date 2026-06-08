@@ -45,7 +45,9 @@ def analyze_crash(crash_log_path: str, library_dir: str, code_root: str, executo
         # 使用 crash_info 而非 crash_summary
         crash_info = parse_result.get('crash_info', {})
         resolved = result.get('resolved_stack', {})
-        resolved_frames = resolved.get('resolved_frames', [])
+        from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
+        resolved_frames = flatten_resolved_frames_from_stack(resolved)
 
         return {
             "file": os.path.basename(crash_log_path),

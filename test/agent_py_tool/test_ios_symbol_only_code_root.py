@@ -42,7 +42,9 @@ class TestIosSymbolOnlyCodeRoot(unittest.TestCase):
             parsed = json.loads(crash_log_parser(SAMPLE))
             resolved = json.loads(add2line_resolver(json.dumps(parsed), library_dir=None))
             self.assertEqual(resolved.get("resolution_source"), "log_symbolicated_passthrough")
-            top = resolved["resolved_frames"][0]
+            from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
+            top = flatten_resolved_frames_from_stack(resolved)[0]
             self.assertIn("CrashFunc", top.get("resolved_function") or "")
 
             provider = CodeContentProvider(max_symbol_only_rescues=4)

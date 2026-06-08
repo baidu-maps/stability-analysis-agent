@@ -8,6 +8,8 @@ from typing import Any, Dict, Tuple
 
 
 def extract_features(parsed_data: Dict[str, Any], resolved_data: Dict[str, Any], prompt_data: Dict[str, Any]) -> Dict[str, Any]:
+    from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
     features: Dict[str, Any] = {}
     crash_info = parsed_data.get("crash_info", {}) if isinstance(parsed_data, dict) else {}
     meta_info = parsed_data.get("meta_info", {}) if isinstance(parsed_data, dict) else {}
@@ -24,7 +26,7 @@ def extract_features(parsed_data: Dict[str, Any], resolved_data: Dict[str, Any],
     function_name = None
     module_name = None
     if isinstance(resolved_data, dict):
-        frames = resolved_data.get("resolved_frames") or []
+        frames = flatten_resolved_frames_from_stack(resolved_data)
         if frames:
             function_name = frames[0].get("function")
             module_name = frames[0].get("module")
@@ -43,7 +45,11 @@ def extract_features(parsed_data: Dict[str, Any], resolved_data: Dict[str, Any],
 
     # Stack signature for rule matching
     stack_functions = []
-    for f in (resolved_data.get("resolved_frames") or []) if isinstance(resolved_data, dict) else []:
+    for f in (
+        flatten_resolved_frames_from_stack(resolved_data)
+        if isinstance(resolved_data, dict)
+        else []
+    ):
         if f.get("function"):
             stack_functions.append(f.get("function"))
     features["stack_functions"] = " ".join(stack_functions[:10])

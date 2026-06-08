@@ -67,6 +67,11 @@ class MetaInfo:
     frames_removed_by_library_dir_filter: Optional[int] = None
     # 识别到的日志格式（见 crash_parser.parsers 中 format_id）
     log_format: Optional[str] = None
+    # Harmony crashDiagnosis：平台标注的崩溃/归因线程（与 process_id 可能相同）
+    crash_thread_id: Optional[str] = None
+    crash_thread_name: Optional[str] = None
+    # Harmony 线程提取模式：full_by_threads（全量 body.stacks）| selective（限量精选）
+    harmony_extraction_mode: Optional[str] = None
 
 @dataclass
 class ThreadStack:
@@ -75,7 +80,7 @@ class ThreadStack:
     name: Optional[str]
     # 线程在日志中的序号（如 Apple .crash 的 Thread N / Crashed Thread: N）
     thread_index: Optional[int]
-    role: str  # primary / main / background / system 等
+    is_crash_thread: bool  # 平台归因 / 日志标注的崩溃线程
     frames: List[StackFrame]
     stack_layers: List[str]  # 该线程栈中出现的层级，如 ["native", "arkts"]
     has_native_frames: bool
@@ -84,6 +89,7 @@ class ThreadStack:
     has_objc_frames: bool  # 是否含 Objective-C 帧
     has_swift_frames: bool  # 是否含 Swift 帧
     languages: List[str] = None  # 线程内涉及的语言集合，如 ["cpp","arkts","java","objc","swift"]
+    is_main_thread: Optional[bool] = None  # 是否主(UI)线程；未知为 null
 
 
 @dataclass
@@ -148,7 +154,7 @@ def _maybe_filter_threads_by_library_dir(
         logger.warning("library_dir 路径不存在，跳过按库目录过滤堆栈帧: %s", lib_raw)
         return threads, 0, False
 
-    from ._library_frame_whitelist import find_library_files_in_dir, match_libraries_for_module
+    from tools._library_frame_whitelist import find_library_files_in_dir, match_libraries_for_module
 
     if lib_path.is_file():
         library_files = [lib_path]
@@ -177,7 +183,8 @@ def _maybe_filter_threads_by_library_dir(
                 tid=ts.tid,
                 name=ts.name,
                 thread_index=ts.thread_index,
-                role=ts.role,
+                is_crash_thread=ts.is_crash_thread,
+                is_main_thread=ts.is_main_thread,
                 frames=kept,
                 **_thread_layer_summary(kept),
             )

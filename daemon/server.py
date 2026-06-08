@@ -202,6 +202,18 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
     scope = str(getattr(req, "scope", "full") or "full")
     if scope and scope != "full":
         cmd += ["--scope", scope]
+    prompt_mode = str(getattr(req, "prompt_mode", "analysis") or "analysis")
+    if prompt_mode and prompt_mode != "analysis":
+        cmd += ["--prompt-mode", prompt_mode]
+    agent_loop = getattr(req, "agent_loop", None)
+    if agent_loop in {"single", "context_loop"}:
+        cmd += ["--agent-loop", str(agent_loop)]
+    max_rounds = int(getattr(req, "max_agent_rounds", 1) or 1)
+    if max_rounds != 1:
+        cmd += ["--max-agent-rounds", str(max_rounds)]
+    max_context_requests = int(getattr(req, "max_context_requests_per_round", 5) or 5)
+    if max_context_requests != 5:
+        cmd += ["--max-context-requests-per-round", str(max_context_requests)]
     if req.optimized:
         cmd += ["--optimized"]
     if req.streaming:
@@ -291,16 +303,16 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
 
 
 def _start_run(req_dict: Dict[str, Any]) -> RunState:
-    # 旧字段（skip_ai / parse_only）兼容：静默归并为 scope 后再丢弃。
+    # 旧字段（skip_ai / parse_stack_only）兼容：静默归并为 scope 后再丢弃。
     if "scope" not in req_dict:
         legacy_skip_ai = bool(req_dict.get("skip_ai", False))
-        legacy_parse_only = bool(req_dict.get("parse_only", False))
-        if legacy_parse_only:
-            req_dict["scope"] = "parse_only"
+        legacy_parse_stack_only = bool(req_dict.get("parse_stack_only", False))
+        if legacy_parse_stack_only:
+            req_dict["scope"] = "parse_stack_only"
         elif legacy_skip_ai:
-            req_dict["scope"] = "prompt_only"
+            req_dict["scope"] = "gen_prompt_only"
     req_dict.pop("skip_ai", None)
-    req_dict.pop("parse_only", None)
+    req_dict.pop("parse_stack_only", None)
     req = RunRequest(**req_dict)
     run = RUNS.create_run(req)
 

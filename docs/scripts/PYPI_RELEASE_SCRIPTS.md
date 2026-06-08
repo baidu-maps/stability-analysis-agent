@@ -75,12 +75,12 @@ sa-agent config doctor
 # 2) Optional: initialize local config interactively
 sa-agent config init
 
-# 3) No-config path should still work with --scope prompt_only
+# 3) No-config path should still work with --scope gen_prompt_only
 sa-agent \
   --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
   --code-root examples/crash_cases/demo_basic/code_dir \
-  --scope prompt_only
+  --scope gen_prompt_only
 ```
 
 ### 5) Upload to Production PyPI

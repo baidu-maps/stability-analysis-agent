@@ -43,6 +43,8 @@ docs/
 
 | 文档 | 说明 |
 |------|------|
+| [tools/CRASH_LOG_FORMATS.md](./tools/CRASH_LOG_FORMATS.md) | 崩溃日志文件后缀与平台导出格式（英文） |
+| [tools/CRASH_LOG_FORMATS.zh-CN.md](./tools/CRASH_LOG_FORMATS.zh-CN.md) | 崩溃日志格式与平台支持（中文） |
 | [tools/addr2line/README.md](./tools/addr2line/README.md) | 地址解析工具 |
 | [tools/ai_tip/README.md](./tools/ai_tip/README.md) | 提示词拼装逻辑 |
 | [tools/llm/TEST_LLM_CONNECTION_GUIDE.md](./tools/llm/TEST_LLM_CONNECTION_GUIDE.md) | LLM 连接测试 |

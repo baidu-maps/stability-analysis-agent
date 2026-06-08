@@ -94,6 +94,7 @@ class CrashAnalysisState(TypedDict):
     decision_trace: Optional[list]
     vector_used: Optional[bool]
     memory_context: Optional[str]
+    repo_search_results: Optional[list]
     
     # 最终结果
     ai_analysis: Optional[str]
@@ -257,6 +258,7 @@ class FullStabilityAnalyzer:
             workflow.add_node("add2line_resolver", self._node_add2line_resolver)
             workflow.add_node("code_content_provider", self._node_code_content_provider)
             workflow.add_node("vector_db_search", self._node_vector_db_search)
+            workflow.add_node("repo_search", self._node_repo_search)
             workflow.add_node("ai_analysis", self._node_ai_analysis)
             workflow.add_node("enhance_context", self._node_enhance_context)  # 新增：上下文增强节点
             
@@ -285,9 +287,12 @@ class FullStabilityAnalyzer:
                     "crash_log_parser": "crash_log_parser",
                     "add2line_resolver": "add2line_resolver",
                     "code_content_provider": "code_content_provider",
+                    "repo_search": "repo_search",
                     "ai_analysis": "ai_analysis"  # 如果所有工具都调用完了，回到AI分析
                 }
             )
+            
+            workflow.add_edge("repo_search", "enhance_context")
             
             # 工具节点执行完后，都回到 enhance_context 检查是否还需要调用其他工具
             # 注意：这些边只在增强上下文的迭代中生效，初始流程不受影响
@@ -537,58 +542,37 @@ class FullStabilityAnalyzer:
                 state["vector_used"] = False
                 state["memory_context"] = ""
                 return state
-            
+
+            from rag.memory_retriever import collect_memory_context
+
             print("INFO: 步骤4: 规则优先检索与向量召回...", file=sys.stderr)
 
             parsed_data = state.get("parsed_data") or {}
             resolved_data = state.get("resolved_data") or {}
             prompt_data = state.get("prompt_data") or {}
-            features = extract_features(parsed_data, resolved_data, prompt_data)
-
             workflow_config = self.config.get("workflow_config", {}) if isinstance(self.config, dict) else {}
+            vector_db_cfg = self.config.get("vector_db_config", {}) if isinstance(self.config, dict) else {}
+            vector_db_path = str(vector_db_cfg.get("path") or "./vector_db")
             rule_threshold = float(workflow_config.get("rule_confidence_threshold", 0.85))
-            max_results = int(self.config.get("vector_db_config", {}).get("max_results", 3))
+            max_results = int(vector_db_cfg.get("max_results", 3))
 
-            rule_hits = self.vector_db_analyzer.match_rules(features, min_confidence=rule_threshold)
-            high_conf_hits = [h for h in rule_hits if h.get("is_high_confidence")]
+            rag_out = collect_memory_context(
+                parse_result=parsed_data,
+                resolved_stack=resolved_data,
+                code_context=prompt_data,
+                vector_db_path=vector_db_path,
+                rule_confidence_threshold=rule_threshold,
+                vector_db_max_results=max_results,
+            )
 
-            decision_trace = []
-            pattern_hits: List[Dict[str, Any]] = []
-            evidence_map: Dict[str, Any] = {}
-            strategy_hits: List[Dict[str, Any]] = []
-            vector_used = False
+            state["rule_hits"] = rag_out.get("rule_hits", []) or []
+            state["pattern_hits"] = rag_out.get("pattern_hits", []) or []
+            state["evidence_map"] = rag_out.get("evidence_map", {}) or {}
+            state["strategy_hits"] = rag_out.get("strategy_hits", []) or []
+            state["decision_trace"] = rag_out.get("decision_trace", []) or []
+            state["vector_used"] = bool(rag_out.get("vector_used", False))
+            state["memory_context"] = str(rag_out.get("memory_context") or "")
 
-            if high_conf_hits:
-                decision_trace.append({
-                    "stage": "rule",
-                    "result": "hit",
-                    "rule_ids": [h.get("rule_id") for h in high_conf_hits],
-                })
-            else:
-                query_text, _signature = build_pattern_query(parsed_data, resolved_data, prompt_data)
-                pattern_hits = self.vector_db_analyzer.retrieve_patterns(query_text, n_results=max_results)
-                vector_used = bool(pattern_hits)
-                pattern_ids = [p.get("pattern_id") for p in pattern_hits if p.get("pattern_id")]
-                for pid in pattern_ids:
-                    evidence_map[pid] = self.vector_db_analyzer.get_evidence(pid)
-                strategy_hits = self.vector_db_analyzer.get_fix_strategies(pattern_ids)
-                decision_trace.append({
-                    "stage": "vector",
-                    "result": "hit" if pattern_hits else "miss",
-                    "pattern_ids": pattern_ids,
-                })
-
-            memory_context = self._render_memory_context(rule_hits, pattern_hits, evidence_map, strategy_hits)
-
-            # 更新状态
-            state["rule_hits"] = rule_hits
-            state["pattern_hits"] = pattern_hits
-            state["evidence_map"] = evidence_map
-            state["strategy_hits"] = strategy_hits
-            state["decision_trace"] = decision_trace
-            state["vector_used"] = vector_used
-            state["memory_context"] = memory_context
-            
             return state
         except Exception as e:
             print(f"WARNING: 向量数据库搜索失败: {e}", file=sys.stderr)
@@ -601,6 +585,131 @@ class FullStabilityAnalyzer:
             state["memory_context"] = ""
             return state  # 不抛出异常，继续执行
     
+    def _parse_repo_search_params(self, state: CrashAnalysisState) -> Dict[str, Any]:
+        """从 AI 上下文请求 JSON 解析 repo_search 参数。"""
+        mode = "find_references"
+        query = ""
+        file_path = ""
+        line_start = 1
+        line_end = 80
+        ctx_str = state.get("context_enhancement_request") or ""
+        try:
+            req = json.loads(ctx_str) if ctx_str else {}
+            if isinstance(req, dict):
+                details = req.get("details") or {}
+                if isinstance(details, dict):
+                    mode = str(details.get("mode") or mode).strip().lower()
+                    query = str(
+                        details.get("query")
+                        or details.get("symbol")
+                        or details.get("symbol_name")
+                        or details.get("pattern")
+                        or ""
+                    ).strip()
+                    file_path = str(details.get("file_path") or details.get("path") or "").strip()
+                    if details.get("line_start") is not None:
+                        line_start = int(details.get("line_start"))
+                    if details.get("line_end") is not None:
+                        line_end = int(details.get("line_end"))
+                missing = req.get("missing") or []
+                if isinstance(missing, list):
+                    if any(
+                        m in missing
+                        for m in (
+                            "grep_search",
+                            "cross_file_context",
+                            "caller_context",
+                            "repo_search",
+                        )
+                    ):
+                        if not query and mode == "find_references":
+                            mode = "find_references"
+                suggested = req.get("suggested_tools") or []
+                if isinstance(suggested, list):
+                    if "grep" in suggested and "repo_search" in suggested:
+                        mode = "grep"
+                    for st in suggested:
+                        st_l = str(st).lower()
+                        if st_l in ("grep", "read_file", "find_symbol", "find_references"):
+                            mode = st_l
+                            break
+        except Exception:
+            pass
+        if not query:
+            resolved_data = state.get("resolved_data") or {}
+            from services.repo_search import infer_symbol_from_resolved_stack
+
+            query = infer_symbol_from_resolved_stack(resolved_data)
+        payload: Dict[str, Any] = {
+            "mode": mode,
+            "code_roots": state.get("code_roots") or ([state["code_root"]] if state.get("code_root") else []),
+            "max_matches": 60,
+            "resolved_stack": state.get("resolved_stack_trace"),
+            "use_ctags_index": bool(
+                (state.get("config") or {}).get("use_ctags_index", False)
+            ),
+        }
+        if mode == "read_file":
+            payload["file_path"] = file_path
+            payload["line_start"] = line_start
+            payload["line_end"] = line_end
+        elif mode in ("find_symbol", "find_references"):
+            payload["symbol_name"] = query
+        else:
+            payload["query"] = query or "crash"
+            payload["mode"] = "grep"
+        return payload
+
+    def _node_repo_search(self, state: CrashAnalysisState) -> CrashAnalysisState:
+        """节点：在 code_roots 内按需检索（增强流程）。"""
+        try:
+            step_start = datetime.now()
+            need_more_context = state.get("need_more_context", False)
+            iteration_count = state.get("iteration_count", 0)
+            is_enhancement = need_more_context and iteration_count > 0
+            print(
+                f"INFO: [{'增强流程' if is_enhancement else '主流程'}] repo_search...",
+                file=sys.stderr,
+            )
+            tools_called = state.get("tools_called_in_enhancement", [])
+            if "repo_search" not in tools_called:
+                tools_called.append("repo_search")
+                state["tools_called_in_enhancement"] = tools_called
+
+            from tools.repo_search_tool import RepoSearchTool
+
+            tool = RepoSearchTool()
+            payload = self._parse_repo_search_params(state)
+            result = tool.execute(payload)
+            runs = list(state.get("repo_search_results") or [])
+            if isinstance(result, dict):
+                runs.append(result)
+            state["repo_search_results"] = runs
+
+            step_time = (datetime.now() - step_start).total_seconds()
+            state["execution_log"] = state.get("execution_log", []) + [{
+                "step": "repo_search",
+                "status": "success" if result.get("success") else "partial",
+                "duration": step_time,
+                "is_enhancement": is_enhancement,
+                "iteration": iteration_count if is_enhancement else 0,
+                "timestamp": datetime.now().isoformat(),
+            }]
+            print(
+                f"TOOL_OUTPUT:repo_search:{json.dumps(result, ensure_ascii=False)}",
+                file=sys.stderr,
+            )
+            return state
+        except Exception as e:
+            print(f"WARNING: repo_search 失败: {e}", file=sys.stderr)
+            state["execution_log"] = state.get("execution_log", []) + [{
+                "step": "repo_search",
+                "status": "failed",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat(),
+            }]
+            return state
+
     def _node_ai_analysis(self, state: CrashAnalysisState) -> CrashAnalysisState:
         """节点5: AI分析（支持多轮调用）"""
         try:
@@ -627,7 +736,9 @@ class FullStabilityAnalyzer:
                 guidance_text += "\n\n## 增强的上下文信息\n"
                 for i, ctx in enumerate(enhanced_contexts):
                     guidance_text += f"\n增强上下文 {i+1}:\n{ctx}\n"
-            full_prompt = self._build_full_prompt(crash_contexts, code_contexts, guidance_text, memory_context)
+            full_prompt = self._build_full_prompt(
+                crash_contexts, code_contexts, guidance_text, memory_context
+            )
             
             # 执行AI分析
             model = state.get("model")
@@ -796,7 +907,8 @@ class FullStabilityAnalyzer:
             # 优先级：crash_log_parser -> add2line_resolver -> code_content_provider
             
             # 检查是否需要调用 crash_log_parser
-            if (("crash_log_details" in missing or 
+            # log_filter：历史别名，与 crash_log_parser 同义（兼容旧模型 JSON）
+            if (("crash_log_details" in missing or
                  "crash_log_parser" in suggested_tools or
                  "log_filter" in suggested_tools) and
                 "crash_log_parser" not in tools_called):
@@ -811,6 +923,15 @@ class FullStabilityAnalyzer:
                 print("INFO: 路由到工具: add2line_resolver", file=sys.stderr)
                 return "add2line_resolver"
             
+            # repo_search：轻量跨文件检索，优先于昂贵的 code_content_provider
+            if (("repo_search" in suggested_tools or
+                 "grep_search" in missing or
+                 "cross_file_context" in missing or
+                 "caller_context" in missing) and
+                "repo_search" not in tools_called):
+                print("INFO: 路由到工具: repo_search", file=sys.stderr)
+                return "repo_search"
+
             # 检查是否需要调用 code_content_provider
             if (("function_source_code" in missing or 
                  "surrounding_code_context" in missing or
@@ -1105,6 +1226,7 @@ class FullStabilityAnalyzer:
                     "decision_trace": None,
                     "vector_used": None,
                     "memory_context": None,
+                    "repo_search_results": None,
                     "ai_analysis": None,
                     "ai_result": None,
                     "config": self.config,
@@ -1214,7 +1336,7 @@ class FullStabilityAnalyzer:
             total = (datetime.now() - start_time).total_seconds()
             return CrashAnalysisResult(crash_log_content, {}, {}, {}, "解析失败", analysis_steps, total, datetime.now().isoformat(), "failed")
 
-    def analyze_crash_parse_only(self, crash_log_content: str, library_dir: str, max_stack_frames: Optional[int] = None,
+    def analyze_crash_parse_stack_only(self, crash_log_content: str, library_dir: str, max_stack_frames: Optional[int] = None,
                                  crash_parse_options: Optional[CrashParseOptions] = None) -> CrashAnalysisResult:
         start_time = datetime.now()
         analysis_steps: List[AnalysisStep] = []
@@ -1249,7 +1371,7 @@ class FullStabilityAnalyzer:
                 analysis_steps=analysis_steps,
                 total_execution_time=total,
                 timestamp=datetime.now().isoformat(),
-                status="success_parse_only",
+                status="success_parse_stack_only",
             )
         except Exception:
             total = (datetime.now() - start_time).total_seconds()
@@ -1263,7 +1385,7 @@ class FullStabilityAnalyzer:
         start_time = datetime.now()
         analysis_steps: List[AnalysisStep] = []
         try:
-            parse_res = self.analyze_crash_parse_only(
+            parse_res = self.analyze_crash_parse_stack_only(
                 crash_log_content=crash_log_content,
                 library_dir=library_dir,
                 max_stack_frames=max_stack_frames,
@@ -1302,7 +1424,7 @@ class FullStabilityAnalyzer:
             print(f"TOOL_OUTPUT:code_content_provider:{json.dumps(prompt_data, separators=(',', ':'), ensure_ascii=False)}")
             analysis_steps.append(AnalysisStep("code_content_provider", resolved_data, prompt_data, t3, "success"))
 
-            # 与 run bundle 对齐：输出 vector_memory + ai_prompt（即使在 prompt_only 模式下）
+            # 与 run bundle 对齐：输出 vector_memory + ai_prompt（即使在 gen_prompt_only 模式下）
             rule_hits = pattern_hits = strategy_hits = []
             evidence_map: Dict[str, Any] = {}
             decision_trace: List[Dict[str, Any]] = []
@@ -1435,7 +1557,9 @@ class FullStabilityAnalyzer:
                 crash_category = "concurrency"
 
             evidence_requirements = []
-            if resolved_data.get("resolved_frames"):
+            from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
+            if flatten_resolved_frames_from_stack(resolved_data):
                 evidence_requirements.append("stack_trace")
             if prompt_data.get("code_contexts"):
                 evidence_requirements.append("code_snippet")
@@ -1460,7 +1584,7 @@ class FullStabilityAnalyzer:
             }
 
             evidence_list = []
-            for frame in resolved_data.get("resolved_frames", [])[:5]:
+            for frame in flatten_resolved_frames_from_stack(resolved_data)[:5]:
                 evidence_list.append({
                     "evidence_id": f"evidence_{hashlib.md5((pattern_id + str(frame)).encode()).hexdigest()}",
                     "pattern_id": pattern_id,
@@ -1660,11 +1784,11 @@ class FullStabilityAnalyzer:
 - 必须明确指出缺少哪些信息，并以结构化JSON格式返回
 - 只有在信息充足的情况下，才输出完整的修复方案
 
-可用工具：
-- crash_log_parser: 解析崩溃日志，提取堆栈帧和崩溃信息
+可用工具（仅此四项，勿使用其它工具名）：
+- crash_log_parser: 解析崩溃日志，提取信号/线程/堆栈帧等结构化信息（含从原始日志中定位关键片段）
 - add2line_resolver: 解析堆栈地址，将PC地址转换为文件:行号
-- code_content_provider: 提取相关源代码上下文
- - log_filter: 过滤和提取特定日志信息"""
+- code_content_provider: 提取相关源代码上下文（较重，沿崩溃栈展开）
+- repo_search: 在源码目录内 grep/读文件/查符号定义与调用点（结果仅落状态/TOOL_OUTPUT，不并入本提示词）"""
 
             # 常见协议支持：
             # 1) openai_chat_completions_compatible（默认）
@@ -1961,7 +2085,13 @@ class FullStabilityAnalyzer:
             else:
                 raise Exception(f"回退模式请求失败，状态码: {response.status_code}, 错误: {response.text}")
     
-    def _build_full_prompt(self, crash_contexts: list, code_contexts: list, guidance_text: str, memory_context: str = "") -> str:
+    def _build_full_prompt(
+        self,
+        crash_contexts: list,
+        code_contexts: list,
+        guidance_text: str,
+        memory_context: str = "",
+    ) -> str:
         """构建完整的AI提示词（优化版本）。指导内容来自 guidance_text（向量库或默认 JSON）。"""
         max_crash_contexts = 3
         max_code_contexts = 2
@@ -2006,8 +2136,8 @@ class FullStabilityAnalyzer:
         
         # 添加历史相似案例信息
         if memory_context:
-            full_prompt += memory_context
-        
+            full_prompt += f"\n\n## 规则与经验模式参考\n{memory_context}"
+
         # 添加输出格式要求（支持结构化输出）
         full_prompt += f"""
 
@@ -2092,11 +2222,13 @@ class FullStabilityAnalyzer:
 - "thread_context": 缺少线程上下文信息
 - "call_stack": 缺少完整调用栈
 
-**suggested_tools 字段可选值：**
-- "crash_log_parser": 崩溃日志解析工具
+**suggested_tools 字段可选值（仅以下名称有效）：**
+- "crash_log_parser": 崩溃日志解析与关键信息提取（原 log_filter 已合并为此工具，请勿再写 log_filter）
 - "add2line_resolver": 堆栈地址解析工具
+- "repo_search": 仓库内检索（details 可含 mode/query/symbol/file_path；不写入提示词正文）
 - "code_content_provider": 代码上下文提取工具
-- "log_filter": 日志过滤工具
+
+**missing 字段可补充（触发 repo_search）：** "cross_file_context", "caller_context", "grep_search"
 
 **重要规则：**
 1. 如果信息不足，**必须**使用情况2的JSON格式输出

@@ -45,7 +45,7 @@ __all__ = [
 ]
 
 
-_VALID_SCOPES = {"full", "prompt_only", "parse_only", "parse_log_only"}
+_VALID_SCOPES = {"full", "gen_prompt_only", "parse_stack_only", "parse_log_only"}
 
 
 def _resolve_state_scope(state: Dict[str, Any]) -> str:
@@ -54,10 +54,10 @@ def _resolve_state_scope(state: Dict[str, Any]) -> str:
     if raw_scope in _VALID_SCOPES:
         return raw_scope
     legacy_scope = str(state.get("run_scope") or "").strip()
-    if legacy_scope in {"parse_only", "parse_log_only"}:
+    if legacy_scope in {"parse_stack_only", "parse_log_only"}:
         return legacy_scope
     if bool(state.get("skip_ai", False)):
-        return "prompt_only"
+        return "gen_prompt_only"
     return "full"
 
 
@@ -84,6 +84,22 @@ def interactive_state_to_argv(state: Dict[str, Any]) -> List[str]:
     scope = _resolve_state_scope(state)
     if scope != "full":
         argv.extend(["--scope", scope])
+    prompt_mode = str(state.get("prompt_mode") or "").strip()
+    if prompt_mode in {"analysis", "fix"} and prompt_mode != "analysis":
+        argv.extend(["--prompt-mode", prompt_mode])
+    if "agent_loop" in state:
+        agent_loop = str(state.get("agent_loop") or "").strip()
+        if agent_loop in {"single", "context_loop"}:
+            argv.extend(["--agent-loop", agent_loop])
+    if state.get("max_agent_rounds") is not None:
+        argv.extend(["--max-agent-rounds", str(state.get("max_agent_rounds"))])
+    if state.get("max_context_requests_per_round") is not None:
+        argv.extend(
+            [
+                "--max-context-requests-per-round",
+                str(state.get("max_context_requests_per_round")),
+            ]
+        )
     return argv
 
 

@@ -29,7 +29,7 @@ class FixCodeExtractorTool(BaseTool):
             input_schema={
                 "type": "object",
                 "properties": {
-                    "analysis_text": {"type": "string", "description": "AI 分析文本（通常是 06_ai_res.txt 内容）"},
+                    "analysis_text": {"type": "string", "description": "AI 分析文本（通常是 06_ai_gen_res.md 内容）"},
                     "code_context": {"type": "object", "description": "03_code_content_provider.json 对应对象"},
                     "required_targets": {
                         "type": "array",

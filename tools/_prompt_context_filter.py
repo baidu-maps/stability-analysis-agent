@@ -30,8 +30,9 @@ _STACK_PATH_HINTS = (
 
 @dataclass(frozen=True)
 class PromptFilterOptions:
-    max_functions_in_prompt: int = 12
-    max_stack_frames_in_prompt: int = 6
+    # 0 表示不限制函数数量（05 纳入全部有 snippet 的候选）
+    max_functions_in_prompt: int = 0
+    max_stack_frames_in_prompt: int = 4
 
 
 def norm_graph_nid(raw: Optional[str]) -> str:
@@ -45,9 +46,16 @@ def resolve_prompt_filter_options(
     problem: Optional[Dict[str, Any]],
 ) -> PromptFilterOptions:
     """从 code_context_options / problem 读取筛选上限。"""
+    diagnostics = (code_context or {}).get("diagnostics") if isinstance(code_context, dict) else {}
+    diagnostics_options = (
+        diagnostics.get("code_context_options")
+        if isinstance(diagnostics, dict)
+        else None
+    )
 
     def _pick_int(key: str, default: int, lo: int, hi: int) -> int:
         for src in (
+            diagnostics_options or {},
             (code_context or {}).get("code_context_options") or {},
             problem or {},
         ):
@@ -63,9 +71,25 @@ def resolve_prompt_filter_options(
         return default
 
     return PromptFilterOptions(
-        max_functions_in_prompt=_pick_int("max_functions_in_prompt", 12, 4, 24),
-        max_stack_frames_in_prompt=_pick_int("max_stack_frames_in_prompt", 6, 2, 16),
+        max_functions_in_prompt=_pick_int("max_functions_in_prompt", 0, 0, 24),
+        max_stack_frames_in_prompt=_pick_int("max_stack_frames_in_prompt", 4, 2, 16),
     )
+
+
+def prompt_edit_eligibility_hint(tags: Any) -> str:
+    """根据来源标签生成改码依据说明（写入 05 提示词）。"""
+    tag_set = set(tags) if isinstance(tags, (set, list)) else set()
+    if not tag_set:
+        return "改码依据: 仅排查线索（不得单独列入「需要修改的函数」）"
+    if tag_set <= _WEAK_ONLY_TAGS or "调用链" in tag_set:
+        return "改码依据: 仅排查线索（不得单独列入「需要修改的函数」）"
+    if tag_set == {"共享变量读/访问"} or (
+        tag_set <= {"共享变量读/访问", "共享变量关键读"} and "共享变量写" not in tag_set
+    ):
+        return "改码依据: 需与高置信「共享变量写」证据一并论证，不得单独改码"
+    if "共享变量关键读" in tag_set and "共享变量写" not in tag_set:
+        return "改码依据: 需与高置信写路径一并论证，不得单独改码"
+    return "改码依据: 可作为改码候选（须在证据清单引用本片段中的具体行）"
 
 
 def _function_name_from_signature(sig: str) -> str:
@@ -130,14 +154,20 @@ def build_stack_anchor_paths(
     if isinstance(code_context, dict):
         cs = code_context.get("crash_summary")
         if isinstance(cs, dict):
-            owner = cs.get("owner_class_context")
+            from tools.owner_class_context import resolve_owner_class_from_code_context
+
+            owner = resolve_owner_class_from_code_context(code_context)
             if isinstance(owner, dict) and owner.get("definition_file"):
                 anchors.add(_normalize_path_key(str(owner["definition_file"])))
-            node_id = cs.get("node_id")
-            if isinstance(node_id, str) and "|" in node_id:
-                parts = node_id.split("|")
-                if len(parts) >= 2 and parts[1].strip():
-                    anchors.add(_normalize_path_key(parts[1]))
+            candidate_node_ids = [cs.get("node_id")]
+            crash_location = cs.get("crash_location")
+            if isinstance(crash_location, dict):
+                candidate_node_ids.append(crash_location.get("node_id"))
+            for node_id in candidate_node_ids:
+                if isinstance(node_id, str) and "|" in node_id:
+                    parts = node_id.split("|")
+                    if len(parts) >= 2 and parts[1].strip():
+                        anchors.add(_normalize_path_key(parts[1]))
         graph = code_context.get("graph")
         if isinstance(graph, dict):
             for sym in graph.get("stack_function_symbols") or []:
@@ -156,7 +186,9 @@ def build_stack_anchor_paths(
                     if fp.strip():
                         anchors.add(_normalize_path_key(fp))
     if isinstance(resolved, dict):
-        for frame in resolved.get("resolved_frames") or []:
+        from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
+        for frame in flatten_resolved_frames_from_stack(resolved):
             if not isinstance(frame, dict):
                 continue
             rf = str(frame.get("resolved_function") or frame.get("function") or "")
@@ -203,8 +235,10 @@ def match_resolved_frames_to_node_ids(
     """按日志栈序（自上而下）匹配图节点，供 prompt 强制纳入。"""
     if not isinstance(resolved, dict):
         return []
-    frames = resolved.get("resolved_frames")
-    if not isinstance(frames, list):
+    from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+
+    frames = flatten_resolved_frames_from_stack(resolved)
+    if not frames:
         return []
     cap = max(2, min(int(max_frames), 16))
     out: List[str] = []
@@ -294,16 +328,18 @@ def filter_prompt_function_records(
     root_cause_norm_ids: Optional[Set[str]] = None,
     stack_frame_norm_ids: Optional[Set[str]] = None,
     anchor_paths: Optional[Set[str]] = None,
-    max_functions: int = 12,
+    max_functions: int = 0,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
-    按置信度保留函数源码记录（全局上限，含强制档）。
+    筛选送入 05 的函数源码记录。
+    ``max_functions <= 0`` 时不设上限，且纳入全部有 snippet 的候选（含原 tier>=99）。
     返回 (included_records, index_lines)。
     """
     root_cause_norm = root_cause_norm_ids or set()
     stack_norm = stack_frame_norm_ids or set()
     anchors = anchor_paths or set()
-    cap = max(4, min(int(max_functions), 24))
+    unlimited = int(max_functions) <= 0
+    cap = 0 if unlimited else max(4, min(int(max_functions), 24))
 
     candidates: List[Dict[str, Any]] = []
     excluded: List[Dict[str, Any]] = []
@@ -319,7 +355,7 @@ def filter_prompt_function_records(
             root_cause_norm=root_cause_norm,
             anchor_paths=anchors,
         )
-        if tier >= 99:
+        if tier >= 99 and not unlimited:
             excluded.append(rec)
             continue
         rec_copy = dict(rec)
@@ -337,7 +373,7 @@ def filter_prompt_function_records(
     included: List[Dict[str, Any]] = []
     seen_norm: Set[str] = set()
     for rec in candidates:
-        if len(included) >= cap:
+        if not unlimited and len(included) >= cap:
             excluded.append(rec)
             continue
         nf = str(rec.get("norm_id") or "")
