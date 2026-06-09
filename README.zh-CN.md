@@ -33,7 +33,7 @@
 | **日志解析** | 看到原始文本，噪音高 | 结构化解析，提取信号类型、线程、关键帧；自动分类 Crash / ANR / OOM / Freeze |
 | **知识沉淀** | 无状态，每次从零开始 | RAG：规则表 + 向量数据库，模式持续积累 |
 | **工作流** | 单次 prompt，一轮对话 | 多步 Agent，支持条件分支和多轮推理 |
-| **可扩展性** | 只能改 prompt | Tool + Workflow 插件系统，配置驱动 |
+| **可扩展性** | 只能改 prompt | Tool + Workflow + Skill 系统，配置驱动 |
 
 ### Agent 引擎
 
@@ -59,6 +59,7 @@
 | **源码上下文提取** | 自动提取崩溃点附近的代码片段 |
 | **RAG 知识库** | 规则表（快速路径）+ 向量检索（ChromaDB），支持反馈闭环 |
 | **Tool + Workflow 系统** | 可插拔架构 — 通过配置或装饰器注册自定义工具和工作流 |
+| **Skill 系统** | 安装 Claude 兼容 skill，支持提示词技能或桥接为工具 / 工作流 |
 | **多种接入方式** | CLI、HTTP Daemon（流式 / SSE）、Python API |
 
 ## 架构
@@ -72,8 +73,8 @@
                        └──────────────┼──────────────┘
                                       │
                             ┌─────────▼─────────┐
-                            │   Tool + Workflow │
-                            │   (tool_system)   │
+                            │ Tool + Workflow + │
+                            │      Skill        │
                             └─────────┬─────────┘
                                       │
           ┌───────────────────────────┼───────────────────────────┐
@@ -315,6 +316,7 @@ stability-analysis-agent/
 ├── tools/              # 工具实现（解析器、符号化、代码提取）
 │   └── configs/        # 配置模板
 ├── tool_system/        # Tool + Workflow 注册与调度框架
+├── skill_system/       # Skill 发现、安装、运行时桥接
 ├── workflows/          # Workflow 定义（崩溃分析）
 ├── rag/                # RAG：规则存储 + 向量索引（ChromaDB）+ 元数据
 ├── prompts/            # LLM 分析提示词模板
@@ -334,12 +336,14 @@ stability-analysis-agent/
 | CLI 使用指南 | [docs/cli/CLI_GUIDE.md](./docs/cli/CLI_GUIDE.md) |
 | CLI 参数参考 | [docs/cli/CLI_COMMANDS_REFERENCE.md](./docs/cli/CLI_COMMANDS_REFERENCE.md) |
 | Daemon 服务指南 | [docs/cli/DAEMON_SERVER_GUIDE.md](./docs/cli/DAEMON_SERVER_GUIDE.md) |
+| Skill 系统 | [docs/skills/README.md](./docs/skills/README.md) |
 | PyPI 发布脚本指南 | [docs/scripts/PYPI_RELEASE_SCRIPTS.md](./docs/scripts/PYPI_RELEASE_SCRIPTS.md) |
 | 系统架构 | [docs/architecture/README.md](./docs/architecture/README.md) |
 | 架构图 | [docs/architecture/ARCHITECTURE_DIAGRAM.md](./docs/architecture/ARCHITECTURE_DIAGRAM.md) |
 | Tool System 概览 | [docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md](./docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md) |
 | 工具扩展指南 | [docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md](./docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md) |
 | Workflow 系统 | [docs/workflows/WORKFLOWS.md](./docs/workflows/WORKFLOWS.md) |
+| Skill 系统 | [docs/skills/README.md](./docs/skills/README.md) |
 | RAG 向量数据库 | [docs/rag/README.md](./docs/rag/README.md) |
 | 崩溃示例 | [docs/crash_cases/README.md](./docs/crash_cases/README.md) |
 | 崩溃日志格式与平台支持 | [docs/tools/CRASH_LOG_FORMATS.zh-CN.md](./docs/tools/CRASH_LOG_FORMATS.zh-CN.md) |

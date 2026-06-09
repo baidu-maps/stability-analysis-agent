@@ -8,6 +8,7 @@
 docs/
 ├── architecture/          # 架构设计
 ├── cli/                   # CLI 使用指南
+├── skills/                # Skill 系统
 ├── workflows/                # Workflow 系统
 ├── rag/                   # RAG 向量库
 ├── tools/                 # 工具链
@@ -38,6 +39,14 @@ docs/
 | 文档 | 说明 |
 |------|------|
 | [workflows/WORKFLOWS.md](./workflows/WORKFLOWS.md) | Workflow 系统完整文档 |
+
+### Skill
+
+| 文档 | 说明 |
+|------|------|
+| [skills/README.md](./skills/README.md) | Skill 系统总览 |
+| [skills/SKILL_TEMPLATE.md](./skills/SKILL_TEMPLATE.md) | Skill 模板 |
+| [skills/CLAUDE_COMPATIBILITY.md](./skills/CLAUDE_COMPATIBILITY.md) | Claude Skill 兼容说明 |
 
 ### 工具链
 

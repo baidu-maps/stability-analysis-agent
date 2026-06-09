@@ -33,7 +33,7 @@ This Agent solves all three:
 | **Log parsing** | Sees raw text, high noise | Structured parser extracts signal, threads, key frames; classifies crash / ANR / OOM / freeze |
 | **Knowledge accumulation** | Stateless, starts from zero | RAG: rule table + vector DB, patterns improve over time |
 | **Workflow** | Single-prompt, one-shot | Multi-step Agent with conditional multi-turn reasoning |
-| **Extensibility** | Prompt-only | Tool + Workflow plugin system, config-driven |
+| **Extensibility** | Prompt-only | Tool + Workflow + Skill system, config-driven |
 
 ### Agent Engine
 
@@ -59,6 +59,7 @@ Select via `--engine direct|langchain|langgraph`. All modes share the same tool 
 | **Source Code Context** | Extracts code snippets around crash points |
 | **RAG Knowledge Base** | Rule table (fast path) + vector retrieval (ChromaDB) with feedback loop |
 | **Tool + Workflow System** | Pluggable architecture — register custom tools and workflows via config or decorators |
+| **Skill System** | Install Claude-compatible skills, render prompt skills, or bridge skills into tools/workflows |
 | **Multiple Interfaces** | CLI, HTTP Daemon (streaming / SSE), Python API |
 
 ## Architecture
@@ -72,8 +73,8 @@ Select via `--engine direct|langchain|langgraph`. All modes share the same tool 
                        └──────────────┼──────────────┘
                                       │
                             ┌─────────▼─────────┐
-                            │   Tool + Workflow │
-                            │   (tool_system)   │
+                            │ Tool + Workflow +  │
+                            │     Skill         │
                             └─────────┬─────────┘
                                       │
           ┌───────────────────────────┼───────────────────────────┐
@@ -315,6 +316,7 @@ stability-analysis-agent/
 ├── tools/              # Tool implementations (parser, resolver, code provider)
 │   └── configs/        # Configuration templates
 ├── tool_system/        # Tool + Workflow registration & dispatch framework
+├── skill_system/       # Skill discovery, install, runtime bridge
 ├── workflows/          # Workflow definitions (crash analysis)
 ├── rag/                # RAG: rule store + vector index (ChromaDB) + metadata
 ├── prompts/            # Prompt templates for LLM analysis
@@ -334,12 +336,14 @@ stability-analysis-agent/
 | CLI Guide | [docs/cli/CLI_GUIDE.md](./docs/cli/CLI_GUIDE.md) |
 | CLI Commands Reference | [docs/cli/CLI_COMMANDS_REFERENCE.md](./docs/cli/CLI_COMMANDS_REFERENCE.md) |
 | Daemon Server Guide | [docs/cli/DAEMON_SERVER_GUIDE.md](./docs/cli/DAEMON_SERVER_GUIDE.md) |
+| Skill System | [docs/skills/README.md](./docs/skills/README.md) |
 | PyPI Release Scripts | [docs/scripts/PYPI_RELEASE_SCRIPTS.md](./docs/scripts/PYPI_RELEASE_SCRIPTS.md) |
 | System Architecture | [docs/architecture/README.md](./docs/architecture/README.md) |
 | Architecture Diagram | [docs/architecture/ARCHITECTURE_DIAGRAM.md](./docs/architecture/ARCHITECTURE_DIAGRAM.md) |
 | Tool System Overview | [docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md](./docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md) |
 | Tool Extension Guide | [docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md](./docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md) |
 | Workflow System | [docs/workflows/WORKFLOWS.md](./docs/workflows/WORKFLOWS.md) |
+| Skill System | [docs/skills/README.md](./docs/skills/README.md) |
 | RAG Vector Database | [docs/rag/README.md](./docs/rag/README.md) |
 | Crash Demos | [docs/crash_cases/README.md](./docs/crash_cases/README.md) |
 | Crash log formats & platforms | [docs/tools/CRASH_LOG_FORMATS.md](./docs/tools/CRASH_LOG_FORMATS.md) |

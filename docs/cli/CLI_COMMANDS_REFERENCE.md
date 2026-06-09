@@ -1,7 +1,7 @@
 # Stability Analysis Agent — CLI 命令参考
 
 本文档与仓库根目录下的 **`cli/main.py`**（Tool System 统一入口）保持一致。  
-CLI 为**扁平参数**（含少量管理子命令）：崩溃分析主流程与向量库运维类参数通过**是否携带向量库相关开关**区分；携带向量库运维参数时会**执行完即退出**，不跑崩溃分析。另提供 `config/profile/cancel` 子命令用于配置管理、会话模板与 daemon 任务取消。
+CLI 为**扁平参数**（含少量管理子命令）：崩溃分析主流程与向量库运维类参数通过**是否携带向量库相关开关**区分；携带向量库运维参数时会**执行完即退出**，不跑崩溃分析。另提供 `config/profile/cancel/skill` 子命令用于配置管理、会话模板、skill 管理与 daemon 任务取消。
 
 **入口与典型工作目录**（在仓库根目录执行）：
 
@@ -153,7 +153,31 @@ LLM 密钥与默认厂商/模型来自 **`tools/configs/agent_config.json`**；�
 
 ---
 
-## 6. 管理子命令
+## 6. Skill 管理子命令
+
+`sa-agent skill ...` 用于安装、发现、校验与运行 Claude 兼容 skill。
+
+| 子命令 | 作用 |
+|--------|------|
+| `skill list` | 列出可发现的 skills。 |
+| `skill show <name>` | 显示某个 skill 的详情。 |
+| `skill lint <path>` | 校验某个 skill 目录或安装包。 |
+| `skill install <source>` | 安装 skill 目录或 zip 包。 |
+| `skill uninstall <name>` | 卸载已安装 skill。 |
+| `skill init <name> <target>` | 生成 skill 模板。 |
+| `skill run <name>` | 渲染或执行 skill。 |
+
+`skill` 子命令支持的公共参数：
+
+| 参数 | 作用 |
+|------|------|
+| `--skill-home PATH` | 指定默认安装目录，默认 `~/.config/stability-analysis-agent/skills`。 |
+| `--skill-dir PATH` | 额外的技能发现目录，可重复。 |
+| `--json` | 将 `list/show/lint/install/uninstall/run` 的结果输出为 JSON。 |
+
+---
+
+## 7. 管理子命令
 
 | 子命令 | 作用 |
 |--------|------|
@@ -161,7 +185,7 @@ LLM 密钥与默认厂商/模型来自 **`tools/configs/agent_config.json`**；�
 | `profile` | 管理会话模板（list/show/use/save/delete）。 |
 | `cancel` | 取消 daemon 中正在运行的任务。 |
 
-### 6.1 取消 daemon 任务
+### 7.1 取消 daemon 任务
 
 ```bash
 # 取消默认 daemon（http://127.0.0.1:8765）中的任务
@@ -173,7 +197,7 @@ python3 cli/main.py cancel <run_id> --daemon http://127.0.0.1:8765
 
 ---
 
-## 7. 参数组合速查
+## 8. 参数组合速查
 
 | 场景 | 建议参数 |
 |------|----------|
@@ -190,10 +214,10 @@ python3 cli/main.py cancel <run_id> --daemon http://127.0.0.1:8765
 
 ---
 
-## 8. 文档维护
+## 9. 文档维护
 
 - **实现来源**：仓库根目录 `cli/main.py` 中 `build_parser()` 与 `main()`。
-- **最后更新**：2026-06-04（补充崩溃日志格式说明链接）。
+- **最后更新**：2026-06-08（新增 skill 子命令与 skill system 文档入口）。
 - 若增减参数或改变 `cli_reports` / 改码语义，请同步更新本文件。
 
 **说明**：若你曾在旧版本文档中见到 `tools/cli/main.py`、`--daemon` 等条目，**当前本仓库以 `cli/main.py` 为准**；其他入口（如 `agent/ai_stability_agent.py`、daemon）的参数不在此文件覆盖范围内。

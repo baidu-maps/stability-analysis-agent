@@ -7,6 +7,8 @@ Tool System 是 Stability Analysis Agent 的核心架构，采用 **Tool + Workf
 - **Tool（工具）** - 基础单元能力
 - **Workflow（工作流）** - 问题类型解决方案
 
+在此之上，仓库新增了独立的 **Skill System** 作为对外安装与分发层；Skill 可以把 Tool / Workflow / Prompt 组合成可安装包，但不会改变 Tool System 本身的职责边界。
+
 ## 核心组件
 
 ### 1. Tool 接口

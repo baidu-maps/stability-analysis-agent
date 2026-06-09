@@ -80,6 +80,7 @@ from tool_system import (  # type: ignore
     LLMAdapterFactory,
     register_all_tools_and_workflows,
 )
+from skill_system.cli import handle_skill_command
 
 # RAG（chromadb / sentence-transformers 等）仅在向量库子命令需要时加载，避免 `sa-agent` 首屏被拖慢。
 _rag_runtime_resolved = False
@@ -4469,6 +4470,8 @@ def _is_tty_interactive() -> bool:
 def main(argv: Optional[List[str]] = None) -> int:
     raw_argv = list(argv if argv is not None else sys.argv[1:])
     try:
+        if raw_argv and raw_argv[0] == "skill":
+            return handle_skill_command(raw_argv[1:])
         if raw_argv and raw_argv[0] == "config":
             return _handle_config_command(raw_argv[1:])
         if raw_argv and raw_argv[0] == "profile":
@@ -4536,4 +4539,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
