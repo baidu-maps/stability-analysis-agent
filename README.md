@@ -60,6 +60,7 @@ Select via `--engine direct|langchain|langgraph`. All modes share the same tool 
 | **RAG Knowledge Base** | Rule table (fast path) + vector retrieval (ChromaDB) with feedback loop |
 | **Tool + Workflow System** | Pluggable architecture — register custom tools and workflows via config or decorators |
 | **Skill System** | Install Claude-compatible skills, render prompt skills, or bridge skills into tools/workflows |
+| **External Agent Skill Pack** | Bundled [`stability-analysis-agent-skill/`](./stability-analysis-agent-skill/) — teach Claude Code, Cursor, and other agents how to install and run `sa-agent` |
 | **Multiple Interfaces** | CLI, HTTP Daemon (streaming / SSE), Python API |
 
 ## Architecture
@@ -124,10 +125,15 @@ Crash Log → Parse → Symbolize → Extract Code
 ### Prerequisites
 
 - Binary usage: no Python runtime required
-- Source usage: Python 3.9+
+- **Python version**: minimum **3.9**; **recommended 3.10–3.12** (primary CI coverage)
+  - Core only (parse + symbolize + LLM): 3.9+ is generally fine
+  - With `[rag]` (torch / transformers): prefer **3.10–3.12**; 3.9 may hit ML stack issues
+  - On macOS, prefer **Homebrew / pyenv** Python over python.org installers without CA setup (SSL)
 - (Optional) `atos` (macOS, built-in) or `addr2line` (Linux, via binutils) for symbolization
 
 ### Install and Launch (Recommended)
+
+**Option A — pip (venv or system environment)**
 
 ```bash
 # Install (for Mainland China, add -i https://pypi.tuna.tsinghua.edu.cn/simple)
@@ -140,7 +146,20 @@ pip install "stability-analysis-agent[rag]"
 sa-agent
 ```
 
-See [docs/cli/INSTALL_TROUBLESHOOTING.md](./docs/cli/INSTALL_TROUBLESHOOTING.md) for SSL, `transformers` / `nn` errors, etc.
+**Option B — pipx (isolated CLI, no global site-packages pollution)**
+
+```bash
+# Install pipx first: https://pipx.pypa.io/
+pipx install stability-analysis-agent
+# Or with RAG (large download, slower first install)
+pipx install "stability-analysis-agent[rag]"
+
+sa-agent --help
+```
+
+**Option C — prebuilt binary**: see “Use Prebuilt CLI Binary” below.
+
+See [docs/cli/INSTALL_TROUBLESHOOTING.md](./docs/cli/INSTALL_TROUBLESHOOTING.md) for Python versions, SSL, pipx, `transformers` / `nn` errors, etc.
 
 > The UX is intentionally Claude CLI-like: arrow-key menus, grouped "More options", clear back paths, and concise confirmations.  
 > In most cases, you can finish configuration + analysis + AI fix flow directly in the terminal.
@@ -166,6 +185,44 @@ code_root  -> examples/crash_cases/demo_basic/code_dir
 The CLI prints an execution plan and runs automatically. In AI mode, it performs parse + symbolize + code-context extraction + LLM reasoning, and can apply fix suggestions with backup.
 
 To analyze your own case, run `sa-agent` and input your own paths using the same flow.
+
+## Use with External AI Agents (Claude / Cursor)
+
+If you already use **Claude Code**, **Cursor**, or similar AI coding tools, install the bundled skill pack so the agent knows how to call this toolchain (symbolization, structured reports, `--scope`, etc.) — instead of guessing commands or pasting raw logs only.
+
+This is **not** the same as `sa-agent skill install` (runtime extensions for sa-agent). The pack lives at [`stability-analysis-agent-skill/`](./stability-analysis-agent-skill/) and is copied into **your external agent's** skill directory.
+
+**Step 1 — install the Python package** (provides `sa-agent`):
+
+```bash
+pip install stability-analysis-agent
+# or: pipx install stability-analysis-agent
+```
+
+**Step 2 — install the skill pack** into your agent:
+
+```bash
+git clone https://github.com/baidu-maps/stability-analysis-agent.git
+cp -R stability-analysis-agent/stability-analysis-agent-skill ~/.claude/skills/stability-analysis-agent
+```
+
+For **Cursor** (project-level example):
+
+```bash
+mkdir -p .cursor/skills
+cp -R stability-analysis-agent/stability-analysis-agent-skill .cursor/skills/stability-analysis-agent
+```
+
+After that, ask your agent to analyze a crash log with Stability Analysis Agent — it should propose `sa-agent` commands, pick the right `--scope`, and read `cli_reports/<timestamp>/` outputs.
+
+| Resource | Description |
+|----------|-------------|
+| [SKILL.md](./stability-analysis-agent-skill/SKILL.md) | Main entry for external agents |
+| [examples.md](./stability-analysis-agent-skill/examples.md) | Copy-paste command examples |
+| [reference.md](./stability-analysis-agent-skill/reference.md) | Flags, reports, config paths |
+| [docs/skills/README.md](./docs/skills/README.md) | sa-agent Skill System (runtime extensions) |
+
+> **No LLM key?** The skill documents `--scope gen_prompt_only` — full parse + symbolize + code context + prompt file, without calling an LLM.
 
 ## Other Ways (Advanced)
 
@@ -326,6 +383,7 @@ stability-analysis-agent/
 │       ├── demo_basic/         # NullPtr, DivZero, Abort, DoubleFree, etc.
 │       └── demo_multithread/   # Race condition, deadlock, atomic failure, etc.
 ├── test/               # Test suite
+├── stability-analysis-agent-skill/  # External agent skill pack (Claude / Cursor)
 └── docs/               # Documentation
 ```
 
@@ -336,14 +394,14 @@ stability-analysis-agent/
 | CLI Guide | [docs/cli/CLI_GUIDE.md](./docs/cli/CLI_GUIDE.md) |
 | CLI Commands Reference | [docs/cli/CLI_COMMANDS_REFERENCE.md](./docs/cli/CLI_COMMANDS_REFERENCE.md) |
 | Daemon Server Guide | [docs/cli/DAEMON_SERVER_GUIDE.md](./docs/cli/DAEMON_SERVER_GUIDE.md) |
-| Skill System | [docs/skills/README.md](./docs/skills/README.md) |
+| External Agent Skill Pack | [stability-analysis-agent-skill/](./stability-analysis-agent-skill/) |
+| Skill System (sa-agent runtime) | [docs/skills/README.md](./docs/skills/README.md) |
 | PyPI Release Scripts | [docs/scripts/PYPI_RELEASE_SCRIPTS.md](./docs/scripts/PYPI_RELEASE_SCRIPTS.md) |
 | System Architecture | [docs/architecture/README.md](./docs/architecture/README.md) |
 | Architecture Diagram | [docs/architecture/ARCHITECTURE_DIAGRAM.md](./docs/architecture/ARCHITECTURE_DIAGRAM.md) |
 | Tool System Overview | [docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md](./docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md) |
 | Tool Extension Guide | [docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md](./docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md) |
 | Workflow System | [docs/workflows/WORKFLOWS.md](./docs/workflows/WORKFLOWS.md) |
-| Skill System | [docs/skills/README.md](./docs/skills/README.md) |
 | RAG Vector Database | [docs/rag/README.md](./docs/rag/README.md) |
 | Crash Demos | [docs/crash_cases/README.md](./docs/crash_cases/README.md) |
 | Crash log formats & platforms | [docs/tools/CRASH_LOG_FORMATS.md](./docs/tools/CRASH_LOG_FORMATS.md) |
@@ -377,6 +435,9 @@ Ensure `--code-root` points to the source directory that contains the files list
 
 **Q: Can I use this without an LLM key?**
 Yes. Use `--scope gen_prompt_only` to run the full toolchain (parse + symbolize + extract code) without calling the LLM. The structured JSON output is useful on its own for triage and debugging.
+
+**Q: How do I use this from Claude Code or Cursor?**
+Install the Python package (`pip install stability-analysis-agent`), then copy [`stability-analysis-agent-skill/`](./stability-analysis-agent-skill/) into your agent's skill directory (e.g. `~/.claude/skills/stability-analysis-agent`). See [Use with External AI Agents](#use-with-external-ai-agents-claude--cursor) above.
 
 ## Contributing
 

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package (core + test extras)
+        run: |
+          python -m pip install -U pip
+          python -m pip install -e ".[test]"
+
+      - name: Verify CLI entrypoint
+        run: |
+          sa-agent --help
+          sa-agent config path
+
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -s test/tool_system -p 'test_http_ssl.py' -v
+          python -m unittest discover -s test/agent_py_tool -p 'test_parse_crash_errors.py' -v
+          python -m unittest discover -s test/agent_py_tool -p 'test_resolve_stack_errors.py' -v
+          python -m unittest discover -s test/agent_py_tool -p 'test_code_context_errors.py' -v
+          python -m unittest discover -s test/skill_system -p 'test_skill_system.py' -v

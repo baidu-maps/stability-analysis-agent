@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -1069,6 +1070,58 @@ def _safe_input(prompt: str) -> str:
         return "__EOF__"
 
 
+def _safe_input_back(prompt: str) -> str:
+    """行输入；直接回车或单独按 ESC 返回空串（表示返回上一级）。EOF -> __EOF__。"""
+    if not _is_tty_interactive():
+        try:
+            return input(prompt)
+        except EOFError:
+            return "__EOF__"
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    buf: List[str] = []
+    try:
+        tty.setcbreak(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if not ch:
+                return "__EOF__"
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch == "\x04" and not buf:
+                return "__EOF__"
+            if ch in ("\r", "\n"):
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(buf)
+            if ch == "\x1b":
+                if select.select([sys.stdin], [], [], 0.05)[0]:
+                    extra = sys.stdin.read(1)
+                    if extra:
+                        if extra == "[":
+                            sys.stdin.read(2)
+                        continue
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return ""
+            if ch in ("\x7f", "\b"):
+                if buf:
+                    buf.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            buf.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+    except EOFError:
+        return "__EOF__"
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 _ANSI_RED = "\033[31;1m"
 _ANSI_YELLOW = "\033[33;1m"
 _ANSI_GREEN = "\033[32;1m"
@@ -1506,6 +1559,7 @@ def _config_command_doctor() -> int:
         problems.append("未检测到 atos/addr2line/llvm-addr2line/llvm-symbolizer/ndk-stack 任一工具")
 
     print("== 配置检查结果 ==")
+    print(f"python: {sys.version.split()[0]} @ {sys.executable}")
     print(f"agent_config: {_user_agent_config_file()}")
     print(f"add2line_config: {_user_add2line_config_file()}")
     print("tools:")
@@ -2026,9 +2080,9 @@ def _update_add2line_config_interactive(initial_mode: Optional[str] = None) -> O
     if not isinstance(os_cfg, dict):
         os_cfg = {}
 
-    raw_path = _safe_input(
+    raw_path = _safe_input_back(
         "请输入符号化工具的绝对路径：可为可执行文件本身（如 .../llvm-addr2line），"
-        "或仅含该可执行文件的目录（直接回车返回上一级）: "
+        "或仅含该可执行文件的目录（直接回车或按ESC返回上一级）: "
     ).strip()
     if raw_path == "__EOF__" or not raw_path or raw_path.lower() in {"back", "b"}:
         return False
@@ -2200,8 +2254,90 @@ def _connectivity_probe_via_llm_adapter(engine: str) -> Dict[str, Any]:
     }
 
 
+def _connectivity_request_format(engine: str) -> str:
+    """读取当前配置下的 request_format（用于 SSL 预检选择 HTTP 栈）。"""
+    user_cfg = _load_user_agent_config_file()
+    llm_config = _build_llm_config_from_agent_config(engine, agent_cfg=user_cfg)
+    if llm_config is None:
+        return "openai_chat_completions_compatible"
+    return str((llm_config.extra or {}).get("request_format") or "openai_chat_completions_compatible").strip().lower()
+
+
+def _connectivity_transport_label(request_format: str) -> str:
+    from tool_system.llm.http_ssl import uses_urllib_transport
+
+    return "urllib + certifi" if uses_urllib_transport(request_format) else "OpenAI SDK / httpx"
+
+
+def _print_connectivity_ssl_precheck_failure(
+    exc: BaseException,
+    *,
+    elapsed: float,
+    request_format: str,
+) -> None:
+    from tool_system.llm.http_ssl import classify_connectivity_failure, python_ssl_diagnostics
+
+    info = classify_connectivity_failure(exc)
+    transport = _connectivity_transport_label(request_format)
+    print(f"❌ {info.headline}")
+    print(f"- 失败类型: {info.category}（本机 CA / SSL 环境）")
+    print(f"- 传输栈: {transport}")
+    print(f"- 说明: {info.reason}")
+    print("- 建议操作：")
+    for step in info.fix_steps:
+        print(f"  · {step}")
+    print("- 环境信息：")
+    for line in python_ssl_diagnostics():
+        print(f"  {line}")
+    print(f"- 耗时: {elapsed:.2f}s")
+    print("- 已跳过对大模型的联通性探测（请先修复本机 SSL 环境）。")
+
+
+def _print_connectivity_probe_failure(
+    exc: BaseException,
+    *,
+    elapsed: float,
+    request_format: str,
+) -> bool:
+    """打印联通性探测失败信息。返回是否已在交互模式展示「查看详细错误」。"""
+    from tool_system.llm.http_ssl import classify_connectivity_failure
+
+    info = classify_connectivity_failure(exc)
+    transport = _connectivity_transport_label(request_format)
+    raw_msg = str(exc).strip()
+    print(f"❌ {info.headline}")
+    print(f"- 失败类型: {info.category}")
+    print(f"- 传输栈: {transport}")
+    print(f"- 原因: {info.reason}")
+    if info.fix_steps:
+        print("- 建议操作：")
+        for step in info.fix_steps:
+            print(f"  · {step}")
+    print(f"- 耗时: {elapsed:.2f}s")
+    if info.show_raw_by_default and raw_msg:
+        print(f"- 错误: {raw_msg}")
+        return False
+    if raw_msg and _is_tty_interactive():
+        detail_choice = _prompt_select(
+            "联通性检测已完成",
+            [
+                ("back", "返回"),
+                ("detail", "查看详细错误"),
+            ],
+            default_index=0,
+        )
+        if detail_choice == "detail":
+            print(f"- 详细错误: {raw_msg}")
+        return True
+    if raw_msg and not info.show_raw_by_default:
+        print("- 提示: 原始异常已隐藏；如需排查可查看日志或联系支持。")
+    return False
+
+
 def _check_llm_connectivity() -> None:
-    def _ack_result() -> None:
+    def _ack_result(*, skip_prompt: bool = False) -> None:
+        if skip_prompt:
+            return
         if _is_tty_interactive():
             _prompt_select(
                 "联通性检测已完成",
@@ -2211,7 +2347,32 @@ def _check_llm_connectivity() -> None:
         else:
             _safe_input("联通性检测已完成，按回车返回... ")
 
+    from tool_system.llm.http_ssl import is_ssl_certificate_error, precheck_https_ssl_environment, uses_urllib_transport
+
     engine = _connectivity_engine_from_session()
+    request_format = _connectivity_request_format(engine)
+    use_urllib = uses_urllib_transport(request_format)
+    transport = _connectivity_transport_label(request_format)
+
+    print(f"正在检查本机 SSL 环境（传输栈: {transport}）...")
+    precheck_start = time.time()
+    try:
+        precheck_https_ssl_environment(use_urllib=use_urllib, timeout=5.0)
+        print("✓ 本机 SSL 环境检查通过")
+    except KeyboardInterrupt:
+        print("\n已取消联通性检测。")
+        _ack_result()
+        return
+    except Exception as pre_exc:
+        if is_ssl_certificate_error(pre_exc):
+            _print_connectivity_ssl_precheck_failure(
+                pre_exc,
+                elapsed=time.time() - precheck_start,
+                request_format=request_format,
+            )
+            _ack_result()
+            return
+
     print(f"正在检测联通性（engine={engine}，最长约 10 秒，可按 Ctrl+C 取消）...")
     start = time.time()
     try:
@@ -2239,27 +2400,12 @@ def _check_llm_connectivity() -> None:
         _ack_result()
     except Exception as exc:
         elapsed = time.time() - start
-        msg = str(exc)
-        lower = msg.lower()
-        reason = "请求失败"
-        if "404" in lower:
-            reason = "接口路径可能错误（404）"
-        elif "401" in lower or "403" in lower:
-            reason = "鉴权失败（401/403，检查密钥与权限）"
-        elif "timeout" in lower or "timed out" in lower:
-            reason = "请求超时（网络或网关较慢）"
-        elif "name or service not known" in lower or "nodename nor servname" in lower:
-            reason = "域名解析失败（DNS/地址配置问题）"
-        elif "certificate verify failed" in lower or "ssl: certificate_verify_failed" in lower:
-            reason = (
-                "SSL 证书校验失败（多为 Python 环境 CA 不完整；"
-                "macOS 官方安装包可运行「Install Certificates.command」或使用 Homebrew Python）"
-            )
-        print("❌ 联通性检测失败")
-        print(f"- 原因: {reason}")
-        print(f"- 耗时: {elapsed:.2f}s")
-        print(f"- 错误: {msg}")
-        _ack_result()
+        handled_detail = _print_connectivity_probe_failure(
+            exc,
+            elapsed=elapsed,
+            request_format=request_format,
+        )
+        _ack_result(skip_prompt=handled_detail)
 
 
 def _configure_llm_only() -> None:
@@ -3963,7 +4109,7 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
     print("")
     print(_yellow(f"[步骤 1/{total_steps}] 崩溃日志路径"))
     while True:
-        raw = _safe_input("请输入崩溃日志路径（直接回车返回上一级）: ").strip()
+        raw = _safe_input_back("请输入崩溃日志路径（直接回车或按ESC返回上一级）: ").strip()
         if raw == "__EOF__":
             return None
         if not raw:
@@ -3994,7 +4140,9 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
         print("  · Android / 鸿蒙 / Linux：含 .so（未 strip，保留调试信息）的目录")
         print("  · Windows：含 .pdb / .exe 的目录")
         while True:
-            raw = _safe_input("请输入符号库目录（直接回车返回上一级；日志已含函数名+行号可输入 skip 跳过）: ").strip()
+            raw = _safe_input_back(
+                "请输入符号库目录（直接回车或按ESC返回上一级；日志已含函数名+行号可输入 skip 跳过）: "
+            ).strip()
             if raw == "__EOF__":
                 return None
             if not raw:
@@ -4024,9 +4172,12 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
             print(f"- {title_prefix}C/C++ 源码目录{_yellow('（必填）')}：与崩溃二进制对应的本地源码所在目录")
             print("  · 多个目录用中文或英文逗号分隔，例：~/code/MyApp/src, ~/code/MySDK/src")
             print(_yellow("  · 建议精确到工程/模块根目录，太大的目录（如 ~/code 整个仓库根目录）可能会拖慢源文件定位"))
-            input_prompt = f"请输入{input_prefix}C/C++ 源码目录（支持输入多个目录，可用中文或英文逗号分隔，直接回车返回上一级）: "
+            input_prompt = (
+                f"请输入{input_prefix}C/C++ 源码目录（支持输入多个目录，可用中文或英文逗号分隔，"
+                f"直接回车或按ESC返回上一级）: "
+            )
             while True:
-                raw = _safe_input(input_prompt).strip()
+                raw = _safe_input_back(input_prompt).strip()
                 if raw == "__EOF__":
                     return None
                 if not raw:

@@ -1,8 +1,32 @@
 # 安装与依赖排错
 
-## 推荐安装方式
+## Python 版本
+
+| 场景 | 建议版本 |
+|------|----------|
+| 最低支持 | **Python 3.9**（`pyproject.toml` → `requires-python = ">=3.9"`） |
+| 推荐（核心 + 交互 CLI） | **3.10 – 3.12** |
+| 含 `[rag]` extra | **3.10 – 3.12**（torch / transformers 组合在 3.9 上更容易踩坑） |
+| 未在 CI 中验证 | 3.13+：可尝试安装，但不保证 `[rag]` 依赖均有 wheel |
+
+查看当前环境：
 
 ```bash
+python3 --version
+python3 -c "import sys; print(sys.executable)"
+sa-agent config doctor
+```
+
+**macOS 提示**：优先使用 Homebrew（`brew install python@3.12`）或 pyenv 安装的 Python；python.org 官方包若未运行 `Install Certificates.command`，易出现 SSL 证书错误（见下文）。
+
+## 推荐安装方式
+
+### pip（venv，通用）
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+
 # 核心能力：崩溃解析、符号化、代码上下文、LLM 分析
 pip install stability-analysis-agent
 
@@ -15,6 +39,37 @@ pip install "stability-analysis-agent[rag]"
 ```bash
 pip install -e ".[rag,test]"
 ```
+
+### pipx（隔离 CLI，推荐终端用户）
+
+[pipx](https://pipx.pypa.io/) 为每个 CLI 工具创建独立虚拟环境，避免与系统/项目 Python 包冲突。
+
+```bash
+# 安装 pipx（macOS 示例）
+brew install pipx
+pipx ensurepath
+
+# 核心 CLI
+pipx install stability-analysis-agent
+
+# 含 RAG（下载体积大，首次安装较慢）
+pipx install "stability-analysis-agent[rag]"
+
+# 验证
+sa-agent --help
+sa-agent config doctor
+```
+
+**pipx 说明**：
+
+- 升级：`pipx upgrade stability-analysis-agent`
+- 卸载：`pipx uninstall stability-analysis-agent`
+- SSL / CA 问题仍取决于 pipx 使用的 **底层 Python 解释器**（与 pip 相同）
+- 开发调试（可编辑安装）请用 `pip install -e .`，不要用 pipx
+
+### 预编译二进制（无需 Python）
+
+见 [README.zh-CN.md](../../README.zh-CN.md) 中「使用预编译 CLI 二进制」。
 
 ## `PyTorch >= 2.4 is required but found 2.2.x` / NumPy 2.x 与 torch 不兼容
 
@@ -61,7 +116,12 @@ pip install --upgrade "stability-analysis-agent[rag]"
 
 ## SSL：`CERTIFICATE_VERIFY_FAILED`
 
-属于本机 Python 的 CA 环境，包无法自动修复。参见联通性检测失败时的 CLI 提示，或 macOS 运行 `Install Certificates.command` / 使用 Homebrew Python。
+属于本机 Python 的 CA 环境，包无法自动修复。处理建议：
+
+1. macOS 官方 Python：运行安装目录下 **Install Certificates.command**
+2. 或改用 Homebrew / pyenv 安装的 Python
+3. 交互菜单「检测联通性」会先检查本机 SSL 环境并给出分层提示
+4. 企业内网：向 IT 导入公司根证书
 
 ## 向量库子命令提示「向量数据库不可用」
 

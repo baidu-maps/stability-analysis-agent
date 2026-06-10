@@ -60,6 +60,7 @@
 | **RAG 知识库** | 规则表（快速路径）+ 向量检索（ChromaDB），支持反馈闭环 |
 | **Tool + Workflow 系统** | 可插拔架构 — 通过配置或装饰器注册自定义工具和工作流 |
 | **Skill 系统** | 安装 Claude 兼容 skill，支持提示词技能或桥接为工具 / 工作流 |
+| **对外 Agent 能力包** | 仓库自带 [`stability-analysis-agent-skill/`](./stability-analysis-agent-skill/) — 教 Claude Code、Cursor 等外部 Agent 如何安装并调用 `sa-agent` |
 | **多种接入方式** | CLI、HTTP Daemon（流式 / SSE）、Python API |
 
 ## 架构
@@ -124,10 +125,15 @@
 ### 环境要求
 
 - 二进制使用：无需 Python 运行时
-- 源码使用：Python 3.9+
+- **Python 版本**：最低 **3.9**；**推荐 3.10–3.12**（依赖与 CI 主要在此区间验证）
+  - 仅核心能力（解析 + 符号化 + LLM）：3.9+ 通常可用
+  - 含 `[rag]`（torch / transformers 等）：建议 **3.10–3.12**；3.9 可能遇到 ML 栈组合问题
+  - macOS 建议优先使用 **Homebrew / pyenv** 安装的 Python，避免官方安装包未配置 CA 导致 SSL 失败
 - （可选）符号化工具：`atos`（macOS 自带）或 `addr2line`（Linux，来自 binutils）
 
 ### 安装并启动（推荐）
+
+**方式 A — pip（venv 或系统环境）**
 
 ```bash
 # 安装（中国大陆可加 -i https://pypi.tuna.tsinghua.edu.cn/simple）
@@ -140,7 +146,20 @@ pip install "stability-analysis-agent[rag]"
 sa-agent
 ```
 
-安装排错（SSL、`transformers`/`nn` 报错等）见 [docs/cli/INSTALL_TROUBLESHOOTING.md](./docs/cli/INSTALL_TROUBLESHOOTING.md)。
+**方式 B — pipx（隔离 CLI，不污染全局 site-packages）**
+
+```bash
+# 先安装 pipx：https://pipx.pypa.io/
+pipx install stability-analysis-agent
+# 或含 RAG（体积较大、首次安装较慢）
+pipx install "stability-analysis-agent[rag]"
+
+sa-agent --help
+```
+
+**方式 C — 预编译二进制**：见下方「使用预编译 CLI 二进制」。
+
+安装排错（Python 版本、SSL、pipx、`transformers`/`nn` 报错等）见 [docs/cli/INSTALL_TROUBLESHOOTING.md](./docs/cli/INSTALL_TROUBLESHOOTING.md)。
 
 > 交互体验对标 Claude CLI：支持上下键菜单、分组化“设置 / 帮助”、可返回路径和关键步骤确认。  
 > 大多数场景可在终端向导内完成“配置 + 分析 + AI 修复建议”全流程。
@@ -166,6 +185,44 @@ code_root   -> examples/crash_cases/demo_basic/code_dir
 CLI 会先输出执行计划，再自动执行。AI 模式下将完成解析、符号化、代码上下文提取和 LLM 推理，并可回写修复建议（含备份）。
 
 分析你自己的崩溃日志同样使用 `sa-agent` 交互输入路径即可。输出位于 `./cli_reports/<timestamp>/`。
+
+## 在 Claude / Cursor 等外部 Agent 中使用
+
+若你已在用 **Claude Code**、**Cursor** 等 AI 编程工具，可安装仓库自带的对外能力包，让外部 Agent 知道如何调用本工具链（符号化、结构化报告、`--scope` 等），而不是仅凭猜测拼命令或只粘贴原始日志。
+
+这与 `sa-agent skill install`（给 sa-agent 运行时安装扩展）**不是一回事**。能力包位于 [`stability-analysis-agent-skill/`](./stability-analysis-agent-skill/)，需复制到**外部 Agent 自己的** skill 目录。
+
+**步骤 1 — 安装 Python 包**（提供 `sa-agent` 命令）：
+
+```bash
+pip install stability-analysis-agent
+# 或：pipx install stability-analysis-agent
+```
+
+**步骤 2 — 安装能力包**到外部 Agent：
+
+```bash
+git clone https://github.com/baidu-maps/stability-analysis-agent.git
+cp -R stability-analysis-agent/stability-analysis-agent-skill ~/.claude/skills/stability-analysis-agent
+```
+
+**Cursor**（项目级示例）：
+
+```bash
+mkdir -p .cursor/skills
+cp -R stability-analysis-agent/stability-analysis-agent-skill .cursor/skills/stability-analysis-agent
+```
+
+安装后，可让外部 Agent「用 Stability Analysis Agent 分析崩溃日志」——它应能给出 `sa-agent` 命令、选择合适的 `--scope`，并读取 `cli_reports/<timestamp>/` 下的报告。
+
+| 资源 | 说明 |
+|------|------|
+| [SKILL.md](./stability-analysis-agent-skill/SKILL.md) | 外部 Agent 主入口 |
+| [examples.md](./stability-analysis-agent-skill/examples.md) | 可复制命令示例 |
+| [reference.md](./stability-analysis-agent-skill/reference.md) | 参数、报告、配置路径 |
+| [docs/skills/README.md](./docs/skills/README.md) | sa-agent Skill System（运行时扩展机制） |
+
+> **没有 LLM Key？** 能力包内说明可使用 `--scope gen_prompt_only` — 完整解析 + 符号化 + 代码上下文 + 提示词文件，不调用 LLM。
 
 ## 其它方式（高级）
 
@@ -326,6 +383,7 @@ stability-analysis-agent/
 │       ├── demo_basic/         # NullPtr、DivZero、Abort、DoubleFree 等
 │       └── demo_multithread/   # 竞态条件、死锁、原子操作失败等
 ├── test/               # 测试套件
+├── stability-analysis-agent-skill/  # 对外 Agent 能力包（Claude / Cursor 等）
 └── docs/               # 文档
 ```
 
@@ -336,14 +394,14 @@ stability-analysis-agent/
 | CLI 使用指南 | [docs/cli/CLI_GUIDE.md](./docs/cli/CLI_GUIDE.md) |
 | CLI 参数参考 | [docs/cli/CLI_COMMANDS_REFERENCE.md](./docs/cli/CLI_COMMANDS_REFERENCE.md) |
 | Daemon 服务指南 | [docs/cli/DAEMON_SERVER_GUIDE.md](./docs/cli/DAEMON_SERVER_GUIDE.md) |
-| Skill 系统 | [docs/skills/README.md](./docs/skills/README.md) |
+| 对外 Agent 能力包 | [stability-analysis-agent-skill/](./stability-analysis-agent-skill/) |
+| Skill 系统（sa-agent 运行时） | [docs/skills/README.md](./docs/skills/README.md) |
 | PyPI 发布脚本指南 | [docs/scripts/PYPI_RELEASE_SCRIPTS.md](./docs/scripts/PYPI_RELEASE_SCRIPTS.md) |
 | 系统架构 | [docs/architecture/README.md](./docs/architecture/README.md) |
 | 架构图 | [docs/architecture/ARCHITECTURE_DIAGRAM.md](./docs/architecture/ARCHITECTURE_DIAGRAM.md) |
 | Tool System 概览 | [docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md](./docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md) |
 | 工具扩展指南 | [docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md](./docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md) |
 | Workflow 系统 | [docs/workflows/WORKFLOWS.md](./docs/workflows/WORKFLOWS.md) |
-| Skill 系统 | [docs/skills/README.md](./docs/skills/README.md) |
 | RAG 向量数据库 | [docs/rag/README.md](./docs/rag/README.md) |
 | 崩溃示例 | [docs/crash_cases/README.md](./docs/crash_cases/README.md) |
 | 崩溃日志格式与平台支持 | [docs/tools/CRASH_LOG_FORMATS.zh-CN.md](./docs/tools/CRASH_LOG_FORMATS.zh-CN.md) |
@@ -377,6 +435,9 @@ python3 test/agent_py_tool/test_vector_db.py
 
 **Q：不配置 LLM Key 能用吗？**
 可以。使用 `--scope gen_prompt_only` 即可运行完整工具链（解析 + 符号化 + 代码提取），跳过 LLM 调用并生成可复用提示词，结构化 JSON 输出本身就对问题定位很有帮助。
+
+**Q：如何在 Claude Code 或 Cursor 里使用？**
+先安装 Python 包（`pip install stability-analysis-agent`），再将 [`stability-analysis-agent-skill/`](./stability-analysis-agent-skill/) 复制到外部 Agent 的 skill 目录（例如 `~/.claude/skills/stability-analysis-agent`）。详见上文 [在 Claude / Cursor 等外部 Agent 中使用](#在-claude--cursor-等外部-agent-中使用)。
 
 ## 贡献
 

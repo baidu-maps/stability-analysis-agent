@@ -2,6 +2,15 @@
 
 Skill 是 Stability Analysis Agent 的对外扩展单元，负责把第三方能力包装成可发现、可安装、可运行的资产。
 
+## 两种 Skill（勿混淆）
+
+| | 仓库根 `stability-analysis-agent-skill/` | `sa-agent skill` 管理的 skill |
+|---|---|---|
+| **用途** | 教 **外部 Agent**（Claude、Cursor 等）如何使用本仓库能力 | 给 **sa-agent 运行时** 安装第三方扩展 |
+| **安装方式** | 复制到 `~/.claude/skills/`、`~/.cursor/skills/` 等 | `sa-agent skill install <path>` |
+| **依赖** | 需先 `pip install stability-analysis-agent` | 由 SkillManager 发现与管理 |
+| **文档** | [stability-analysis-agent-skill/README.md](../../stability-analysis-agent-skill/README.md) | 本文档下文 |
+
 ## 分层关系
 
 - `Tool`：原子能力，例如解析、符号化、检索。
@@ -71,6 +80,7 @@ Skill 安装后可以通过导出进入现有 Tool System：
 
 ## 相关文档
 
+- [对外能力包 stability-analysis-agent-skill](../../stability-analysis-agent-skill/README.md)（给 Claude / Cursor 等外部 Agent）
 - [Skill 模板](./SKILL_TEMPLATE.md)
 - [Claude 兼容说明](./CLAUDE_COMPATIBILITY.md)
 - [Tool System 概览](../tools/tool_system/TOOL_SYSTEM_OVERVIEW.md)

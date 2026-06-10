@@ -80,6 +80,8 @@ AI_STABILITY_TEST_FAST=1 python3 test/llm/test_vscode_simulation.py
 
 ### Package Installation
 
+Python **3.9+**（推荐 **3.10–3.12**；`[rag]` 建议 3.10–3.12）。详见 `docs/cli/INSTALL_TROUBLESHOOTING.md`。
+
 ```bash
 # Install as editable package (required before first run)
 pip install -e ".[rag]"
@@ -87,6 +89,10 @@ pip install -e ".[rag]"
 # PyPI: core only vs with vector/RAG stack
 pip install stability-analysis-agent
 pip install "stability-analysis-agent[rag]"
+
+# Isolated CLI (terminal users)
+pipx install stability-analysis-agent
+pipx install "stability-analysis-agent[rag]"
 ```
 
 Install troubleshooting: `docs/cli/INSTALL_TROUBLESHOOTING.md`  

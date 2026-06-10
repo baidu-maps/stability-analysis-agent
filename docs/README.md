@@ -44,7 +44,8 @@ docs/
 
 | 文档 | 说明 |
 |------|------|
-| [skills/README.md](./skills/README.md) | Skill 系统总览 |
+| [../stability-analysis-agent-skill/README.md](../stability-analysis-agent-skill/README.md) | **对外能力包**（给 Claude / Cursor 等外部 Agent） |
+| [skills/README.md](./skills/README.md) | Skill 系统总览（sa-agent 扩展机制） |
 | [skills/SKILL_TEMPLATE.md](./skills/SKILL_TEMPLATE.md) | Skill 模板 |
 | [skills/CLAUDE_COMPATIBILITY.md](./skills/CLAUDE_COMPATIBILITY.md) | Claude Skill 兼容说明 |
 

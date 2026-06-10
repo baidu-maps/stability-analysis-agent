@@ -14,6 +14,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Generator, Union
 
+from tool_system.llm.http_ssl import urllib_urlopen
+
 logger = logging.getLogger(__name__)
 
 
@@ -277,7 +279,7 @@ class DirectLLMAdapter(BaseLLMAdapter):
         else:
             http_timeout = base_timeout
         try:
-            resp = urllib.request.urlopen(req, timeout=http_timeout)
+            resp = urllib_urlopen(req, timeout=http_timeout)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore").strip()
             raise RuntimeError(f"LLM call failed: Error code: {exc.code} - {detail or exc.reason}") from exc
@@ -426,7 +428,7 @@ class DirectLLMAdapter(BaseLLMAdapter):
             headers=headers,
         )
         try:
-            with urllib.request.urlopen(req, timeout=max(float(self.timeout or 180), 300.0)) as resp:
+            with urllib_urlopen(req, timeout=max(float(self.timeout or 180), 300.0)) as resp:
                 raw = resp.read().decode("utf-8", errors="ignore")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore").strip()
