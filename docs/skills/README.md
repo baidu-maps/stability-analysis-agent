@@ -51,6 +51,13 @@ sa-agent skill lint /path/to/skill-dir
 
 # 生成 skill 模板
 sa-agent skill init my-skill ./my-skill
+
+# 闭环场景空模板
+sa-agent skill init automation-testing-skill ./automation-testing-skill --preset automation-testing
+sa-agent skill init cicd-pipeline-skill ./cicd-pipeline-skill --preset cicd-pipeline
+
+# 缺陷管理平台拉取（工单号 → crash 上下文）
+sa-agent skill init bug-platform-fetcher-skill ./bug-platform-fetcher-skill --preset bug-platform-fetcher
 ```
 
 ## 安装目录
@@ -77,6 +84,22 @@ Skill 安装后可以通过导出进入现有 Tool System：
 - `exports.kind = workflow` -> 注册到 `tool_system` 的工作流表
 - `entrypoint = prompt` -> 作为提示词技能渲染并输出
 - `entrypoint = workflow:<name>` -> 直接执行导出的工作流
+
+## 闭环模板
+
+如果你希望把“修复后验证”和“修复后打包”拆成独立 Skill，请优先看：
+
+- [闭环 Skill 模板](./CLOSE_LOOP_SKILL_TEMPLATES.md)
+
+这两个模板默认是空壳，适合开发者先接入菜单与执行骨架，再逐步补充项目专属命令。
+
+## 缺陷管理平台拉取模板
+
+如果需要"输入工单号 → 拉取崩溃日志 + 调试库"，请看：
+
+- [Bug Platform Fetcher 模板](./BUG_PLATFORM_FETCHER_TEMPLATE.md)
+
+这一模板**只提供菜单交互与 Skill 骨架**，具体的平台 API 调用（iCafe / Jira / WorkTile / 飞书 / 自建系统）由团队在自己的仓库里实现，与本开源仓库无任何依赖。
 
 ## 相关文档
 

@@ -238,7 +238,7 @@ class GraphEdge:
     """崩溃相关代码图中的边，描述节点之间的关系"""
     from_id: str
     to_id: str
-    type: str  # "calls_direct" | "calls_stack_order" | "calls_to_crash_site" | "use_shared_var"
+    type: str  # "calls_direct" | "calls_stack_order" | "calls_stack_verified" | "calls_to_crash_site" | "use_shared_var"
     thread_id: Optional[str] = None
     is_crash_thread: Optional[bool] = None
     is_main_thread: Optional[bool] = None
@@ -3132,6 +3132,258 @@ class CodeContentProvider:
             else:
                 break
         return out
+
+    _STACK_BRIDGE_CALL_NAMES = frozenset({"VDelete", "RemoveAll"})
+
+    def _graph_node_body_text(self, node: GraphNode) -> str:
+        """读取 GraphNode 可分析的函数体文本（snippet 优先，否则按行号读文件）。"""
+        if node.snippet:
+            return "\n".join(node.snippet)
+        path = node.file
+        if not path or not os.path.isfile(path):
+            return ""
+        ss = (node.snippet_start_line or 0) - 1
+        ee = (node.snippet_end_line or 0) - 1
+        if ss < 0 or ee < ss:
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
+            if ee >= len(lines):
+                ee = len(lines) - 1
+            return "".join(lines[ss : ee + 1])
+        except Exception:
+            return ""
+
+    def _extract_call_target_simple_names(self, caller: GraphNode) -> List[str]:
+        """从 caller 函数体提取被调用的简单方法名（成员调用、自由函数、已知桥接宏）。"""
+        body = self._graph_node_body_text(caller)
+        if not body:
+            return []
+        names: List[str] = []
+        for m in re.finditer(r"(?:->|\.)\s*(\w+)\s*\(", body):
+            names.append(m.group(1))
+        for m in re.finditer(r"\b(\w+)\s*\(", body):
+            tok = m.group(1)
+            if tok in self._STACK_BRIDGE_CALL_NAMES:
+                names.append(tok)
+        if self._ts_parser and caller.file and os.path.isfile(caller.file):
+            try:
+                with open(caller.file, "r", encoding="utf-8", errors="ignore") as f:
+                    source_text = f.read()
+                source_bytes = source_text.encode("utf-8", errors="ignore")
+                tree = self._ts_parser.parse(source_bytes)
+                fn_node = self._ts_pick_function_definition_for_graph_node(
+                    caller, source_bytes, tree.root_node
+                )
+                if fn_node is not None:
+                    stack: List[Any] = [fn_node]
+                    while stack:
+                        cur = stack.pop()
+                        if cur is None:
+                            continue
+                        if cur.type == "call_expression":
+                            callee_text = source_bytes[
+                                cur.start_byte : cur.end_byte
+                            ].decode("utf-8", errors="ignore")
+                            cm = re.search(r"(?:->|\.|\b)(\w+)\s*\(", callee_text)
+                            if cm:
+                                names.append(cm.group(1))
+                        try:
+                            stack.extend(list(cur.children))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        seen: set = set()
+        out: List[str] = []
+        for n in names:
+            if n and n not in seen and n not in ("if", "for", "while", "switch", "return"):
+                seen.add(n)
+                out.append(n)
+        return out
+
+    def _callee_is_vdestruct_elements(self, callee: GraphNode) -> bool:
+        sig = (callee.signature or callee.name or "").strip()
+        return "VDestructElements" in sig
+
+    def _node_has_bridge_to_callee(self, node: GraphNode, callee: GraphNode) -> bool:
+        """判断 node 是否通过 VDelete/RemoveAll 等桥接逻辑可达模板析构 callee。"""
+        if self._verify_stack_caller_resolves_call_to_callee(node, callee):
+            return True
+        if not self._callee_is_vdestruct_elements(callee):
+            return False
+        body = self._graph_node_body_text(node)
+        if not body:
+            return False
+        if re.search(r"\bVDelete\s*[<(]", body):
+            return True
+        if re.search(r"\bRemoveAll\s*\(", body):
+            return True
+        return False
+
+    def _probe_called_function_node(
+        self,
+        call_name: str,
+        caller: GraphNode,
+        code_roots: List[str],
+        stack_priority_files: Optional[List[str]] = None,
+    ) -> Optional[GraphNode]:
+        """将 caller 体内的 call_name 解析为可继续 BFS 的 GraphNode（优先栈邻近源文件）。"""
+        if not call_name or not code_roots:
+            return None
+        files_to_scan: List[str] = []
+        for raw in stack_priority_files or []:
+            if raw and os.path.isfile(raw) and raw not in files_to_scan:
+                files_to_scan.append(raw)
+        if caller.file and caller.file not in files_to_scan:
+            files_to_scan.insert(0, caller.file)
+
+        def _node_from_location(file_path: str, line_no: int, sig_hint: str) -> Optional[GraphNode]:
+            try:
+                cf = self._extract_crash_function(sig_hint, file_path, line_no, code_roots)
+            except Exception:
+                cf = None
+            if cf is None or not cf.snippet:
+                return None
+            sig = (cf.signature or sig_hint or call_name).strip()
+            return GraphNode(
+                id="",
+                type="function",
+                name=self._extract_function_name_from_resolved(sig) or call_name,
+                file=file_path,
+                signature=sig,
+                snippet=cf.snippet,
+            )
+
+        qual_pat = re.compile(
+            rf"\b(\w+(?:::\w+)::{re.escape(call_name)}\s*\([^)]*\))"
+        )
+        for fp in files_to_scan:
+            try:
+                lines = self._read_file_lines_cached(fp) or []
+            except Exception:
+                continue
+            for idx, line in enumerate(lines):
+                if not re.search(rf"\b{re.escape(call_name)}\s*\(", line):
+                    continue
+                qm = qual_pat.search(line)
+                sig_hint = qm.group(1) if qm else call_name
+                if qm or re.search(rf"^\s*\w[\w\s\*&:<>,]*\b{re.escape(call_name)}\s*\(", line):
+                    node = _node_from_location(fp, idx + 1, sig_hint)
+                    if node is not None:
+                        return node
+
+        loc = self._find_function_definition_location(call_name, code_roots)
+        if loc:
+            node = _node_from_location(loc[0], loc[1], call_name)
+            if node is not None:
+                return node
+        if call_name in self._STACK_BRIDGE_CALL_NAMES:
+            for fp in files_to_scan:
+                try:
+                    lines = self._read_file_lines_cached(fp) or []
+                except Exception:
+                    continue
+                for idx, line in enumerate(lines):
+                    if re.search(rf"\b{re.escape(call_name)}\s*[<(]", line):
+                        node = _node_from_location(fp, idx + 1, call_name)
+                        if node is not None:
+                            return node
+        return None
+
+    def _bridge_nodes_between(
+        self,
+        from_node: GraphNode,
+        to_node: GraphNode,
+        code_roots: List[str],
+        stack_priority_files: Optional[List[str]],
+    ) -> List[GraphNode]:
+        """在 from_node 与 to_node 之间插入 VDelete 等桥接节点（仅当源码可见）。"""
+        if not self._callee_is_vdestruct_elements(to_node):
+            return []
+        body = self._graph_node_body_text(from_node)
+        if not body:
+            return []
+        bridges: List[GraphNode] = []
+        if re.search(r"\bVDelete\s*[<(]", body):
+            vd = self._probe_called_function_node(
+                "VDelete", from_node, code_roots, stack_priority_files
+            )
+            if vd is not None:
+                bridges.append(vd)
+        return bridges
+
+    def _resolve_stack_adjacent_call_chain_ids(
+        self,
+        outer: GraphNode,
+        inner: GraphNode,
+        code_roots: List[str],
+        stack_priority_files: Optional[List[str]],
+        register_graph_node: Any,
+        max_depth: int = 4,
+    ) -> Optional[List[str]]:
+        """
+        解析栈相邻帧 outer(caller) -> inner(callee) 的可达调用链（含间接 hop）。
+        返回从 outer 到 inner 的 GraphNode.id 列表；不可达则 None。
+        """
+        if self._node_has_bridge_to_callee(outer, inner):
+            mids = self._bridge_nodes_between(outer, inner, code_roots, stack_priority_files)
+            out_ids = [register_graph_node(outer)]
+            for mid in mids:
+                out_ids.append(register_graph_node(mid))
+            inner_id = register_graph_node(inner)
+            if out_ids[-1] != inner_id:
+                out_ids.append(inner_id)
+            return out_ids if len(out_ids) >= 2 else None
+
+        from collections import deque
+
+        start_id = register_graph_node(outer)
+        inner_id = register_graph_node(inner)
+        if start_id == inner_id:
+            return [start_id]
+
+        queue: deque = deque([(outer, [start_id])])
+        visited: set = {start_id}
+        while queue:
+            node, path_ids = queue.popleft()
+            if len(path_ids) > max_depth:
+                continue
+            for call_name in self._extract_call_target_simple_names(node):
+                child = self._probe_called_function_node(
+                    call_name, node, code_roots, stack_priority_files
+                )
+                if child is None:
+                    continue
+                cid = register_graph_node(child)
+                if cid in visited:
+                    continue
+                new_path = path_ids + [cid]
+                child_node = GraphNode(
+                    id=cid,
+                    type="function",
+                    name=child.name,
+                    file=child.file,
+                    signature=child.signature,
+                    snippet=child.snippet,
+                    snippet_start_line=child.snippet_start_line,
+                    snippet_end_line=child.snippet_end_line,
+                )
+                if self._node_has_bridge_to_callee(child_node, inner):
+                    mids = self._bridge_nodes_between(
+                        child_node, inner, code_roots, stack_priority_files
+                    )
+                    final_path = new_path[:]
+                    for mid in mids:
+                        final_path.append(register_graph_node(mid))
+                    if final_path[-1] != inner_id:
+                        final_path.append(inner_id)
+                    return final_path
+                if len(new_path) < max_depth:
+                    visited.add(cid)
+                    queue.append((child_node, new_path))
+        return None
 
     def _collect_stack_priority_source_files(
         self, add2line_data: Optional[Dict[str, Any]], code_roots: List[str]
@@ -6912,6 +7164,7 @@ class CodeContentProvider:
 
         has_direct = False
         has_stack = False
+        has_stack_verified = False
         has_to_crash = False
         has_sv = False
         proven_caller_norm: Set[str] = set()
@@ -6919,7 +7172,7 @@ class CodeContentProvider:
             if not isinstance(e, dict):
                 continue
             et = str(e.get("type") or "")
-            if et in ("calls_direct", "calls_to_crash_site"):
+            if et in ("calls_direct", "calls_stack_verified", "calls_to_crash_site"):
                 if _norm_fid(e.get("to_id")) == cf_norm:
                     fid = _norm_fid(e.get("from_id"))
                     if fid:
@@ -6928,6 +7181,8 @@ class CodeContentProvider:
                 has_direct = True
             elif et == "calls_stack_order":
                 has_stack = True
+            elif et == "calls_stack_verified":
+                has_stack_verified = True
             elif et == "calls_to_crash_site":
                 has_to_crash = True
 
@@ -6944,14 +7199,14 @@ class CodeContentProvider:
             if fid and fid != cf_norm and fid in proven_caller_norm:
                 sv_write_upstream = True
 
-        auto_ok = bool(has_direct or has_to_crash or sv_write_upstream)
+        auto_ok = bool(has_stack_verified or has_direct or has_to_crash or sv_write_upstream)
         block_reason = ""
         if not auto_ok:
             parts: List[str] = []
             if has_stack:
                 parts.append("存在 calls_stack_order（栈序关联，非源码证明的调用）")
-            if not has_direct and not has_to_crash:
-                parts.append("无 calls_direct / calls_to_crash_site")
+            if not has_stack_verified and not has_direct and not has_to_crash:
+                parts.append("无 calls_direct / calls_stack_verified / calls_to_crash_site")
             if not sv_write_upstream:
                 parts.append("无崩溃点外共享变量写路径")
             block_reason = (
@@ -6961,6 +7216,7 @@ class CodeContentProvider:
         return {
             "has_calls_direct": has_direct,
             "has_calls_stack_order": has_stack,
+            "has_stack_adjacent_verified_chain": has_stack_verified,
             "has_calls_to_crash_site": has_to_crash,
             "has_use_shared_var": has_sv,
             "has_shared_var_write_upstream": sv_write_upstream,
@@ -7632,117 +7888,192 @@ class CodeContentProvider:
                 }
             )
 
-        # 静态 + 变量边之后是否已有 calls_direct（5b 之前快照，供补边与补全 call_chain_from_code）
-        had_static_calls_direct = any(e.type == "calls_direct" for e in edges)
+        static_call_chain_from_code = list(call_chain_from_code)
 
-        # 5b. 静态分析未产生 calls_direct 时，按 add2line 栈序「候选」相邻帧，但仅在通过源码校验时连边：
-        #     在外层函数中用语义分析（tree-sitter call_expression，失败则 snippet/行范围正则）确认存在对内层函数的调用。
-        #     thread_nodes[0] 为崩溃帧，索引增大方向为向栈底延伸；边方向为 外层 -> 内层（tnodes[i] -> tnodes[i-1]）。
+        stack_priority_files_graph: List[str] = list(
+            getattr(self, "_cc_stack_priority_files", None) or []
+        )
+        if not stack_priority_files_graph:
+            for gn in nodes.values():
+                fp = (gn.file or "").strip()
+                if fp and os.path.isfile(fp) and fp not in stack_priority_files_graph:
+                    stack_priority_files_graph.append(fp)
+
+        def register_graph_node(gn: GraphNode) -> str:
+            if gn.id and gn.id in nodes:
+                return gn.id
+            sig = (gn.signature or gn.name or "").strip()
+            return ensure_func_node(gn.name or sig, gn.file, sig, gn.snippet)
+
+        # 5b. 始终按 add2line 栈序校验相邻帧（含间接 hop）；thread_nodes[0] 为崩溃帧。
         verified_stack_pairs: set = set()
-        if not had_static_calls_direct:
-            for item in call_chain_from_add2line:
-                tnodes = item.get("nodes") or []
-                if len(tnodes) < 2:
+        stack_adjacent_hop_chains: Dict[Tuple[str, str], List[str]] = {}
+        for item in call_chain_from_add2line:
+            tnodes = item.get("nodes") or []
+            if len(tnodes) < 2:
+                continue
+            tid = item.get("thread_id")
+            item_is_crash = item.get("is_crash_thread")
+            item_is_main = item.get("is_main_thread")
+            for i in range(len(tnodes) - 1, 0, -1):
+                outer_id, inner_id = tnodes[i], tnodes[i - 1]
+                outer_node = nodes.get(outer_id)
+                inner_node = nodes.get(inner_id)
+                if not outer_node or not inner_node:
                     continue
-                tid = item.get("thread_id")
-                item_is_crash = item.get("is_crash_thread")
-                item_is_main = item.get("is_main_thread")
-                for i in range(len(tnodes) - 1, 0, -1):
-                    outer_id, inner_id = tnodes[i], tnodes[i - 1]
-                    outer_node = nodes.get(outer_id)
-                    inner_node = nodes.get(inner_id)
-                    if not outer_node or not inner_node:
-                        continue
-                    if self._verify_stack_caller_resolves_call_to_callee(outer_node, inner_node):
-                        verified_stack_pairs.add((outer_id, inner_id))
+                hop_chain = self._resolve_stack_adjacent_call_chain_ids(
+                    outer_node,
+                    inner_node,
+                    code_roots_for_graph,
+                    stack_priority_files_graph,
+                    register_graph_node,
+                )
+                if hop_chain and len(hop_chain) >= 2:
+                    stack_adjacent_hop_chains[(outer_id, inner_id)] = hop_chain
+                    for j in range(len(hop_chain) - 1):
+                        a_id, b_id = hop_chain[j], hop_chain[j + 1]
+                        verified_stack_pairs.add((a_id, b_id))
+                        a_node = nodes.get(a_id)
+                        b_node = nodes.get(b_id)
+                        direct_hop = (
+                            a_node is not None
+                            and b_node is not None
+                            and self._verify_stack_caller_resolves_call_to_callee(a_node, b_node)
+                        )
                         edges.append(
                             GraphEdge(
-                                from_id=outer_id,
-                                to_id=inner_id,
-                                type="calls_direct",
+                                from_id=a_id,
+                                to_id=b_id,
+                                type="calls_direct" if direct_hop else "calls_stack_verified",
                                 thread_id=tid,
                                 is_crash_thread=item_is_crash if isinstance(item_is_crash, bool) else None,
                                 is_main_thread=item_is_main if isinstance(item_is_main, bool) else None,
                             )
                         )
-                    else:
-                        edges.append(
-                            GraphEdge(
-                                from_id=outer_id,
-                                to_id=inner_id,
-                                type="calls_stack_order",
-                                thread_id=tid,
-                                is_crash_thread=item_is_crash if isinstance(item_is_crash, bool) else None,
-                                is_main_thread=item_is_main if isinstance(item_is_main, bool) else None,
-                            )
+                elif self._verify_stack_caller_resolves_call_to_callee(outer_node, inner_node):
+                    verified_stack_pairs.add((outer_id, inner_id))
+                    edges.append(
+                        GraphEdge(
+                            from_id=outer_id,
+                            to_id=inner_id,
+                            type="calls_direct",
+                            thread_id=tid,
+                            is_crash_thread=item_is_crash if isinstance(item_is_crash, bool) else None,
+                            is_main_thread=item_is_main if isinstance(item_is_main, bool) else None,
                         )
+                    )
+                else:
+                    edges.append(
+                        GraphEdge(
+                            from_id=outer_id,
+                            to_id=inner_id,
+                            type="calls_stack_order",
+                            thread_id=tid,
+                            is_crash_thread=item_is_crash if isinstance(item_is_crash, bool) else None,
+                            is_main_thread=item_is_main if isinstance(item_is_main, bool) else None,
+                        )
+                    )
 
-        # 5c. 静态未产出 calls_direct 时，call_chain_from_code 与 5b 一致：仅包含已通过校验的相邻 hop，
-        #     从崩溃端向前取最长后缀（避免未校验的外层帧混进路径）。
-        if not had_static_calls_direct:
-            extended_paths: List[ExecutionPath] = []
-            seen_stack_path_keys: set = set()
+        # 5c. 栈相邻帧校验路径优先于全仓静态路径；从崩溃端向前拼接已验证 hop。
+        stack_verified_paths: List[ExecutionPath] = []
+        seen_stack_path_keys: set = set()
+        stack_path_idx = 0
+        crash_items = [
+            it
+            for it in call_chain_from_add2line
+            if isinstance(it, dict) and it.get("is_crash_thread")
+        ] or list(call_chain_from_add2line)
+        for item in crash_items:
+            tnodes = item.get("nodes") or []
+            if len(tnodes) < 2:
+                continue
+            tid_raw = item.get("thread_id")
+            tid_str = "unknown" if tid_raw is None else str(tid_raw)
+            item_is_crash = item.get("is_crash_thread")
+            item_is_main = item.get("is_main_thread")
+            chain_outer_to_crash = list(reversed(tnodes))
+            merged_chain: List[str] = []
+            for k in range(len(chain_outer_to_crash) - 1):
+                a_id = chain_outer_to_crash[k]
+                b_id = chain_outer_to_crash[k + 1]
+                hop = stack_adjacent_hop_chains.get((a_id, b_id))
+                if hop and len(hop) >= 2:
+                    if not merged_chain:
+                        merged_chain.extend(hop)
+                    else:
+                        merged_chain.extend(hop[1:])
+                else:
+                    break
+            if len(merged_chain) < 2:
+                merged_chain = self._longest_verified_suffix_chain(
+                    chain_outer_to_crash, verified_stack_pairs
+                )
+            if len(merged_chain) < 2:
+                continue
+            pk = tuple(merged_chain)
+            if pk in seen_stack_path_keys:
+                continue
+            seen_stack_path_keys.add(pk)
+            stack_verified_paths.append(
+                ExecutionPath(
+                    id=f"path_stack_verified_{stack_path_idx}",
+                    thread_id=tid_str,
+                    nodes=merged_chain,
+                    description="stack_adjacent_verified",
+                    is_crash_thread=item_is_crash if isinstance(item_is_crash, bool) else None,
+                    is_main_thread=item_is_main if isinstance(item_is_main, bool) else None,
+                )
+            )
+            stack_path_idx += 1
+
+        if stack_verified_paths:
+            static_secondary: List[ExecutionPath] = []
+            seen_static: set = set()
+            for p in static_call_chain_from_code:
+                pk = tuple(p.nodes)
+                if pk in seen_stack_path_keys or pk in seen_static:
+                    continue
+                seen_static.add(pk)
+                static_secondary.append(
+                    ExecutionPath(
+                        id=f"path_static_{len(static_secondary)}",
+                        thread_id=p.thread_id,
+                        nodes=list(p.nodes),
+                        description="static_repo_inferred",
+                        is_crash_thread=p.is_crash_thread,
+                        is_main_thread=p.is_main_thread,
+                    )
+                )
+            call_chain_from_code = stack_verified_paths + static_secondary
+        elif not call_chain_from_code:
+            stack_fallback_paths: List[ExecutionPath] = []
             stack_path_idx = 0
             for item in call_chain_from_add2line:
                 tnodes = item.get("nodes") or []
-                if len(tnodes) < 2:
+                if not isinstance(tnodes, list) or len(tnodes) < 2:
+                    continue
+                kept = [n for n in tnodes if isinstance(n, str) and n in nodes]
+                if len(kept) < 2:
                     continue
                 tid_raw = item.get("thread_id")
                 tid_str = "unknown" if tid_raw is None else str(tid_raw)
                 item_is_crash = item.get("is_crash_thread")
                 item_is_main = item.get("is_main_thread")
-                chain_outer_to_crash = list(reversed(tnodes))
-                verified_chain = self._longest_verified_suffix_chain(
-                    chain_outer_to_crash, verified_stack_pairs
-                )
-                if len(verified_chain) < 2:
-                    continue
-                pk = tuple(verified_chain)
-                if pk in seen_stack_path_keys:
-                    continue
-                seen_stack_path_keys.add(pk)
-                extended_paths.append(
+                stack_fallback_paths.append(
                     ExecutionPath(
-                        id=f"path_{stack_path_idx}",
+                        id=f"path_stack_order_{stack_path_idx}",
                         thread_id=tid_str,
-                        nodes=verified_chain,
-                        description=None,
+                        nodes=kept,
+                        description="inferred_from_add2line_stack_order",
                         is_crash_thread=item_is_crash if isinstance(item_is_crash, bool) else None,
                         is_main_thread=item_is_main if isinstance(item_is_main, bool) else None,
                     )
                 )
                 stack_path_idx += 1
-            if extended_paths:
-                call_chain_from_code = extended_paths
-            else:
-                stack_fallback_paths: List[ExecutionPath] = []
-                stack_path_idx = 0
-                for item in call_chain_from_add2line:
-                    tnodes = item.get("nodes") or []
-                    if not isinstance(tnodes, list) or len(tnodes) < 2:
-                        continue
-                    kept = [n for n in tnodes if isinstance(n, str) and n in nodes]
-                    if len(kept) < 2:
-                        continue
-                    tid_raw = item.get("thread_id")
-                    tid_str = "unknown" if tid_raw is None else str(tid_raw)
-                    item_is_crash = item.get("is_crash_thread")
-                    item_is_main = item.get("is_main_thread")
-                    stack_fallback_paths.append(
-                        ExecutionPath(
-                            id=f"path_stack_order_{stack_path_idx}",
-                            thread_id=tid_str,
-                            nodes=kept,
-                            description="inferred_from_add2line_stack_order",
-                            is_crash_thread=item_is_crash if isinstance(item_is_crash, bool) else None,
-                            is_main_thread=item_is_main if isinstance(item_is_main, bool) else None,
-                        )
-                    )
-                    stack_path_idx += 1
-                if stack_fallback_paths:
-                    call_chain_from_code = stack_fallback_paths
+            if stack_fallback_paths:
+                call_chain_from_code = stack_fallback_paths
 
-        # 6. 基于代码的调用路径：优先第 2 步静态结果；若仅由 5c/栈序回退补全，则为 add2line 推导链路
+        # 6. call_chain_from_code：栈相邻校验路径优先，其次为全仓静态推断路径
 
         # 7. 对 edges 去重：基于 (from_id, to_id, type) 三元组
         deduped_edges: List[GraphEdge] = []
@@ -9462,6 +9793,7 @@ class CodeContentProvider:
                 if self.seed_callsite_files:
                     merged_priority = list(dict.fromkeys(stack_priority_files + self.seed_callsite_files))
                     stack_priority_files = merged_priority
+                self._cc_stack_priority_files = list(stack_priority_files)
 
                 # 3. 查找直接调用崩溃函数的上层函数
                 template_info = self._parse_template_container_function(resolved_function)

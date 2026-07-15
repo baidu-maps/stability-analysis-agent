@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from .manager import SkillManager, _default_skill_home
 from .runtime import SkillRuntime
-from .templates import write_skill_scaffold
+from .templates import available_skill_presets, write_skill_scaffold
 
 
 def _print_json(payload: Any) -> None:
@@ -130,7 +130,13 @@ def _cmd_uninstall(args: argparse.Namespace) -> int:
 
 def _cmd_init(args: argparse.Namespace) -> int:
     target = Path(args.target).expanduser().resolve()
-    written = write_skill_scaffold(target, args.name, skill_type=args.type, overwrite=bool(args.overwrite))
+    written = write_skill_scaffold(
+        target,
+        args.name,
+        skill_type=args.type,
+        overwrite=bool(args.overwrite),
+        preset=getattr(args, "preset", None),
+    )
     if args.json:
         _print_json({"target": str(target), "written": [str(path) for path in written]})
         return 0
@@ -205,6 +211,12 @@ def build_skill_parser() -> argparse.ArgumentParser:
         choices=["prompt", "workflow", "tool", "plugin"],
         help="模板类型",
     )
+    preset_choices = sorted(available_skill_presets().keys())
+    p_init.add_argument(
+        "--preset",
+        choices=preset_choices,
+        help="内置空模板预置（会生成对应的 SKILL.md 骨架）",
+    )
     p_init.add_argument("--overwrite", action="store_true", help="覆盖已存在目录")
     p_init.add_argument("--json", action="store_true", help="JSON 输出")
     p_init.set_defaults(func=_cmd_init)
@@ -224,4 +236,3 @@ def handle_skill_command(argv: List[str]) -> int:
     parser = build_skill_parser()
     args = parser.parse_args(argv)
     return int(args.func(args))
-

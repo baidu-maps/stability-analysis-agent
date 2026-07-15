@@ -1027,6 +1027,265 @@ class SymbolLocator:
         self._ctx = ctx
         self._last_extract_backend: str = "unknown"
 
+    @staticmethod
+    def parse_qualified_member_symbol(full_function_name: str) -> Optional[Dict[str, str]]:
+        """解析 Class::method / Ns::Class::method 形式的成员符号。"""
+        head = str(full_function_name or "").strip()
+        if not head:
+            return None
+        paren_idx = head.find("(")
+        if paren_idx > 0:
+            head = head[:paren_idx].strip()
+        head = SymbolLocator._strip_template_args(head)
+        if "::" not in head:
+            return None
+        parts = [p.strip() for p in head.split("::") if p.strip()]
+        if len(parts) < 2:
+            return None
+        method = parts[-1]
+        short_scope = parts[-2]
+        scope = "::".join(parts[:-1])
+        return {
+            "scope": scope,
+            "short_scope": short_scope,
+            "method": method,
+        }
+
+    @staticmethod
+    def _line_matches_qualified_member(parsed: Dict[str, str], line_text: str) -> bool:
+        short_scope = str(parsed.get("short_scope") or "")
+        method = str(parsed.get("method") or "")
+        if not short_scope or not method:
+            return False
+        if method.startswith("~"):
+            return bool(
+                re.search(
+                    rf"\b{re.escape(short_scope)}::\s*{re.escape(method)}\s*\(",
+                    line_text,
+                )
+            )
+        return bool(
+            re.search(
+                rf"\b{re.escape(short_scope)}::{re.escape(method)}\s*\(",
+                line_text,
+            )
+        )
+
+    @classmethod
+    def qualified_symbol_matches_line(
+        cls, symbol: str, line_text: str, function_signature: str = ""
+    ) -> bool:
+        parsed = cls.parse_qualified_member_symbol(symbol)
+        if not parsed:
+            return True
+        for candidate in (function_signature, line_text):
+            text = str(candidate or "").strip()
+            if text and cls._line_matches_qualified_member(parsed, text):
+                return True
+        return False
+
+    @staticmethod
+    def _function_definition_path_score(file_path: str) -> int:
+        path = str(file_path or "").replace("\\", "/").lower()
+        score = 0
+        if any(
+            token in path
+            for token in ("/demo/", "/test/", "/apptest/", "/unittest/", "/systemtest/")
+        ):
+            score -= 120
+        if any(token in path for token in ("/support/", "/huiwei")):
+            score -= 150
+        if any(token in path for token in ("/engine-dev/", "/src/app/", "/src/")):
+            score += 80
+        if "/engine-dev/inc/" in path or "/inc/vi/" in path or "/inc/app/" in path:
+            score += 40
+        if path.endswith(".cpp") or path.endswith(".cc") or path.endswith(".cxx"):
+            score += 60
+        elif path.endswith(".h") or path.endswith(".hpp") or path.endswith(".hh"):
+            score -= 40
+        if path.endswith("baselayer.cpp") or path.endswith("vbaselayer.cpp"):
+            score += 40
+        if path.endswith("vtempl.h"):
+            score += 80
+        if "/inc/vi/vos/" in path or "/engine-dev/inc/" in path:
+            score += 30
+        return score
+
+    @staticmethod
+    def _is_template_method_definition_line(line_text: str, member: str) -> bool:
+        stripped = str(line_text or "").strip()
+        if not stripped or stripped.startswith("//"):
+            return False
+        return bool(
+            re.search(rf"::\s*{re.escape(member)}\s*\(", stripped)
+            or re.search(rf"\b{re.escape(member)}\s*\(\s*\)", stripped)
+        )
+
+    @staticmethod
+    def parse_template_qualified_symbol(full_symbol: str) -> Optional[Dict[str, str]]:
+        """解析 TemplateClass<...>::member 形式的模板限定符号。"""
+        head = str(full_symbol or "").strip()
+        if not head:
+            return None
+        paren_idx = head.find("(")
+        if paren_idx > 0:
+            head = head[:paren_idx].strip()
+        match = re.match(r"^(\w+)\s*<[^>]+>\s*::\s*(\w+)\s*$", head)
+        if not match:
+            return None
+        return {
+            "template_class": match.group(1),
+            "member": match.group(2),
+        }
+
+    def _find_template_member_definition_location(
+        self, parsed: Dict[str, str], code_roots: List[str]
+    ) -> Optional[Tuple[str, int]]:
+        template_class = str(parsed.get("template_class") or "")
+        member = str(parsed.get("member") or "")
+        if not template_class or not member:
+            return None
+        cache_key = f"__funcdef_tpl__:{template_class}::{member}"
+        cached = self._ctx._function_def_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if member.startswith("~"):
+            member_pattern = rf"{re.escape(template_class)}\s*<[^>]*>\s*::\s*{re.escape(member)}\s*\("
+        else:
+            member_pattern = (
+                rf"{re.escape(template_class)}\s*<[^>]*>\s*::\s*{re.escape(member)}\s*\("
+            )
+        walk_pattern = re.compile(member_pattern)
+        candidates: List[Tuple[int, str, int]] = []
+        rg_hits = self._ctx.rg_grep_lines(member_pattern, code_roots)
+        if rg_hits is not None:
+            for fp, line_no, line_text in rg_hits:
+                if not walk_pattern.search(line_text):
+                    continue
+                if not self._is_template_method_definition_line(line_text, member):
+                    continue
+                score = self._function_definition_path_score(fp)
+                candidates.append((score, fp, line_no))
+        else:
+            for code_root in code_roots:
+                if not os.path.isdir(code_root):
+                    continue
+                for dirpath, dirnames, filenames in os.walk(code_root):
+                    dirnames[:] = [
+                        d for d in dirnames if not self._ctx.should_skip_directory(d)
+                    ]
+                    for fn in filenames:
+                        fp = os.path.join(dirpath, fn)
+                        if not self._ctx.is_supported_file(fp):
+                            continue
+                        if not self._ctx.is_file_readable(fp):
+                            continue
+                        content = self._ctx.read_file_cached(fp)
+                        if not content:
+                            continue
+                        for idx, line in enumerate(content.split("\n"), 1):
+                            if walk_pattern.search(line) and self._is_template_method_definition_line(
+                                line, member
+                            ):
+                                score = self._function_definition_path_score(fp)
+                                candidates.append((score, fp, idx))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        best = (candidates[0][1], candidates[0][2])
+        self._ctx._function_def_cache[cache_key] = best
+        return best
+
+    def find_function_definition_location_for_symbol(
+        self, full_symbol: str, code_roots: List[str]
+    ) -> Optional[Tuple[str, int]]:
+        """按完整符号定位函数定义，优先使用 Class::method 限定。"""
+        symbol = str(full_symbol or "").strip()
+        if not symbol or not code_roots:
+            return None
+        template_parsed = self.parse_template_qualified_symbol(symbol)
+        if template_parsed:
+            located = self._find_template_member_definition_location(
+                template_parsed, code_roots
+            )
+            if located is not None:
+                return located
+        parsed = self.parse_qualified_member_symbol(symbol)
+        if parsed:
+            located = self._find_qualified_function_definition_location(parsed, code_roots)
+            if located is not None:
+                return located
+            tpl_located = self._find_template_member_definition_location(
+                {"template_class": parsed["short_scope"], "member": parsed["method"]},
+                code_roots,
+            )
+            if tpl_located is not None:
+                return tpl_located
+            return None
+        simple = self.extract_simple_function_name(symbol)
+        return self.find_function_definition_location(simple, code_roots)
+
+    def _find_qualified_function_definition_location(
+        self, parsed: Dict[str, str], code_roots: List[str]
+    ) -> Optional[Tuple[str, int]]:
+        short_scope = str(parsed.get("short_scope") or "")
+        method = str(parsed.get("method") or "")
+        if not short_scope or not method:
+            return None
+        cache_key = f"__funcdef_q__:{short_scope}::{method}"
+        cached = self._ctx._function_def_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if method.startswith("~"):
+            rg_pattern = rf"\b{re.escape(short_scope)}::\s*{re.escape(method)}\s*\("
+            walk_pattern = re.compile(
+                rf"\b{re.escape(short_scope)}::\s*{re.escape(method)}\s*\("
+            )
+        else:
+            rg_pattern = rf"\b{re.escape(short_scope)}::{re.escape(method)}\s*\("
+            walk_pattern = re.compile(
+                rf"\b{re.escape(short_scope)}::{re.escape(method)}\s*\("
+            )
+        candidates: List[Tuple[int, str, int]] = []
+        rg_hits = self._ctx.rg_grep_lines(rg_pattern, code_roots)
+        if rg_hits is not None:
+            for fp, line_no, line_text in rg_hits:
+                if not self._line_matches_qualified_member(parsed, line_text):
+                    continue
+                if not self.is_function_definition_line(line_text):
+                    continue
+                score = self._function_definition_path_score(fp)
+                candidates.append((score, fp, line_no))
+        else:
+            for code_root in code_roots:
+                if not os.path.isdir(code_root):
+                    continue
+                for dirpath, dirnames, filenames in os.walk(code_root):
+                    dirnames[:] = [
+                        d for d in dirnames if not self._ctx.should_skip_directory(d)
+                    ]
+                    for fn in filenames:
+                        fp = os.path.join(dirpath, fn)
+                        if not self._ctx.is_supported_file(fp):
+                            continue
+                        if not self._ctx.is_file_readable(fp):
+                            continue
+                        content = self._ctx.read_file_cached(fp)
+                        if not content:
+                            continue
+                        for idx, line in enumerate(content.split("\n"), 1):
+                            if walk_pattern.search(line) and self.is_function_definition_line(
+                                line
+                            ):
+                                score = self._function_definition_path_score(fp)
+                                candidates.append((score, fp, idx))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        best = (candidates[0][1], candidates[0][2])
+        self._ctx._function_def_cache[cache_key] = best
+        return best
+
     def find_function_definition_location(
         self, simple_name: str, code_roots: List[str]
     ) -> Optional[Tuple[str, int]]:
@@ -1061,17 +1320,28 @@ class SymbolLocator:
                 return result
         # Try rg-based search (fast path). When rg runs successfully but finds no
         # definition, do not repeat the same text search with an os.walk fallback.
-        rg_pattern = rf"\b{re.escape(simple_name)}\s*\("
+        if simple_name.startswith("~"):
+            dtor_name = simple_name[1:]
+            rg_pattern = rf"::~\s*{re.escape(dtor_name)}\s*\("
+        else:
+            rg_pattern = rf"\b{re.escape(simple_name)}\s*\("
         rg_hits = self._ctx.rg_grep_lines(rg_pattern, code_roots)
         if rg_hits is not None:
+            ranked: List[Tuple[int, str, int]] = []
             for fp, line_no, line_text in rg_hits:
-                if self.is_function_definition_line(line_text):
-                    result = (fp, line_no)
-                    self._ctx._function_def_cache[cache_key] = result
-                    self._record_function_def(
-                        simple_name, fp, line_no, "rg", dedupe_key, success=True
-                    )
-                    return result
+                if not self._line_matches_function_name(simple_name, line_text):
+                    continue
+                if not self.is_function_definition_line(line_text):
+                    continue
+                ranked.append((self._function_definition_path_score(fp), fp, line_no))
+            if ranked:
+                ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
+                result = (ranked[0][1], ranked[0][2])
+                self._ctx._function_def_cache[cache_key] = result
+                self._record_function_def(
+                    simple_name, result[0], result[1], "rg", dedupe_key, success=True
+                )
+                return result
             self._ctx.record_location(
                 "find_function_definition",
                 dedupe_key=dedupe_key,
@@ -1082,7 +1352,11 @@ class SymbolLocator:
             )
             return None
         # Fallback: os.walk + regex (slow path, only if rg unavailable)
-        pattern = re.compile(rf"\b{re.escape(simple_name)}\s*\(")
+        if simple_name.startswith("~"):
+            dtor_name = simple_name[1:]
+            pattern = re.compile(rf"::~\s*{re.escape(dtor_name)}\s*\(")
+        else:
+            pattern = re.compile(rf"\b{re.escape(simple_name)}\s*\(")
         for code_root in code_roots:
             if not os.path.isdir(code_root):
                 continue
@@ -1104,7 +1378,9 @@ class SymbolLocator:
                     if simple_name not in content:
                         continue
                     for idx, line in enumerate(content.split("\n"), 1):
-                        if pattern.search(line) and self.is_function_definition_line(line):
+                        if pattern.search(line) and self._line_matches_function_name(
+                            simple_name, line
+                        ):
                             result = (fp, idx)
                             self._ctx._function_def_cache[cache_key] = result
                             self._record_function_def(
@@ -1141,17 +1417,34 @@ class SymbolLocator:
             line=line_no,
         )
 
+    def _line_matches_function_name(self, simple_name: str, line_text: str) -> bool:
+        """Match a function definition line for simple_name, disambiguating ctor/dtor."""
+        if not self.is_function_definition_line(line_text):
+            return False
+        if simple_name.startswith("~"):
+            dtor_name = simple_name[1:]
+            return bool(
+                re.search(rf"::~\s*{re.escape(dtor_name)}\s*\(", line_text)
+            )
+        if re.search(rf"::~\s*{re.escape(simple_name)}\s*\(", line_text):
+            return False
+        return bool(re.search(rf"\b{re.escape(simple_name)}\s*\(", line_text))
+
     def _find_function_def_via_rg(
         self, simple_name: str, code_roots: List[str]
     ) -> Optional[Tuple[str, int]]:
         """Use rg to quickly find function definition location."""
-        rg_pattern = rf"\b{re.escape(simple_name)}\s*\("
+        if simple_name.startswith("~"):
+            dtor_name = simple_name[1:]
+            rg_pattern = rf"::~\s*{re.escape(dtor_name)}\s*\("
+        else:
+            rg_pattern = rf"\b{re.escape(simple_name)}\s*\("
         hits = self._ctx.rg_grep_lines(rg_pattern, code_roots)
         if hits is None:
             return None  # rg not available, caller should fallback
         # Filter hits to find a definition (not a call)
         for fp, line_no, line_text in hits:
-            if self.is_function_definition_line(line_text):
+            if self._line_matches_function_name(simple_name, line_text):
                 return (fp, line_no)
         return None
 
@@ -1278,9 +1571,10 @@ class SymbolLocator:
         parts = s.split()
         if parts:
             s = parts[-1]
-        # Remove pointer/reference prefixes
-        s = s.lstrip("*&~")
-        return s
+        # 析构函数保留前导 ~，避免 ~CBaseLayer 被降格为 CBaseLayer 后误命中构造函数。
+        if s.startswith("~"):
+            return "~" + s[1:].lstrip("*&")
+        return s.lstrip("*&~")
 
     @staticmethod
     def _strip_template_args(text: str) -> str:
@@ -1305,6 +1599,8 @@ class SymbolLocator:
         stripped = line.strip()
         if not stripped:
             return False
+        if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
+            return False
         if is_control_flow_source_line(stripped):
             return False
         # 明确排除函数声明/原型（以 ';' 收尾且不含函数体起始）。
@@ -1317,7 +1613,9 @@ class SymbolLocator:
         # Function defs typically have: type name( or Class::name(
         if re.search(r"(?:[\w:<>,~*&\s]+\s+)[\w:~]+\s*\(", stripped):
             return True
-        if re.search(r"\w+::\w+\s*\(", stripped):
+        if re.search(r"\w+::\~?\w+\s*\(", stripped):
+            return True
+        if re.search(r"::~\w+\s*\(", stripped):
             return True
         return False
 
@@ -2229,6 +2527,14 @@ class CodeLocatorService:
     ) -> Optional[Tuple[str, int]]:
         """Find function definition (file, line)."""
         return self.symbol_locator.find_function_definition_location(simple_name, code_roots)
+
+    def find_function_definition_for_symbol(
+        self, symbol: str, code_roots: List[str]
+    ) -> Optional[Tuple[str, int]]:
+        """Find function definition (file, line) using full symbol when qualified."""
+        return self.symbol_locator.find_function_definition_location_for_symbol(
+            symbol, code_roots
+        )
 
     def extract_function_body(
         self, lines: List[str], target_line_index: int, target_function_name: Optional[str] = None

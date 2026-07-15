@@ -64,6 +64,13 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="tree_sitter")
 
 from services.code_fixer import CodeFixer
 from cli.phase_spinner import PhaseSpinner
+from cli.upgrade import run_upgrade_check_interactive
+from cli.report_paths import (
+    clear_cli_reports,
+    format_bytes,
+    print_cli_reports_overview,
+    summarize_cli_reports,
+)
 from tools.code_context_errors import (
     code_context_failure_message,
     code_context_skip_pipeline_message,
@@ -82,6 +89,8 @@ from tool_system import (  # type: ignore
     register_all_tools_and_workflows,
 )
 from skill_system.cli import handle_skill_command
+from skill_system.manager import SkillManager
+from skill_system.templates import available_skill_presets
 
 # RAG（chromadb / sentence-transformers 等）仅在向量库子命令需要时加载，避免 `sa-agent` 首屏被拖慢。
 _rag_runtime_resolved = False
@@ -1310,6 +1319,118 @@ def _prompt_select(question: str, options: List[Tuple[str, str]], default_index:
         sys.stdout.write("\r\n")
         sys.stdout.flush()
     return options[idx][0]
+
+
+_CLOSURE_SKILL_PRESETS = {
+    "automation-testing": {
+        "menu_label": "自动验证修复结果",
+        "skill_name": "automation-testing-skill",
+        "title": "Automation Testing Skill",
+        "summary": "用于在修复后跑自动化测试、冒烟检查或回归检查。",
+    },
+    "cicd-pipeline": {
+        "menu_label": "自动生成修复后的新包",
+        "skill_name": "cicd-pipeline-skill",
+        "title": "CICD Pipeline Skill",
+        "summary": "用于把已验证的修复打包、构建、发布或交接给流水线。",
+    },
+}
+
+
+_BUG_PLATFORM_SKILL_PRESETS = {
+    "bug-platform-fetcher": {
+        "menu_label": "根据缺陷管理平台自动修复",
+        "skill_name": "bug-platform-fetcher-skill",
+        "title": "Bug Platform Fetcher Skill",
+        "summary": "根据工单号拉取崩溃日志与调试库，自动交给 sa-agent 标准分析流程。",
+    },
+}
+
+
+def _closure_skill_install_cmd(skill_name: str, preset_key: str) -> str:
+    return f"sa-agent skill init {skill_name} ./{skill_name} --preset {preset_key}"
+
+
+def _describe_closure_skill(preset_key: str) -> None:
+    preset = _CLOSURE_SKILL_PRESETS[preset_key]
+    skill_name = preset["skill_name"]
+    preset_spec = available_skill_presets().get(preset_key)
+    manager = SkillManager()
+    print("━━━━━━━━━━━━━━━━━━━━━━")
+    print(preset["menu_label"])
+    print("")
+    print(f"- 推荐 skill 名称: {skill_name}")
+    print(f"- 预置模板: {preset['title']}")
+    print(f"- 用途: {preset['summary']}")
+    if preset_spec is not None:
+        print(f"- 预置描述: {preset_spec.description}")
+        print(f"- 触发场景: {preset_spec.when_to_use}")
+    print(f"- 推荐初始化命令: {_closure_skill_install_cmd(skill_name, preset_key)}")
+    print(f"- 推荐安装命令: sa-agent skill install ./{skill_name}")
+    print(f"- 查询已安装状态: sa-agent skill show {skill_name}")
+    print("")
+    try:
+        bundle = manager.resolve(skill_name)
+    except Exception:
+        print("当前状态: 未发现已安装实例")
+        print("说明: 这是一个空模板 Skill，先用 init 生成，再按项目需要补充具体命令或工作流。")
+    else:
+        print("当前状态: 已发现已安装实例")
+        print(f"- 安装位置: {bundle.path}")
+        print(f"- 类型: {bundle.package.type}")
+        print(f"- 入口: {bundle.entrypoint}")
+    print("")
+    print("在当前开源版本里，它不会自动混入崩溃分析主提示词。")
+    print("更推荐的接入点是: 修复候选产出后进入验证分支，或验证通过后进入打包分支。")
+    print("后续如果你把它写成 workflow/tool skill，再由对应流程显式调用。")
+    print("━━━━━━━━━━━━━━━━━━━━━━")
+    _prompt_select(
+        "请选择操作",
+        [("done", "已了解，返回")],
+        default_index=0,
+    )
+    print("")
+
+
+def _describe_bug_platform_skill(preset_key: str = "bug-platform-fetcher") -> None:
+    preset = _BUG_PLATFORM_SKILL_PRESETS[preset_key]
+    skill_name = preset["skill_name"]
+    preset_spec = available_skill_presets().get(preset_key)
+    manager = SkillManager()
+    print("━━━━━━━━━━━━━━━━━━━━━━")
+    print(preset["menu_label"])
+    print("")
+    print(f"- 推荐 skill 名称: {skill_name}")
+    print(f"- 预置模板: {preset['title']}")
+    print(f"- 用途: {preset['summary']}")
+    if preset_spec is not None:
+        print(f"- 预置描述: {preset_spec.description}")
+        print(f"- 触发场景: {preset_spec.when_to_use}")
+    print(f"- 推荐初始化命令: {_closure_skill_install_cmd(skill_name, preset_key)}")
+    print(f"- 推荐安装命令: sa-agent skill install ./{skill_name}")
+    print(f"- 查询已安装状态: sa-agent skill show {skill_name}")
+    print("")
+    try:
+        bundle = manager.resolve(skill_name)
+    except Exception:
+        print("当前状态: 未发现已安装实例")
+        print("说明: 本仓库只提供空模板，平台 API 的真实对接由开发者自己实现。")
+        print("      详见 docs/skills/BUG_PLATFORM_FETCHER_TEMPLATE.md。")
+    else:
+        print("当前状态: 已发现已安装实例")
+        print(f"- 安装位置: {bundle.path}")
+        print(f"- 类型: {bundle.package.type}")
+        print(f"- 入口: {bundle.entrypoint}")
+    print("")
+    print("在当前开源版本里，本菜单仅生成 / 展示模板，不会向任何具体平台发请求。")
+    print("完整工单号拉取、调试库下载、字段解析由 Skill 编写者在自己仓库里实现。")
+    print("━━━━━━━━━━━━━━━━━━━━━━")
+    _prompt_select(
+        "请选择操作",
+        [("done", "已了解，返回")],
+        default_index=0,
+    )
+    print("")
 
 
 def _prompt_yes_no(question: str, default_yes: bool = True) -> bool:
@@ -3313,10 +3434,23 @@ def _write_cli_report(
                     )
                 context_requests = round_payload.get("context_requests")
                 resolved_context = round_payload.get("resolved_context")
+                pre_round_add_res = round_payload.get("pre_round_add_res")
+                if isinstance(pre_round_add_res, dict):
+                    _write_json(round_dir / "05b_pre_round_add_res.json", pre_round_add_res)
                 if context_requests or resolved_context:
+                    from workflows.crash_analysis_workflow import (
+                        BaseCrashAnalysisWorkflow,
+                    )
+
                     _write_json(
-                        round_dir / "06_context_requests.json",
+                        round_dir / "06b_next_round_ai_request.json",
                         {
+                            "return_form_legend": (
+                                BaseCrashAnalysisWorkflow.CONTEXT_REQUEST_RETURN_FORM_LABELS
+                            ),
+                            "type_to_expected_return_form": (
+                                BaseCrashAnalysisWorkflow.CONTEXT_REQUEST_RETURN_FORMS
+                            ),
                             "context_requests": context_requests or [],
                             "resolved_context": resolved_context or [],
                         },
@@ -3716,6 +3850,68 @@ def _resolve_scope_from_record(record: Dict[str, Any]) -> str:
     return "full"
 
 
+def _run_cache_overview_menu() -> None:
+    """设置菜单：查看 ``cli_reports/`` 占用与最近若干次会话，不修改磁盘。"""
+    stats = print_cli_reports_overview()
+    if not stats.get("exists", False):
+        print("当前不需要清理。")
+        print("")
+        return
+
+    extras = int(stats.get("report_count") or 0) - len(stats.get("preview") or [])
+    if extras <= 0:
+        print("✅ 没有需要清理的报告。")
+        print("")
+        return
+
+    print(f"另有 {extras} 份历史报告未在上述预览中列出。")
+    print("如需进一步清理，请回到「设置」选择「清理本地缓存（cli_reports）」。")
+    print("")
+
+
+def _run_cache_clear_menu() -> None:
+    """设置菜单：清理 ``cli_reports/`` 下的历史会话子目录。"""
+    stats = summarize_cli_reports()
+    print_cli_reports_overview()
+
+    if not stats.get("exists", False):
+        print("暂无可清理内容。")
+        print("")
+        return
+
+    if int(stats.get("report_count") or 0) == 0:
+        print("暂无可清理的报告。")
+        print("")
+        return
+
+    action = _prompt_select(
+        "请选择清理范围",
+        [
+            ("back", "返回设置"),
+            ("all", f"清理全部（{stats['report_count']} 份，约 {format_bytes(int(stats['total_bytes'] or 0))}）"),
+            ("preview", f"仅清理最近 {len(stats.get('preview') or [])} 份"),
+        ],
+        default_index=0,
+    )
+    if action == "back" or action == "__eof__":
+        print("")
+        return
+
+    only_preview = action == "preview"
+    result = clear_cli_reports(only_preview=only_preview)
+
+    if result.get("skipped"):
+        print(f"⚠️  {result['skipped']}")
+    elif int(result.get("removed") or 0) <= 0:
+        print("⚠️  未删除任何会话。")
+    else:
+        print(
+            f"✅ 已清理 {result['removed']} 份会话，"
+            f"释放 {format_bytes(int(result.get('freed_bytes') or 0))}。"
+        )
+    print("")
+
+
 def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
     _ensure_user_config_templates()
     session_state = _load_session_state()
@@ -3824,14 +4020,17 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
         recent_log = str(last_run.get("crash_log", "")).strip() if isinstance(last_run, dict) else ""
         has_recent = bool(recent_log)
         opts: List[Tuple[str, str]] = [
-            ("1", "快速开始分析（推荐）"),
+            ("q", "退出"),
+            ("1", "快速开始修复（推荐）"),
+            ("4", "根据缺陷管理平台自动修复（基于 bug-platform-fetcher-skill）"),
         ]
         if has_recent:
-            opts.append(("5", "再次进行上一次分析"))
+            opts.append(("5", "再次进行上一次修复"))
+        opts.append(("6", "自动验证修复结果（基于 automation-testing-skill）"))
+        opts.append(("7", "自动生成修复后的新包（基于 cicd-pipeline-skill）"))
         opts.append(("2", "设置"))
         opts.append(("3", "帮助"))
-        opts.append(("q", "退出"))
-        choice = _prompt_select("请选择要执行的操作", opts, default_index=0).strip().lower()
+        choice = _prompt_select("请选择要执行的操作", opts, default_index=1).strip().lower()
         if choice == "__eof__":
             return None
         if choice == "q":
@@ -3844,6 +4043,9 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                         ("back", "返回"),
                         ("cfg_llm", "配置大模型（厂商 / 密钥 / 模型）"),
                         ("cfg_add2line", "配置堆栈地址解析工具（addr2line / atos 等）"),
+                        ("check_update", "检查更新（升级 sa-agent 到最新版）"),
+                        ("cache_overview", "查看本地缓存（cli_reports 占用）"),
+                        ("cache_clear", "清理本地缓存（cli_reports）"),
                         ("advanced", "高级选项"),
                     ],
                     default_index=0,
@@ -3855,6 +4057,15 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                 if sub_choice == "cfg_add2line":
                     _configure_add2line_only()
                     print("")
+                    continue
+                if sub_choice == "check_update":
+                    run_upgrade_check_interactive()
+                    continue
+                if sub_choice == "cache_overview":
+                    _run_cache_overview_menu()
+                    continue
+                if sub_choice == "cache_clear":
+                    _run_cache_clear_menu()
                     continue
                 if sub_choice == "advanced":
                     while True:
@@ -3973,6 +4184,15 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                     print("")
                     continue
                 break
+            continue
+        if choice == "6":
+            _describe_closure_skill("automation-testing")
+            continue
+        if choice == "7":
+            _describe_closure_skill("cicd-pipeline")
+            continue
+        if choice == "4":
+            _describe_bug_platform_skill("bug-platform-fetcher")
             continue
         if choice == "5" and has_recent:
             recent_state = {
@@ -4289,6 +4509,13 @@ def execute_analysis(args: argparse.Namespace) -> int:
     registry = ToolAndWorkflowRegistry()
     register_all_tools_and_workflows(registry)
 
+    # 加载扩展：仓库自带示例 + 用户级 extensions/ 目录 + Python 入口点。
+    try:
+        from extensions import register_all as register_extensions
+        register_extensions()
+    except Exception as exc:
+        logging.getLogger(__name__).debug("扩展自动发现失败（已忽略）: %s", exc)
+
     env_modules = [m.strip() for m in os.environ.get("STABILITY_AGENT_PLUGIN_MODULES", "").split(",") if m.strip()]
     cli_modules = args.plugin_modules or []
     _register_third_party_modules(registry, env_modules + cli_modules)
@@ -4339,7 +4566,7 @@ def execute_analysis(args: argparse.Namespace) -> int:
     llm_skipped = bool(meta.get("llm_skipped"))
     analysis_text_for_fix = str(result.get("analysis") or "")
     final_still_needs_context = bool(
-        re.search(r'"need_more_context"\s*:\s*true', analysis_text_for_fix, re.I)
+        re.search(r'"(?:agent_can_fetch_more|need_more_context)"\s*:\s*true', analysis_text_for_fix, re.I)
     )
     if (
         args.apply_ai_fixes

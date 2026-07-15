@@ -56,7 +56,7 @@ python3 cli/main.py [参数...]
 |------|------|
 | （省略） | 随 `--prompt-mode`：`analysis`→`context_loop`，`fix` 等→`single`。 |
 | `single` | 只调用一次 LLM；`round_0/05_ai_prompt.md` 作为输入，`round_0/06_ai_gen_res.md` 保存模型输出。 |
-| `context_loop` | 当模型在输出中返回 `need_more_context=true` 和 `context_requests[]` 时，Agent 按请求定位函数源码，构造下一轮 prompt 继续询问，直到无请求或达到 `--max-agent-rounds`。 |
+| `context_loop` | 当模型在输出中返回 `agent_can_fetch_more=true` 和 `context_requests[]` 时，Agent 按请求定位函数源码，在首轮 prompt 基座上追加 `## 其它代码上下文` 后继续询问；`round_N/05b_pre_round_add_res.json` 记录该轮补充结果。直到 `agent_can_fetch_more=false`、请求耗尽或达到 `--max-agent-rounds`。兼容旧字段 `need_more_context`。 |
 
 ### 1.2 传给工作流的问题上下文（内部字段）
 
@@ -118,7 +118,7 @@ LLM 密钥与默认厂商/模型来自 **`tools/configs/agent_config.json`**；�
 | 行为 | 说明 |
 |------|------|
 | 终端 / `--output-file` | 与 `--output-format` 一致，为面向阅读的摘要（markdown/json/text）。 |
-| `cli_reports/.../` | 每次分析成功后会尽量写入：`01_crash_log_parser.json`（所有 scope）、`02_add2line_resolver.json`（`full`/`gen_prompt_only`/`parse_stack_only`）、`03_code_content_provider.json`（`full`/`gen_prompt_only`）、`03b_code_location_trace.json`（`full`/`gen_prompt_only`，`03` 生成过程中的代码定位审计轨迹，**仅供调试/二次消费，不写入** `05_ai_prompt.md`）、`04_memory_context.json`（`full`/`gen_prompt_only`，`vector_memory_retriever` **只读**检索快照；默认不并入 `05`，仅在 `--include-memory-in-05` 时追加到提示词，且**默认不回写**向量库）、`round_0/05_ai_prompt.md`（`full`/`gen_prompt_only`）、`round_0/06_ai_gen_res.md`（仅 `full`）。若启用 `--agent-loop context_loop` 且产生多轮，会继续写入 `round_1/`、`round_2/` 等目录，每轮包含 `05_ai_prompt.md`、`06_ai_gen_res.md` 与可选 `06_context_requests.json`，同时写入 `agent_rounds_summary.json`。若执行了改码逻辑，还会写入 `07b_fix_extract_debug.json.json`（提取阶段：含 `fix_plan` 与覆盖率统计）与 `07_apply_ai_fixes.json`（应用结果）。`final_output.md` 仅在 `--scope full` 下生成，且内容为最终一轮模型原始返回。 |
+| `cli_reports/.../` | 每次分析成功后会尽量写入：`01_crash_log_parser.json`（所有 scope）、`02_add2line_resolver.json`（`full`/`gen_prompt_only`/`parse_stack_only`）、`03_code_content_provider.json`（`full`/`gen_prompt_only`）、`03b_code_location_trace.json`（`full`/`gen_prompt_only`，`03` 生成过程中的代码定位审计轨迹，**仅供调试/二次消费，不写入** `05_ai_prompt.md`）、`04_memory_context.json`（`full`/`gen_prompt_only`，`vector_memory_retriever` **只读**检索快照；默认不并入 `05`，仅在 `--include-memory-in-05` 时追加到提示词，且**默认不回写**向量库）、`round_0/05_ai_prompt.md`（`full`/`gen_prompt_only`）、`round_0/06_ai_gen_res.md`（仅 `full`）。若启用 `--agent-loop context_loop` 且产生多轮，会继续写入 `round_1/`、`round_2/` 等目录，每轮包含 `05_ai_prompt.md`、`05b_pre_round_add_res.json`（上一轮 `context_requests` 的补充结果审计）、`06_ai_gen_res.md` 与可选 `06b_next_round_ai_request.json`，同时写入 `agent_rounds_summary.json`。若执行了改码逻辑，还会写入 `07b_fix_extract_debug.json.json`（提取阶段：含 `fix_plan` 与覆盖率统计）与 `07_apply_ai_fixes.json`（应用结果）。`final_output.md` 仅在 `--scope full` 下生成，且内容为最终一轮模型原始返回。 |
 
 ---
 
@@ -164,7 +164,7 @@ LLM 密钥与默认厂商/模型来自 **`tools/configs/agent_config.json`**；�
 | `skill lint <path>` | 校验某个 skill 目录或安装包。 |
 | `skill install <source>` | 安装 skill 目录或 zip 包。 |
 | `skill uninstall <name>` | 卸载已安装 skill。 |
-| `skill init <name> <target>` | 生成 skill 模板。 |
+| `skill init <name> <target>` | 生成 skill 模板；可通过 `--preset automation-testing|cicd-pipeline` 生成闭环空模板。 |
 | `skill run <name>` | 渲染或执行 skill。 |
 
 `skill` 子命令支持的公共参数：
@@ -174,6 +174,7 @@ LLM 密钥与默认厂商/模型来自 **`tools/configs/agent_config.json`**；�
 | `--skill-home PATH` | 指定默认安装目录，默认 `~/.config/stability-analysis-agent/skills`。 |
 | `--skill-dir PATH` | 额外的技能发现目录，可重复。 |
 | `--json` | 将 `list/show/lint/install/uninstall/run` 的结果输出为 JSON。 |
+| `--preset NAME` | `skill init` 的内置空模板预置，当前支持 `automation-testing` 和 `cicd-pipeline`。 |
 
 ---
 

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from skill_system import SkillManager, SkillRuntime, load_skill_bundle
+from skill_system import SkillManager, SkillRuntime, load_skill_bundle, write_skill_scaffold
 
 
 class TestSkillSystem(unittest.TestCase):
@@ -138,7 +138,76 @@ Execute the workflow.
                 if str(module_dir) in sys.path:
                     sys.path.remove(str(module_dir))
 
+    def test_builtin_preset_skill_scaffolds_are_minimal_and_specific(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            automation_dir = root / "automation-testing-skill"
+            cicd_dir = root / "cicd-pipeline-skill"
+
+            automation_written = write_skill_scaffold(
+                automation_dir,
+                "automation-testing-skill",
+                preset="automation-testing",
+            )
+            cicd_written = write_skill_scaffold(
+                cicd_dir,
+                "cicd-pipeline-skill",
+                preset="cicd-pipeline",
+            )
+
+            self.assertEqual({path.name for path in automation_written}, {"SKILL.md", "skill.json"})
+            self.assertEqual({path.name for path in cicd_written}, {"SKILL.md", "skill.json"})
+
+            automation_skill_md = (automation_dir / "SKILL.md").read_text(encoding="utf-8")
+            cicd_skill_md = (cicd_dir / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("Automation Testing Skill", automation_skill_md)
+            self.assertIn("disable-model-invocation: true", automation_skill_md)
+            self.assertIn("CICD Pipeline Skill", cicd_skill_md)
+            self.assertIn("disable-model-invocation: true", cicd_skill_md)
+
+    def test_bug_platform_fetcher_preset_is_generic_template(self):
+        """`bug-platform-fetcher` 预设只生成空骨架，不依赖任何具体平台 API。"""
+        from skill_system.templates import available_skill_presets
+
+        presets = available_skill_presets()
+        self.assertIn("bug-platform-fetcher", presets)
+        spec = presets["bug-platform-fetcher"]
+
+        # 暴露给 sa-agent 菜单的元数据
+        self.assertTrue(spec.display_name)
+        self.assertTrue(spec.description)
+        self.assertTrue(spec.when_to_use)
+        self.assertTrue(spec.purpose)
+        # 输入 / 输出 / 流程都是通用项
+        self.assertGreater(len(spec.inputs), 0)
+        self.assertGreater(len(spec.workflow), 0)
+        self.assertGreater(len(spec.outputs), 0)
+        # 重点: 必须不出现百度内网 API / 命令 / 域名（这是引入内网安全债的红线）
+        spec_blob = "\n".join([spec.description, spec.when_to_use, spec.purpose,
+                               "\n".join(spec.inputs), "\n".join(spec.workflow),
+                               "\n".join(spec.outputs)])
+        for forbidden in ("icafe-cli", "uuap.baidu", "bcebos", "baidu-int.com", "UGate"):
+            self.assertNotIn(forbidden, spec_blob,
+                             f"{forbidden!r} 必须不出现在通用预设元数据里")
+
+        # 落盘后能生成两个文件且正文不引入具体平台实现
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "bug-platform-fetcher-skill"
+            written = write_skill_scaffold(
+                target, "bug-platform-fetcher-skill", preset="bug-platform-fetcher",
+            )
+            self.assertEqual({path.name for path in written}, {"SKILL.md", "skill.json"})
+
+            skill_md = (target / "SKILL.md").read_text(encoding="utf-8")
+            for forbidden in ("icafe-cli", "uuap.baidu", "bcebos", "baidu-int.com", "UGate"):
+                self.assertNotIn(forbidden, skill_md,
+                                 f"{forbidden!r} 必须不出现在 SKILL.md 里")
+            # 通用骨架签名
+            self.assertIn("Bug Platform Fetcher Skill", skill_md)
+            self.assertIn("Ticket ID", skill_md)
+            self.assertIn("crash_log", skill_md)
+            self.assertIn("library_dir", skill_md)
+
 
 if __name__ == "__main__":
     unittest.main()
-

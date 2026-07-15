@@ -692,6 +692,124 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 continue
         return None
 
+    CONTEXT_REQUEST_RETURN_FORMS: Dict[str, str] = {
+        "function": "function_source",
+        "field": "member_declaration",
+        "references": "read_write_references",
+        "callers": "caller_snippets",
+    }
+    CONTEXT_REQUEST_RETURN_FORM_LABELS: Dict[str, str] = {
+        "function_source": "函数定义处完整源码（含签名与函数体）",
+        "member_declaration": "所属类成员声明（优先头文件）",
+        "member_initialization": "成员初始化语句",
+        "class_declaration": "类/结构体声明块（头文件）",
+        "read_write_references": "读写/引用位置（文件:行 + 片段）",
+        "caller_snippets": "调用方函数名 + 调用点片段",
+    }
+
+    @classmethod
+    def _default_expected_return_form(cls, req_type: str) -> str:
+        return cls.CONTEXT_REQUEST_RETURN_FORMS.get(
+            str(req_type or "").strip().lower(), "function_source"
+        )
+
+    @classmethod
+    def _return_form_label(cls, form: str) -> str:
+        return cls.CONTEXT_REQUEST_RETURN_FORM_LABELS.get(
+            str(form or "").strip(), str(form or "")
+        )
+
+    @classmethod
+    def _normalize_expected_return_form(cls, req_type: str, raw_form: Any) -> str:
+        req_type = str(req_type or "").strip().lower()
+        default_form = cls._default_expected_return_form(req_type)
+        token = str(raw_form or "").strip().lower()
+        if not token:
+            return default_form
+        aliases = {
+            "function": "function_source",
+            "function_source": "function_source",
+            "source": "function_source",
+            "field": "member_declaration",
+            "member_declaration": "member_declaration",
+            "declaration": "member_declaration",
+            "references": "read_write_references",
+            "read_write_references": "read_write_references",
+            "reference": "read_write_references",
+            "callers": "caller_snippets",
+            "caller_snippets": "caller_snippets",
+        }
+        normalized = aliases.get(token, token)
+        allowed_by_type = {
+            "function": {"function_source"},
+            "field": {"member_declaration", "member_initialization"},
+            "references": {"read_write_references"},
+            "callers": {"caller_snippets"},
+        }
+        if normalized in allowed_by_type.get(req_type, {default_form}):
+            return normalized
+        return default_form
+
+    @classmethod
+    def _infer_actual_return_form(cls, item: Dict[str, Any]) -> Optional[str]:
+        if not item.get("success"):
+            return None
+        context_type = str(item.get("context_type") or "function").strip().lower()
+        if context_type == "function":
+            return "function_source"
+        if context_type == "field":
+            matches = item.get("matches")
+            if isinstance(matches, list) and matches:
+                kind = str((matches[0] or {}).get("match_kind") or "").strip().lower()
+                if kind == "class_declaration":
+                    return "class_declaration"
+                if kind == "initialization":
+                    return "member_initialization"
+            return "member_declaration"
+        if context_type == "references":
+            return "read_write_references"
+        if context_type == "callers":
+            return "caller_snippets"
+        return None
+
+    @classmethod
+    def _fulfillment_matched(cls, expected_form: str, actual_form: Optional[str]) -> Optional[bool]:
+        if not actual_form:
+            return None
+        expected = str(expected_form or "").strip().lower()
+        actual = str(actual_form or "").strip().lower()
+        if expected == actual:
+            return True
+        if expected == "member_declaration" and actual in {
+            "member_initialization",
+            "class_declaration",
+        }:
+            return True
+        return False
+
+    @classmethod
+    def _attach_return_form_metadata(cls, item: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(item, dict):
+            return item
+        req = item.get("request") if isinstance(item.get("request"), dict) else {}
+        req_type = str(req.get("type") or "function").strip().lower()
+        expected = cls._normalize_expected_return_form(
+            req_type,
+            req.get("expected_return_form")
+            or req.get("return_form")
+            or req.get("expected_form"),
+        )
+        item["expected_return_form"] = expected
+        item["expected_return_form_label"] = cls._return_form_label(expected)
+        actual = cls._infer_actual_return_form(item)
+        if actual:
+            item["actual_return_form"] = actual
+            item["actual_return_form_label"] = cls._return_form_label(actual)
+            matched = cls._fulfillment_matched(expected, actual)
+            if matched is not None:
+                item["fulfillment_matched"] = matched
+        return item
+
     @classmethod
     def _parse_context_requests(cls, analysis_text: str) -> Dict[str, Any]:
         payload = cls._extract_json_object(analysis_text) or {}
@@ -718,6 +836,18 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 line_number = int(item.get("line") or item.get("line_number") or 0)
             except (TypeError, ValueError):
                 line_number = 0
+            expected_return_form = cls._normalize_expected_return_form(
+                req_type,
+                item.get("expected_return_form")
+                or item.get("return_form")
+                or item.get("expected_form"),
+            )
+            fulfillment_note = str(
+                item.get("fulfillment_note")
+                or item.get("request_type_note")
+                or item.get("return_form_note")
+                or ""
+            ).strip()
             normalized.append(
                 {
                     "type": req_type,
@@ -726,14 +856,35 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     "line_number": line_number,
                     "reason": reason,
                     "priority": priority,
+                    "expected_return_form": expected_return_form,
+                    "expected_return_form_label": cls._return_form_label(
+                        expected_return_form
+                    ),
+                    "fulfillment_note": fulfillment_note,
                 }
             )
-        need_more = bool(payload.get("need_more_context")) or bool(normalized)
+        agent_can_fetch_more = cls._parse_agent_can_fetch_more(payload, normalized)
         return {
-            "need_more_context": need_more,
+            "agent_can_fetch_more": agent_can_fetch_more,
+            # 兼容旧版 LLM 输出字段
+            "need_more_context": agent_can_fetch_more,
             "context_requests": normalized,
             "raw_payload": payload,
         }
+
+    @staticmethod
+    def _parse_agent_can_fetch_more(
+        payload: Dict[str, Any], normalized_requests: List[Dict[str, Any]]
+    ) -> bool:
+        """解析是否继续由 Agent 自动拉取上下文（兼容 need_more_context）。"""
+        raw = payload.get("agent_can_fetch_more")
+        if raw is None:
+            legacy = payload.get("need_more_context")
+            if legacy is not None:
+                raw = legacy
+        if raw is None:
+            return bool(normalized_requests)
+        return bool(raw) or bool(normalized_requests)
 
     @staticmethod
     def _read_source_lines(file_path: str) -> List[str]:
@@ -741,6 +892,307 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             return Path(file_path).read_text(encoding="utf-8", errors="ignore").splitlines()
         except Exception:
             return []
+
+    @staticmethod
+    def _is_destructor_symbol(symbol: str) -> bool:
+        raw = str(symbol or "").strip()
+        if not raw:
+            return False
+        head = raw.split("(", 1)[0]
+        return bool(re.search(r"::~\w+\s*$", head) or re.search(r"::~\w+\s*$", raw))
+
+    @classmethod
+    def _normalize_context_request_symbol(cls, symbol: str, req_type: str = "") -> str:
+        """规范化 context request 符号，减少等价写法导致的定位/去重失败。"""
+        raw = str(symbol or "").strip()
+        if not raw:
+            return raw
+        req_type = str(req_type or "").strip().lower()
+        head = raw.split("(", 1)[0].strip()
+        if req_type == "function" and re.search(r"::\s*~\w+\s*$", head):
+            return head + "()"
+        if req_type == "references":
+            return raw.rstrip().rstrip(";")
+        return raw
+
+    @classmethod
+    def _canonical_context_request_symbol(cls, symbol: str, req_type: str = "") -> str:
+        """将等价函数符号规范为同一去重键（如 CVList::RemoveAll 与 CVList<T>::RemoveAll）。"""
+        norm = cls._normalize_context_request_symbol(symbol, req_type)
+        if str(req_type or "").strip().lower() != "function":
+            return norm
+        head = norm.split("(", 1)[0].strip()
+        from services.code_locator import SymbolLocator
+
+        tpl = SymbolLocator.parse_template_qualified_symbol(head)
+        if tpl:
+            return f"{tpl['template_class']}<>::{tpl['member']}"
+        parsed = SymbolLocator.parse_qualified_member_symbol(head)
+        if parsed:
+            scope = str(parsed.get("short_scope") or "")
+            method = str(parsed.get("method") or "")
+            if (
+                scope
+                and method
+                and scope[0].isupper()
+                and not scope.startswith("m_")
+                and "<" not in head
+            ):
+                return f"{scope}<>::{method}"
+        return norm
+
+    @classmethod
+    def _context_request_outcome_key(
+        cls, req_type: str, symbol: str, file_path: str, line_number: int
+    ) -> str:
+        norm = cls._normalize_context_request_symbol(symbol, req_type)
+        req_type = str(req_type or "").strip().lower()
+        if req_type == "function" and not file_path and line_number <= 0:
+            return f"{req_type}::{norm}"
+        return f"{req_type}:{file_path}:{line_number}:{norm}".strip(":")
+
+    @classmethod
+    def _context_request_success_dedupe_keys(
+        cls, req_type: str, symbol: str, file_path: str, line_number: int
+    ) -> List[str]:
+        """成功去重键：等价模板函数写法共享；失败/拒绝仍用精确 outcome key。"""
+        exact = cls._context_request_outcome_key(req_type, symbol, file_path, line_number)
+        keys = [exact]
+        if str(req_type or "").strip().lower() == "function":
+            canon = cls._canonical_context_request_symbol(symbol, req_type)
+            canon_key = cls._context_request_outcome_key(req_type, canon, file_path, line_number)
+            if canon_key not in keys:
+                keys.append(canon_key)
+        return keys
+
+    @classmethod
+    def _record_context_request_outcome(
+        cls,
+        outcomes: Dict[str, str],
+        req_type: str,
+        symbol: str,
+        file_path: str,
+        line_number: int,
+        status: str,
+    ) -> None:
+        key = cls._context_request_outcome_key(req_type, symbol, file_path, line_number)
+        if not key:
+            return
+        outcomes[key] = status
+        if status == "success":
+            for alias in cls._context_request_success_dedupe_keys(
+                req_type, symbol, file_path, line_number
+            ):
+                outcomes[alias] = "success"
+
+    @staticmethod
+    def _looks_like_package_or_thread_label(symbol: str) -> bool:
+        """判断是否为 Android 包名/线程标签（而非 C++ 成员访问）。"""
+        symbol = str(symbol or "").strip()
+        if not symbol or "::" in symbol:
+            return False
+        if re.match(r"^m_[A-Za-z_]\w*\.[A-Za-z_]\w+", symbol):
+            return False
+        if not re.match(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$", symbol):
+            return False
+        return True
+
+    @staticmethod
+    def _parse_member_method_reference(symbol: str) -> Optional[Dict[str, str]]:
+        """解析 obj.method / obj.method() 形式的引用符号。"""
+        raw = str(symbol or "").strip().rstrip(";")
+        if raw.endswith("()"):
+            raw = raw[:-2]
+        raw = raw.rstrip(")").strip()
+        match = re.match(r"^(?:([\w:<>*,&\s]+)::)?(m_\w+)\.(\w+)$", raw)
+        if match:
+            return {
+                "owner_prefix": str(match.group(1) or "").strip(),
+                "member": match.group(2),
+                "method": match.group(3),
+            }
+        match = re.match(r"^(\w+)\.(\w+)$", raw)
+        if match and match.group(1).startswith("m_"):
+            return {
+                "owner_prefix": "",
+                "member": match.group(1),
+                "method": match.group(2),
+            }
+        return None
+
+    @classmethod
+    def _extract_brace_block_lines(
+        cls, lines: List[str], start_index: int, *, max_lines: int = 120
+    ) -> List[str]:
+        if start_index < 0 or start_index >= len(lines):
+            return []
+        collected: List[str] = []
+        depth = 0
+        started = False
+        for idx in range(start_index, min(len(lines), start_index + max_lines)):
+            line = lines[idx]
+            collected.append(line)
+            depth += line.count("{") - line.count("}")
+            if "{" in line:
+                started = True
+            if started and depth <= 0:
+                break
+        if not collected:
+            collected = lines[start_index : min(len(lines), start_index + 20)]
+        return collected
+
+    @classmethod
+    def _repair_template_function_snippet(
+        cls,
+        *,
+        symbol: str,
+        target_file: str,
+        target_line: int,
+        out: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        from services.code_locator import SymbolLocator
+
+        lines = cls._read_source_lines(target_file)
+        if not lines or not (0 < target_line <= len(lines)):
+            return out
+        def_idx = target_line - 1
+        def_line = lines[def_idx]
+        is_template_member = bool(
+            re.search(r"\b\w+\s*<[^>]*>\s*::", def_line)
+            or (
+                def_idx > 0
+                and re.match(r"\s*template\s*<", lines[def_idx - 1])
+                and "::" in def_line
+            )
+        )
+        if not is_template_member:
+            return out
+        head = str(symbol or "").split("(", 1)[0].strip()
+        if not (
+            SymbolLocator.parse_template_qualified_symbol(symbol)
+            or SymbolLocator.parse_qualified_member_symbol(head)
+        ):
+            return out
+        start_idx = def_idx
+        if def_idx > 0 and re.match(r"\s*template\s*<", lines[def_idx - 1]):
+            start_idx = def_idx - 1
+        body_lines = cls._extract_brace_block_lines(lines, def_idx)
+        if not body_lines:
+            return out
+        snippet_lines: List[str] = []
+        if start_idx < def_idx:
+            snippet_lines.append(lines[start_idx])
+        snippet_lines.extend(body_lines)
+        out = dict(out)
+        out["snippet"] = snippet_lines
+        out["function_name"] = def_line.strip()
+        out["snippet_start_line"] = start_idx + 1
+        out["snippet_end_line"] = start_idx + len(snippet_lines)
+        return out
+
+    @classmethod
+    def _template_symbol_matches_text(cls, symbol: str, *texts: str) -> bool:
+        from services.code_locator import SymbolLocator
+
+        parsed = SymbolLocator.parse_template_qualified_symbol(symbol)
+        if not parsed:
+            return False
+        template_class = str(parsed.get("template_class") or "")
+        member = str(parsed.get("member") or "")
+        if not template_class or not member:
+            return False
+        pattern = rf"\b{re.escape(template_class)}\s*<[^>]*>\s*::\s*{re.escape(member)}\s*\("
+        for candidate in texts:
+            text = str(candidate or "").strip()
+            if text and re.search(pattern, text):
+                return True
+        return False
+
+    @classmethod
+    def _bare_template_class_method_matches_text(cls, symbol: str, *texts: str) -> bool:
+        """CVList::RemoveAll 等未写模板参数的限定符号，匹配 CVList<T>::RemoveAll 实现。"""
+        from services.code_locator import SymbolLocator
+
+        head = str(symbol or "").split("(", 1)[0].strip()
+        if "<" in head:
+            return False
+        parsed = SymbolLocator.parse_qualified_member_symbol(head)
+        if not parsed:
+            return False
+        scope = str(parsed.get("short_scope") or "")
+        method = str(parsed.get("method") or "")
+        if not scope or not method or not scope[0].isupper() or scope.startswith("m_"):
+            return False
+        pattern = rf"\b{re.escape(scope)}\s*<[^>]*>\s*::\s*{re.escape(method)}\s*\("
+        for candidate in texts:
+            text = str(candidate or "").strip()
+            if text and re.search(pattern, text):
+                return True
+        return False
+
+    @classmethod
+    def _resolved_function_matches_symbol(
+        cls,
+        symbol: str,
+        file_path: str,
+        line_number: int,
+        function_signature: str = "",
+        snippet_text: str = "",
+    ) -> bool:
+        """校验定位结果是否与请求的符号类型一致（限定名、ctor/dtor）。"""
+        from services.code_locator import SymbolLocator
+
+        lines = cls._read_source_lines(file_path)
+        line = ""
+        if 0 < line_number <= len(lines):
+            line = lines[line_number - 1]
+        sig = str(function_signature or line)
+        norm_symbol = cls._normalize_context_request_symbol(symbol, "function")
+        if SymbolLocator.parse_template_qualified_symbol(norm_symbol):
+            return cls._template_symbol_matches_text(norm_symbol, line, snippet_text)
+        if cls._template_symbol_matches_text(norm_symbol, sig, line):
+            return True
+        if cls._bare_template_class_method_matches_text(
+            norm_symbol, sig, line, snippet_text
+        ):
+            return True
+        head = str(norm_symbol or "").split("(", 1)[0]
+        if "::" in head:
+            if not SymbolLocator.qualified_symbol_matches_line(norm_symbol, line, sig):
+                if cls._is_destructor_symbol(norm_symbol):
+                    m = re.search(r"::~(\w+)", norm_symbol)
+                    if m:
+                        class_name = m.group(1)
+                        return bool(re.search(rf"::~\s*{re.escape(class_name)}\s*\(", sig))
+                return False
+        if cls._is_destructor_symbol(norm_symbol):
+            m = re.search(r"::~(\w+)", norm_symbol)
+            if m:
+                class_name = m.group(1)
+                return bool(re.search(rf"::~\s*{re.escape(class_name)}\s*\(", sig))
+        return True
+
+    @classmethod
+    def _resolved_snippet_matches_symbol(
+        cls, symbol: str, snippet_text: str, function_signature: str = ""
+    ) -> bool:
+        """限定成员符号时，要求片段或签名中出现 Class::method。"""
+        from services.code_locator import SymbolLocator
+
+        if cls._template_symbol_matches_text(symbol, snippet_text, function_signature):
+            return True
+        if cls._bare_template_class_method_matches_text(
+            symbol, function_signature, snippet_text
+        ):
+            return True
+        head = str(symbol or "").split("(", 1)[0]
+        if "::" not in head:
+            return True
+        for candidate in (function_signature, snippet_text):
+            text = str(candidate or "").strip()
+            if text and SymbolLocator.qualified_symbol_matches_line(symbol, text):
+                return True
+        return False
 
     @staticmethod
     def _context_request_symbol_leaf(symbol: str) -> str:
@@ -770,7 +1222,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         if not symbol:
             return None
         # 典型误用：把线程名/进程名/包名（如 com.anjuke.home）臆造成 C++ 符号。
-        if re.match(r"^[a-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$", symbol):
+        if BaseCrashAnalysisWorkflow._looks_like_package_or_thread_label(symbol):
             return (
                 f"拒绝请求: `{symbol}` 看起来是线程名/进程名/包名标签，"
                 "不是可解析的源码符号；请作为缺失证据/人工补充项处理。"
@@ -830,6 +1282,511 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         return files
         return files
 
+    @staticmethod
+    def _parse_qualified_field_symbol(symbol: str) -> Optional[Dict[str, str]]:
+        """解析 Class::field / Ns::Class::field 形式的字段符号。"""
+        head = str(symbol or "").strip()
+        if not head:
+            return None
+        paren_idx = head.find("(")
+        if paren_idx > 0:
+            head = head[:paren_idx].strip()
+        if "::" not in head:
+            return None
+        parts = [p.strip() for p in head.split("::") if p.strip()]
+        if len(parts) < 2:
+            return None
+        return {
+            "class_name": parts[-2],
+            "field": parts[-1],
+            "scope": "::".join(parts[:-1]),
+        }
+
+    @staticmethod
+    def _field_context_path_score(
+        file_path: str,
+        class_name: str = "",
+        *,
+        stack_priority_classes: Optional[List[str]] = None,
+    ) -> int:
+        path = str(file_path or "").replace("\\", "/").lower()
+        score = 0
+        if any(
+            token in path
+            for token in ("/demo/", "/test/", "/apptest/", "/unittest/", "/systemtest/", "/enginetest/")
+        ):
+            score -= 120
+        if any(token in path for token in ("/support/", "/huiwei")):
+            score -= 150
+        if any(token in path for token in ("/engine-dev/", "/src/app/", "/src/", "/inc/")):
+            score += 80
+        if "/basemap/vmap/" in path:
+            score += 50
+        elif "/basemap/gmap/" in path:
+            score -= 30
+        if path.endswith(".h") or path.endswith(".hpp") or path.endswith(".hh"):
+            score += 60
+        elif path.endswith(".cpp") or path.endswith(".cc") or path.endswith(".cxx"):
+            score += 20
+        if path.endswith("vtempl.h"):
+            score += 40
+        if class_name:
+            stem = class_name.lower().lstrip("cv").lstrip("c")
+            base = class_name.lower()
+            file_name = path.rsplit("/", 1)[-1]
+            if base in file_name or (stem and stem in file_name):
+                score += 100
+        for cls_name in stack_priority_classes or []:
+            token = str(cls_name or "").strip().lower()
+            if token and token in path:
+                score += 70
+        return score
+
+    @classmethod
+    def _classify_field_match_kind(cls, line: str, field: str) -> Optional[str]:
+        stripped = str(line or "").strip()
+        if not stripped or not re.search(rf"\b{re.escape(field)}\b", stripped):
+            return None
+        if re.search(rf"\b{re.escape(field)}\s*;", stripped) and not re.search(
+            rf"\b{re.escape(field)}\s*=", stripped
+        ):
+            return "declaration"
+        if re.search(rf"\b{re.escape(field)}\s*\(", stripped) and (
+            ":" in stripped or stripped.endswith(")") or stripped.endswith("),")
+        ):
+            return "initialization"
+        if re.search(rf"\b{re.escape(field)}\s*=", stripped) or re.search(
+            rf"\b{re.escape(field)}\s*[+\-]{2}", stripped
+        ):
+            return "usage"
+        if re.search(rf"\bif\s*\([^)]*\b{re.escape(field)}\b", stripped):
+            return "usage"
+        if re.search(rf"\b{re.escape(field)}\b\s*[,;=)]", stripped):
+            return "usage"
+        return "usage"
+
+    @staticmethod
+    def _field_match_kind_label(kind: str) -> str:
+        return {
+            "declaration": "成员声明",
+            "initialization": "初始化",
+            "usage": "读写/使用",
+            "class_declaration": "类声明",
+        }.get(str(kind or ""), str(kind or ""))
+
+    @classmethod
+    def _looks_like_type_name_field_request(cls, symbol: str) -> bool:
+        raw = str(symbol or "").strip()
+        if not raw or "::" in raw or raw.startswith("m_"):
+            return False
+        return bool(re.match(r"^[A-Z][A-Za-z0-9_]*$", raw))
+
+    @classmethod
+    def _extract_class_declaration_span(
+        cls, lines: List[str], line_number: int
+    ) -> Tuple[int, int]:
+        idx = max(0, line_number - 1)
+        start_idx = idx
+        if idx > 0 and re.match(r"\s*template\s*<", lines[idx - 1]):
+            start_idx = idx - 1
+        depth = 0
+        started = False
+        end_idx = idx
+        for i in range(start_idx, min(len(lines), start_idx + 100)):
+            line = lines[i]
+            end_idx = i
+            if "{" in line:
+                started = True
+            depth += line.count("{") - line.count("}")
+            if started and depth <= 0:
+                break
+            if not started and line.strip().endswith(";") and i > idx:
+                break
+        return start_idx + 1, end_idx + 1
+
+    @classmethod
+    def _find_class_declaration_context_matches(
+        cls,
+        symbol: str,
+        code_roots: List[str],
+        *,
+        max_matches: int = 2,
+        stack_priority_classes: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        class_name = str(symbol or "").strip()
+        if not class_name:
+            return []
+        class_re = re.compile(rf"\b(?:class|struct)\s+{re.escape(class_name)}\b")
+        ctor_re = re.compile(
+            rf"\b{re.escape(class_name)}\s*::\s*{re.escape(class_name)}\s*\("
+        )
+        ranked: List[Tuple[int, Dict[str, Any]]] = []
+        files = cls._iter_context_search_files(code_roots)
+        files.sort(
+            key=lambda fp: -cls._field_context_path_score(
+                fp, class_name, stack_priority_classes=stack_priority_classes
+            )
+        )
+        for file_path in files:
+            lines = cls._read_source_lines(file_path)
+            if not lines:
+                continue
+            path_score = cls._field_context_path_score(
+                file_path, class_name, stack_priority_classes=stack_priority_classes
+            )
+            for idx, line in enumerate(lines, start=1):
+                if ctor_re.search(line) or not class_re.search(line):
+                    continue
+                start, end = cls._extract_class_declaration_span(lines, idx)
+                ranked.append(
+                    (
+                        path_score,
+                        {
+                            "file": file_path,
+                            "line_number": idx,
+                            "line_text": lines[idx - 1].strip(),
+                            "match_kind": "class_declaration",
+                            "match_kind_label": cls._field_match_kind_label(
+                                "class_declaration"
+                            ),
+                            "context_start_line": start,
+                            "context_end_line": end,
+                            "context": lines[start - 1 : end],
+                        },
+                    )
+                )
+        ranked.sort(key=lambda item: (-item[0], item[1]["file"], item[1]["line_number"]))
+        return [entry for _, entry in ranked[:max_matches]]
+
+    @classmethod
+    def _file_declares_class(cls, lines: List[str], class_name: str) -> bool:
+        if not class_name or not lines:
+            return False
+        pattern = re.compile(rf"\b(?:class|struct)\s+{re.escape(class_name)}\b")
+        return any(pattern.search(line) for line in lines)
+
+    @classmethod
+    def _build_field_match_entry(
+        cls,
+        *,
+        file_path: str,
+        lines: List[str],
+        line_number: int,
+        match_kind: str,
+        context_radius: int = 2,
+    ) -> Dict[str, Any]:
+        stripped = lines[line_number - 1].strip()
+        if match_kind == "class_declaration":
+            start, end = cls._extract_class_declaration_span(lines, line_number)
+            return {
+                "file": file_path,
+                "line_number": line_number,
+                "line_text": stripped,
+                "match_kind": match_kind,
+                "match_kind_label": cls._field_match_kind_label(match_kind),
+                "context_start_line": start,
+                "context_end_line": end,
+                "context": lines[start - 1 : end],
+            }
+        if match_kind == "declaration":
+            context_radius = 4
+        start = max(1, line_number - context_radius)
+        end = min(len(lines), line_number + context_radius)
+        return {
+            "file": file_path,
+            "line_number": line_number,
+            "line_text": stripped,
+            "match_kind": match_kind,
+            "match_kind_label": cls._field_match_kind_label(match_kind),
+            "context_start_line": start,
+            "context_end_line": end,
+            "context": lines[start - 1:end],
+        }
+
+    @classmethod
+    def _find_template_field_context_matches(
+        cls,
+        symbol: str,
+        code_roots: List[str],
+        *,
+        max_matches: int = 2,
+        stack_priority_classes: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        from services.code_locator import SymbolLocator
+
+        parsed = SymbolLocator.parse_template_qualified_symbol(symbol)
+        if not parsed:
+            return []
+        template_class = str(parsed.get("template_class") or "")
+        field = str(parsed.get("member") or "")
+        if not template_class or not field:
+            return []
+        class_re = re.compile(rf"\b(?:class|struct)\s+{re.escape(template_class)}\b")
+        token_re = re.compile(rf"\b{re.escape(field)}\b")
+        ranked: List[Tuple[int, Dict[str, Any]]] = []
+        files = cls._iter_context_search_files(code_roots)
+        files.sort(
+            key=lambda fp: -cls._field_context_path_score(
+                fp, template_class, stack_priority_classes=stack_priority_classes
+            )
+        )
+        for file_path in files:
+            lines = cls._read_source_lines(file_path)
+            if not lines or not class_re.search("\n".join(lines)):
+                continue
+            path_score = cls._field_context_path_score(
+                file_path, template_class, stack_priority_classes=stack_priority_classes
+            )
+            for idx, line in enumerate(lines, start=1):
+                if not token_re.search(line):
+                    continue
+                match_kind = cls._classify_field_match_kind(line, field)
+                if match_kind != "declaration":
+                    continue
+                entry = cls._build_field_match_entry(
+                    file_path=file_path,
+                    lines=lines,
+                    line_number=idx,
+                    match_kind="declaration",
+                )
+                ranked.append((path_score, entry))
+        ranked.sort(key=lambda item: (-item[0], item[1]["file"], item[1]["line_number"]))
+        return [entry for _, entry in ranked[:max_matches]]
+
+    @classmethod
+    def _collect_field_match_candidates(
+        cls,
+        *,
+        field: str,
+        class_name: str,
+        code_roots: List[str],
+        allowed_kinds: Optional[Set[str]] = None,
+        stack_priority_classes: Optional[List[str]] = None,
+    ) -> List[Tuple[int, Dict[str, Any]]]:
+        if not field:
+            return []
+        token_re = re.compile(rf"\b{re.escape(field)}\b")
+        ranked: List[Tuple[int, Dict[str, Any]]] = []
+        kind_weight = {"declaration": 200, "initialization": 80, "usage": 20}
+        files = cls._iter_context_search_files(code_roots)
+        files.sort(
+            key=lambda fp: -cls._field_context_path_score(
+                fp, class_name, stack_priority_classes=stack_priority_classes
+            )
+        )
+        for file_path in files:
+            lines = cls._read_source_lines(file_path)
+            if not lines:
+                continue
+            if class_name and not cls._file_declares_class(lines, class_name):
+                continue
+            path_score = cls._field_context_path_score(
+                file_path, class_name, stack_priority_classes=stack_priority_classes
+            )
+            for idx, line in enumerate(lines, start=1):
+                if not token_re.search(line):
+                    continue
+                match_kind = cls._classify_field_match_kind(line, field)
+                if not match_kind:
+                    continue
+                if allowed_kinds is not None and match_kind not in allowed_kinds:
+                    continue
+                entry = cls._build_field_match_entry(
+                    file_path=file_path,
+                    lines=lines,
+                    line_number=idx,
+                    match_kind=match_kind,
+                )
+                score = path_score + kind_weight.get(match_kind, 0) - idx // 10000
+                ranked.append((score, entry))
+        ranked.sort(key=lambda item: (-item[0], item[1]["file"], item[1]["line_number"]))
+        return ranked
+
+    @classmethod
+    def _find_field_context_matches(
+        cls,
+        symbol: str,
+        code_roots: List[str],
+        *,
+        max_matches: int = 4,
+        stack_priority_classes: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        from services.code_locator import SymbolLocator
+
+        if cls._looks_like_type_name_field_request(symbol):
+            class_matches = cls._find_class_declaration_context_matches(
+                symbol,
+                code_roots,
+                max_matches=max_matches,
+                stack_priority_classes=stack_priority_classes,
+            )
+            if class_matches:
+                return class_matches
+        template_matches = cls._find_template_field_context_matches(
+            symbol,
+            code_roots,
+            max_matches=max_matches,
+            stack_priority_classes=stack_priority_classes,
+        )
+        if template_matches:
+            return template_matches
+        parsed = cls._parse_qualified_field_symbol(symbol)
+        field = parsed["field"] if parsed else cls._context_request_symbol_leaf(symbol)
+        class_name = str(parsed.get("class_name") or "") if parsed else ""
+        if not field:
+            return []
+        if not class_name:
+            max_matches = min(max_matches, 1)
+
+        if class_name:
+            ranked = cls._collect_field_match_candidates(
+                field=field,
+                class_name=class_name,
+                code_roots=code_roots,
+                allowed_kinds={"declaration"},
+                stack_priority_classes=stack_priority_classes,
+            )
+            if not ranked:
+                ranked = cls._collect_field_match_candidates(
+                    field=field,
+                    class_name=class_name,
+                    code_roots=code_roots,
+                    allowed_kinds={"initialization"},
+                    stack_priority_classes=stack_priority_classes,
+                )
+        else:
+            ranked = cls._collect_field_match_candidates(
+                field=field,
+                class_name="",
+                code_roots=code_roots,
+                allowed_kinds={"declaration", "initialization"},
+                stack_priority_classes=stack_priority_classes,
+            )
+
+        matches: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, int, str]] = set()
+        for _, entry in ranked:
+            key = (entry["file"], int(entry["line_number"]), str(entry.get("match_kind")))
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append(entry)
+            if len(matches) >= max_matches:
+                break
+        return matches
+
+    @staticmethod
+    def _extract_stack_priority_classes(problem: Optional[Dict[str, Any]]) -> List[str]:
+        """从 problem / 解析结果中提取栈上业务类名，用于字段/引用消歧。"""
+        classes: List[str] = []
+        seen: Set[str] = set()
+        if not isinstance(problem, dict):
+            return classes
+
+        def _add(name: str) -> None:
+            token = str(name or "").strip()
+            if not token or token in seen:
+                return
+            seen.add(token)
+            classes.append(token)
+
+        for key in ("stack_priority_classes", "crash_priority_classes"):
+            raw = problem.get(key)
+            if isinstance(raw, list):
+                for item in raw:
+                    _add(str(item))
+
+        for blob_key in ("parsed_stack", "symbolized_stack", "resolve_stack"):
+            blob = problem.get(blob_key)
+            if not isinstance(blob, dict):
+                continue
+            for thread in blob.get("threads", []) or []:
+                if not isinstance(thread, dict):
+                    continue
+                for frame in thread.get("frames", []) or []:
+                    if not isinstance(frame, dict):
+                        continue
+                    for token_key in ("function", "symbol", "raw_symbol"):
+                        fn = str(frame.get(token_key) or "")
+                        for m in re.finditer(r"\b([A-Z][A-Za-z0-9_]*(?:::[A-Za-z0-9_~]+)*)\b", fn):
+                            head = m.group(1).split("::")[0]
+                            if head.endswith("Layer") or head.endswith("Control") or head.startswith("C"):
+                                _add(head)
+        return classes[:12]
+
+    @classmethod
+    def _find_reference_context_matches(
+        cls,
+        symbol: str,
+        code_roots: List[str],
+        *,
+        max_matches: int = 12,
+        stack_priority_classes: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        member_method = cls._parse_member_method_reference(symbol)
+        if member_method:
+            member = member_method["member"]
+            method = member_method["method"]
+            literal_re = re.compile(
+                rf"\b{re.escape(member)}\s*\.\s*{re.escape(method)}\s*\("
+            )
+            method_re = re.compile(
+                rf"\.{re.escape(method)}\s*\(|\b{re.escape(method)}\s*\("
+            )
+            ranked: List[Tuple[int, Dict[str, Any]]] = []
+            files = cls._iter_context_search_files(code_roots)
+            files.sort(
+                key=lambda fp: -cls._field_context_path_score(
+                    fp, "", stack_priority_classes=stack_priority_classes
+                )
+            )
+            for file_path in files:
+                lines = cls._read_source_lines(file_path)
+                if not lines:
+                    continue
+                path_score = cls._field_context_path_score(
+                    file_path, "", stack_priority_classes=stack_priority_classes
+                )
+                for idx, line in enumerate(lines, start=1):
+                    stripped = line.strip()
+                    if literal_re.search(stripped):
+                        boost = 120
+                    elif method_re.search(stripped) and member in stripped:
+                        boost = 80
+                    elif method_re.search(stripped):
+                        boost = 20
+                    else:
+                        continue
+                    entry = cls._build_field_match_entry(
+                        file_path=file_path,
+                        lines=lines,
+                        line_number=idx,
+                        match_kind="usage",
+                    )
+                    ranked.append((path_score + boost - idx // 10000, entry))
+            ranked.sort(key=lambda item: (-item[0], item[1]["file"], item[1]["line_number"]))
+            matches: List[Dict[str, Any]] = []
+            seen: Set[Tuple[str, int]] = set()
+            for _, entry in ranked:
+                key = (entry["file"], int(entry["line_number"]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                matches.append(entry)
+                if len(matches) >= max_matches:
+                    break
+            if matches:
+                return matches
+
+        return cls._find_text_context_matches(
+            symbol,
+            code_roots,
+            mode="references",
+            max_matches=max_matches,
+            stack_priority_classes=stack_priority_classes,
+            parse_member_method=False,
+        )
+
     @classmethod
     def _find_text_context_matches(
         cls,
@@ -838,42 +1795,62 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         *,
         mode: str,
         max_matches: int = 8,
+        stack_priority_classes: Optional[List[str]] = None,
+        parse_member_method: bool = True,
     ) -> List[Dict[str, Any]]:
+        if mode == "field":
+            return cls._find_field_context_matches(
+                symbol,
+                code_roots,
+                max_matches=max_matches,
+                stack_priority_classes=stack_priority_classes,
+            )
         leaf = cls._context_request_symbol_leaf(symbol)
         if not leaf:
             return []
+        parsed = cls._parse_qualified_field_symbol(symbol)
+        class_name = str(parsed.get("class_name") or "") if parsed else ""
         token_re = re.compile(rf"\b{re.escape(leaf)}\b")
-        matches: List[Dict[str, Any]] = []
-        for file_path in cls._iter_context_search_files(code_roots):
+        ranked: List[Tuple[int, Dict[str, Any]]] = []
+        files = cls._iter_context_search_files(code_roots)
+        files.sort(
+            key=lambda fp: -cls._field_context_path_score(
+                fp, class_name, stack_priority_classes=stack_priority_classes
+            )
+        )
+        for file_path in files:
             lines = cls._read_source_lines(file_path)
             if not lines:
                 continue
+            if class_name and not cls._file_declares_class(lines, class_name):
+                continue
+            path_score = cls._field_context_path_score(
+                file_path, class_name, stack_priority_classes=stack_priority_classes
+            )
             for idx, line in enumerate(lines, start=1):
                 if not token_re.search(line):
                     continue
-                stripped = line.strip()
-                if mode == "field":
-                    # 字段请求优先保留声明/初始化/赋值附近，减少普通读取噪声。
-                    if not (
-                        re.search(rf"\b{re.escape(leaf)}\b\s*[,;=)]", stripped)
-                        or re.search(rf"\b{re.escape(leaf)}\b\s*\(", stripped)
-                        or stripped.startswith((",", f", {leaf}", f", {leaf}("))
-                    ):
-                        continue
-                start = max(1, idx - 2)
-                end = min(len(lines), idx + 2)
-                matches.append(
-                    {
-                        "file": file_path,
-                        "line_number": idx,
-                        "line_text": stripped,
-                        "context_start_line": start,
-                        "context_end_line": end,
-                        "context": lines[start - 1:end],
-                    }
+                match_kind = cls._classify_field_match_kind(line, leaf) or "usage"
+                entry = cls._build_field_match_entry(
+                    file_path=file_path,
+                    lines=lines,
+                    line_number=idx,
+                    match_kind=match_kind,
                 )
-                if len(matches) >= max_matches:
-                    return matches
+                ranked.append((path_score - idx // 10000, entry))
+                if len(ranked) >= max_matches * 4:
+                    break
+        ranked.sort(key=lambda item: (-item[0], item[1]["file"], item[1]["line_number"]))
+        matches: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, int]] = set()
+        for _, entry in ranked:
+            key = (entry["file"], int(entry["line_number"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append(entry)
+            if len(matches) >= max_matches:
+                break
         return matches
 
     @classmethod
@@ -884,9 +1861,17 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         symbol: str,
         code_roots: List[str],
         locator: CodeLocatorService,
+        *,
+        stack_priority_classes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         if req_type == "field":
-            matches = cls._find_text_context_matches(symbol, code_roots, mode="field", max_matches=8)
+            matches = cls._find_text_context_matches(
+                symbol,
+                code_roots,
+                mode="field",
+                max_matches=4,
+                stack_priority_classes=stack_priority_classes,
+            )
             if matches:
                 return {
                     "request": req,
@@ -902,7 +1887,12 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 "error": f"未定位到字段声明/初始化: {symbol}",
             }
         if req_type == "references":
-            matches = cls._find_text_context_matches(symbol, code_roots, mode="references", max_matches=12)
+            matches = cls._find_reference_context_matches(
+                symbol,
+                code_roots,
+                max_matches=12,
+                stack_priority_classes=stack_priority_classes,
+            )
             if matches:
                 return {
                     "request": req,
@@ -918,6 +1908,36 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 "error": f"未定位到引用: {symbol}",
             }
         if req_type == "callers":
+            if cls._is_destructor_symbol(symbol):
+                norm = cls._normalize_context_request_symbol(symbol, "function")
+                found = locator.find_function_definition_for_symbol(norm, code_roots)
+                if found:
+                    out = SnippetExtractorTool().execute(
+                        {
+                            "file_path": found[0],
+                            "line_number": int(found[1]),
+                            "function_name": norm,
+                            "max_code_length": 0,
+                        }
+                    )
+                    if not out.get("error"):
+                        return {
+                            "request": req,
+                            "success": True,
+                            "context_type": "callers",
+                            "symbol": symbol,
+                            "matches": [
+                                {
+                                    "name": out.get("function_name") or norm,
+                                    "file": out.get("file_path") or found[0],
+                                    "parent_fun": "",
+                                    "snippet": out.get("snippet")
+                                    if isinstance(out.get("snippet"), list)
+                                    else [],
+                                    "note": "callers 请求命中析构函数，已回填析构实现源码。",
+                                }
+                            ],
+                        }
             simple = locator.symbol_locator.extract_simple_function_name(symbol) or symbol
             callers = locator.find_callers(simple, code_roots, max_search_files=600)[:8]
             if callers:
@@ -959,9 +1979,15 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         *,
         max_requests: int = 5,
         seen_keys: Optional[Set[str]] = None,
+        request_outcomes: Optional[Dict[str, str]] = None,
+        stack_priority_classes: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """按模型请求补充函数源码。当前仅支持 file+line 或 symbol/function 定位。"""
-        seen = seen_keys if isinstance(seen_keys, set) else set()
+        # seen_keys 保留兼容；新逻辑使用 request_outcomes 记录 success/failed/rejected。
+        outcomes = request_outcomes if isinstance(request_outcomes, dict) else {}
+        if isinstance(seen_keys, set) and seen_keys and not outcomes:
+            for legacy_key in seen_keys:
+                outcomes.setdefault(str(legacy_key), "success")
         locator = CodeLocatorService(LocatorConfig(max_code_length=0))
         extractor = SnippetExtractorTool()
         resolved: List[Dict[str, Any]] = []
@@ -969,23 +1995,61 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             if not isinstance(req, dict):
                 continue
             req_type = str(req.get("type") or "function").strip().lower()
-            symbol = str(req.get("symbol") or "").strip()
+            symbol = cls._normalize_context_request_symbol(
+                str(req.get("symbol") or "").strip(), req_type
+            )
             file_path = str(req.get("file") or "").strip()
             line_number = int(req.get("line_number") or 0)
-            key = f"{req_type}:{file_path}:{line_number}:{symbol}".strip(":")
-            if key and key in seen:
+            key = cls._context_request_outcome_key(req_type, symbol, file_path, line_number)
+            success_keys = cls._context_request_success_dedupe_keys(
+                req_type, symbol, file_path, line_number
+            )
+            if any(outcomes.get(alias) == "success" for alias in success_keys):
                 resolved.append(
                     {
                         "request": req,
                         "success": False,
                         "skipped": True,
                         "skip_reason": "duplicate_request",
-                        "error": f"重复请求，已在前序轮次处理: {symbol or file_path}",
+                        "error": f"重复请求，已在前序轮次成功补充: {symbol or file_path}",
                     }
                 )
                 continue
-            if key:
-                seen.add(key)
+            if key and key in outcomes:
+                prior = outcomes[key]
+                if prior == "success":
+                    resolved.append(
+                        {
+                            "request": req,
+                            "success": False,
+                            "skipped": True,
+                            "skip_reason": "duplicate_request",
+                            "error": f"重复请求，已在前序轮次成功补充: {symbol or file_path}",
+                        }
+                    )
+                elif prior == "rejected":
+                    resolved.append(
+                        {
+                            "request": req,
+                            "success": False,
+                            "rejected": True,
+                            "reject_reason": "duplicate_rejected",
+                            "error": f"重复请求，此前已判定不可用: {symbol or file_path}",
+                        }
+                    )
+                else:
+                    resolved.append(
+                        {
+                            "request": req,
+                            "success": False,
+                            "lookup_exhausted": True,
+                            "error": (
+                                f"此前已尝试但未定位，Agent 无法自动补充: "
+                                f"{symbol or file_path}"
+                            ),
+                        }
+                    )
+                continue
 
             target_file = ""
             target_line = 0
@@ -1007,13 +2071,32 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         "reject_reason": "unavailable_context",
                     }
                 )
+                cls._record_context_request_outcome(
+                    outcomes, req_type, symbol, file_path, line_number, "rejected"
+                )
                 continue
             if req_type != "function":
-                resolved.append(
-                    cls._resolve_non_function_context_request(
-                        req, req_type, symbol, code_roots, locator
-                    )
+                item = cls._resolve_non_function_context_request(
+                    req,
+                    req_type,
+                    symbol,
+                    code_roots,
+                    locator,
+                    stack_priority_classes=stack_priority_classes,
                 )
+                resolved.append(item)
+                if item.get("success"):
+                    cls._record_context_request_outcome(
+                        outcomes, req_type, symbol, file_path, line_number, "success"
+                    )
+                elif item.get("rejected"):
+                    cls._record_context_request_outcome(
+                        outcomes, req_type, symbol, file_path, line_number, "rejected"
+                    )
+                else:
+                    cls._record_context_request_outcome(
+                        outcomes, req_type, symbol, file_path, line_number, "failed"
+                    )
                 continue
             if file_path and line_number > 0 and Path(file_path).is_file():
                 target_file = str(Path(file_path).expanduser().resolve())
@@ -1032,9 +2115,11 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                             ),
                         }
                     )
+                    cls._record_context_request_outcome(
+                        outcomes, req_type, symbol, file_path, line_number, "rejected"
+                    )
                     continue
-                simple = locator.symbol_locator.extract_simple_function_name(symbol)
-                found = locator.find_function_definition(simple or symbol, code_roots)
+                found = locator.find_function_definition_for_symbol(symbol, code_roots)
                 if found:
                     target_file, target_line = found[0], int(found[1])
                 else:
@@ -1043,7 +2128,11 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 error = "缺少 symbol/function 或 file+line"
 
             if not target_file or target_line <= 0:
-                resolved.append({"request": req, "success": False, "error": error or "定位失败"})
+                item = {"request": req, "success": False, "error": error or "定位失败"}
+                resolved.append(item)
+                cls._record_context_request_outcome(
+                    outcomes, req_type, symbol, file_path, line_number, "failed"
+                )
                 continue
 
             out = extractor.execute(
@@ -1055,20 +2144,52 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 }
             )
             if out.get("error"):
-                resolved.append({"request": req, "success": False, "error": str(out.get("error"))})
+                item = {"request": req, "success": False, "error": str(out.get("error"))}
+                resolved.append(item)
+                cls._record_context_request_outcome(
+                    outcomes, req_type, symbol, file_path, line_number, "failed"
+                )
+                continue
+            out = cls._repair_template_function_snippet(
+                symbol=symbol,
+                target_file=target_file,
+                target_line=target_line,
+                out=out,
+            )
+            resolved_sig = str(out.get("function_name") or function_name or "")
+            snippet_lines = out.get("snippet") if isinstance(out.get("snippet"), list) else []
+            snippet_text = "\n".join(str(line) for line in snippet_lines)
+            if not cls._resolved_function_matches_symbol(
+                symbol, target_file, target_line, resolved_sig, snippet_text
+            ) or not cls._resolved_snippet_matches_symbol(symbol, snippet_text, resolved_sig):
+                item = {
+                    "request": req,
+                    "success": False,
+                    "error": (
+                        f"定位结果与请求符号不一致（疑似误命中构造函数/其它同名函数）: "
+                        f"{symbol}"
+                    ),
+                }
+                resolved.append(item)
+                cls._record_context_request_outcome(
+                    outcomes, req_type, symbol, file_path, line_number, "failed"
+                )
                 continue
             resolved.append(
                 {
                     "request": req,
                     "success": True,
                     "file": out.get("file_path") or target_file,
-                    "function_signature": out.get("function_name") or function_name,
+                    "function_signature": resolved_sig,
                     "snippet_start_line": out.get("snippet_start_line"),
                     "snippet_end_line": out.get("snippet_end_line"),
                     "snippet": out.get("snippet") if isinstance(out.get("snippet"), list) else [],
                     "strategy": out.get("strategy"),
                     "is_complete_function": out.get("is_complete_function"),
                 }
+            )
+            cls._record_context_request_outcome(
+                outcomes, req_type, symbol, file_path, line_number, "success"
             )
         return resolved
 
@@ -1122,6 +2243,9 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     "callers": "已提供调用方上下文",
                 }.get(context_type, "已提供相关上下文")
                 bucket = "success"
+            elif item.get("lookup_exhausted"):
+                desc = str(item.get("error") or "此前已尝试但未定位")
+                bucket = "failed"
             elif item.get("rejected"):
                 desc = str(item.get("error") or "请求已拒绝")
                 bucket = "rejected"
@@ -1157,143 +2281,312 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.extend(buckets[key])
 
     @staticmethod
-    def _all_context_requests_blocked(resolved_context: List[Dict[str, Any]]) -> bool:
+    def _context_request_exhausted(item: Dict[str, Any]) -> bool:
+        if not isinstance(item, dict) or item.get("success"):
+            return False
+        if item.get("lookup_exhausted"):
+            return True
+        if item.get("rejected"):
+            return True
+        if item.get("skipped") and item.get("skip_reason") == "duplicate_request":
+            return True
+        return False
+
+    @classmethod
+    def _all_context_requests_blocked(cls, resolved_context: List[Dict[str, Any]]) -> bool:
         items = [x for x in resolved_context if isinstance(x, dict)]
         if not items:
             return False
         if any(bool(x.get("success")) for x in items):
             return False
-        return all(bool(x.get("skipped")) or bool(x.get("rejected")) for x in items)
+        return all(cls._context_request_exhausted(x) for x in items)
+
+    @classmethod
+    def _context_request_dedupe_key(cls, item: Dict[str, Any]) -> str:
+        req = item.get("request") if isinstance(item, dict) else {}
+        req = req if isinstance(req, dict) else {}
+        req_type = str(req.get("type") or item.get("context_type") or "function").strip().lower()
+        symbol = str(req.get("symbol") or req.get("file") or "").strip()
+        file_path = str(req.get("file") or "").strip()
+        line_number = int(req.get("line_number") or 0)
+        return cls._context_request_outcome_key(req_type, symbol, file_path, line_number)
+
+    @classmethod
+    def _merge_accumulated_context_items(
+        cls,
+        accumulated: List[Dict[str, Any]],
+        new_items: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        merged: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
+        for item in list(accumulated) + list(new_items):
+            if not isinstance(item, dict):
+                continue
+            key = cls._context_request_dedupe_key(item)
+            if not key:
+                continue
+            if key not in merged:
+                order.append(key)
+            merged[key] = item
+        return [merged[k] for k in order if k in merged]
 
     @staticmethod
-    def _build_context_loop_prompt(
-        previous_prompt: str,
-        previous_analysis: str,
-        round_index: int,
+    def _resolved_context_status(item: Dict[str, Any]) -> str:
+        if item.get("success"):
+            return "located"
+        if item.get("lookup_exhausted"):
+            return "lookup_exhausted"
+        if item.get("rejected"):
+            return "rejected"
+        if item.get("skipped"):
+            return "duplicate_success"
+        return "not_located"
+
+    @classmethod
+    def _build_pre_round_add_res(
+        cls,
+        *,
+        source_round: int,
+        target_round: int,
         resolved_context: List[Dict[str, Any]],
-        handled_context: Optional[List[Dict[str, Any]]] = None,
-        is_final_round: bool = False,
+    ) -> Dict[str, Any]:
+        requests_out: List[Dict[str, Any]] = []
+        for item in resolved_context:
+            if not isinstance(item, dict):
+                continue
+            req = item.get("request") if isinstance(item.get("request"), dict) else {}
+            status = cls._resolved_context_status(item)
+            req_type = str(req.get("type") or "function")
+            expected_return_form = cls._normalize_expected_return_form(
+                req_type,
+                req.get("expected_return_form")
+                or item.get("expected_return_form"),
+            )
+            entry: Dict[str, Any] = {
+                "type": req_type,
+                "symbol": str(req.get("symbol") or ""),
+                "reason": str(req.get("reason") or ""),
+                "priority": str(req.get("priority") or ""),
+                "expected_return_form": expected_return_form,
+                "expected_return_form_label": cls._return_form_label(expected_return_form),
+                "fulfillment_note": str(req.get("fulfillment_note") or "") or None,
+                "status": status,
+                "located": bool(item.get("success")),
+                "error": str(item.get("error") or "") or None,
+            }
+            actual_return_form = cls._infer_actual_return_form(item)
+            if actual_return_form:
+                entry["actual_return_form"] = actual_return_form
+                entry["actual_return_form_label"] = cls._return_form_label(actual_return_form)
+                matched = cls._fulfillment_matched(expected_return_form, actual_return_form)
+                if matched is not None:
+                    entry["fulfillment_matched"] = matched
+            if item.get("success"):
+                context_type = str(item.get("context_type") or "function")
+                entry["context_type"] = context_type
+                if context_type == "function":
+                    entry["file"] = item.get("file")
+                    entry["line_start"] = item.get("snippet_start_line")
+                    entry["line_end"] = item.get("snippet_end_line")
+                    entry["function_signature"] = item.get("function_signature")
+                else:
+                    entry["matches"] = item.get("matches")
+            requests_out.append(entry)
+        return {
+            "source_round": int(source_round),
+            "target_round": int(target_round),
+            "requests": requests_out,
+        }
+
+    @classmethod
+    def _format_extra_code_context_item_markdown(cls, item: Dict[str, Any]) -> str:
+        req = item.get("request") if isinstance(item.get("request"), dict) else {}
+        symbol = str(req.get("symbol") or req.get("file") or "未知符号").strip()
+        req_type = str(req.get("type") or item.get("context_type") or "function").strip()
+        title = f"{symbol}（{req_type}）"
+        lines: List[str] = [f"#### 其它代码上下文: {title}"]
+        expected_form = cls._normalize_expected_return_form(
+            req_type,
+            req.get("expected_return_form") or item.get("expected_return_form"),
+        )
+        lines.append(
+            f"- 期望回填形式: {cls._return_form_label(expected_form)} (`{expected_form}`)"
+        )
+        if req.get("fulfillment_note"):
+            lines.append(f"- 请求说明: {req.get('fulfillment_note')}")
+
+        if not item.get("success"):
+            status = cls._resolved_context_status(item)
+            status_label = {
+                "located": "已定位",
+                "not_located": "未定位",
+                "lookup_exhausted": "此前已尝试未定位",
+                "rejected": "已拒绝",
+                "duplicate_success": "已成功补充（重复请求）",
+            }.get(status, "未定位")
+            lines.append(f"- 状态: {status_label}")
+            if item.get("error"):
+                lines.append(f"- 说明: {item.get('error')}")
+            return "\n".join(lines)
+
+        context_type = str(item.get("context_type") or "function")
+        lines.append("- 状态: 已定位")
+        if context_type in {"field", "references"}:
+            if context_type == "field":
+                lines.append("- 回填说明: 优先返回所属类的成员声明；若无声明则返回同类初始化；不包含调用链。")
+            else:
+                lines.append("- 回填说明: 返回符号在所属类相关文件中的读写/引用位置。")
+            for m_idx, match in enumerate(item.get("matches", [])[:8], start=1):
+                if not isinstance(match, dict):
+                    continue
+                if m_idx > 1:
+                    lines.append("")
+                if match.get("match_kind_label") or match.get("match_kind"):
+                    label = match.get("match_kind_label") or match.get("match_kind")
+                    lines.append(f"- 命中类型: {label}")
+                lines.append(f"- 文件: {match.get('file')}")
+                lines.append(f"- 行号: {match.get('line_number')}")
+                if match.get("line_text"):
+                    lines.append(f"- 命中行: {match.get('line_text')}")
+                ctx = match.get("context")
+                if isinstance(ctx, list) and ctx:
+                    lines.append("- 代码片段:")
+                    lines.append("```cpp")
+                    lines.extend([str(x) for x in ctx])
+                    lines.append("```")
+            return "\n".join(lines)
+
+        if context_type == "callers":
+            for m_idx, match in enumerate(item.get("matches", [])[:8], start=1):
+                if not isinstance(match, dict):
+                    continue
+                if m_idx > 1:
+                    lines.append("")
+                if match.get("name"):
+                    lines.append(f"- 函数: {match.get('name')}")
+                lines.append(f"- 文件: {match.get('file')}")
+                snippet = match.get("snippet")
+                if isinstance(snippet, list) and snippet:
+                    lines.append("- 代码片段:")
+                    lines.append("```cpp")
+                    lines.extend([str(x) for x in snippet[:80]])
+                    lines.append("```")
+            return "\n".join(lines)
+
+        lines.append(f"- 文件: {item.get('file')}")
+        start_line = item.get("snippet_start_line")
+        end_line = item.get("snippet_end_line")
+        if start_line and end_line:
+            lines.append(f"- 行号范围: {start_line}～{end_line}")
+        sig = item.get("function_signature")
+        if sig:
+            lines.append(f"- 函数: {sig}")
+        snippet = item.get("snippet")
+        if isinstance(snippet, list) and snippet:
+            lines.append("- 代码片段:")
+            lines.append("```cpp")
+            lines.extend([str(x) for x in snippet])
+            lines.append("```")
+        return "\n".join(lines)
+
+    @classmethod
+    def _format_extra_code_context_section(cls, accumulated_context: List[Dict[str, Any]]) -> str:
+        blocks: List[str] = []
+        for item in accumulated_context:
+            if not isinstance(item, dict):
+                continue
+            block = cls._format_extra_code_context_item_markdown(item).strip()
+            if block:
+                blocks.append(block)
+        if not blocks:
+            return ""
+        return "\n\n".join(blocks)
+
+    @staticmethod
+    def _inject_extra_code_context_into_base_prompt(
+        base_prompt: str, extra_context_markdown: str
+    ) -> str:
+        text = str(base_prompt or "")
+        extra = str(extra_context_markdown or "").strip()
+        if not extra:
+            return text
+        section = f"## 其它代码上下文\n\n{extra}\n"
+        for marker in ("### 崩溃所属类骨架", "# 崩溃分析任务"):
+            pos = text.find(marker)
+            if pos >= 0:
+                return text[:pos].rstrip() + "\n\n" + section + "\n" + text[pos:].lstrip()
+        return text.rstrip() + "\n\n" + section
+
+    @staticmethod
+    def _append_round_task_to_prompt(
+        prompt: str,
+        *,
+        is_final_round: bool,
         early_final_reason: Optional[str] = None,
     ) -> str:
-        lines: List[str] = []
-        lines.append(previous_prompt)
-        lines.append("")
-        lines.append(f"## 第 {round_index} 轮补充上下文")
-        cleaned_analysis = BaseCrashAnalysisWorkflow._strip_context_request_section(
-            previous_analysis
-        )
-        if cleaned_analysis:
-            lines.append("上一轮模型分析摘要如下（已去除末尾重复的补充上下文 JSON）：")
-            lines.append("```markdown")
-            lines.append(cleaned_analysis)
-            lines.append("```")
-            lines.append("")
-        request_items = []
-        for item in resolved_context:
-            req = item.get("request") if isinstance(item, dict) else {}
-            if isinstance(req, dict):
-                request_items.append(req)
-        if request_items:
-            lines.append("上一轮模型要求补充的信息：")
-            lines.append("```json")
-            lines.append(json.dumps({"context_requests": request_items}, ensure_ascii=False, indent=2))
-            lines.append("```")
-        lines.append("")
-        lines.append("Agent 根据上一轮 `context_requests` 补充到以下上下文：")
-        for idx, item in enumerate(resolved_context, start=1):
-            req = item.get("request") if isinstance(item, dict) else {}
-            symbol = req.get("symbol") if isinstance(req, dict) else ""
-            reason = req.get("reason") if isinstance(req, dict) else ""
-            req_type = req.get("type") if isinstance(req, dict) else ""
-            lines.append("")
-            lines.append(f"### 补充上下文 {idx}")
-            if req_type:
-                lines.append(f"- 请求类型: {req_type}")
-            if symbol:
-                lines.append(f"- 请求符号: {symbol}")
-            if reason:
-                lines.append(f"- 请求原因: {reason}")
-            if not item.get("success"):
-                if item.get("rejected"):
-                    lines.append(f"- 请求已拒绝: {item.get('error') or '不可用上下文'}")
-                elif item.get("skipped"):
-                    lines.append(f"- 请求已跳过: {item.get('error') or '重复请求'}")
-                else:
-                    lines.append(f"- 定位失败: {item.get('error') or '未知原因'}")
-                continue
-            context_type = str(item.get("context_type") or "function")
-            if context_type in {"field", "references"}:
-                lines.append(f"- 上下文类型: {context_type}")
-                for m_idx, match in enumerate(item.get("matches", [])[:8], start=1):
-                    if not isinstance(match, dict):
-                        continue
-                    lines.append("")
-                    lines.append(f"#### 匹配 {m_idx}")
-                    lines.append(f"- 文件: {match.get('file')}")
-                    lines.append(f"- 行号: {match.get('line_number')}")
-                    if match.get("line_text"):
-                        lines.append(f"- 命中行: {match.get('line_text')}")
-                    ctx = match.get("context")
-                    if isinstance(ctx, list) and ctx:
-                        lines.append("```cpp")
-                        lines.extend([str(x) for x in ctx])
-                        lines.append("```")
-                continue
-            if context_type == "callers":
-                lines.append("- 上下文类型: callers")
-                for m_idx, match in enumerate(item.get("matches", [])[:8], start=1):
-                    if not isinstance(match, dict):
-                        continue
-                    lines.append("")
-                    lines.append(f"#### 调用方 {m_idx}")
-                    if match.get("name"):
-                        lines.append(f"- 函数: {match.get('name')}")
-                    lines.append(f"- 文件: {match.get('file')}")
-                    snippet = match.get("snippet")
-                    if isinstance(snippet, list) and snippet:
-                        lines.append("```cpp")
-                        lines.extend([str(x) for x in snippet[:80]])
-                        lines.append("```")
-                continue
-            lines.append(f"- 文件: {item.get('file')}")
-            lines.append(
-                f"- 行号范围: {item.get('snippet_start_line')}～{item.get('snippet_end_line')}"
-            )
-            sig = item.get("function_signature")
-            if sig:
-                lines.append(f"- 函数: {sig}")
-            lines.append("```cpp")
-            lines.extend([str(x) for x in item.get("snippet", [])])
-            lines.append("```")
-        BaseCrashAnalysisWorkflow._append_handled_context_summary(
-            lines,
-            handled_context if isinstance(handled_context, list) else resolved_context,
-        )
-        lines.append("")
-        lines.append("## 本轮任务")
+        lines: List[str] = ["## 本轮任务"]
         if is_final_round:
             if early_final_reason == "all_requests_blocked":
                 lines.append(
                     "- 上一轮 `context_requests` 中的请求均已由 Agent 处理过（重复、拒绝或不可用），"
                     "无法继续补充新上下文。"
                 )
-                lines.append("- 本轮必须基于已有材料输出最终分析，不得再发起新的 `context_requests`。")
             else:
                 lines.append("- 当前已经达到允许的最大多轮次数，本轮必须输出最终分析。")
             lines.append("- 不得再请求 Agent 补充上下文；请将仍缺失的信息列为人工补充证据或排查建议。")
-            lines.append("- 末尾必须输出 `need_more_context=false` 的 JSON：`{\"need_more_context\": false, \"context_requests\": []}`。")
+            lines.append(
+                "- 末尾必须输出 Agent 上下文获取结束 JSON："
+                '`{"agent_can_fetch_more": false, "context_requests": []}`。'
+            )
+            lines.append(
+                "- 说明：`agent_can_fetch_more=false` 表示 Agent 自动化不再拉取上下文，"
+                "不等于所有证据已齐全；仍缺的信息应写入「人工补充证据」。"
+            )
         else:
             lines.append("- 先判断是否仍需要 Agent 继续补充上下文。")
-            lines.append("- 如果仍需要补充上下文，只输出「需要 Agent 补充什么内容」以及「为什么需要这些内容」；不要输出最终分析报告、修复方案或修复代码。")
-            lines.append("- 每个请求必须说明：请求类型、请求符号、为什么当前证据不足、补充该内容后希望验证什么假设、优先级。")
-            lines.append("- 如果不再需要补充上下文，再基于原始材料、上一轮分析和本轮补充上下文输出完整最终分析。")
-        lines.append("- 你可以在分析正文中继续讨论「已成功补充」的符号，但不得把它们再次放入 `context_requests`。")
-        lines.append("- 不得重复请求「已处理的上下文请求」中已经补充、已拒绝、已跳过或已尝试未定位的 symbol。")
-        if not is_final_round:
-            lines.append("- 如果下一步只能请求这些已处理 symbol，请不要继续请求上下文，应输出最终分析并将 `need_more_context` 置为 false。")
-            lines.append("- 只有当本轮新增源码直接引出新的高价值函数/字段/引用时，才继续提出下一轮 `context_requests`。")
-            lines.append("- 如果证据已经足够，请输出最终分析，并将 `need_more_context` 置为 false。")
-        return "\n".join(lines)
+            lines.append(
+                "- 若仍需补充：只输出需要 Agent 补充什么及原因；不要输出最终分析报告、修复方案或修复代码。"
+            )
+            lines.append(
+                "- 若证据足够或剩余缺口只能人工补充：输出完整最终分析，并将 `agent_can_fetch_more` 置为 false。"
+            )
+            lines.append(
+                "- 不得重复请求「其它代码上下文」中状态为已定位 / 未定位 / 此前已尝试未定位 / 已拒绝的 symbol。"
+            )
+            lines.append(
+                "- 只有当「其它代码上下文」中的新增源码直接引出新的高价值函数、字段或引用时，"
+                "才继续提出下一轮 `context_requests`。"
+            )
+        task_block = "\n".join(lines)
+        closing = "请基于以上信息"
+        pos = prompt.rfind(closing)
+        if pos >= 0:
+            return prompt[:pos].rstrip() + "\n\n" + task_block + "\n\n" + prompt[pos:].lstrip()
+        return prompt.rstrip() + "\n\n" + task_block
+
+    @classmethod
+    def _build_context_loop_prompt(
+        cls,
+        base_prompt: str,
+        round_index: int,
+        resolved_context: List[Dict[str, Any]],
+        accumulated_context: Optional[List[Dict[str, Any]]] = None,
+        *,
+        is_final_round: bool = False,
+        early_final_reason: Optional[str] = None,
+    ) -> str:
+        merged = (
+            accumulated_context
+            if isinstance(accumulated_context, list)
+            else resolved_context
+        )
+        extra_md = cls._format_extra_code_context_section(merged)
+        body = cls._inject_extra_code_context_into_base_prompt(base_prompt, extra_md)
+        return cls._append_round_task_to_prompt(
+            body,
+            is_final_round=is_final_round,
+            early_final_reason=early_final_reason,
+        )
 
     @staticmethod
     def _llm_call_with_retries(
@@ -1448,16 +2741,20 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         if agent_loop != "context_loop" or max_rounds <= 1:
             return analysis_text, prompt_used, rounds, response
 
-        seen: Set[str] = set()
-        handled_context: List[Dict[str, Any]] = []
-        previous_prompt = prompt_used
+        request_outcomes: Dict[str, str] = {}
+        base_prompt = prompt_used
+        last_prompt_used = base_prompt
+        accumulated_context: List[Dict[str, Any]] = []
         previous_analysis = analysis_text
         last_response = response
         for round_index in range(1, max_rounds):
             parsed = cls._parse_context_requests(previous_analysis)
             requests = parsed.get("context_requests", [])
             rounds[-1]["context_requests"] = requests
-            if not parsed.get("need_more_context") or not requests:
+            agent_can_fetch_more = parsed.get(
+                "agent_can_fetch_more", parsed.get("need_more_context")
+            )
+            if not agent_can_fetch_more or not requests:
                 break
             round_label = cls._round_label_cn(round_index)
             with PhaseSpinner(
@@ -1469,10 +2766,23 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     requests,
                     code_roots,
                     max_requests=max_requests,
-                    seen_keys=seen,
+                    request_outcomes=request_outcomes,
+                    stack_priority_classes=cls._extract_stack_priority_classes(problem),
                 )
-            handled_context.extend(
-                [x for x in resolved_context if isinstance(x, dict)]
+                resolved_context = [
+                    cls._attach_return_form_metadata(x)
+                    if isinstance(x, dict)
+                    else x
+                    for x in resolved_context
+                ]
+            accumulated_context = cls._merge_accumulated_context_items(
+                accumulated_context,
+                [x for x in resolved_context if isinstance(x, dict)],
+            )
+            pre_round_add_res = cls._build_pre_round_add_res(
+                source_round=round_index - 1,
+                target_round=round_index,
+                resolved_context=resolved_context,
             )
             has_success = any(
                 bool(x.get("success")) for x in resolved_context if isinstance(x, dict)
@@ -1486,11 +2796,10 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         "all_requests_blocked" if all_blocked else "max_rounds"
                     )
                     final_prompt = cls._build_context_loop_prompt(
-                        previous_prompt,
-                        previous_analysis,
+                        base_prompt,
                         round_index,
                         resolved_context,
-                        handled_context=handled_context,
+                        accumulated_context=accumulated_context,
                         is_final_round=True,
                         early_final_reason=early_reason,
                     )
@@ -1502,8 +2811,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         total_steps=total_steps,
                         round_index=round_index,
                     )
-                    previous_prompt = final_prompt_used
                     previous_analysis = str(getattr(final_response, "content", "") or "")
+                    last_prompt_used = final_prompt_used
                     last_response = final_response
                     rounds.append(
                         {
@@ -1512,16 +2821,16 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                             "analysis": previous_analysis,
                             "context_requests": [],
                             "resolved_context": resolved_context,
+                            "pre_round_add_res": pre_round_add_res,
                             "early_final_reason": early_reason,
                         }
                     )
                     break
                 feedback_prompt = cls._build_context_loop_prompt(
-                    previous_prompt,
-                    previous_analysis,
+                    base_prompt,
                     round_index,
                     resolved_context,
-                    handled_context=handled_context,
+                    accumulated_context=accumulated_context,
                     is_final_round=False,
                 )
                 feedback_response, feedback_prompt_used = cls._llm_call_with_phase(
@@ -1532,8 +2841,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     total_steps=total_steps,
                     round_index=round_index,
                 )
-                previous_prompt = feedback_prompt_used
                 previous_analysis = str(getattr(feedback_response, "content", "") or "")
+                last_prompt_used = feedback_prompt_used
                 last_response = feedback_response
                 rounds.append(
                     {
@@ -1542,15 +2851,15 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         "analysis": previous_analysis,
                         "context_requests": [],
                         "resolved_context": resolved_context,
+                        "pre_round_add_res": pre_round_add_res,
                     }
                 )
                 continue
             next_prompt = cls._build_context_loop_prompt(
-                previous_prompt,
-                previous_analysis,
+                base_prompt,
                 round_index,
                 resolved_context,
-                handled_context=handled_context,
+                accumulated_context=accumulated_context,
                 is_final_round=round_index >= max_rounds - 1,
             )
             next_response, next_prompt_used = cls._llm_call_with_phase(
@@ -1561,8 +2870,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 total_steps=total_steps,
                 round_index=round_index,
             )
-            previous_prompt = next_prompt_used
             previous_analysis = str(getattr(next_response, "content", "") or "")
+            last_prompt_used = next_prompt_used
             last_response = next_response
             rounds.append(
                 {
@@ -1571,9 +2880,10 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     "analysis": previous_analysis,
                     "context_requests": [],
                     "resolved_context": resolved_context,
+                    "pre_round_add_res": pre_round_add_res,
                 }
             )
-        return previous_analysis, previous_prompt, rounds, last_response
+        return previous_analysis, last_prompt_used, rounds, last_response
 
     @staticmethod
     def _norm_graph_nid(raw: Optional[str]) -> str:
@@ -2025,11 +3335,15 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         has_calls_direct = False
         has_calls_to_crash_site = False
         has_calls_stack_order = False
+        has_stack_adjacent_verified_chain = False
         has_shared_var_write_upstream = False
         if isinstance(evidence_summary, dict):
             has_calls_direct = bool(evidence_summary.get("has_calls_direct"))
             has_calls_to_crash_site = bool(evidence_summary.get("has_calls_to_crash_site"))
             has_calls_stack_order = bool(evidence_summary.get("has_calls_stack_order"))
+            has_stack_adjacent_verified_chain = bool(
+                evidence_summary.get("has_stack_adjacent_verified_chain")
+            )
             has_shared_var_write_upstream = bool(
                 evidence_summary.get("has_shared_var_write_upstream")
             )
@@ -2044,6 +3358,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     has_calls_to_crash_site = True
                 elif et == "calls_stack_order":
                     has_calls_stack_order = True
+                elif et == "calls_stack_verified":
+                    has_stack_adjacent_verified_chain = True
                 elif et == "use_shared_var":
                     rel = str(e.get("relation") or "").strip().lower()
                     if rel in ("write", "assign", "delete"):
@@ -2068,6 +3384,13 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                             primary_path_nodes = extracted
         if not weak_attribution:
             path_label = "路径1"
+            primary_path_desc = ""
+            if isinstance(call_paths, list) and call_paths:
+                primary_path_desc = str(
+                    (call_paths[0] or {}).get("inference")
+                    or (call_paths[0] or {}).get("description")
+                    or ""
+                ).strip()
             if isinstance(call_paths, list):
                 for path in call_paths:
                     if not isinstance(path, dict):
@@ -2075,17 +3398,39 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     desc = str(
                         path.get("inference") or path.get("description") or ""
                     ).strip()
+                    if desc == "stack_adjacent_verified":
+                        path_label = "路径1（栈相邻帧 + 源码间接调用链已校验）"
+                        break
                     if desc == "inferred_from_add2line_stack_order":
                         path_label = "路径1（addr2line 栈序；静态未校验相邻帧调用关系）"
                         break
+                    if desc == "static_repo_inferred":
+                        path_label = "路径1（全仓静态推断；未与栈相邻帧校验一致）"
+                        break
             if primary_path_nodes:
-                if has_calls_direct or has_calls_to_crash_site:
-                    lines.append("- 证据强度说明：高置信度，可单独作为改码依据。")
+                if (
+                    primary_path_desc == "stack_adjacent_verified"
+                    or has_stack_adjacent_verified_chain
+                ):
+                    lines.append(
+                        "- 证据强度说明：高置信度（栈相邻帧 + 源码调用链已校验），"
+                        "可单独作为改码依据。"
+                    )
+                elif primary_path_desc == "static_repo_inferred" or (
+                    (has_calls_direct or has_calls_to_crash_site)
+                    and not has_stack_adjacent_verified_chain
+                ):
+                    lines.append(
+                        "- 证据强度说明：本节来自全仓静态推断，未与栈相邻帧校验一致，"
+                        "只能作为排查线索，不能单独作为改码依据。"
+                    )
                 elif "addr2line 栈序" in path_label or has_calls_stack_order:
                     lines.append(
                         "- 证据强度说明：本节主要来自栈序关联，属于线索证据，"
                         "不能单独作为改码依据。"
                     )
+                elif has_calls_direct or has_calls_to_crash_site:
+                    lines.append("- 证据强度说明：高置信度，可单独作为改码依据。")
             if all_path_nodes_list:
                 for path_idx, path_nodes in enumerate(all_path_nodes_list, 1):
                     if path_idx > 1:
@@ -2171,12 +3516,18 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 is_main = item.get("is_main_thread")
                 label = format_prompt_thread_identity(tid, tname)
                 flags = format_prompt_thread_role_flags(is_crash, is_main)
-                # 统一先给出线程身份说明，再引出下方调用链，避免表头式生硬拼接。
+                # 统一先给出线程身份说明，再引出按栈序排列的帧语义列表。
                 lines.append("### 线程调用链")
                 lines.append(
-                    f"{label}（{flags}）中的函数调用链如下（基于代码结构推断，自下而上）："
+                    f"{label}（{flags}）按堆栈顺序解析的函数/帧语义列表"
+                    "（按调用顺序，自下而上）："
                 )
-                if not is_crash:
+                if is_crash:
+                    lines.append(
+                        "- 证据强度说明：低置信度，只能作为排查线索，"
+                        "不能单独作为改码依据。"
+                    )
+                else:
                     lines.append(
                         "- 证据强度说明：该链路来自非日志标记的崩溃线程，"
                         "仅作跨线程/异步排查线索。"
@@ -2192,7 +3543,11 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         multi_thread_resolved = (
             isinstance(resolved_threads, list) and len(resolved_threads) > 1
         )
-        if not (weak_attribution and multi_thread_resolved):
+        # 已有按线程的 add2line 栈帧列表时，不再重复输出扁平堆栈帧段落。
+        if (
+            not has_add2line_chains
+            and not (weak_attribution and multi_thread_resolved)
+        ):
             lines.append("根据日志中堆栈顺序解析的函数/帧语义列表（按调用顺序，自下而上）：")
             from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
 
@@ -2948,7 +4303,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             if self._resolve_agent_loop(problem) == "context_loop":
                 lines.append("1. 先判断是否需要 Agent 继续补充上下文。")
                 lines.append(
-                    "2. 如果还需要 Agent 补充上下文（`need_more_context=true`）："
+                    "2. 如果还需要 Agent 自动补充上下文（`agent_can_fetch_more=true`）："
                     "不要输出最终分析报告、修复方案或修复代码；"
                     "只输出需要 Agent 补充什么内容，以及为什么需要这些内容。"
                 )
@@ -2957,8 +4312,12 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     "补充该内容后希望验证什么假设、优先级。"
                 )
                 lines.append(
-                    "3. 如果不再需要 Agent 补充上下文（`need_more_context=false`），"
+                    "3. 如果 Agent 不应再继续自动拉取上下文（`agent_can_fetch_more=false`），"
                     "再输出完整崩溃分析报告：结论置信度、关键证据、相关代码分析、修复或排查建议。"
+                )
+                lines.append(
+                    "   `agent_can_fetch_more=false` 仅表示停止 Agent 多轮补上下文，"
+                    "不代表证据已齐全；仍缺的信息应写入「人工补充证据」。"
                 )
                 lines.append("4. 首轮应尽量一次性列出所有高价值补充请求（按优先级排序），避免逐轮试探式追加。")
             else:
@@ -2987,6 +4346,27 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 lines.append("### 情况 A：还需要 Agent 补充上下文时")
                 lines.append("只输出以下内容，不要输出最终结论、修复方案或代码：")
                 lines.append("")
+                lines.append("### Agent 将回填的内容（按 type 选择请求）")
+                lines.append(
+                    "- `function`：返回**函数定义处完整源码**（含签名与函数体）。"
+                    "模板类方法优先写全 `CVList<TArgs>::Method`（如 `CVList<CBaseLayer*, CBaseLayer*>::RemoveAll`）；"
+                    "也可写 `CVList::RemoveAll`，Agent 会自动搜索模板实现。"
+                )
+                lines.append(
+                    "- `field`：返回**所属类的成员声明**（优先头文件），请写 `ClassName::member`；"
+                    "若需查看**类型/容器本身的类结构**，可写 `field: TypeName`（如 `CVList`），"
+                    "将返回 `class/struct` 声明块。"
+                    "若无声明则返回同类中的初始化语句；**不包含**调用链或并发读写路径。"
+                )
+                lines.append(
+                    "- `references`：返回符号在所属类相关文件中的**读写/引用位置**（文件:行 + 片段）。"
+                )
+                lines.append("- `callers`：返回**调用方函数名 + 调用点片段**。")
+                lines.append(
+                    "- 若希望验证调用链、`RemoveAll()` 后是否仍被访问、原子读写细节，"
+                    "应使用 `references` 或 `function`，不要全部塞进 `field`。"
+                )
+                lines.append("")
                 lines.append("### 需要 Agent 补充的上下文")
                 lines.append("- 当前还不能形成最终结论的原因：[简要说明缺少哪些关键证据]")
                 lines.append("- 下一轮需要 Agent 补充的内容：")
@@ -2994,23 +4374,38 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 lines.append("     - 原因：[为什么当前证据不足]")
                 lines.append("     - 希望验证：[补充后要验证的根因假设]")
                 lines.append("     - 优先级：[high/medium/low]")
+                lines.append(
+                    "     - 请求类型说明：[该 type 将回填什么；若需多种证据请拆成多个请求]"
+                )
                 lines.append("")
                 lines.append("```json")
                 lines.append("{")
-                lines.append('  "need_more_context": true,')
+                lines.append('  "agent_can_fetch_more": true,')
                 lines.append('  "context_requests": [')
                 lines.append("    {")
                 lines.append('      "type": "function",')
                 lines.append('      "symbol": "ClassName::FunctionName",')
+                lines.append('      "expected_return_form": "function_source",')
                 lines.append('      "reason": "说明为什么需要该上下文，以及补充后要验证什么假设",')
+                lines.append(
+                    '      "fulfillment_note": "可选：补充说明期望拿到什么形态的证据",'
+                )
                 lines.append('      "priority": "high"')
                 lines.append("    }")
                 lines.append("  ]")
                 lines.append("}")
+                lines.append("")
+                lines.append("`expected_return_form` 必须与 `type` 一致：")
+                lines.append(
+                    "`function`→`function_source`；`field`→`member_declaration`；"
+                    "`references`→`read_write_references`；`callers`→`caller_snippets`。"
+                )
                 lines.append("```")
                 lines.append("")
                 lines.append("### 情况 B：不再需要 Agent 补充上下文时")
-                lines.append("输出完整崩溃分析报告，并在末尾输出 `need_more_context=false` JSON：")
+                lines.append(
+                    "输出完整崩溃分析报告，并在末尾输出 `agent_can_fetch_more=false` JSON："
+                )
                 lines.append("")
             lines.append("### 结论（崩溃定位与置信度）")
             lines.append("- 置信度：[高/中/低]")
@@ -3036,16 +4431,16 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             )
             if self._resolve_agent_loop(problem) == "context_loop":
                 lines.append("")
-                lines.append("### 不再需要 Agent 补充上下文")
+                lines.append("### Agent 上下文获取结束")
                 lines.append("如果已经给出最终分析，末尾必须输出：")
                 lines.append("```json")
-                lines.append('{"need_more_context": false, "context_requests": []}')
+                lines.append('{"agent_can_fetch_more": false, "context_requests": []}')
                 lines.append("```")
                 lines.append("")
-                lines.append("补充说明：支持的 `context_requests[].type` 包括：")
+                lines.append("补充说明：支持的 `context_requests[].type` 与 Agent 回填形式：")
                 lines.append(
-                    "`function`（函数源码）、`field`（字段声明/初始化）、"
-                    "`references`（符号引用/读写位置）、`callers`（函数调用方）。"
+                    "`function`→函数完整源码；`field`→成员声明（优先 .h）；"
+                    "`references`→读写/引用位置；`callers`→调用方片段。"
                 )
             lines.append("")
             lines.append("## 必须遵守的规则")
@@ -3055,17 +4450,34 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             if self._resolve_agent_loop(problem) == "context_loop":
                 lines.append("### context_requests 约束")
                 lines.append("- `type=function` 只能请求函数源码，禁止把成员变量、字段或函数指针伪装成函数请求。")
-                lines.append("- 如需成员变量/字段声明或初始化，请使用 `type=field`。")
-                lines.append("- 如需字段/函数的读写位置或引用位置，请使用 `type=references`。")
+                lines.append(
+                    "- `type=field` 仅用于成员**类型/声明**；Agent 回填成员声明，不回答调用链或并发读写。"
+                )
+                lines.append(
+                    "- 如需字段读写、`RemoveAll()` 后访问、原子操作路径，请使用 `type=references` 或补充相关 `function`。"
+                )
                 lines.append("- 如需某函数的调用方，请使用 `type=callers`。")
+                lines.append("- 单个请求只对应一种回填形式；复合问题应拆成多个 `context_requests`。")
+                lines.append(
+                    "- 每个 `context_requests[]` 必须包含 `expected_return_form`；"
+                    "可与 `fulfillment_note` 补充说明。"
+                )
                 lines.append("- 首轮应尽量一次性列出所有高价值补充请求；后续轮不得重复请求已补充、已拒绝或已跳过的 symbol。")
-                lines.append("- 后续轮只允许请求由新增上下文直接引出的新函数、字段或引用；若没有明确新增线索，应输出 `need_more_context=false`。")
+                lines.append(
+                    "- 后续轮只允许请求由新增上下文直接引出的新函数、字段或引用；"
+                    "若没有明确新增线索，或剩余缺口只能人工补充，应输出 `agent_can_fetch_more=false`。"
+                )
                 lines.append("")
             lines.append("- 必须基于实际日志、堆栈和源码片段分析；不得编造未给出源码的函数实现。")
             lines.append("- 允许说明“不确定/需要补充信息”，但必须指出缺失的具体证据；禁止把未经证实的猜测写成结论。")
             if self._resolve_agent_loop(problem) == "context_loop":
-                lines.append("- 当输出 `need_more_context=true` 时，禁止输出最终分析报告、修复方案、修复代码或“需要修改的函数”。")
-                lines.append("- 只有输出 `need_more_context=false` 时，才允许输出完整分析报告和修复或排查建议。")
+                lines.append(
+                    "- 当输出 `agent_can_fetch_more=true` 时，禁止输出最终分析报告、"
+                    "修复方案、修复代码或“需要修改的函数”。"
+                )
+                lines.append(
+                    "- 只有输出 `agent_can_fetch_more=false` 时，才允许输出完整分析报告和修复或排查建议。"
+                )
             lines.append(
                 "- 当前是偏分析模式：不强制输出修复代码；"
                 "证据不足时只给分析方法、排查路径和人工确认点；"

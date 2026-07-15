@@ -8,7 +8,6 @@
 my-skill/
 ├── SKILL.md
 ├── skill.json
-├── README.md
 ├── reference.md
 ├── examples/
 └── scripts/
@@ -82,10 +81,17 @@ Write concise, actionable instructions here.
 sa-agent skill init my-skill ./my-skill
 ```
 
+## 内置空模板预置
+
+```bash
+sa-agent skill init automation-testing-skill ./automation-testing-skill --preset automation-testing
+sa-agent skill init cicd-pipeline-skill ./cicd-pipeline-skill --preset cicd-pipeline
+```
+
 ## 设计建议
 
 - 让 `SKILL.md` 保持短小，只写加载后必须长期记住的内容。
 - 长规则、样例、脚本说明放到 supporting files。
 - 如果 skill 只是说明性知识，`entrypoint` 保持 `prompt` 即可。
 - 如果 skill 需要真正执行逻辑，使用 `skill.json` 的 `exports` 和 `entrypoint` 连接到 Tool System。
-
+- 空模板 Skill 建议先只保留 `SKILL.md` 和 `skill.json`，等流程稳定后再补 supporting files。

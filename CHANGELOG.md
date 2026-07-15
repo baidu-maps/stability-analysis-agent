@@ -4,6 +4,34 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.2.8] - 2026-07-15
+
+### Added
+
+- **Bug Platform Fetcher Skill 模板**：新增内置 `--preset bug-platform-fetcher`，对应一级菜单「4) 根据缺陷管理平台自动修复（基于 bug-platform-fetcher-skill）」。预设只生成空骨架（`SKILL.md` + `skill.json`），**绝不调用任何具体平台 API**（iCafe / Jira / WorkTile / 飞书 / 自建系统都由下游团队在自己仓库里实现）。详见 `docs/skills/BUG_PLATFORM_FETCHER_TEMPLATE.md`。
+- **一级菜单调整**：把闭源 `bd-sa-agent` 的「输入 iCafe 编号自动修复」抽象为通用「根据缺陷管理平台自动修复」，并将其放到一级菜单"快速开始修复（推荐）"正下方（数字键 4）。这与一键"退出置顶"、设置 / 帮助置末的约定一致。
+- **CLI 文档**：`docs/cli/INTERACTIVE_CLI_DESIGN.md` 与 `docs/cli/CLI_GUIDE.md` 已同步增补新菜单项及其与闭源版的边界（"开源仓库**不**带任何具体平台 API 调用"）。
+- **测试**：`test/skill_system/test_skill_system.py::test_bug_platform_fetcher_preset_is_generic_template` 断言该预设元数据与生成的 `SKILL.md` 中**绝不包含** `icafe-cli` / `uuap.baidu` / `bcebos` / `baidu-int.com` / `UGate` 等内网 API 痕迹，防止以后被人无意中塞进具体平台实现。
+
+### Changed
+
+- 顶部一级菜单文案统一：「快速开始分析」→「快速开始修复」、「再次进行上一次分析」→「再次进行上一次修复」（与闭源版用语对齐）。
+
+## [1.2.7] - 2026-07-15
+
+### Added
+
+- **`extensions/` 扩展框架**：仓库自带 `extensions/tools/example_tool.py` 与 `extensions/workflows/example_workflow.py` 两个可运行模板，覆盖 `@register_tool` / `@register_workflow` 装饰器、`ToolDefinition` / `WorkflowDefinition`、以及 `WorkflowContext.execute_tool()` 等接入方式；`extensions.register_all()` 在 CLI 启动时被自动调用，逐级扫描仓库自带扩展、`~/.config/stability-analysis-agent/extensions/`、`<cwd>/.stability-analysis-agent/extensions/`、`STABILITY_AGENT_EXT_DIRS` 追加目录，以及 Python 入口点 `stability_analysis_agent.tools` / `stability_analysis_agent.workflows`。详见 `docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md`。
+- **设置菜单新增缓存与自检**：增加「查看本地缓存（cli_reports 占用）」与「清理本地缓存（cli_reports）」两个菜单项，背后由新模块 `cli/report_paths.py` 提供（`format_bytes / summarize_cli_reports / clear_cli_reports / print_cli_reports_overview`），可按"全部 / 仅最近 N 份"清理 `cli_reports/`。
+- **`cli/upgrade.run_upgrade_check_interactive`**：设置菜单中的「检查更新（升级 sa-agent 到最新版）」接入公网 PyPI 公开发布渠道，探测 `pip / pipx / 编辑模式 / 预编译二进制` 安装方式，推荐与具体环境匹配的升级命令，可一键 `pip install -U "stability-analysis-agent[rag]"`。
+
+### Documentation
+
+- `docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md`：补充「仓库级示例 `extensions/`」、「用户级扩展发现」、「Python 入口点发布扩展包」三个段落，及设置菜单新动作的说明。
+- `docs/README.md`：在文档目录结构下新增「仓库自带扩展（`extensions/`）」段。
+- `README.md` / `README.zh-CN.md`：同步 Skill System / 闭环 Skill 模板章节的扩展机制。
+- 新增 `test/cli/test_report_paths.py`：覆盖 `format_bytes` 单位换算、`summarize / clear_cli_reports` 在正常、缺失目录、`preview_limit=1` 下的行为，以及 example 模板与用户级扩展自动发现。
+
 ## [1.2.6] - 2026-06-03
 
 ### Changed

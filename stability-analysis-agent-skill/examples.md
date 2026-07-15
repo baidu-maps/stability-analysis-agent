@@ -8,7 +8,7 @@
 sa-agent
 ```
 
-选择「快速开始分析」，输入 crash_log / library_dir / code_root。
+选择「快速开始修复」，输入 crash_log / library_dir / code_root。
 
 ## 2. Demo — 无 LLM Key 完整工具链
 

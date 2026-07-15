@@ -29,6 +29,7 @@ from .parser import (
     split_skill_frontmatter,
 )
 from .runtime import SkillRuntime
+from .templates import available_skill_presets, render_skill_scaffold, write_skill_scaffold
 
 __all__ = [
     "SkillBundle",
@@ -40,11 +41,13 @@ __all__ = [
     "SkillSummary",
     "SkillManager",
     "SkillRuntime",
+    "available_skill_presets",
     "load_skill_bundle",
     "parse_skill_directory",
     "parse_skill_markdown",
     "parse_skill_package_manifest",
     "parse_skill_frontmatter",
     "split_skill_frontmatter",
+    "render_skill_scaffold",
+    "write_skill_scaffold",
 ]
-

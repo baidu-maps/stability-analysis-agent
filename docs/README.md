@@ -15,6 +15,22 @@ docs/
 └── crash_cases/           # 崩溃示例文档
 ```
 
+## 仓库自带扩展（`extensions/`）
+
+仓库根目录下的 `extensions/` 目录是**用户级与插件级 Tool / Workflow 扩展的
+官方模板与自动发现入口**。`extensions/register_all()` 会在 `sa-agent`
+启动时被调用，自动加载：
+
+- 仓库级示例模板（`extensions/tools/example_tool.py`、
+  `extensions/workflows/example_workflow.py`）
+- 用户目录 `~/.config/stability-analysis-agent/extensions/`
+- 工作区 `.stability-analysis-agent/extensions/`
+- Python 入口点 `stability_analysis_agent.tools / workflows`
+
+详见 [tools/tool_system/TOOL_SYSTEM_EXTENSION.md](./tools/tool_system/TOOL_SYSTEM_EXTENSION.md)。
+
+
+
 > 快速开始请直接阅读项目根目录 [README.md](../README.md)（[中文版](../README.zh-CN.md)）。
 
 ## 文档列表
@@ -46,6 +62,8 @@ docs/
 |------|------|
 | [../stability-analysis-agent-skill/README.md](../stability-analysis-agent-skill/README.md) | **对外能力包**（给 Claude / Cursor 等外部 Agent） |
 | [skills/README.md](./skills/README.md) | Skill 系统总览（sa-agent 扩展机制） |
+| [skills/CLOSE_LOOP_SKILL_TEMPLATES.md](./skills/CLOSE_LOOP_SKILL_TEMPLATES.md) | 闭环 Skill 模板 |
+| [skills/BUG_PLATFORM_FETCHER_TEMPLATE.md](./skills/BUG_PLATFORM_FETCHER_TEMPLATE.md) | 缺陷管理平台拉取 Skill 模板 |
 | [skills/SKILL_TEMPLATE.md](./skills/SKILL_TEMPLATE.md) | Skill 模板 |
 | [skills/CLAUDE_COMPATIBILITY.md](./skills/CLAUDE_COMPATIBILITY.md) | Claude Skill 兼容说明 |
 
@@ -53,6 +71,7 @@ docs/
 
 | 文档 | 说明 |
 |------|------|
+| [ROADMAP.md](./ROADMAP.md) | Roadmap 长版（与 README 中的里程碑表一致） |
 | [tools/CRASH_LOG_FORMATS.md](./tools/CRASH_LOG_FORMATS.md) | 崩溃日志文件后缀与平台导出格式（英文） |
 | [tools/CRASH_LOG_FORMATS.zh-CN.md](./tools/CRASH_LOG_FORMATS.zh-CN.md) | 崩溃日志格式与平台支持（中文） |
 | [tools/addr2line/README.md](./tools/addr2line/README.md) | 地址解析工具 |

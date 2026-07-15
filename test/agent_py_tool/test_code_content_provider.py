@@ -18,9 +18,10 @@ project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 
 try:
-    from tools.code_content_provider_tool import CodeContentProvider
+    from tools.code_content_provider_tool import CodeContentProvider, GraphNode
 except ImportError:  # 兼容部分环境仍使用旧包名
     from stability_analyzer_agent.tools import CodeContentProvider  # type: ignore
+    GraphNode = None  # type: ignore
 
 try:
     from workflows.crash_analysis_workflow import iOSCrashAnalyzeWorkflow
@@ -163,6 +164,108 @@ class TestBuildPromptFinalTip(unittest.TestCase):
         self.assertIn("void Caller::run()", text)
         self.assertIn("void Util::cleanup()", text)
         self.assertIn("- 文件: /tmp/Caller.cpp", text)
+        self.assertIn("按堆栈顺序解析的函数/帧语义列表", text)
+        self.assertNotIn("根据日志中堆栈顺序解析的函数/帧语义列表", text)
+        self.assertNotIn("[第1帧][源码函数]", text)
+
+    def test_stack_adjacent_verified_path_high_confidence_in_final_tip(self):
+        crash_id = (
+            "func|/tmp/VTempl.h|VVoid VDestructElements(TYPE* pElements, VInt iCount)"
+        )
+        release_all_id = (
+            "func|/tmp/VMapControl.cpp|VVoid CVMapControl::ReleaseAllLayers()"
+        )
+        release_id = "func|/tmp/BaseLayer.cpp|VVoid CBaseLayer::Release()"
+        code_ctx = {
+            "crash_summary": {
+                "node_id": crash_id + " {",
+                "crash_line_number": 10,
+                "crash_line_code": "pElements->~TYPE();",
+                "error_type": "SIGSEGV",
+            },
+            "graph": {
+                "nodes": [
+                    {
+                        "id": crash_id,
+                        "type": "function",
+                        "signature": "VVoid VDestructElements(TYPE* pElements, VInt iCount)",
+                        "file": "/tmp/VTempl.h",
+                        "snippet": [
+                            "template<class TYPE>",
+                            "VVoid VDestructElements(TYPE* pElements, VInt iCount) {",
+                            "  pElements->~TYPE();",
+                            "}",
+                        ],
+                    },
+                    {
+                        "id": release_all_id,
+                        "type": "function",
+                        "signature": "VVoid CVMapControl::ReleaseAllLayers()",
+                        "file": "/tmp/VMapControl.cpp",
+                        "snippet": [
+                            "VVoid CVMapControl::ReleaseAllLayers() {",
+                            "  pbaselayer->Release();",
+                            "}",
+                        ],
+                    },
+                    {
+                        "id": release_id,
+                        "type": "function",
+                        "signature": "VVoid CBaseLayer::Release()",
+                        "file": "/tmp/BaseLayer.cpp",
+                        "snippet": [
+                            "VVoid CBaseLayer::Release() {",
+                            "  VDelete(this);",
+                            "}",
+                        ],
+                    },
+                ],
+                "edges": [
+                    {
+                        "type": "calls_stack_verified",
+                        "from_id": release_all_id,
+                        "to_id": release_id,
+                    },
+                    {
+                        "type": "calls_stack_verified",
+                        "from_id": release_id,
+                        "to_id": crash_id,
+                    },
+                ],
+                "evidence_summary": {
+                    "has_stack_adjacent_verified_chain": True,
+                    "has_calls_direct": False,
+                    "auto_fix_allowed": True,
+                },
+                "call_chain_from_code": [
+                    {
+                        "nodes": [release_all_id, release_id, crash_id],
+                        "description": "stack_adjacent_verified",
+                    },
+                    {
+                        "nodes": [
+                            "func|/tmp/VMapControl.cpp|VVoid CVMapControl::InvokeLayersReq(VBool needLoad)",
+                            crash_id,
+                        ],
+                        "description": "static_repo_inferred",
+                    },
+                ],
+                "call_chain_from_add2line": [
+                    {
+                        "thread_id": "1",
+                        "is_crash_thread": True,
+                        "nodes": [crash_id, release_all_id],
+                    }
+                ],
+            },
+        }
+        wf = iOSCrashAnalyzeWorkflow()
+        text = wf._build_prompt_final_tip({}, {"resolved_frames": []}, code_ctx)
+        self.assertIn("栈相邻帧 + 源码调用链已校验", text)
+        self.assertIn("CVMapControl::ReleaseAllLayers()", text)
+        self.assertIn("CBaseLayer::Release()", text)
+        self.assertIn("VDestructElements", text)
+        self.assertIn("路径2: 共", text)
 
     def test_evidence_gate_message_in_final_tip(self):
         crash_id = "func|/tmp/Crash.h|void Crash::hit()"
@@ -681,6 +784,87 @@ class TestCodeContentProviderV2(unittest.TestCase):
         )
         self.assertIn("head", merged)
         self.assertIn("tail", merged)
+
+    def test_resolve_stack_adjacent_indirect_chain_release_to_vdestruct(self):
+        """ReleaseAllLayers -> Release -> VDelete 桥接应能连通 VDestructElements。"""
+        root = Path(self.test_dir) / "stack_chain"
+        root.mkdir(parents=True, exist_ok=True)
+        templ = root / "VTempl.h"
+        templ.write_text(
+            "template<class TYPE>\n"
+            "VVoid VDestructElements(TYPE* pElements, VInt iCount) {\n"
+            "  pElements->~TYPE();\n"
+            "}\n"
+            "template<class TYPE>\n"
+            "VVoid VDelete(TYPE* pObjects) {\n"
+            "  VDestructElements<TYPE>(pObjects, 1);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        vmap = root / "VMapControl.cpp"
+        vmap.write_text(
+            "VVoid CVMapControl::ReleaseAllLayers() {\n"
+            "  CBaseLayer* pbaselayer = nullptr;\n"
+            "  pbaselayer->Release();\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        base = root / "BaseLayer.cpp"
+        base.write_text(
+            "VVoid CBaseLayer::Release() {\n"
+            "  VDelete(this);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        code_roots = [str(root.resolve())]
+        p = CodeContentProvider(code_parser_backend="regex")
+        p.current_code_roots = code_roots
+
+        crash_node = GraphNode(
+            id="crash",
+            type="function",
+            name="VDestructElements",
+            file=str(templ.resolve()),
+            signature="VVoid VDestructElements(TYPE* pElements, VInt iCount)",
+            snippet=templ.read_text(encoding="utf-8").splitlines()[:5],
+        )
+        outer_node = GraphNode(
+            id="outer",
+            type="function",
+            name="ReleaseAllLayers",
+            file=str(vmap.resolve()),
+            signature="VVoid CVMapControl::ReleaseAllLayers()",
+            snippet=vmap.read_text(encoding="utf-8").splitlines(),
+        )
+        nodes: dict = {}
+
+        def register_graph_node(gn):
+            sig = (gn.signature or gn.name or "").strip()
+            nid = f"func|{gn.file}|{sig}"
+            if nid not in nodes:
+                nodes[nid] = GraphNode(
+                    id=nid,
+                    type="function",
+                    name=gn.name,
+                    file=gn.file,
+                    signature=sig,
+                    snippet=gn.snippet,
+                )
+            return nid
+
+        chain_ids = p._resolve_stack_adjacent_call_chain_ids(
+            outer_node,
+            crash_node,
+            code_roots,
+            [str(vmap.resolve()), str(base.resolve()), str(templ.resolve())],
+            register_graph_node,
+        )
+        self.assertIsNotNone(chain_ids)
+        self.assertGreaterEqual(len(chain_ids), 3)
+        sigs = [nodes[cid].signature for cid in chain_ids]
+        self.assertTrue(any("ReleaseAllLayers" in s for s in sigs))
+        self.assertTrue(any("Release" in s and "ReleaseAllLayers" not in s for s in sigs))
+        self.assertTrue(any("VDestructElements" in s for s in sigs))
 
     def test_objc_mm_function_snippet_excludes_namespace_macro(self):
         """readlines + 函数体提取不应产生双换行，snippet 不得从 NAMESPACE 宏起跨函数。"""

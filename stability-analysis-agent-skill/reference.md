@@ -51,7 +51,7 @@
 
 - `analysis`：偏证据与置信度，不强制输出修复代码；默认启用 `context_loop`（最多 3 轮）。
 - `fix`：偏可编译补丁输出；默认 `single` 轮。
-- `context_loop`：模型可请求更多函数源码后继续分析；见 `round_N/06_context_requests.json`。
+- `context_loop`：模型可请求更多函数源码后继续分析；续轮 prompt 在 `## 函数源码` 后追加 `## 其它代码上下文`；见 `round_N/05b_pre_round_add_res.json` 与 `06b_next_round_ai_request.json`。
 
 ## 支持的崩溃日志格式（摘要）
 
