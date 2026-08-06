@@ -124,11 +124,53 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         resolved_stack: Dict[str, Any],
         scope: str,
         problem: Dict[str, Any],
+        memory_maps: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Step 2 无可用符号化结果时提前结束（parse_stack_only 仍保留 02 产物）。"""
+        """Step 2 无可用符号化结果时提前结束（parse_stack_only 仍保留 maps/符号化/诊断产物）。"""
         skip_meta = pipeline_skip_metadata_resolve(resolved_stack)
+        memory_maps_data = memory_maps if isinstance(memory_maps, dict) else {}
+        crash_diagnosis: Dict[str, Any] = {}
+        if scope in {"parse_stack_only", "full", "gen_prompt_only"}:
+            try:
+                from tools.crash_diagnosis.core import run_crash_diagnosis
+                crash_log_content = ""
+                if isinstance(problem, dict):
+                    crash_log_content = str(
+                        problem.get("crash_log_content")
+                        or problem.get("crash_log")
+                        or ""
+                    )
+                crash_diagnosis = run_crash_diagnosis(
+                    parse_result,
+                    memory_maps_data,
+                    resolved_stack,
+                    crash_log_content=crash_log_content,
+                    library_dir=str(problem.get("library_dir") or "") if isinstance(problem, dict) else "",
+                    force_disassembly=bool(
+                        (problem or {}).get("force_disassembly")
+                        or (problem or {}).get("enable_disassembly")
+                    ) if isinstance(problem, dict) else False,
+                )
+            except Exception as diag_exc:
+                logger.warning(
+                    "[%s] crash_diagnosis on resolve-skip: %s",
+                    self.definition.name,
+                    diag_exc,
+                )
+                crash_diagnosis = {
+                    "crash_classification": {
+                        "primary_pattern": "diagnosis_error",
+                        "confidence": 0.0,
+                        "summary_zh": f"诊断模块异常，已降级：{diag_exc}",
+                    },
+                    "error": str(diag_exc),
+                    "prompt_section_zh": (
+                        "## 崩溃证据诊断\n\n"
+                        f"诊断模块异常（已降级保留占位）: {diag_exc}\n"
+                    ),
+                }
         if scope == "parse_stack_only":
-            note = "skipped_no_usable_resolve，已写入 02 但无可用符号"
+            note = "skipped_no_usable_resolve，已写入符号化/诊断产物但无可用符号"
         else:
             note = "skipped_no_usable_resolve，未执行源码定位/AI"
         return {
@@ -136,7 +178,12 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             "platform": self.platform,
             "workflow": self.definition.name,
             "parse_result": parse_result,
+            "memory_maps": memory_maps_data,
             "resolved_stack": resolved_stack,
+            "crash_diagnosis": crash_diagnosis,
+            "anr_diagnosis": {},
+            "memory_diagnosis": {},
+            "timeline_diagnosis": {},
             "code_context": {},
             "analysis": None,
             "final_tip": None,
@@ -216,13 +263,14 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         if scope == "parse_log_only":
             total_steps = 1
         elif scope == "parse_stack_only":
-            total_steps = 2
+            total_steps = 3
         elif scope == "gen_prompt_only":
+            # parse → symbolize → diagnosis → code → (prompt 无单独 spinner)
             total_steps = 4
         else:
-            # full scope: 4 steps in workflow + step 5 (apply fix) handled by CLI
+            # full: parse → symbolize → diagnosis → code → LLM；apply 由 CLI 作为最后一步展示
             apply_ai_fixes = problem.get("apply_ai_fixes", True)
-            total_steps = 5 if apply_ai_fixes else 4
+            total_steps = 6 if apply_ai_fixes else 5
 
         try:
             # Step 1: 解析崩溃日志
@@ -250,7 +298,9 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     "platform": self.platform,
                     "workflow": self.definition.name,
                     "parse_result": parse_result,
+                    "memory_maps": {},
                     "resolved_stack": {},
+                    "crash_diagnosis": {},
                     "code_context": {},
                     "analysis": None,
                     "final_tip": None,
@@ -267,7 +317,15 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     }
                 }
 
-            # Step 2: 堆栈符号化
+            # Step 2: 提取内存映射（轻量，紧跟 01 之后）
+            memory_maps_data: Dict[str, Any] = {}
+            try:
+                from tools.crash_diagnosis.maps_extractor import extract_memory_maps
+                memory_maps_data = extract_memory_maps(crash_log)
+            except Exception as maps_exc:
+                logger.debug("memory_maps extraction skipped: %s", maps_exc)
+
+            # Step 3: 堆栈符号化
             with PhaseSpinner("堆栈符号化", step=2, total_steps=total_steps) as _resolve_spinner:
                 logger.info(f"[{self.definition.name}] Step 2: Resolving symbols...")
                 resolved = context.execute_tool("add2line_resolver", {
@@ -283,8 +341,81 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     )
                     _resolve_spinner.set_partial_failure()
                     return self._return_skipped_no_usable_resolve(
-                        parse_result, resolved, scope, problem
+                        parse_result,
+                        resolved,
+                        scope,
+                        problem,
+                        memory_maps=memory_maps_data,
                     )
+
+            # Step 4a: 崩溃诊断（依赖 01+02 maps+03 符号化；含 DeterministicAnalyzer）
+            crash_diagnosis: Dict[str, Any] = {}
+            crash_log_content = ""
+            if isinstance(problem, dict):
+                crash_log_content = str(
+                    problem.get("crash_log_content")
+                    or problem.get("crash_log")
+                    or ""
+                )
+            try:
+                with PhaseSpinner("崩溃证据诊断", step=3, total_steps=total_steps):
+                    from tools.crash_diagnosis.core import run_crash_diagnosis
+                    crash_diagnosis = run_crash_diagnosis(
+                        parse_result,
+                        memory_maps_data,
+                        resolved,
+                        crash_log_content=crash_log_content,
+                        library_dir=str(library_dir or ""),
+                        force_disassembly=bool(
+                            problem.get("force_disassembly")
+                            or problem.get("enable_disassembly")
+                        ),
+                    )
+            except Exception as diag_exc:
+                logger.warning("[%s] crash_diagnosis failed: %s", self.definition.name, diag_exc)
+                crash_diagnosis = {
+                    "crash_classification": {
+                        "primary_pattern": "diagnosis_error",
+                        "confidence": 0.0,
+                        "summary_zh": f"诊断模块异常，已降级：{diag_exc}",
+                    },
+                    "register_diagnosis": None,
+                    "evidence_chain": [
+                        {
+                            "type": "error",
+                            "finding": str(diag_exc),
+                            "implication": "04a 诊断未完整执行，请结合 01/03 手工分析",
+                        }
+                    ],
+                    "prompt_section_zh": (
+                        "## 崩溃证据诊断\n\n"
+                        f"诊断模块异常（已降级保留占位）: {diag_exc}\n"
+                    ),
+                    "error": str(diag_exc),
+                }
+
+            # Step 4a+: ANR/Freeze（仅 anr 族兜底或 force；专用 workflow 主路径不双跑）
+            anr_diagnosis = self._maybe_run_anr_diagnosis(
+                parse_result=parse_result,
+                resolved_stack=resolved,
+                problem=problem if isinstance(problem, dict) else {},
+                crash_log_content=crash_log_content,
+            )
+
+            # Step 4a++: 内存压力/OOM（oom 族或 force；阶段 A 旁路 → 04d）
+            memory_diagnosis = self._maybe_run_memory_diagnosis(
+                parse_result=parse_result,
+                resolved_stack=resolved,
+                problem=problem if isinstance(problem, dict) else {},
+                crash_log_content=crash_log_content,
+            )
+
+            # Step 4a+++: 崩溃前时序/业务路径（有 logcat/HiLog/ASI 信号或 force → 04e）
+            timeline_diagnosis = self._maybe_run_timeline_diagnosis(
+                parse_result=parse_result,
+                problem=problem if isinstance(problem, dict) else {},
+                crash_log_content=crash_log_content,
+            )
 
             if scope == "parse_stack_only":
                 return {
@@ -292,11 +423,16 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     "platform": self.platform,
                     "workflow": self.definition.name,
                     "parse_result": parse_result,
+                    "memory_maps": memory_maps_data,
                     "resolved_stack": resolved,
+                    "crash_diagnosis": crash_diagnosis,
+                    "anr_diagnosis": anr_diagnosis or {},
+                    "memory_diagnosis": memory_diagnosis or {},
+                    "timeline_diagnosis": timeline_diagnosis or {},
                     "code_context": {},
                     "analysis": None,
                     "final_tip": None,
-                    "note": "scope=parse_stack_only，仅执行日志解析+符号化",
+                    "note": "scope=parse_stack_only，已执行日志解析+符号化+崩溃诊断",
                     "rule_hits": [],
                     "pattern_hits": [],
                     "evidence_map": {},
@@ -309,8 +445,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     }
                 }
 
-            # Step 3: 定位崩溃源码
-            with PhaseSpinner("定位崩溃源码", step=3, total_steps=total_steps) as _ccp_spinner:
+            # Step 4b: 定位崩溃源码
+            with PhaseSpinner("定位崩溃源码", step=4, total_steps=total_steps) as _ccp_spinner:
                 logger.info(f"[{self.definition.name}] Step 3: Extracting code context...")
                 ccp_input: Dict[str, Any] = {
                     "resolved_stack": json.dumps(resolved),
@@ -408,6 +544,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 decision_trace = rag_result.get("decision_trace", []) or []
                 vector_used = bool(rag_result.get("vector_used", False))
 
+            # === 确定性结论已并入 04a.prompt_section_zh，此处不再旁路重复注入 ===
+
             # 检查是否有 LLM
             if context.llm is None:
                 logger.warning(f"[{self.definition.name}] No LLM configured, skipping AI analysis")
@@ -420,13 +558,22 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         code_context=code_context,
                         memory_context=memory_context,
                         problem=problem,
+                        crash_diagnosis=crash_diagnosis,
+                        anr_diagnosis=anr_diagnosis,
+                        memory_diagnosis=memory_diagnosis,
+                        timeline_diagnosis=timeline_diagnosis,
                     )
                 return {
                     "status": "success",
                     "platform": self.platform,
                     "workflow": self.definition.name,
                     "parse_result": parse_result,
+                    "memory_maps": memory_maps_data,
                     "resolved_stack": resolved,
+                    "crash_diagnosis": crash_diagnosis,
+                    "anr_diagnosis": anr_diagnosis or {},
+                    "memory_diagnosis": memory_diagnosis or {},
+                    "timeline_diagnosis": timeline_diagnosis or {},
                     "code_context": code_context,
                     "analysis": None,
                     "final_tip": assembled_prompt or None,
@@ -444,8 +591,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     }
                 }
 
-            # Step 4: LLM 分析（按轮次展示子阶段）
-            logger.info(f"[{self.definition.name}] Step 4: LLM analysis...")
+            # Step 5: LLM 分析（按轮次展示子阶段）
+            logger.info(f"[{self.definition.name}] Step 5: LLM analysis...")
             # 与 gen_prompt_only 模式对齐：首轮 05 以首轮 prompt 为基准
             analysis_prompt = self._build_prompt_final_tip(
                 parse_result=parse_result,
@@ -453,13 +600,25 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 code_context=code_context,
                 memory_context=memory_context,
                 problem=problem,
+                crash_diagnosis=crash_diagnosis,
+                anr_diagnosis=anr_diagnosis,
+                memory_diagnosis=memory_diagnosis,
+                timeline_diagnosis=timeline_diagnosis,
             )
+            # === 追加结构化报告格式要求（确定性事实已在 04a 诊断段）===
+            try:
+                from prompts.report_schema import get_report_instruction
+                report_instruction = get_report_instruction(mode="full")
+                if report_instruction:
+                    analysis_prompt += "\n\n" + report_instruction
+            except Exception as ri_exc:
+                logger.debug("Report instruction injection skipped: %s", ri_exc)
             analysis_text, final_prompt, agent_rounds, llm_response = self._run_llm_context_loop(
                 context=context,
                 initial_prompt=analysis_prompt,
                 problem=problem,
                 code_roots=code_roots,
-                step=4,
+                step=5,
                 total_steps=total_steps,
             )
 
@@ -468,7 +627,12 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 "platform": self.platform,
                 "workflow": self.definition.name,
                 "parse_result": parse_result,
+                "memory_maps": memory_maps_data,
                 "resolved_stack": resolved,
+                "crash_diagnosis": crash_diagnosis,
+                "anr_diagnosis": anr_diagnosis or {},
+                "memory_diagnosis": memory_diagnosis or {},
+                "timeline_diagnosis": timeline_diagnosis or {},
                 "code_context": code_context,
                 "analysis": analysis_text,
                 "final_tip": analysis_prompt,
@@ -498,7 +662,9 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
     def _build_analysis_prompt(self, parse_result: Dict, resolved: Dict, code_context: Dict, memory_context: str = "") -> str:
         """构建分析提示词"""
         crash_info = parse_result.get("crash_info", {}) if isinstance(parse_result, dict) else {}
-        cc_summary = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
+        # 解耦重构：从 01+02+03 独立构建 crash_summary
+        from tools.merge_utils import build_crash_summary_view
+        cc_summary = build_crash_summary_view(parse_result, resolved, code_context)
         graph = code_context.get("graph", {}) if isinstance(code_context, dict) else {}
         nodes = graph.get("nodes", []) if isinstance(graph, dict) else []
         node_by_id = {
@@ -3233,6 +3399,165 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         lines.append("")
         lines.append("")
 
+    @staticmethod
+    def _maybe_run_anr_diagnosis(
+        *,
+        parse_result: Dict[str, Any],
+        resolved_stack: Dict[str, Any],
+        problem: Dict[str, Any],
+        crash_log_content: str = "",
+    ) -> Dict[str, Any]:
+        """ANR/Freeze 诊断兜底（crash workflow 内）。
+
+        正常 ANR 流量由 ``anr_freeze_analysis`` 专用 workflow 产出 04c。
+        此处仅在预分类未路由到专用 workflow、但 parse 后 ``log_kind`` 属 ANR 族，
+        或显式 ``force_anr_analysis`` 时执行，避免与专用 workflow 双跑。
+        """
+        if problem.get("skip_anr_sidepath"):
+            return {}
+        force = bool(
+            problem.get("force_anr_analysis")
+            or problem.get("enable_anr_analysis")
+        )
+        meta = parse_result.get("meta_info") if isinstance(parse_result, dict) else None
+        log_kind = None
+        if isinstance(meta, dict):
+            log_kind = meta.get("log_kind")
+        try:
+            from tools.crash_parser.log_kind_classifier import is_anr_family_kind
+            anr_family = is_anr_family_kind(log_kind)
+        except Exception:
+            anr_family = False
+        # 无 ANR 族 log_kind 且非 force：不跑（普通 native crash 不再误触）
+        if not force and not anr_family:
+            # 兼容旧字段：仅当 log_kind 缺失时回退 anr_suspected
+            if log_kind or not (isinstance(meta, dict) and meta.get("anr_suspected")):
+                return {}
+
+        # --- 改进：从原始文件路径读取日志 ---
+        import os
+        log_content = crash_log_content
+        if not log_content:
+            crash_log_path = (
+                problem.get("crash_log_path")
+                or problem.get("crash_log")
+                or ""
+            )
+            if isinstance(crash_log_path, str) and crash_log_path and os.path.isfile(crash_log_path):
+                try:
+                    with open(crash_log_path, "r", encoding="utf-8", errors="replace") as f:
+                        log_content = f.read()
+                except Exception:
+                    pass
+
+        try:
+            from tools.anr_diagnosis.core import run_anr_freeze_diagnosis
+            out = run_anr_freeze_diagnosis(
+                parse_result,
+                resolved_stack,
+                log_content or "",
+                force=force or anr_family,
+            )
+            return out if isinstance(out, dict) else {}
+        except Exception as exc:
+            logger.warning("anr_freeze_diagnosis skipped: %s", exc)
+            return {
+                "analyzed": False,
+                "error": str(exc),
+                "prompt_section_zh": "",
+            }
+
+    @staticmethod
+    def _maybe_run_memory_diagnosis(
+        *,
+        parse_result: Dict[str, Any],
+        resolved_stack: Dict[str, Any],
+        problem: Dict[str, Any],
+        crash_log_content: str = "",
+    ) -> Dict[str, Any]:
+        """内存压力/OOM 旁路（阶段 A）：oom 族 log_kind 或 force 时产出 04d。"""
+        if problem.get("skip_memory_sidepath"):
+            return {}
+        force = bool(
+            problem.get("force_memory_analysis")
+            or problem.get("enable_memory_analysis")
+        )
+        try:
+            from tools.memory_diagnosis.core import run_memory_pressure_diagnosis
+            out = run_memory_pressure_diagnosis(
+                parse_result,
+                resolved_stack,
+                crash_log_content or str(problem.get("crash_log") or ""),
+                force=force,
+            )
+            return out if isinstance(out, dict) else {}
+        except Exception as exc:
+            logger.warning("memory_pressure_diagnosis skipped: %s", exc)
+            return {
+                "analyzed": False,
+                "error": str(exc),
+                "prompt_section_zh": "",
+            }
+
+    @staticmethod
+    def _maybe_run_timeline_diagnosis(
+        *,
+        parse_result: Dict[str, Any],
+        problem: Dict[str, Any],
+        crash_log_content: str = "",
+    ) -> Dict[str, Any]:
+        """崩溃前时序/业务路径旁路 → 04e。
+
+        优先从原始崩溃日志文件路径读取完整内容（而非依赖 parse_result.raw_content），
+        因为 parser 可能跳过业务日志部分、且 raw_content 默认不落盘。
+        """
+        if problem.get("skip_timeline_sidepath"):
+            return {}
+        force = bool(
+            problem.get("force_timeline_analysis")
+            or problem.get("enable_timeline_analysis")
+        )
+
+        # --- 改进：从原始文件路径读取日志（不依赖 raw_content） ---
+        import os
+        log_content = crash_log_content
+        if not log_content:
+            crash_log_path = (
+                problem.get("crash_log_path")
+                or problem.get("crash_log")
+                or ""
+            )
+            if isinstance(crash_log_path, str) and crash_log_path and os.path.isfile(crash_log_path):
+                try:
+                    with open(crash_log_path, "r", encoding="utf-8", errors="replace") as f:
+                        log_content = f.read()
+                except Exception:
+                    pass
+            if not log_content:
+                log_content = str((parse_result or {}).get("raw_content") or "")
+
+        # --- 改进：放宽触发条件——只要文件有足够行数就尝试 ---
+        if not force and log_content:
+            line_count = log_content.count("\n")
+            if line_count >= 20:
+                force = True  # 日志超过 20 行时默认尝试，由 core 内部判断是否有效
+
+        try:
+            from tools.timeline_diagnosis.core import run_log_timeline_diagnosis
+            out = run_log_timeline_diagnosis(
+                parse_result,
+                log_content,
+                force=force,
+            )
+            return out if isinstance(out, dict) else {}
+        except Exception as exc:
+            logger.warning("log_timeline_diagnosis skipped: %s", exc)
+            return {
+                "analyzed": False,
+                "error": str(exc),
+                "prompt_section_zh": "",
+            }
+
     def _build_prompt_final_tip(
         self,
         parse_result: Dict[str, Any],
@@ -3240,13 +3565,20 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         code_context: Dict[str, Any],
         memory_context: str = "",
         problem: Optional[Dict[str, Any]] = None,
+        crash_diagnosis: Optional[Dict[str, Any]] = None,
+        anr_diagnosis: Optional[Dict[str, Any]] = None,
+        memory_diagnosis: Optional[Dict[str, Any]] = None,
+        timeline_diagnosis: Optional[Dict[str, Any]] = None,
     ) -> str:
         """构建供 gen_prompt_only 模式或作为 LLM 输入的统一提示词。"""
-        crash_summary = (
-            self._compat_crash_summary(code_context.get("crash_summary", {}))
-            if isinstance(code_context, dict)
-            else {}
-        )
+        # 解耦重构：从 01+02+03 独立构建 crash_summary，不再依赖 03.crash_summary
+        from tools.merge_utils import build_crash_summary_view
+        crash_summary = build_crash_summary_view(parse_result, resolved, code_context)
+        # 兼容回退：如果 merge_utils 构建结果缺少关键字段，尝试旧路径
+        if not crash_summary.get("analysis_entry_function") and isinstance(code_context, dict):
+            old_cs = code_context.get("crash_summary")
+            if isinstance(old_cs, dict):
+                crash_summary = self._compat_crash_summary(old_cs)
         weak_attribution = is_investigation_hint_attribution(crash_summary)
         graph = code_context.get("graph", {}) if isinstance(code_context, dict) else {}
         nodes = graph.get("nodes", []) if isinstance(graph, dict) else []
@@ -3734,6 +4066,38 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             self._append_crash_location_prompt_section(
                 lines, crash_summary, crash_node, resolved
             )
+
+        # === 注入寄存器与内存状态诊断（来自 04a_crash_diagnosis）===
+        if isinstance(crash_diagnosis, dict):
+            diag_prompt = crash_diagnosis.get("prompt_section_zh", "")
+            if diag_prompt and isinstance(diag_prompt, str) and diag_prompt.strip():
+                lines.append("")
+                lines.append(diag_prompt)
+                lines.append("")
+
+        # === 注入 ANR/Freeze 诊断（来自 04c，仅 anr 族/force 时有内容）===
+        if isinstance(anr_diagnosis, dict):
+            anr_prompt = anr_diagnosis.get("prompt_section_zh", "")
+            if anr_prompt and isinstance(anr_prompt, str) and anr_prompt.strip():
+                lines.append("")
+                lines.append(anr_prompt)
+                lines.append("")
+
+        # === 注入内存压力/OOM 诊断（来自 04d，阶段 A 旁路）===
+        if isinstance(memory_diagnosis, dict):
+            mem_prompt = memory_diagnosis.get("prompt_section_zh", "")
+            if mem_prompt and isinstance(mem_prompt, str) and mem_prompt.strip():
+                lines.append("")
+                lines.append(mem_prompt)
+                lines.append("")
+
+        # === 注入崩溃前时序/业务路径（来自 04e）===
+        if isinstance(timeline_diagnosis, dict):
+            tl_prompt = timeline_diagnosis.get("prompt_section_zh", "")
+            if tl_prompt and isinstance(tl_prompt, str) and tl_prompt.strip():
+                lines.append("")
+                lines.append(tl_prompt)
+                lines.append("")
 
         lines.append("## 函数源码")
         lines.append("")

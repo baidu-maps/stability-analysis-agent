@@ -17,20 +17,25 @@ from __future__ import annotations
 import argparse
 import datetime
 import getpass
+import hashlib
 import importlib
+import importlib.metadata
 import json
 import logging
 import os
+import platform
 import re
 import select
 import shutil
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 import tty
 import urllib.error
 import urllib.request
+import uuid
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -178,6 +183,16 @@ def _read_crash_log(path: str) -> str:
     return raw
 
 
+def _collect_crash_log_files(crash_log_dir: str) -> List[Path]:
+    root = Path(crash_log_dir).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"崩溃日志目录不存在: {root}")
+    if not root.is_dir():
+        raise NotADirectoryError(f"崩溃日志目录无效（需要是目录）: {root}")
+    files = [p for p in root.rglob("*") if p.is_file()]
+    return sorted(files, key=lambda p: str(p).lower())
+
+
 def _normalize_code_roots(raw_roots: Optional[List[str]]) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -189,6 +204,45 @@ def _normalize_code_roots(raw_roots: Optional[List[str]]) -> List[str]:
             seen.add(ar)
             out.append(ar)
     return out
+
+
+def _resolve_crash_input_mode(args: argparse.Namespace) -> Tuple[str, Optional[str], Optional[str], Optional[List[str]]]:
+    """
+    解析输入来源并返回:
+    - crash_log_source: file / stdin / content / dir
+    - crash_log_value: 单文件路径、目录路径或 None
+    - crash_log_content: 直接文本输入或 stdin 读取结果
+    - crash_log_files: 目录模式下的文件列表
+    """
+    legacy = str(getattr(args, "crash_log_legacy", "") or "").strip()
+    file_path = str(getattr(args, "crash_log_file", "") or "").strip()
+    content = getattr(args, "crash_log_content", None)
+    dir_path = str(getattr(args, "crash_log_dir", "") or "").strip()
+
+    file_choice = file_path or legacy
+    has_file = bool(file_choice)
+    has_content = content is not None
+    has_dir = bool(dir_path)
+
+    chosen = sum(1 for item in (has_dir, has_content, has_file) if item)
+    if chosen == 0:
+        raise ValueError("缺少 --crash-log-file / --crash-log-content / --crash-log-dir")
+    if has_dir and (has_content or has_file):
+        raise ValueError("--crash-log-dir 不能与 --crash-log-file / --crash-log-content 同时使用")
+    if has_content and has_file:
+        raise ValueError("--crash-log-content 不能与 --crash-log-file / --crash-log 同时使用")
+
+    if has_dir:
+        files = [str(p) for p in _collect_crash_log_files(dir_path)]
+        return "dir", dir_path, None, files
+
+    if has_content:
+        return "content", None, str(content or ""), None
+
+    if file_choice == "-":
+        return "stdin", "-", _read_crash_log("-"), None
+
+    return "file", file_choice, _read_crash_log(file_choice), None
 
 
 def _user_config_dir() -> Path:
@@ -210,54 +264,43 @@ def _runtime_output_root() -> Path:
 _AGENT_CONFIG_LOAD_PATH: Optional[Path] = None
 
 
-def _resolve_agent_config_paths() -> List[Path]:
-    """按优先级列出 agent_config.local.json 候选路径。"""
-    seen: set = set()
-    ordered: List[Path] = []
+def _is_source_tree() -> bool:
+    """True when running from the git/source checkout (not a pip/site-packages install)."""
+    return (PROJECT_ROOT / "pyproject.toml").is_file() and (PROJECT_ROOT / "configs").is_dir()
 
-    def _add(p: Path) -> None:
-        try:
-            key = str(p.resolve())
-        except OSError:
-            key = str(p)
-        if key in seen:
-            return
-        seen.add(key)
-        ordered.append(p)
 
+def _agent_config_file() -> Path:
+    """
+    Single effective agent_config.local.json for this runtime:
+    - STABILITY_AGENT_CONFIG_DIR (if set): <dir>/agent_config.local.json
+      (used by closed-source checkout to point at its own configs/)
+    - open-source checkout: <repo>/configs/agent_config.local.json
+    - installed CLI: ~/.config/stability-analysis-agent/agent_config.local.json
+    """
     override = os.environ.get("STABILITY_AGENT_CONFIG_DIR", "").strip()
     if override:
-        _add(Path(override).expanduser().resolve() / "agent_config.local.json")
-    _add((Path.cwd() / "configs" / "agent_config.local.json").resolve())
-    _add((Path.cwd() / "tools" / "configs" / "agent_config.local.json").resolve())
-    _add(_user_agent_config_file())
-    return ordered
+        return (Path(override).expanduser().resolve() / "agent_config.local.json")
+    if _is_source_tree():
+        return (PROJECT_ROOT / "configs" / "agent_config.local.json").resolve()
+    return _user_agent_config_file()
 
 
 def _agent_config_write_path() -> Path:
-    """写入 agent 配置时使用的路径（与最近一次成功加载路径一致）。"""
-    global _AGENT_CONFIG_LOAD_PATH
-    if _AGENT_CONFIG_LOAD_PATH is not None and _AGENT_CONFIG_LOAD_PATH.exists():
-        return _AGENT_CONFIG_LOAD_PATH
-    for candidate in _resolve_agent_config_paths():
-        if candidate.exists():
-            return candidate
-    return _user_agent_config_file()
+    """写入 agent 配置时使用的路径。"""
+    return _agent_config_file()
 
 
 def _load_agent_config_file() -> dict:
     global _AGENT_CONFIG_LOAD_PATH
-    for target in _resolve_agent_config_paths():
-        if not target.exists():
-            continue
-        try:
-            payload = json.loads(target.read_text(encoding="utf-8"))
-            _AGENT_CONFIG_LOAD_PATH = target
-            return payload if isinstance(payload, dict) else {}
-        except Exception:
-            continue
-    _AGENT_CONFIG_LOAD_PATH = _user_agent_config_file()
-    return {}
+    target = _agent_config_file()
+    _AGENT_CONFIG_LOAD_PATH = target
+    if not target.exists():
+        return {}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
 
 
 def _workflow_config_dict() -> Dict[str, Any]:
@@ -524,23 +567,26 @@ def _configure_llm_request_timeout_interactive() -> None:
 
 
 def _bundled_config_dir() -> Path:
-    return PROJECT_ROOT / "tools" / "configs"
+    """Repo / wheel template dir for *.local.example.json (never secrets)."""
+    candidates = [
+        PROJECT_ROOT / "configs",
+        Path(__file__).resolve().parent / "configs",  # wheel: cli/configs
+        PROJECT_ROOT / "tools" / "configs",  # legacy
+    ]
+    for path in candidates:
+        if path.is_dir():
+            return path
+    return PROJECT_ROOT / "configs"
 
 
 def _user_agent_config_file() -> Path:
+    """Installed-CLI user-home agent config path (not used when running from source tree)."""
     return _user_config_dir() / "agent_config.local.json"
 
 
 def _load_user_agent_config_file() -> dict:
-    """仅读取 ~/.config/stability-analysis-agent/agent_config.local.json（与菜单配置检测一致）。"""
-    target = _user_agent_config_file()
-    if not target.exists():
-        return {}
-    try:
-        payload = json.loads(target.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
-        return {}
+    """读取当前运行时生效的 agent_config.local.json（源码树或用户目录）。"""
+    return _load_agent_config_file()
 
 
 def _user_add2line_config_file() -> Path:
@@ -556,10 +602,11 @@ def _session_state_file() -> Path:
 
 
 def _ensure_user_config_templates() -> None:
-    config_dir = _user_config_dir()
-    config_dir.mkdir(parents=True, exist_ok=True)
+    _user_config_dir().mkdir(parents=True, exist_ok=True)
+    agent_dest = _agent_config_file()
+    agent_dest.parent.mkdir(parents=True, exist_ok=True)
     template_map = {
-        "agent_config.local.example.json": _user_agent_config_file(),
+        "agent_config.local.example.json": agent_dest,
         "add2line_resolver_config.local.example.json": _user_add2line_config_file(),
     }
     for src_name, dest in template_map.items():
@@ -1131,6 +1178,114 @@ def _safe_input_back(prompt: str) -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
+def _read_crash_log_file_from_interactive_prompt() -> Optional[Dict[str, Any]]:
+    """交互式读取崩溃日志文件路径。"""
+    while True:
+        raw = _safe_input_back("请输入崩溃日志文件路径（直接回车或按ESC返回上一级）: ").strip()
+        if raw == "__EOF__":
+            return None
+        if not raw:
+            return None
+        candidate = Path(raw).expanduser().resolve()
+        if not candidate.exists() or not candidate.is_file():
+            print(_red(f"路径无效（需要是文件）: {candidate}"))
+            continue
+        return {
+            "crash_log_source": "file",
+            "crash_log_file": str(candidate),
+            "crash_log_content": None,
+        }
+
+
+def _read_crash_log_content_from_interactive_prompt() -> Optional[Dict[str, Any]]:
+    """交互式单次粘贴崩溃日志文本；最后一次回车后短暂无输入即提交。"""
+
+    def _finish_from_buffer(buffer: List[str]) -> Optional[Dict[str, Any]]:
+        content = "".join(buffer).strip()
+        if not content:
+            print(_red("崩溃日志内容不能为空。"))
+            return None
+        return {
+            "crash_log_source": "content",
+            "crash_log_file": None,
+            "crash_log_content": content,
+        }
+
+    if not _is_tty_interactive():
+        try:
+            content = sys.stdin.read()
+        except EOFError:
+            return None
+        content = str(content or "").strip()
+        if not content:
+            return None
+        return {
+            "crash_log_source": "content",
+            "crash_log_file": None,
+            "crash_log_content": content,
+        }
+
+    print(_yellow("请直接粘贴崩溃日志内容，最后按回车提交。"))
+    buffer: List[str] = []
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while True:
+            ready, _, _ = select.select([sys.stdin], [], [], None if not buffer else 0.25)
+            if not ready:
+                return _finish_from_buffer(buffer)
+            ch = sys.stdin.read(1)
+            if not ch:
+                return _finish_from_buffer(buffer)
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch == "\x04":
+                return _finish_from_buffer(buffer)
+            if ch == "\x7f" or ch == "\b":
+                if buffer:
+                    last = buffer.pop()
+                    if last == "\n":
+                        # 简化处理：回退一个换行对应的字符，保持粘贴场景稳定
+                        pass
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if ch in ("\r", "\n"):
+                buffer.append("\n")
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                # 回车后短暂等待，若无后续输入则认为粘贴结束
+                if not select.select([sys.stdin], [], [], 0.25)[0]:
+                    return _finish_from_buffer(buffer)
+                continue
+            buffer.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+    except EOFError:
+        return _finish_from_buffer(buffer)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _read_crash_input_source_from_interactive_prompt() -> Optional[Dict[str, Any]]:
+    """先选择输入类型，再分别读取文件或文本内容。"""
+    choice = _prompt_select(
+        "请选择崩溃日志输入方式",
+        [
+            ("back", "返回上一级"),
+            ("file", "输入崩溃日志文件路径"),
+            ("content", "直接粘贴崩溃日志内容"),
+        ],
+        default_index=1,
+    )
+    if choice in {"back", "__eof__"}:
+        return None
+    if choice == "file":
+        return _read_crash_log_file_from_interactive_prompt()
+    return _read_crash_log_content_from_interactive_prompt()
+
+
 _ANSI_RED = "\033[31;1m"
 _ANSI_YELLOW = "\033[33;1m"
 _ANSI_GREEN = "\033[32;1m"
@@ -1480,7 +1635,7 @@ def _pad_display(s: str, target_width: int) -> str:
 
 
 def _prompt_base_url_with_examples(provider: str, default_value: str) -> str:
-    # Keep these examples aligned with tools/configs/agent_config.local.example.json.
+    # Keep these examples aligned with configs/agent_config.local.example.json.
     provider_examples: List[Tuple[str, str, str]] = [
         ("openai", "OpenAI", "https://api.openai.com/v1/chat/completions"),
         ("deepseek", "DeepSeek", "https://api.deepseek.com/v1/chat/completions"),
@@ -1640,9 +1795,9 @@ def _delete_profile(name: str) -> bool:
 
 def _config_command_path() -> int:
     print(f"config_dir: {_user_config_dir()}")
-    for p in [_user_agent_config_file(), _user_add2line_config_file()]:
+    for p in [_agent_config_file(), _user_add2line_config_file()]:
         print(f"{p.name}: {'exists' if p.exists() else 'missing'} ({p})")
-    effective_agent = str(_user_agent_config_file())
+    effective_agent = str(_agent_config_file())
     effective_add2line = os.environ.get("STABILITY_AGENT_ADD2LINE_CONFIG_FILE", "").strip() or str(_user_add2line_config_file())
     print(f"effective_agent_config: {effective_agent}")
     print(f"effective_add2line_config: {effective_add2line}")
@@ -1651,7 +1806,7 @@ def _config_command_path() -> int:
 
 def _config_command_doctor() -> int:
     problems: List[str] = []
-    agent_cfg = _load_json_or_empty(_user_agent_config_file())
+    agent_cfg = _load_json_or_empty(_agent_config_file())
     llm_cfg = agent_cfg.get("llm_config", {}) if isinstance(agent_cfg, dict) else {}
     providers = llm_cfg.get("providers", {}) if isinstance(llm_cfg, dict) else {}
     provider_defaults = llm_cfg.get("provider_defaults", {}) if isinstance(llm_cfg, dict) else {}
@@ -1681,7 +1836,7 @@ def _config_command_doctor() -> int:
 
     print("== 配置检查结果 ==")
     print(f"python: {sys.version.split()[0]} @ {sys.executable}")
-    print(f"agent_config: {_user_agent_config_file()}")
+    print(f"agent_config: {_agent_config_file()}")
     print(f"add2line_config: {_user_add2line_config_file()}")
     print("tools:")
     for name, meta in tool_status.items():
@@ -1745,7 +1900,7 @@ def _invoke_llm_reconfig_extension_action(action_id: str) -> bool:
     约定扩展模块提供: handle_llm_reconfig_action(action_id: str, config_path: str) -> bool
     """
     _ensure_user_config_templates()
-    target = _user_agent_config_file()
+    target = _agent_config_file()
     mod = _load_llm_menu_extension_module()
     if mod is None:
         return False
@@ -1760,7 +1915,7 @@ def _invoke_llm_reconfig_extension_action(action_id: str) -> bool:
 
 
 def _update_llm_config_interactive() -> bool:
-    target = _user_agent_config_file()
+    target = _agent_config_file()
     data = _load_json_or_empty(target)
     llm_cfg = data.get("llm_config", {}) if isinstance(data, dict) else {}
     if not isinstance(llm_cfg, dict):
@@ -2280,7 +2435,7 @@ def _config_command_init() -> int:
 
 def _print_llm_detection_summary(status: Dict[str, Any]) -> None:
     print("== 大模型配置检测 ==")
-    print(f"- 配置文件: {_user_agent_config_file()}")
+    print(f"- 配置文件: {_agent_config_file()}")
     if status.get("llm_ok"):
         print(f"- 状态: {_green('已配置（当前设置了密钥）')}")
         print(f"- 当前启用厂商（active_provider）: {status.get('active_provider') or '未知'}")
@@ -2334,7 +2489,7 @@ def _connectivity_probe_via_llm_adapter(engine: str) -> Dict[str, Any]:
     langchain 模式在 CLI 未注入 AgentExecutor 时回退为 direct 传输探测。
     菜单内联通性检测固定读取用户目录配置，与「大模型配置检测」一致。
     """
-    user_cfg = _load_user_agent_config_file()
+    user_cfg = _load_agent_config_file()
     llm_config = _build_llm_config_from_agent_config(engine, agent_cfg=user_cfg)
     if llm_config is None:
         raise RuntimeError("当前配置未就绪：请先完成厂商与密钥配置。")
@@ -2377,7 +2532,7 @@ def _connectivity_probe_via_llm_adapter(engine: str) -> Dict[str, Any]:
 
 def _connectivity_request_format(engine: str) -> str:
     """读取当前配置下的 request_format（用于 SSL 预检选择 HTTP 栈）。"""
-    user_cfg = _load_user_agent_config_file()
+    user_cfg = _load_agent_config_file()
     llm_config = _build_llm_config_from_agent_config(engine, agent_cfg=user_cfg)
     if llm_config is None:
         return "openai_chat_completions_compatible"
@@ -2609,7 +2764,7 @@ def _configure_llm_only() -> None:
 
 def _configure_llm_manual_panel() -> None:
     _ensure_user_config_templates()
-    target = _user_agent_config_file()
+    target = _agent_config_file()
     while True:
         status = _doctor_status()
         _print_llm_detection_summary(status)
@@ -3059,7 +3214,30 @@ def build_parser() -> argparse.ArgumentParser:
         description="Stability Analysis Agent CLI (Tool System Unified)",
         epilog="无参数运行 `sa-agent` 将进入交互向导并完成配置与分析。",
     )
-    p.add_argument("--crash-log", required=False, help="崩溃日志文件路径；使用 '-' 表示从 stdin 读取")
+    p.add_argument(
+        "--crash-log-file",
+        dest="crash_log_file",
+        required=False,
+        help="崩溃日志文件路径；使用 '-' 表示从 stdin 读取（推荐）",
+    )
+    p.add_argument(
+        "--crash-log-content",
+        dest="crash_log_content",
+        required=False,
+        help="直接传入崩溃日志文本（推荐用于脚本或短日志）",
+    )
+    p.add_argument(
+        "--crash-log-dir",
+        dest="crash_log_dir",
+        required=False,
+        help="批量分析目录中的崩溃日志文件（递归收集目录下所有文件）",
+    )
+    p.add_argument(
+        "--crash-log",
+        dest="crash_log_legacy",
+        required=False,
+        help="兼容旧参数：等同于 --crash-log-file；使用 '-' 表示从 stdin 读取",
+    )
     p.add_argument(
         "--library-dir",
         required=False,
@@ -3099,9 +3277,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["full", "gen_prompt_only", "parse_stack_only", "parse_log_only"],
         help=(
             "Agent 执行流程范围（默认 full）："
-            "full=解析+符号化+定位源码+AI 分析+自动改码；"
-            "gen_prompt_only=完整工具链但不调用 AI，仅生成可复用提示词；"
-            "parse_stack_only=仅解析+符号化；"
+            "full=解析+maps+符号化+诊断族+定位源码+AI 分析+自动改码；"
+            "gen_prompt_only=同上但不调用 AI，仅生成可复用提示词；"
+            "parse_stack_only=解析+maps+符号化+04a 诊断（条件旁路 04c/04d/04e）；"
             "parse_log_only=仅解析崩溃日志"
         ),
     )
@@ -3113,11 +3291,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="是否基于 AI 建议回写源码（默认开启；仅在 --scope full 且 LLM 可用时生效，使用 --no-apply-ai-fixes 关闭）",
     )
     p.add_argument(
+        "--force-disassembly",
+        dest="force_disassembly",
+        action="store_true",
+        default=False,
+        help="强制在 04a 诊断中尝试 PC 附近反汇编（仍需 library_dir 与 objdump；默认按门控按需触发）",
+    )
+    p.add_argument(
+        "--force-anr-analysis",
+        dest="force_anr_analysis",
+        action="store_true",
+        default=False,
+        help="强制走 ANR/Freeze 专用 workflow（热点栈/EventHandler/Binder；默认按 log_kind 自动路由）",
+    )
+    p.add_argument(
+        "--force-memory-analysis",
+        dest="force_memory_analysis",
+        action="store_true",
+        default=False,
+        help="强制运行内存压力/OOM 旁路诊断（04d；默认仅 log_kind 属 OOM 族或 category=oom 时触发）",
+    )
+    p.add_argument(
+        "--force-timeline-analysis",
+        dest="force_timeline_analysis",
+        action="store_true",
+        default=False,
+        help=(
+            "强制运行崩溃前日志时序/业务路径旁路（04e；"
+            "默认仅当检测到 logcat/HiLog/ASI 等业务日志信号时自动跑）"
+        ),
+    )
+    p.add_argument(
         "--prompt-mode",
         choices=["analysis", "fix"],
         default="analysis",
         help=(
-            "05 / LLM 提示词输出模式（默认 analysis）："
+            "06 / LLM 提示词输出模式（默认 analysis）："
             "analysis=偏证据分析与置信度判断，不强制修复代码；"
             "fix=偏补丁输出，要求完整可替换修复代码。"
             "该参数只控制提示词内容，不控制是否自动应用修复。"
@@ -3152,6 +3361,18 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="应用 AI 修复前是否在 cli_reports 下备份改前源码（默认开启；代码已由 Git 管理可用 --no-backup-original-sources 关闭）",
+    )
+    p.add_argument(
+        "--optimized",
+        action="store_true",
+        default=False,
+        help="兼容 daemon 的优化开关（当前主要用于请求记录与转发）",
+    )
+    p.add_argument(
+        "--streaming",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="是否启用 LLM 流式输出（daemon 透传；默认沿用 provider 配置）",
     )
     p.add_argument(
         "--engine",
@@ -3242,7 +3463,7 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "05 / LLM 提示词是否并入向量库检索的「规则与经验模式参考」（默认关闭，避免 RAG 误导；"
+            "06 / LLM 提示词是否并入向量库检索的「规则与经验模式参考」（默认关闭，避免 RAG 误导；"
             "使用 --include-memory-in-05 开启，--no-include-memory-in-05 显式关闭）"
         ),
     )
@@ -3361,9 +3582,414 @@ def _build_report_dir(args: argparse.Namespace) -> Path:
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     scope = str(getattr(args, "scope", "full") or "full")
     mode = f"analysis_{scope}"
-    crash_name = _sanitize_report_name(Path(args.crash_log).stem if args.crash_log and args.crash_log != "-" else "stdin")
+    crash_ref = str(
+        getattr(args, "crash_log", None)
+        or getattr(args, "crash_log_file", None)
+        or getattr(args, "crash_log_legacy", None)
+        or ""
+    ).strip()
+    if not crash_ref:
+        if getattr(args, "crash_log_content", None) is not None:
+            crash_ref = "content"
+        elif getattr(args, "crash_log_dir", None):
+            crash_ref = str(Path(getattr(args, "crash_log_dir")).name or "dir")
+    crash_name = _sanitize_report_name(Path(crash_ref).stem if crash_ref and crash_ref != "-" else "stdin")
     dirname = f"{stamp}_{mode}_{args.engine}_{crash_name}"
     return _runtime_output_root() / "cli_reports" / dirname
+
+
+def _now_iso() -> str:
+    return datetime.datetime.now().astimezone().isoformat()
+
+
+def _run_id_from_request(request_record: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(request_record, dict):
+        return ""
+    return str(request_record.get("run_id") or "")
+
+
+def _git_runtime_snapshot() -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {"commit": None, "dirty": None}
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if proc.returncode == 0:
+            snapshot["commit"] = proc.stdout.strip() or None
+        dirty_proc = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if dirty_proc.returncode == 0:
+            snapshot["dirty"] = bool(dirty_proc.stdout.strip())
+    except Exception:
+        pass
+    return snapshot
+
+
+def _runtime_version() -> Optional[str]:
+    if _is_source_tree():
+        try:
+            text = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+            match = re.search(r'^version\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+            if match:
+                return match.group(1)
+        except Exception:
+            pass
+    try:
+        return importlib.metadata.version("stability-analysis-agent")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _content_fingerprint(content: str) -> Dict[str, Any]:
+    raw = content.encode("utf-8")
+    return {
+        "size_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _file_fingerprint(path_value: str) -> Dict[str, Any]:
+    path = Path(path_value).expanduser().resolve()
+    payload: Dict[str, Any] = {
+        "original_path": path_value,
+        "resolved_path": str(path),
+        "size_bytes": None,
+        "sha256": None,
+    }
+    try:
+        raw = path.read_bytes()
+        payload["size_bytes"] = len(raw)
+        payload["sha256"] = hashlib.sha256(raw).hexdigest()
+    except OSError:
+        pass
+    return payload
+
+
+def _llm_request_snapshot(args: argparse.Namespace, scope: str) -> Dict[str, Any]:
+    config_source: Optional[str] = None
+    llm_config: Optional[LLMConfig] = None
+    provider_key: Optional[str] = None
+    custom_config = str(getattr(args, "config", None) or "").strip()
+    if custom_config:
+        config_source = str(Path(custom_config).expanduser().resolve())
+        try:
+            llm_config = SystemConfig.from_file(custom_config).llm
+        except Exception:
+            llm_config = None
+    else:
+        agent_cfg = _load_agent_config_file()
+        config_source = str(_AGENT_CONFIG_LOAD_PATH or _agent_config_file())
+        provider_key = _active_llm_provider_key(agent_cfg=agent_cfg)
+        llm_config = _build_llm_config_from_agent_config(args.engine, agent_cfg=agent_cfg)
+
+    enabled = scope == "full" and llm_config is not None
+    endpoint = _describe_llm_endpoint_for_display(llm_config) if llm_config else None
+    if endpoint:
+        endpoint = endpoint.split("?", 1)[0].split("#", 1)[0]
+    snapshot: Dict[str, Any] = {
+        "enabled": enabled,
+        "provider": provider_key or (llm_config.provider if llm_config else None),
+        "adapter_provider": llm_config.provider if llm_config else None,
+        "model": llm_config.model if llm_config else None,
+        "request_format": (
+            str((llm_config.extra or {}).get("request_format") or "openai_chat_completions_compatible")
+            if llm_config
+            else None
+        ),
+        "endpoint": endpoint,
+        "request_timeout_sec": llm_config.timeout if llm_config else None,
+        "temperature": llm_config.temperature if llm_config else None,
+        "max_tokens": llm_config.max_tokens if llm_config else None,
+        "config_source": config_source,
+    }
+    explicit_streaming = getattr(args, "streaming", None)
+    if explicit_streaming is not None:
+        snapshot["streaming"] = bool(explicit_streaming)
+    elif llm_config is not None:
+        stream_value = (llm_config.extra or {}).get("stream", True)
+        if isinstance(stream_value, str):
+            stream_value = stream_value.strip().lower() not in {"false", "0", "no"}
+        snapshot["streaming"] = bool(stream_value)
+    else:
+        snapshot["streaming"] = None
+    return snapshot
+
+
+def _initial_run_summary(request_record: Dict[str, Any]) -> Dict[str, Any]:
+    started_at = str(request_record.get("created_at") or _now_iso())
+    return {
+        "schema_version": 2,
+        "run_id": _run_id_from_request(request_record),
+        "request_file": "00_run_request.json",
+        "status": "running",
+        "exit_code": None,
+        "completion_reason": None,
+        "started_at": started_at,
+        "finished_at": None,
+        "duration_ms": None,
+        "workflow": {
+            "name": "crash_analysis",
+            "status": "running",
+            "last_completed_stage": None,
+            "pipeline_skipped": False,
+            "skip_reason": None,
+        },
+        "stages": [],
+        "errors": [],
+        "warnings": [],
+        "artifacts": {},
+    }
+
+
+def _initialize_run_report(report_dir: Path, request_record: Dict[str, Any]) -> None:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(report_dir / "00_run_request.json", request_record)
+    _write_json(report_dir / "00_run_summary.json", _initial_run_summary(request_record))
+
+
+def _artifact_manifest(report_dir: Path, *, scope: str) -> Dict[str, Any]:
+    manifest: Dict[str, Any] = {}
+    for path in sorted(report_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(report_dir).as_posix()
+        if rel in {"00_run_request.json", "00_run_summary.json"}:
+            continue
+        try:
+            size_bytes: Optional[int] = path.stat().st_size
+        except OSError:
+            size_bytes = None
+        manifest[rel] = {"status": "written", "size_bytes": size_bytes}
+    expected = ["01_crash_log_parser.json"]
+    if scope in {"full", "gen_prompt_only", "parse_stack_only"}:
+        expected.extend(
+            [
+                "02_memory_maps.json",
+                "03_add2line_resolver.json",
+                "04a_crash_diagnosis.json",
+            ]
+        )
+    if scope in {"full", "gen_prompt_only"}:
+        expected.extend(
+            [
+                "04b_code_content_provider.json",
+                "05_memory_context.json",
+            ]
+        )
+    if scope == "full":
+        expected.append("final_output.md")
+    for rel in expected:
+        manifest.setdefault(rel, {"status": "not_written", "size_bytes": None})
+    # 条件旁路：仅当已写入时标注 optional；缺失不算失败
+    for rel in (
+        "04c_anr_freeze_diagnosis.json",
+        "04d_memory_pressure_diagnosis.json",
+        "04e_log_timeline.json",
+        "04b2_code_location_trace.json",
+        "04b_code_location_trace.json",  # 旧名兼容
+    ):
+        if rel in manifest and isinstance(manifest[rel], dict):
+            manifest[rel]["optional"] = True
+    return manifest
+
+
+def _stage_summary(
+    result: Dict[str, Any],
+    *,
+    scope: str,
+    apply_ai_fixes_enabled: bool,
+    applied_fix_result: Optional[Dict[str, Any]],
+    apply_fix_duration_ms: Optional[int],
+    execution_events: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    events: Any = execution_events
+    if events is None:
+        events = metadata.get("execution_events") if isinstance(metadata, dict) else []
+    if not isinstance(events, list):
+        events = []
+    stage_names = ["crash_log_parser"]
+    if scope in {"full", "gen_prompt_only", "parse_stack_only"}:
+        stage_names.extend(["add2line_resolver", "crash_diagnosis"])
+    if scope in {"full", "gen_prompt_only"}:
+        stage_names.extend(["code_content_provider", "memory_retrieval"])
+    if scope == "full":
+        stage_names.extend(["llm_analysis", "apply_ai_fixes"])
+
+    event_stage_map = {
+        "crash_log_parser": "crash_log_parser",
+        "add2line_resolver": "add2line_resolver",
+        "crash_diagnosis": "crash_diagnosis",
+        "symbol_callsite_finder": "code_content_provider",
+        "code_content_provider": "code_content_provider",
+        "vector_memory_retriever": "memory_retrieval",
+        "llm_analysis": "llm_analysis",
+    }
+    grouped: Dict[str, List[Dict[str, Any]]] = {name: [] for name in stage_names}
+    errors: List[Dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        stage_name = event_stage_map.get(str(event.get("name") or ""))
+        if stage_name in grouped:
+            grouped[stage_name].append(event)
+        if event.get("status") == "failed":
+            errors.append(
+                {
+                    "stage": stage_name or event.get("name"),
+                    "message": str(event.get("error") or "unknown error"),
+                }
+            )
+
+    stages: List[Dict[str, Any]] = []
+    pipeline_skipped = bool(metadata.get("pipeline_skipped"))
+    for name in stage_names:
+        stage_events = grouped.get(name, [])
+        if name == "apply_ai_fixes":
+            if not apply_ai_fixes_enabled:
+                status = "disabled"
+            elif applied_fix_result is None:
+                status = "skipped"
+            else:
+                status = "success" if applied_fix_result.get("success") else "failed"
+                if status == "failed":
+                    errors.append(
+                        {
+                            "stage": name,
+                            "message": str(applied_fix_result.get("error") or "AI fix was not applied"),
+                        }
+                    )
+            stages.append(
+                {
+                    "name": name,
+                    "status": status,
+                    "duration_ms": apply_fix_duration_ms or 0,
+                }
+            )
+            continue
+        successful = [event for event in stage_events if event.get("status") == "success"]
+        failed = [event for event in stage_events if event.get("status") == "failed"]
+        if successful:
+            status = "success"
+        elif failed:
+            status = "failed"
+        elif pipeline_skipped or result.get("status") != "success":
+            status = "skipped"
+        elif name == "llm_analysis" and result.get("analysis") is None:
+            status = "skipped"
+        elif name == "crash_diagnosis":
+            cd = result.get("crash_diagnosis")
+            anr = result.get("anr_diagnosis")
+            mem = result.get("memory_diagnosis")
+            tl = result.get("timeline_diagnosis")
+            if any(
+                isinstance(x, dict) and (x.get("analyzed") or x.get("prompt_section_zh") or x)
+                for x in (cd, anr, mem, tl)
+                if x
+            ) or (isinstance(cd, dict) and cd):
+                status = "success"
+            else:
+                status = "skipped"
+        else:
+            status = "not_applicable"
+        stages.append(
+            {
+                "name": name,
+                "status": status,
+                "duration_ms": sum(int(event.get("duration_ms") or 0) for event in stage_events),
+            }
+        )
+    return stages, errors
+
+
+def _final_run_summary(
+    report_dir: Path,
+    request_record: Dict[str, Any],
+    result: Dict[str, Any],
+    *,
+    scope: str,
+    started_at: str,
+    duration_ms: Optional[int],
+    applied_fix_result: Optional[Dict[str, Any]],
+    apply_fix_duration_ms: Optional[int],
+    execution_events: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    effective = request_record.get("effective_parameters")
+    if not isinstance(effective, dict):
+        effective = request_record
+    apply_enabled = bool(effective.get("apply_ai_fixes", True)) and scope == "full"
+    stages, errors = _stage_summary(
+        result,
+        scope=scope,
+        apply_ai_fixes_enabled=apply_enabled,
+        applied_fix_result=applied_fix_result,
+        apply_fix_duration_ms=apply_fix_duration_ms,
+        execution_events=execution_events,
+    )
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    pipeline_skipped = bool(metadata.get("pipeline_skipped"))
+    raw_status = str(result.get("status") or "error")
+    if raw_status != "success":
+        status = "failed"
+        completion_reason = "workflow_error"
+    elif pipeline_skipped:
+        status = "partial"
+        note = str(result.get("note") or "")
+        completion_reason = note.split("，", 1)[0] or "pipeline_skipped"
+    else:
+        status = "success"
+        completion_reason = "completed"
+    if result.get("error"):
+        errors.append({"stage": "workflow", "message": str(result.get("error"))})
+    last_completed = None
+    for stage in stages:
+        if stage.get("status") == "success":
+            last_completed = stage.get("name")
+    warnings: List[Dict[str, Any]] = []
+    for event_error in errors:
+        if status == "success":
+            warnings.append(event_error)
+    if status == "success":
+        errors = []
+    finished_at = _now_iso()
+    if duration_ms is None:
+        try:
+            start_dt = datetime.datetime.fromisoformat(started_at)
+            finish_dt = datetime.datetime.fromisoformat(finished_at)
+            duration_ms = max(0, int(round((finish_dt - start_dt).total_seconds() * 1000)))
+        except (TypeError, ValueError):
+            duration_ms = None
+    return {
+        "schema_version": 2,
+        "run_id": _run_id_from_request(request_record),
+        "request_file": "00_run_request.json",
+        "status": status,
+        "exit_code": 0 if raw_status == "success" else 1,
+        "completion_reason": completion_reason,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_ms": duration_ms,
+        "workflow": {
+            "name": str(result.get("workflow") or "crash_analysis"),
+            "status": raw_status,
+            "last_completed_stage": last_completed,
+            "pipeline_skipped": pipeline_skipped,
+            "skip_reason": metadata.get("pipeline_skip_reason"),
+        },
+        "stages": stages,
+        "errors": errors,
+        "warnings": warnings,
+        "artifacts": _artifact_manifest(report_dir, scope=scope),
+    }
 
 
 def _write_cli_report(
@@ -3373,13 +3999,41 @@ def _write_cli_report(
     applied_fix_result: Optional[Dict[str, Any]] = None,
     write_readme_output: bool = True,
     scope: str = "full",
+    request_record: Optional[Dict[str, Any]] = None,
+    run_started_at: Optional[str] = None,
+    run_duration_ms: Optional[int] = None,
+    apply_fix_duration_ms: Optional[int] = None,
+    execution_events: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Path]:
     try:
         report_dir.mkdir(parents=True, exist_ok=True)
+        if isinstance(request_record, dict):
+            _write_json(report_dir / "00_run_request.json", request_record)
         if result.get("parse_result") is not None:
             _write_json(report_dir / "01_crash_log_parser.json", result.get("parse_result"))
+        # 02: 内存映射
+        if result.get("memory_maps") is not None and result.get("memory_maps"):
+            _write_json(report_dir / "02_memory_maps.json", result.get("memory_maps"))
         if scope in {"full", "gen_prompt_only", "parse_stack_only"} and result.get("resolved_stack") is not None:
-            _write_json(report_dir / "02_add2line_resolver.json", result.get("resolved_stack"))
+            _write_json(report_dir / "03_add2line_resolver.json", result.get("resolved_stack"))
+        # 04a: 崩溃诊断（full / gen_prompt_only / parse_stack_only）
+        if scope in {"full", "gen_prompt_only", "parse_stack_only"} and result.get("crash_diagnosis"):
+            _write_json(report_dir / "04a_crash_diagnosis.json", result.get("crash_diagnosis"))
+        # 04c: ANR/Freeze（仅 anr 族 / force 时有内容）
+        if scope in {"full", "gen_prompt_only", "parse_stack_only"}:
+            anr_diag = result.get("anr_diagnosis")
+            if isinstance(anr_diag, dict) and anr_diag.get("analyzed"):
+                _write_json(report_dir / "04c_anr_freeze_diagnosis.json", anr_diag)
+        # 04d: 内存压力/OOM（阶段 A 旁路）
+        if scope in {"full", "gen_prompt_only", "parse_stack_only"}:
+            mem_diag = result.get("memory_diagnosis")
+            if isinstance(mem_diag, dict) and mem_diag.get("analyzed"):
+                _write_json(report_dir / "04d_memory_pressure_diagnosis.json", mem_diag)
+        # 04e: 崩溃前时序/业务路径
+        if scope in {"full", "gen_prompt_only", "parse_stack_only"}:
+            tl_diag = result.get("timeline_diagnosis")
+            if isinstance(tl_diag, dict) and tl_diag.get("analyzed"):
+                _write_json(report_dir / "04e_log_timeline.json", tl_diag)
         if scope in {"full", "gen_prompt_only"} and result.get("code_context") is not None:
             code_context = result.get("code_context")
             location_trace = None
@@ -3389,12 +4043,12 @@ def _write_cli_report(
                     k: v for k, v in code_context.items() if k != "location_trace"
                 }
                 _write_json(
-                    report_dir / "03_code_content_provider.json", code_context_write
+                    report_dir / "04b_code_content_provider.json", code_context_write
                 )
             else:
-                _write_json(report_dir / "03_code_content_provider.json", code_context)
+                _write_json(report_dir / "04b_code_content_provider.json", code_context)
             if isinstance(location_trace, dict) and location_trace.get("steps"):
-                _write_json(report_dir / "03b_code_location_trace.json", location_trace)
+                _write_json(report_dir / "04b2_code_location_trace.json", location_trace)
         if scope in {"full", "gen_prompt_only"}:
             memory_payload = result.get("memory_retrieval")
             if not isinstance(memory_payload, dict):
@@ -3409,7 +4063,7 @@ def _write_cli_report(
                     "vector_used": result.get("vector_used"),
                 }
             if isinstance(memory_payload, dict):
-                _write_json(report_dir / "04_memory_context.json", memory_payload)
+                _write_json(report_dir / "05_memory_context.json", memory_payload)
         final_tip = result.get("final_tip")
         if final_tip is None:
             final_tip = result.get("analysis")
@@ -3425,11 +4079,11 @@ def _write_cli_report(
                 prompt_text = round_payload.get("prompt")
                 analysis_round_text = _strip_outer_fence(round_payload.get("analysis"))
                 if prompt_text is not None:
-                    (round_dir / "05_ai_prompt.md").write_text(
+                    (round_dir / "06_ai_prompt.md").write_text(
                         str(prompt_text), encoding="utf-8"
                     )
                 if analysis_round_text is not None:
-                    (round_dir / "06_ai_gen_res.md").write_text(
+                    (round_dir / "07_ai_gen_res.md").write_text(
                         str(analysis_round_text), encoding="utf-8"
                     )
                 context_requests = round_payload.get("context_requests")
@@ -3473,22 +4127,355 @@ def _write_cli_report(
         elif final_tip is not None:
             round_dir = report_dir / "round_0"
             round_dir.mkdir(parents=True, exist_ok=True)
-            (round_dir / "05_ai_prompt.md").write_text(str(final_tip), encoding="utf-8")
+            (round_dir / "06_ai_prompt.md").write_text(str(final_tip), encoding="utf-8")
         analysis_text = _strip_outer_fence(result.get("analysis"))
         if analysis_text is not None:
             round_dir = report_dir / "round_0"
             round_dir.mkdir(parents=True, exist_ok=True)
-            if not (round_dir / "06_ai_gen_res.md").exists():
-                (round_dir / "06_ai_gen_res.md").write_text(str(analysis_text), encoding="utf-8")
+            if not (round_dir / "07_ai_gen_res.md").exists():
+                (round_dir / "07_ai_gen_res.md").write_text(str(analysis_text), encoding="utf-8")
         if applied_fix_result is not None:
-            _write_json(report_dir / "07_apply_ai_fixes.json", applied_fix_result)
+            _write_json(report_dir / "08_apply_ai_fixes.json", applied_fix_result)
         if write_readme_output:
             final_output_text = analysis_text if analysis_text is not None else rendered_output
             (report_dir / "final_output.md").write_text(str(final_output_text), encoding="utf-8")
+        if isinstance(request_record, dict):
+            started_at = str(
+                run_started_at
+                or request_record.get("created_at")
+                or _now_iso()
+            )
+            summary = _final_run_summary(
+                report_dir,
+                request_record,
+                result,
+                scope=scope,
+                started_at=started_at,
+                duration_ms=run_duration_ms,
+                applied_fix_result=applied_fix_result,
+                apply_fix_duration_ms=apply_fix_duration_ms,
+                execution_events=execution_events,
+            )
+            _write_json(report_dir / "00_run_summary.json", summary)
         return report_dir
     except Exception as exc:
         print(f"警告: 写入 cli_reports 失败: {exc}", file=sys.stderr)
         return None
+
+
+def _build_run_request_record(
+    args: argparse.Namespace,
+    *,
+    crash_log_content: str,
+    scope: str,
+    code_roots: List[str],
+    crash_log_source: str,
+    crash_log_value: Optional[str] = None,
+    crash_log_files: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    crash_log_source_norm = str(crash_log_source or "").strip().lower() or "file"
+    crash_log_value_norm = str(crash_log_value or "").strip()
+    prompt_mode = str(getattr(args, "prompt_mode", "analysis") or "analysis")
+    explicit_agent_loop = str(getattr(args, "agent_loop", None) or "").strip()
+    agent_loop = explicit_agent_loop or ("context_loop" if prompt_mode == "analysis" else "single")
+    configured_rounds = int(getattr(args, "max_agent_rounds", 0) or 0)
+    max_agent_rounds = (
+        max(1, min(configured_rounds, 8))
+        if configured_rounds > 0
+        else (3 if prompt_mode == "analysis" else 1)
+    )
+    max_context_requests = max(
+        1,
+        min(int(getattr(args, "max_context_requests_per_round", 5) or 5), 16),
+    )
+    code_context_timeout = (
+        float(args.code_context_timeout_sec)
+        if getattr(args, "code_context_timeout_sec", None) is not None
+        else _effective_code_context_timeout_sec()
+    )
+    find_source_timeout = (
+        float(args.find_source_timeout_sec)
+        if getattr(args, "find_source_timeout_sec", None) is not None
+        else _effective_find_source_timeout_sec()
+    )
+    llm_snapshot = _llm_request_snapshot(args, scope)
+    plugin_modules = list(getattr(args, "plugin_modules", []) or [])
+    for module in os.environ.get("STABILITY_AGENT_PLUGIN_MODULES", "").split(","):
+        module = module.strip()
+        if module and module not in plugin_modules:
+            plugin_modules.append(module)
+
+    crash_input: Dict[str, Any] = {"source": crash_log_source_norm}
+    if crash_log_source_norm == "dir":
+        resolved_dir = str(Path(crash_log_value_norm).expanduser().resolve())
+        crash_input.update(
+            {
+                "original_path": crash_log_value_norm,
+                "resolved_path": resolved_dir,
+                "files": [_file_fingerprint(path) for path in (crash_log_files or [])],
+            }
+        )
+    elif crash_log_source_norm in {"content", "stdin"}:
+        crash_input.update(
+            {
+                "content": crash_log_content,
+                **_content_fingerprint(crash_log_content),
+            }
+        )
+    else:
+        crash_input.update(_file_fingerprint(crash_log_value_norm))
+
+    library_dir = str(getattr(args, "library_dir", None) or "").strip()
+    config_path = str(getattr(args, "config", None) or "").strip()
+    vector_db_path = str(getattr(args, "vector_db_path", "./vector_db") or "./vector_db")
+    effective_parameters: Dict[str, Any] = {
+        "scope": scope,
+        "output_format": getattr(args, "output_format", "markdown"),
+        "prompt_mode": prompt_mode,
+        "agent_loop": agent_loop,
+        "max_agent_rounds": max_agent_rounds,
+        "max_context_requests_per_round": max_context_requests,
+        "apply_ai_fixes": bool(getattr(args, "apply_ai_fixes", True)),
+        "backup_original_sources": bool(getattr(args, "backup_original_sources", True)),
+        "engine": getattr(args, "engine", "direct"),
+        "optimized": bool(getattr(args, "optimized", False)),
+        "streaming": llm_snapshot.get("streaming"),
+        "vector_db_max_results": int(getattr(args, "vector_db_max_results", 3) or 3),
+        "vector_db_record_usage": bool(getattr(args, "vector_db_record_usage", False)),
+        "rule_confidence_threshold": float(getattr(args, "rule_confidence_threshold", 0.85) or 0.85),
+        "max_sibling_member_functions": int(getattr(args, "max_sibling_member_functions", 0) or 0),
+        "max_shared_var_related_functions": int(
+            getattr(args, "max_shared_var_related_functions", 20) or 20
+        ),
+        "min_key_read_related_functions": int(
+            getattr(args, "min_key_read_related_functions", 2) or 0
+        ),
+        "use_ctags_index": bool(getattr(args, "use_ctags_index", False)),
+        "include_memory_in_05": bool(getattr(args, "include_memory_in_05", False)),
+        "code_context_timeout_sec": code_context_timeout,
+        "find_source_timeout_sec": find_source_timeout,
+        "uaf_nullptr_guard_policy": _effective_uaf_nullptr_guard_policy(),
+        "plugin_modules": plugin_modules,
+        "output_file": getattr(args, "output_file", None),
+        "print_full_report": bool(getattr(args, "print_full_report", False)),
+    }
+    return {
+        "schema_version": 2,
+        "run_id": datetime.datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8],
+        "created_at": _now_iso(),
+        "invocation": {
+            "entrypoint": "cli/main.py",
+            "cwd": str(Path.cwd().resolve()),
+        },
+        "crash_input": crash_input,
+        "paths": {
+            "library_dir": str(Path(library_dir).expanduser().resolve()) if library_dir else None,
+            "code_roots": [str(Path(root).expanduser().resolve()) for root in code_roots],
+            "vector_db_path": str(Path(vector_db_path).expanduser().resolve()),
+            "config": str(Path(config_path).expanduser().resolve()) if config_path else None,
+        },
+        "effective_parameters": effective_parameters,
+        "llm": llm_snapshot,
+        "runtime": {
+            "python_version": platform.python_version(),
+            "python_executable": sys.executable,
+            "platform": platform.platform(),
+            "agent_version": _runtime_version(),
+            "git": _git_runtime_snapshot(),
+        },
+    }
+
+
+def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    if not isinstance(record, dict):
+        raise ValueError("run_request 记录无效")
+
+    if int(record.get("schema_version") or 1) >= 2:
+        crash_input = record.get("crash_input")
+        paths = record.get("paths")
+        effective = record.get("effective_parameters")
+        if not isinstance(crash_input, dict) or not isinstance(paths, dict) or not isinstance(effective, dict):
+            raise ValueError("run_request v2 缺少 crash_input / paths / effective_parameters")
+        source = str(crash_input.get("source") or "file")
+        record = {
+            **effective,
+            "crash_log_source": source,
+            "crash_log": crash_input.get("resolved_path"),
+            "crash_log_dir": crash_input.get("resolved_path") if source == "dir" else None,
+            "crash_log_content": crash_input.get("content"),
+            "library_dir": paths.get("library_dir"),
+            "code_roots": paths.get("code_roots"),
+            "vector_db_path": paths.get("vector_db_path"),
+            "config": paths.get("config"),
+        }
+
+    crash_log_source = str(record.get("crash_log_source") or "").strip().lower()
+    crash_log = str(record.get("crash_log") or "").strip()
+    crash_log_dir = str(record.get("crash_log_dir") or "").strip()
+    crash_log_content = str(record.get("crash_log_content") or "")
+    argv: List[str] = []
+    cleanup_paths: List[str] = []
+    if crash_log_source == "dir":
+        if not crash_log_dir:
+            raise ValueError("run_request 中缺少 crash_log_dir，无法重放目录输入")
+        argv += ["--crash-log-dir", crash_log_dir]
+    elif crash_log_source in {"stdin", "content"}:
+        if not crash_log_content:
+            raise ValueError("run_request 中缺少 crash_log_content，无法重放文本输入")
+        with tempfile.NamedTemporaryFile(
+            "w",
+            delete=False,
+            encoding="utf-8",
+            suffix=".crash",
+            prefix="sa_agent_replay_",
+        ) as tmp:
+            tmp.write(crash_log_content)
+            temp_path = tmp.name
+        cleanup_paths.append(temp_path)
+        argv += ["--crash-log-file", temp_path]
+    elif crash_log:
+        argv += ["--crash-log-file", crash_log]
+    else:
+        raise ValueError("run_request 中缺少 crash_log，无法重放")
+
+    library_dir = str(record.get("library_dir") or "").strip()
+    if library_dir:
+        argv += ["--library-dir", library_dir]
+
+    code_roots = record.get("code_roots")
+    if isinstance(code_roots, list):
+        for root in code_roots:
+            root_text = str(root or "").strip()
+            if root_text:
+                argv += ["--code-root", root_text]
+    else:
+        single_root = str(record.get("code_root") or "").strip()
+        if single_root:
+            argv += ["--code-root", single_root]
+
+    config = str(record.get("config") or "").strip()
+    if config:
+        argv += ["--config", config]
+
+    scope = str(record.get("scope") or "full").strip() or "full"
+    if scope != "full":
+        argv += ["--scope", scope]
+
+    output_format = str(record.get("output_format") or "markdown").strip() or "markdown"
+    if output_format != "markdown":
+        argv += ["--output-format", output_format]
+
+    prompt_mode = str(record.get("prompt_mode") or "analysis").strip() or "analysis"
+    if prompt_mode != "analysis":
+        argv += ["--prompt-mode", prompt_mode]
+
+    agent_loop = str(record.get("agent_loop") or "").strip()
+    if agent_loop in {"single", "context_loop"}:
+        argv += ["--agent-loop", agent_loop]
+
+    max_agent_rounds = int(record.get("max_agent_rounds") or 0)
+    if max_agent_rounds:
+        argv += ["--max-agent-rounds", str(max_agent_rounds)]
+
+    max_context_requests = int(record.get("max_context_requests_per_round") or 0)
+    if max_context_requests:
+        argv += ["--max-context-requests-per-round", str(max_context_requests)]
+
+    engine = str(record.get("engine") or "direct").strip() or "direct"
+    if engine != "direct":
+        argv += ["--engine", engine]
+
+    if not bool(record.get("apply_ai_fixes", True)):
+        argv += ["--no-apply-ai-fixes"]
+    if not bool(record.get("backup_original_sources", True)):
+        argv += ["--no-backup-original-sources"]
+    if bool(record.get("optimized", False)):
+        argv += ["--optimized"]
+    if record.get("streaming") is True:
+        argv += ["--streaming"]
+    elif record.get("streaming") is False:
+        argv += ["--no-streaming"]
+    if bool(record.get("vector_db_record_usage", False)):
+        argv += ["--vector-db-record-usage"]
+    vector_db_path = str(record.get("vector_db_path") or "").strip()
+    if vector_db_path:
+        argv += ["--vector-db-path", vector_db_path]
+    vector_db_max_results = record.get("vector_db_max_results")
+    if vector_db_max_results is not None:
+        argv += ["--vector-db-max-results", str(vector_db_max_results)]
+    rule_confidence_threshold = record.get("rule_confidence_threshold")
+    if rule_confidence_threshold is not None:
+        argv += ["--rule-confidence-threshold", str(rule_confidence_threshold)]
+    if bool(record.get("use_ctags_index", False)):
+        argv += ["--use-ctags-index"]
+    if bool(record.get("include_memory_in_05", False)):
+        argv += ["--include-memory-in-05"]
+
+    max_sibling = record.get("max_sibling_member_functions")
+    if max_sibling is not None:
+        argv += ["--max-sibling-member-functions", str(max_sibling)]
+    max_shared = record.get("max_shared_var_related_functions")
+    if max_shared is not None:
+        argv += ["--max-shared-var-related-functions", str(max_shared)]
+    min_key = record.get("min_key_read_related_functions")
+    if min_key is not None:
+        argv += ["--min-key-read-related-functions", str(min_key)]
+    code_ctx_timeout = record.get("code_context_timeout_sec")
+    if code_ctx_timeout is not None:
+        argv += ["--code-context-timeout-sec", str(code_ctx_timeout)]
+    find_source_timeout = record.get("find_source_timeout_sec")
+    if find_source_timeout is not None:
+        argv += ["--find-source-timeout-sec", str(find_source_timeout)]
+
+    for module in record.get("plugin_modules") or []:
+        module_text = str(module or "").strip()
+        if module_text:
+            argv += ["--plugin-module", module_text]
+    return argv, cleanup_paths
+
+
+def _handle_replay_command(argv: List[str]) -> int:
+    parser = argparse.ArgumentParser(description="从 cli_reports 中重放一次历史分析")
+    parser.add_argument("report_dir", help="历史报告目录（含 00_run_request.json）")
+    parser.add_argument("--dry-run", action="store_true", help="仅打印将要执行的命令，不真正重放")
+    parser.add_argument("--show-request", action="store_true", help="打印读取到的 run_request 内容")
+    args = parser.parse_args(argv)
+
+    report_dir = Path(args.report_dir).expanduser().resolve()
+    request_file = report_dir / "00_run_request.json"
+    if not request_file.exists():
+        print(f"错误: 未找到可重放请求文件: {request_file}", file=sys.stderr)
+        return 1
+    try:
+        record = json.loads(request_file.read_text(encoding="utf-8"))
+        if not isinstance(record, dict):
+            raise ValueError("run_request 不是对象")
+    except Exception as exc:
+        print(f"错误: 读取重放请求失败: {exc}", file=sys.stderr)
+        return 1
+
+    if args.show_request:
+        print(json.dumps(record, ensure_ascii=False, indent=2))
+
+    try:
+        replay_argv, cleanup_paths = _build_replay_argv_from_record(record)
+    except Exception as exc:
+        print(f"错误: 无法构造重放参数: {exc}", file=sys.stderr)
+        return 1
+
+    cmd = [sys.executable, str(Path(__file__).resolve())] + replay_argv
+    print("重放命令:")
+    print(" ".join(cmd))
+    if args.dry_run:
+        return 0
+    try:
+        return main(replay_argv)
+    finally:
+        for item in cleanup_paths:
+            try:
+                Path(item).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 
@@ -3529,7 +4516,12 @@ def _print_user_parameter_confirmation(
     code_roots_input: Optional[str] = None,
 ) -> None:
     print(_yellow("【参数确认】"))
-    print(f"  崩溃日志: {state['crash_log']}")
+    crash_source = str(state.get("crash_log_source") or "file").strip()
+    if crash_source == "content":
+        content = str(state.get("crash_log_content") or "")
+        print(f"  崩溃日志: <已粘贴文本内容，{len(content)} 字符>")
+    else:
+        print(f"  崩溃日志: {state.get('crash_log_file') or state.get('crash_log')}")
     library_dir = str(state.get("library_dir") or "").strip()
     code_roots = state.get("code_roots") or []
 
@@ -3556,9 +4548,13 @@ def _primary_artifact_for_scope(scope: str, report_dir: Path) -> Optional[Path]:
     if scope_norm == "parse_log_only":
         p = report_dir / "01_crash_log_parser.json"
     elif scope_norm == "parse_stack_only":
-        p = report_dir / "02_add2line_resolver.json"
+        p = report_dir / "04a_crash_diagnosis.json"
+        if not p.exists():
+            p = report_dir / "03_add2line_resolver.json"
     elif scope_norm == "gen_prompt_only":
-        p = report_dir / "round_0" / "05_ai_prompt.md"
+        p = report_dir / "round_0" / "06_ai_prompt.md"
+        if not p.exists():
+            p = report_dir / "round_0" / "05_ai_prompt.md"  # 旧报告兼容
     else:
         p = report_dir / "final_output.md"
     return p if p.exists() else None
@@ -3633,40 +4629,59 @@ def _print_tty_markdown_brief_summary(
         and result_meta.get("pipeline_skip_reason") not in _skip_reasons
     ):
         skip_tip = str(result_meta.get("llm_skip_user_message") or "").strip()
-        print(_yellow("【AI】未调用大模型（03 无可用源码，已跳过）"))
+        print(_yellow("【AI】未调用大模型（04b 无可用源码，已跳过）"))
         if skip_tip and not cc_msg:
             print(_yellow(f"  {skip_tip}"))
 
     artifact = _primary_artifact_for_scope(scope_norm, report_dir)
     if artifact is None and result_meta.get("pipeline_skipped") and report_dir is not None:
         if result_meta.get("pipeline_skip_reason") == "no_usable_resolve":
-            fallback02 = report_dir / "02_add2line_resolver.json"
-            if fallback02.exists():
-                artifact = fallback02
+            for name in ("03_add2line_resolver.json", "02_add2line_resolver.json"):
+                fallback02 = report_dir / name
+                if fallback02.exists():
+                    artifact = fallback02
+                    break
         if artifact is None and result_meta.get("pipeline_skip_reason") == "no_usable_code":
-            fallback03 = report_dir / "03_code_content_provider.json"
-            if fallback03.exists():
-                artifact = fallback03
+            for name in (
+                "04b_code_content_provider.json",
+                "03_code_content_provider.json",
+            ):
+                fallback03 = report_dir / name
+                if fallback03.exists():
+                    artifact = fallback03
+                    break
         if artifact is None:
             fallback01 = report_dir / "01_crash_log_parser.json"
             if fallback01.exists():
                 artifact = fallback01
     if artifact is None and result_meta.get("llm_skipped") and report_dir is not None:
-        fallback = report_dir / "03_code_content_provider.json"
-        if fallback.exists():
-            artifact = fallback
+        for name in (
+            "04b_code_content_provider.json",
+            "03_code_content_provider.json",
+        ):
+            fallback = report_dir / name
+            if fallback.exists():
+                artifact = fallback
+                break
     if artifact is not None:
         if scope_norm == "parse_log_only":
             print("【产物】崩溃日志解析结果：")
         elif scope_norm == "parse_stack_only":
-            label = "崩溃日志解析结果" if result_meta.get("pipeline_skipped") else "堆栈符号化结果"
+            if (report_dir / "04a_crash_diagnosis.json").exists():
+                label = "崩溃诊断结果（04a）"
+            else:
+                label = (
+                    "崩溃日志解析结果"
+                    if result_meta.get("pipeline_skipped")
+                    else "堆栈符号化结果"
+                )
             print(f"【产物】{label}：")
         elif scope_norm == "gen_prompt_only":
             reason = str(result_meta.get("pipeline_skip_reason") or "")
             if reason == "no_usable_parse":
                 label = "崩溃日志解析结果"
             elif reason in ("no_usable_resolve", "no_usable_code"):
-                label = "阶段报告（01～03）"
+                label = "阶段报告（01～04b）"
             else:
                 label = "可复用提示词"
             print(f"【产物】{label}：")
@@ -3675,7 +4690,7 @@ def _print_tty_markdown_brief_summary(
             if reason == "no_usable_parse":
                 label = "崩溃日志解析结果"
             elif reason in ("no_usable_resolve", "no_usable_code"):
-                label = "阶段报告（01～03）"
+                label = "阶段报告（01～04b）"
             else:
                 label = "分析报告"
             print(f"【产物】{label}：")
@@ -3691,9 +4706,9 @@ def _print_tty_markdown_brief_summary(
             elif reason == "no_usable_resolve":
                 print(_yellow("【改码】已跳过（02 无可用符号）"))
             elif reason == "no_usable_code":
-                print(_yellow("【改码】已跳过（03 无可用源码）"))
+                print(_yellow("【改码】已跳过（04b 无可用源码）"))
             else:
-                print(_yellow("【改码】已跳过（03 无可用源码）"))
+                print(_yellow("【改码】已跳过（04b 无可用源码）"))
         elif not isinstance(applied_fix_result, dict):
             print("【改码】未生成改码结果")
         else:
@@ -3793,7 +4808,7 @@ def _print_tty_markdown_brief_summary(
 
 
 def _doctor_status() -> Dict[str, Any]:
-    agent_cfg = _load_json_or_empty(_user_agent_config_file())
+    agent_cfg = _load_json_or_empty(_agent_config_file())
     llm_cfg = agent_cfg.get("llm_config", {}) if isinstance(agent_cfg, dict) else {}
     providers = llm_cfg.get("providers", {}) if isinstance(llm_cfg, dict) else {}
     provider_defaults = llm_cfg.get("provider_defaults", {}) if isinstance(llm_cfg, dict) else {}
@@ -3924,16 +4939,18 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
     def _show_command_reference() -> None:
         print("== 全部命令参考（完整参数手册） ==")
         print("[主流程参数]")
-        print("1) --crash-log PATH：崩溃日志路径（支持 '-' 从 stdin 读取）")
-        print("2) --library-dir DIR：符号库目录（含 .so / .dylib / .dSYM；日志已含函数名+行号可省略）")
-        print("3) --code-root DIR：项目 C/C++ 源码目录（可重复指定；建议精确到工程/模块根目录，避免传整个仓库根目录）")
-        print("4) --config PATH：指定 SystemConfig JSON（不填则使用内置默认工具链与工作流）")
-        print("5) --scope {full|gen_prompt_only|parse_stack_only|parse_log_only}：Agent 执行流程范围")
-        print("   - full（默认）：解析+符号化+定位源码+AI 分析+自动改码")
-        print("   - gen_prompt_only：完整工具链但不调用 AI，仅生成可复用提示词")
-        print("   - parse_stack_only：仅解析+符号化")
+        print("1) --crash-log-file PATH：崩溃日志文件路径（支持 '-' 从 stdin 读取）")
+        print("2) --crash-log-content TEXT：直接传入崩溃日志文本")
+        print("3) --crash-log-dir DIR：批量分析目录中的崩溃日志文件")
+        print("4) --library-dir DIR：符号库目录（含 .so / .dylib / .dSYM；日志已含函数名+行号可省略）")
+        print("5) --code-root DIR：项目 C/C++ 源码目录（可重复指定；建议精确到工程/模块根目录，避免传整个仓库根目录）")
+        print("6) --config PATH：指定 SystemConfig JSON（不填则使用内置默认工具链与工作流）")
+        print("7) --scope {full|gen_prompt_only|parse_stack_only|parse_log_only}：Agent 执行流程范围")
+        print("   - full（默认）：解析+maps+符号化+诊断族+定位源码+AI 分析+自动改码")
+        print("   - gen_prompt_only：同上但不调用 AI，仅生成可复用提示词（round_0/06_ai_prompt.md）")
+        print("   - parse_stack_only：解析+maps+符号化+04a 诊断（条件旁路 04c/04d/04e）")
         print("   - parse_log_only：仅解析崩溃日志")
-        print("6) --engine {direct|langchain|langgraph}：AI 推理模式（直调 / 工具编排 / 状态图编排）")
+        print("8) --engine {direct|langchain|langgraph}：AI 推理模式（直调 / 工具编排 / 状态图编排）")
         print("")
         print("[RAG 上下文参数（进入分析 problem）]")
         print("1) --vector-db-path PATH：向量数据库目录（默认 ./vector_db）")
@@ -3971,13 +4988,15 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
         print("3) sa-agent run ...：显式使用参数模式执行分析")
         print("")
         print("[常见组合]")
-        print("1) 完整分析：--crash-log ... --library-dir ... --code-root ...")
+        print("1) 完整分析：--crash-log-file ... --library-dir ... --code-root ...")
         print("2) 只分析不改码：加 --no-apply-ai-fixes")
         print("3) 只跑工具链不走 LLM：加 --scope gen_prompt_only")
-        print("4) 仅解析+符号化：加 --scope parse_stack_only")
+        print("4) 仅解析+符号化+诊断：加 --scope parse_stack_only")
         print("5) 仅解析崩溃日志：加 --scope parse_log_only")
-        print("6) 向量库统计：--vector-db-stats")
-        print("7) 向量库初始化：--init-vector-db")
+        print("6) 直接传文本：--crash-log-content \"...\"")
+        print("7) 批量目录分析：--crash-log-dir <logs_dir>")
+        print("8) 向量库统计：--vector-db-stats")
+        print("9) 向量库初始化：--init-vector-db")
         print("")
 
     def _pick_engine(current_engine: str) -> str:
@@ -4000,7 +5019,7 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
     scope_options = [
         ("full", "完整分析（解析+符号化+定位源码+AI 分析+自动改码）"),
         ("gen_prompt_only", "完整工具链，仅生成提示词，不调用 AI"),
-        ("parse_stack_only", "仅解析+符号化"),
+        ("parse_stack_only", "解析+符号化+04a 诊断（条件 04c/d/e）"),
         ("parse_log_only", "仅解析崩溃日志"),
     ]
     scope_label_map = {key: label for key, label in scope_options}
@@ -4173,7 +5192,7 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                     print("")
                     print("推荐：输入 1 进入交互引导（新手首选）。")
                     print("或直接命令运行（适合熟手/脚本）：")
-                    print("sa-agent --crash-log <log.crash> --library-dir <lib_dir> --code-root <code_dir>")
+                    print("sa-agent --crash-log-file <log.crash> --library-dir <lib_dir> --code-root <code_dir>")
                     print("更多参数：sa-agent --help")
                     print("━━━━━━━━━━━━━━━━━━━━━━")
                     _prompt_select(
@@ -4327,23 +5346,13 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
     total_steps = 1 if scope_default == "parse_log_only" else (2 if scope_default == "parse_stack_only" else 3)
 
     print("")
-    print(_yellow(f"[步骤 1/{total_steps}] 崩溃日志路径"))
-    while True:
-        raw = _safe_input_back("请输入崩溃日志路径（直接回车或按ESC返回上一级）: ").strip()
-        if raw == "__EOF__":
-            return None
-        if not raw:
-            return collect_interactive_run_state()
-        crash_log = raw
-        if not crash_log:
-            print(_red("崩溃日志路径不能为空。"))
-            continue
-        p = Path(crash_log).expanduser().resolve()
-        if not p.exists() or not p.is_file():
-            print(_red(f"路径无效（需要是文件）: {p}"))
-            continue
-        crash_log = str(p)
-        break
+    print(_yellow(f"[步骤 1/{total_steps}] 崩溃日志输入方式"))
+    crash_input = _read_crash_input_source_from_interactive_prompt()
+    if crash_input is None:
+        return collect_interactive_run_state()
+    crash_log_source = str(crash_input.get("crash_log_source") or "file")
+    crash_log_file = str(crash_input.get("crash_log_file") or "")
+    crash_log_content = str(crash_input.get("crash_log_content") or "")
 
     library_dir_input: Optional[str] = None
     code_roots_input: Optional[str] = None
@@ -4425,7 +5434,10 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
     engine = engine_default if engine_default in {"direct", "langchain", "langgraph"} else "direct"
 
     state = {
-        "crash_log": crash_log,
+        "crash_log_source": crash_log_source,
+        "crash_log_file": crash_log_file,
+        "crash_log_content": crash_log_content,
+        "crash_log": crash_log_file if crash_log_source == "file" else "",
         "library_dir": library_dir,
         "code_roots": code_roots,
         "engine": engine,
@@ -4441,25 +5453,40 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
     )
     print(_yellow("提示: 运行中可按 Ctrl+C 立即终止当前任务。"))
 
-    session_state["last_run"] = state
+    session_state["last_run"] = {
+        **state,
+        "crash_log_content": "" if crash_log_source == "content" else state.get("crash_log_content", ""),
+    }
     _save_session_state(session_state)
     return state
 
 
-def execute_analysis(args: argparse.Namespace) -> int:
+def _execute_analysis_single(args: argparse.Namespace) -> int:
     _configure_cli_analysis_logging()
     vector_cmd_exit = _run_vector_db_command(args)
     if vector_cmd_exit is not None:
         return vector_cmd_exit
 
-    if not args.crash_log:
-        print("错误: 缺少 --crash-log", file=sys.stderr)
+    try:
+        crash_input_source, crash_log_value, crash_log_content, crash_log_files = _resolve_crash_input_mode(args)
+    except Exception as exc:
+        print(f"错误: {exc}", file=sys.stderr)
         return 1
 
-    crash_log_content = _read_crash_log(args.crash_log)
     if not crash_log_content.strip():
         print("错误: 崩溃日志内容为空", file=sys.stderr)
         return 1
+
+    if crash_input_source == "dir":
+        print("错误: --crash-log-dir 只能通过批量入口处理，不能直接进入单次分析流程", file=sys.stderr)
+        return 1
+
+    if crash_input_source == "content":
+        setattr(args, "crash_log", "content")
+    elif crash_input_source == "stdin":
+        setattr(args, "crash_log", "-")
+    else:
+        setattr(args, "crash_log", crash_log_value or "")
 
     scope = str(getattr(args, "scope", "full") or "full").strip()
     if scope not in {"full", "gen_prompt_only", "parse_stack_only", "parse_log_only"}:
@@ -4470,6 +5497,23 @@ def execute_analysis(args: argparse.Namespace) -> int:
         return 1
     code_roots = _normalize_code_roots(args.code_roots)
     call_llm = scope == "full"
+    request_record = _build_run_request_record(
+        args,
+        crash_log_content=crash_log_content,
+        scope=scope,
+        code_roots=code_roots,
+        crash_log_source=crash_input_source,
+        crash_log_value=crash_log_value,
+        crash_log_files=crash_log_files,
+    )
+    report_dir = _build_report_dir(args)
+    _analysis_started_at = str(request_record.get("created_at") or _now_iso())
+    _analysis_start_time = time.time()
+    _analysis_start_perf = time.perf_counter()
+    try:
+        _initialize_run_report(report_dir, request_record)
+    except Exception as exc:
+        print(f"警告: 初始化 cli_reports 运行记录失败: {exc}", file=sys.stderr)
     problem = {
         "crash_log": crash_log_content,
         "library_dir": args.library_dir,
@@ -4477,6 +5521,10 @@ def execute_analysis(args: argparse.Namespace) -> int:
         "engine": args.engine,
         "scope": scope,
         "apply_ai_fixes": bool(args.apply_ai_fixes),
+        "force_disassembly": bool(getattr(args, "force_disassembly", False)),
+        "force_anr_analysis": bool(getattr(args, "force_anr_analysis", False)),
+        "force_memory_analysis": bool(getattr(args, "force_memory_analysis", False)),
+        "force_timeline_analysis": bool(getattr(args, "force_timeline_analysis", False)),
         "prompt_mode": str(getattr(args, "prompt_mode", "analysis") or "analysis"),
         # 0 表示让 workflow 按 prompt_mode 决定默认轮数
         "max_agent_rounds": int(getattr(args, "max_agent_rounds", 0) or 0),
@@ -4533,8 +5581,36 @@ def execute_analysis(args: argparse.Namespace) -> int:
             tool_entries.append(ToolConfig(name="repo_search", enabled=True))
         config = SystemConfig(
             tools=tool_entries,
-            workflows=[WorkflowConfig(name="crash_analysis", enabled=True)],
+            workflows=[
+                WorkflowConfig(name="crash_analysis", enabled=True),
+                WorkflowConfig(name="anr_freeze_analysis", enabled=True),
+            ],
         )
+
+    # 预分类路由：只读分类原文 → crash_analysis | anr_freeze_analysis
+    force_anr = bool(getattr(args, "force_anr_analysis", False))
+    try:
+        from tools.crash_parser.log_kind_classifier import (
+            classify_log_kind,
+            workflow_name_for_log_kind,
+        )
+        _kind = classify_log_kind(crash_log_content)
+        workflow_name = workflow_name_for_log_kind(
+            _kind.log_kind, force_anr=force_anr, confidence=_kind.confidence
+        )
+        problem["log_kind_preclassify"] = {
+            "log_kind": _kind.log_kind,
+            "confidence": _kind.confidence,
+            "reasons": list(_kind.reasons),
+        }
+    except Exception as pre_exc:
+        logging.getLogger(__name__).debug("log_kind preclassify failed: %s", pre_exc)
+        workflow_name = "anr_freeze_analysis" if force_anr else "crash_analysis"
+
+    if isinstance(request_record, dict):
+        request_record["workflow"] = workflow_name
+        if problem.get("log_kind_preclassify"):
+            request_record["log_kind_preclassify"] = problem.get("log_kind_preclassify")
 
     llm_adapter = None
     if call_llm:
@@ -4543,6 +5619,24 @@ def execute_analysis(args: argparse.Namespace) -> int:
             if llm_config is not None:
                 config.llm = llm_config
             else:
+                error_result = {
+                    "status": "error",
+                    "error": "未检测到可用 LLM 配置",
+                    "workflow": workflow_name,
+                    "metadata": {"execution_events": []},
+                }
+                _write_cli_report(
+                    report_dir,
+                    error_result,
+                    "",
+                    write_readme_output=False,
+                    scope=scope,
+                    request_record=request_record,
+                    run_started_at=_analysis_started_at,
+                    run_duration_ms=int(
+                        round((time.perf_counter() - _analysis_start_perf) * 1000)
+                    ),
+                )
                 print(
                     "错误: 未检测到可用 LLM 配置。请直接运行 `sa-agent` 按引导配置，"
                     "或改用 `--scope gen_prompt_only` 仅生成提示词。",
@@ -4550,16 +5644,18 @@ def execute_analysis(args: argparse.Namespace) -> int:
                 )
                 return 1
         if config.llm is not None:
+            if getattr(args, "streaming", None) is not None:
+                config.llm.extra["stream"] = bool(args.streaming)
             try:
                 llm_adapter = LLMAdapterFactory.create(config.llm.to_dict())
             except Exception as exc:
                 print(f"警告: LLM 适配器初始化失败，将继续执行工具链。错误: {exc}", file=sys.stderr)
 
     executor = ConfigDrivenExecutor(registry, config, llm_adapter)
-    _analysis_start_time = time.time()
-    result = executor.execute_workflow("crash_analysis", problem)
-    report_dir = _build_report_dir(args)
+    result = executor.execute_workflow(workflow_name, problem)
+    execution_events = list(executor.last_execution_events)
     applied_fix_result: Optional[Dict[str, Any]] = None
+    apply_fix_duration_ms: Optional[int] = None
 
     meta = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
     pipeline_skipped = bool(meta.get("pipeline_skipped"))
@@ -4576,6 +5672,7 @@ def execute_analysis(args: argparse.Namespace) -> int:
         and not llm_skipped
         and not final_still_needs_context
     ):
+        apply_fix_started_perf = time.perf_counter()
         with PhaseSpinner("应用代码修复", step=5, total_steps=5):
             fixer = CodeFixer(llm_adapter, uaf_nullptr_guard_policy=_effective_uaf_nullptr_guard_policy())
             fix_result = fixer.generate_and_apply(
@@ -4586,6 +5683,9 @@ def execute_analysis(args: argparse.Namespace) -> int:
             )
             applied_fix_result = fix_result.to_dict()
             result["applied_ai_fixes"] = applied_fix_result
+        apply_fix_duration_ms = int(
+            round((time.perf_counter() - apply_fix_started_perf) * 1000)
+        )
 
     if args.output_format == "json":
         output = json.dumps(result, ensure_ascii=False, indent=2)
@@ -4667,7 +5767,7 @@ def execute_analysis(args: argparse.Namespace) -> int:
                     if rest > 0:
                         lines.append(f"  - … 还有 {rest} 帧")
                 if len(resolved_threads) > 12:
-                    lines.append(f"- … 还有 {len(resolved_threads) - 12} 条线程，见 02_add2line_resolver.json")
+                    lines.append(f"- … 还有 {len(resolved_threads) - 12} 条线程，见 03_add2line_resolver.json")
                 lines.append("")
             code_context = result.get("code_context", {}) or {}
             crash_summary = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
@@ -4806,6 +5906,11 @@ def execute_analysis(args: argparse.Namespace) -> int:
         applied_fix_result,
         write_readme_output=(scope == "full"),
         scope=scope,
+        request_record=request_record,
+        run_started_at=_analysis_started_at,
+        run_duration_ms=None,
+        apply_fix_duration_ms=apply_fix_duration_ms,
+        execution_events=execution_events,
     )
 
     use_tty_brief = (
@@ -4838,6 +5943,68 @@ def execute_analysis(args: argparse.Namespace) -> int:
     return 0 if result.get("status") == "success" else 1
 
 
+def execute_analysis(args: argparse.Namespace) -> int:
+    crash_log_dir = str(getattr(args, "crash_log_dir", "") or "").strip()
+    if crash_log_dir:
+        if getattr(args, "output_file", None):
+            print("错误: --crash-log-dir 暂不支持与 --output-file 同时使用", file=sys.stderr)
+            return 1
+        try:
+            crash_files = _collect_crash_log_files(crash_log_dir)
+        except Exception as exc:
+            print(f"错误: {exc}", file=sys.stderr)
+            return 1
+        if not crash_files:
+            print(f"错误: 目录中未找到可分析的日志文件: {crash_log_dir}", file=sys.stderr)
+            return 1
+
+        total = len(crash_files)
+        success_count = 0
+        failure_count = 0
+        for idx, crash_file in enumerate(crash_files, start=1):
+            print("")
+            print(f"=== 批量分析 {idx}/{total}: {crash_file} ===")
+            sub_args = argparse.Namespace(**vars(args))
+            sub_args.crash_log_file = str(crash_file)
+            sub_args.crash_log_content = None
+            sub_args.crash_log_legacy = None
+            sub_args.crash_log_dir = None
+            rc = _execute_analysis_single(sub_args)
+            if rc == 0:
+                success_count += 1
+            else:
+                failure_count += 1
+
+        print("")
+        print(f"批量分析完成：成功 {success_count}/{total}，失败 {failure_count}/{total}")
+        return 0 if failure_count == 0 else 1
+
+    return _execute_analysis_single(args)
+
+
+def _interactive_state_to_argv(state: Dict[str, Any]) -> List[str]:
+    argv: List[str] = []
+    crash_source = str(state.get("crash_log_source") or "file").strip()
+    if crash_source == "content":
+        content = str(state.get("crash_log_content") or "")
+        argv += ["--crash-log-content", content]
+    else:
+        crash_file = str(state.get("crash_log_file") or state.get("crash_log") or "").strip()
+        if not crash_file:
+            raise ValueError("交互状态缺少 crash_log_file")
+        argv += ["--crash-log-file", crash_file]
+
+    argv += ["--engine", str(state.get("engine", "direct")).strip() or "direct", "--no-interactive"]
+    if state.get("library_dir"):
+        argv.extend(["--library-dir", str(state["library_dir"])])
+    for code_root in state.get("code_roots", []):
+        argv.extend(["--code-root", str(code_root)])
+    scope = str(state.get("scope", "full")).strip() or "full"
+    if scope != "full":
+        argv.extend(["--scope", scope])
+    return argv
+
+
 def _is_tty_interactive() -> bool:
     try:
         return bool(sys.stdin.isatty() and sys.stdout.isatty())
@@ -4856,6 +6023,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _handle_profile_command(raw_argv[1:])
         if raw_argv and raw_argv[0] == "cancel":
             return _handle_cancel_command(raw_argv[1:])
+        if raw_argv and raw_argv[0] == "replay":
+            return _handle_replay_command(raw_argv[1:])
 
         if raw_argv and raw_argv[0] == "run":
             raw_argv = raw_argv[1:]
@@ -4864,7 +6033,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         args = parser.parse_args(raw_argv)
         has_business_args = any(
             [
-                bool(args.crash_log),
+                bool(getattr(args, "crash_log_file", None)),
+                bool(getattr(args, "crash_log_content", None) is not None),
+                bool(getattr(args, "crash_log_dir", None)),
+                bool(getattr(args, "crash_log_legacy", None)),
                 bool(args.init_vector_db),
                 bool(args.vector_db_stats),
                 args.export_vector_db is not None,
@@ -4885,29 +6057,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             if state is None:
                 print("已退出交互模式。")
                 return 0
-            argv_from_state: List[str] = [
-                "--crash-log",
-                state["crash_log"],
-                "--engine",
-                state["engine"],
-                "--no-interactive",
-            ]
-            if state.get("library_dir"):
-                argv_from_state.extend(["--library-dir", state["library_dir"]])
-            for code_root in state.get("code_roots", []):
-                argv_from_state.extend(["--code-root", code_root])
-            scope = str(state.get("scope", "full")).strip() or "full"
-            if scope != "full":
-                argv_from_state.extend(["--scope", scope])
-            args = parser.parse_args(argv_from_state)
+            args = parser.parse_args(_interactive_state_to_argv(state))
             return execute_analysis(args)
 
         if interactive_requested and not _is_tty_interactive():
             print("错误: 当前为非交互环境，无法启用 --interactive。", file=sys.stderr)
             return 1
 
-        if not args.crash_log and not has_business_args:
-            print("错误: 缺少 --crash-log（或直接运行 `sa-agent` 进入交互模式）", file=sys.stderr)
+        if not any(
+            [
+                getattr(args, "crash_log_file", None),
+                getattr(args, "crash_log_content", None) is not None,
+                getattr(args, "crash_log_dir", None),
+                getattr(args, "crash_log_legacy", None),
+            ]
+        ) and not has_business_args:
+            print(
+                "错误: 缺少 --crash-log-file / --crash-log-content / --crash-log-dir（或直接运行 `sa-agent` 进入交互模式）",
+                file=sys.stderr,
+            )
             return 1
         return execute_analysis(args)
     except KeyboardInterrupt:

@@ -13,7 +13,7 @@ import os
 import platform
 import concurrent.futures
 from typing import Dict, List, Any, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 from tools._stack_symbol_utils import (
@@ -139,7 +139,7 @@ def _is_probably_system_module(module: Optional[str]) -> bool:
 
 @dataclass
 class ResolvedFrame:
-    """解析后的堆栈帧信息"""
+    """解析后的堆栈帧信息（仅包含解析增量，线程上下文由 ResolvedThreadStack 提供）"""
     address: str
     function: Optional[str] = None
     file: Optional[str] = None
@@ -149,12 +149,6 @@ class ResolvedFrame:
     resolved_function: Optional[str] = None
     resolved_file: Optional[str] = None
     resolved_line: Optional[int] = None
-    # 多线程 01 对齐字段（P0）
-    thread_tid: Optional[str] = None
-    thread_name: Optional[str] = None
-    thread_index: Optional[int] = None
-    thread_is_crash_thread: Optional[bool] = None
-    thread_is_main_thread: Optional[bool] = None
     # addr2line | log_symbol（崩溃线程沿用 01 符号）| offset_estimate | unresolved
     resolution_kind: Optional[str] = None
 
@@ -231,28 +225,62 @@ def _should_emit_frame_in_02_output(
 
 
 @dataclass
+class ResolvedRegister:
+    """寄存器代码指针的符号化结果（写入 02.resolved_registers）。"""
+    address: str
+    module: Optional[str] = None
+    offset: Optional[str] = None
+    resolved_function: Optional[str] = None
+    resolved_file: Optional[str] = None
+    resolved_line: Optional[int] = None
+    resolution_kind: Optional[str] = None  # addr2line | unresolved
+    kind: Optional[str] = None  # 与 01 address_map.kind 对齐，通常为 code
+
+
+@dataclass
 class Add2lineResult:
-    """add2line解析结果（堆栈帧仅通过 ``resolved_threads[]`` 输出）"""
+    """add2line 解析结果。
+
+    JSON 字段顺序（asdict）：
+    resolved_threads → resolved_registers → 计数/崩溃线程摘要 →
+    os_type / library_path / 工具信息 / resolution_source（元数据置末）。
+    """
+
     resolved_threads: List[ResolvedThreadStack]
-    os_type: str
-    library_path: str
-    success_count: int
-    total_count: int
-    errors: List[str]
+    # 仅符号化 01.registers.address_map 中 kind=code 的寄存器；不计入 success_count
+    resolved_registers: Optional[Dict[str, ResolvedRegister]] = None
+    success_count: int = 0
+    total_count: int = 0
+    errors: List[str] = field(default_factory=list)
     crash_thread_id: Optional[str] = None
     crash_thread_name: Optional[str] = None
     crash_thread_is_main_thread: Optional[bool] = None
     crash_thread_has_business_frames: Optional[bool] = None
     frame_count_total: Optional[int] = None
     frame_count_resolvable: Optional[int] = None
-    # 新增字段：记录本次解析实际使用的堆栈地址解析工具，便于回溯与对比环境
-    tool_name: Optional[str] = None          # 例如: "atos" / "addr2line" / "llvm-addr2line"
-                                              # 注：当系统仅有 llvm-symbolizer（缺少 llvm-addr2line / addr2line）时，
-                                              # 解析器会将 llvm-symbolizer 注册为 "llvm-addr2line" 的兼容回退，
-                                              # 此处仍记为 "llvm-addr2line"，可结合 tool_path 区分真实可执行文件。
-    tool_path: Optional[str] = None          # 例如: "/usr/bin/atos"
-    tools_available: Optional[Dict[str, str]] = None  # 当前环境中探测到的所有可用工具 {name: path}
-    resolution_source: Optional[str] = None  # 如 ios_log_symbolicated：无库时从已符号化日志回填
+    os_type: str = "unknown"
+    library_path: str = ""
+    # 例如: "atos" / "addr2line" / "llvm-addr2line"
+    # 当系统仅有 llvm-symbolizer（缺少 llvm-addr2line / addr2line）时，
+    # 解析器会将 llvm-symbolizer 注册为 "llvm-addr2line" 的兼容回退，
+    # 此处仍记为 "llvm-addr2line"，可结合 tool_path 区分真实可执行文件。
+    tool_name: Optional[str] = None
+    tool_path: Optional[str] = None
+    tools_available: Optional[Dict[str, str]] = None
+    # by_addr2line_tool | by_atos_tool | by_resolver_tool | log_symbolicated_passthrough
+    resolution_source: Optional[str] = None
+
+def _resolution_source_for_tool(tool_name: Optional[str]) -> str:
+    """正常工具链路径的 resolution_source（避免 null）。"""
+    if not tool_name:
+        return "by_resolver_tool"
+    t = str(tool_name).strip().lower()
+    if "atos" in t:
+        return "by_atos_tool"
+    if "addr2line" in t or "symbolizer" in t:
+        return "by_addr2line_tool"
+    return "by_resolver_tool"
+
 
 class Add2lineResolver:
     """增强的堆栈地址解析器，支持多种操作系统和工具"""
@@ -279,8 +307,17 @@ class Add2lineResolver:
         self.config_file = config_file
         self.library_dir = library_dir
         self.quick_mode = quick_mode
+        self._env_snapshot: Dict[str, Optional[str]] = {
+            "PATH": os.environ.get("PATH"),
+            "ANDROID_NDK_HOME": os.environ.get("ANDROID_NDK_HOME"),
+            "ANDROID_SDK_HOME": os.environ.get("ANDROID_SDK_HOME"),
+            "ANDROID_HOME": os.environ.get("ANDROID_HOME"),
+            "LLVM_HOME": os.environ.get("LLVM_HOME"),
+            "TOOLCHAIN_PATH": os.environ.get("TOOLCHAIN_PATH"),
+        }
         self.config = self._load_config_file()
-        self.os_type = self._detect_current_os()
+        self.host_os_type = self._detect_current_os()
+        self.os_type = self.host_os_type
         # 当系统未直接提供 llvm-addr2line / addr2line 但提供 llvm-symbolizer 时，
         # 我们会把 llvm-symbolizer 注册为 llvm-addr2line 的兼容回退；
         # 此字段记录该回退的真实可执行路径，调用 _resolve_with_addr2line 时据此切换命令行格式。
@@ -290,6 +327,41 @@ class Add2lineResolver:
         self._function_location_cache: Dict[str, Optional[Tuple[str, int]]] = {}
         
         # 仅在需要时使用 library_dir 查找库文件，不再构建显式白名单
+
+    def _restore_env_snapshot(self) -> None:
+        """恢复用于工具探测的关键环境变量，避免前一次探测污染下一次平台判定。"""
+        for key, value in self._env_snapshot.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _normalize_os_type(self, os_type: Optional[str]) -> Optional[str]:
+        """将平台标识规整为内部统一的枚举值。"""
+        if os_type is None:
+            return None
+        normalized = str(os_type).strip().lower()
+        if not normalized:
+            return None
+        alias_map = {
+            "openharmony": "harmonyos",
+            "harmony os": "harmonyos",
+            "harmony": "harmonyos",
+            "ohos": "harmonyos",
+        }
+        return alias_map.get(normalized, normalized)
+
+    def _is_harmonyos_affinity_path(self, path: str) -> bool:
+        lowered = str(path or "").lower()
+        return any(keyword in lowered for keyword in ["openharmony", "deveco", "harmony", "ohos"])
+
+    def _is_android_affinity_path(self, path: str) -> bool:
+        lowered = str(path or "").lower()
+        if any(keyword in lowered for keyword in ["android", "ndk"]):
+            return True
+        if "sdk" in lowered and not self._is_harmonyos_affinity_path(lowered):
+            return True
+        return False
 
     def _emit_progress(self, message: str) -> None:
         # CLI 端默认由 workflow 统一展示阶段进展，工具级细节写入 report 文件即可。
@@ -317,8 +389,8 @@ class Add2lineResolver:
                 # 相对路径，尝试多个位置
                 config_candidates.extend([
                     Path(self.config_file),
-                    root / "tools" / "configs" / self.config_file,
                     root / "configs" / self.config_file,
+                    root / "tools" / "configs" / self.config_file,  # legacy
                 ])
         else:
             # 默认配置文件位置：仅使用 .local.json，避免 base/local 双配置造成混淆
@@ -333,8 +405,9 @@ class Add2lineResolver:
                 cwd_configs / local_name,
             ])
 
-            # 项目配置目录
+            # 项目配置目录（根目录 configs/；tools/configs 为历史兼容）
             config_candidates.extend([
+                root / "configs" / local_name,
                 root / "tools" / "configs" / local_name,
             ])
 
@@ -650,6 +723,8 @@ class Add2lineResolver:
                 
                 # 额外读取「所有平台」声明的环境变量（例如在 macOS 上调试 Android 崩溃时，需要 ANDROID_NDK_HOME）
                 for os_key, plt_cfg in self.config["platforms"].items():
+                    if self.os_type == "harmonyos" and os_key == "android":
+                        continue
                     env_cfg = plt_cfg.get("environment_vars") or {}
                     for var_name, var_value in env_cfg.items():
                         if var_value and Path(var_value).exists():
@@ -847,7 +922,7 @@ class Add2lineResolver:
         """加载系统级环境变量"""
         try:
             # 尝试执行source命令加载环境变量
-            if self.os_type == "linux" or self.os_type == "macos":
+            if self.host_os_type == "linux" or self.host_os_type == "macos":
                 # 获取当前shell
                 shell = os.environ.get('SHELL', '/bin/bash')
                 if 'zsh' in shell:
@@ -882,17 +957,33 @@ class Add2lineResolver:
     def _get_extended_search_paths(self) -> List[str]:
         """获取扩展的搜索路径，包括环境变量中的工具路径"""
         search_paths = []
-        
+        seen_paths = set()
+        def _push(path: str) -> None:
+            if path and Path(path).exists() and path not in seen_paths and len(path) < 500:
+                search_paths.append(path)
+                seen_paths.add(path)
+
+        # HarmonyOS 先找 OpenHarmony / DevEco SDK，再回退到系统 LLVM。
+        if self.os_type == "harmonyos":
+            try:
+                from cli.main import _openharmony_sdk_dirs as _cli_openharmony_sdk_dirs  # type: ignore
+                for sdk_dir, _labels in _cli_openharmony_sdk_dirs():
+                    _push(str(sdk_dir))
+            except Exception as exc:  # pragma: no cover - 仅做防御性降级
+                logger.debug(f"未加载 CLI 端 OpenHarmony SDK 探测器: {exc}")
+
         # 添加标准PATH
         if 'PATH' in os.environ:
             # 清理PATH中的换行符和无效字符
             path_entries = os.environ['PATH'].split(':')
             for path_entry in path_entries:
                 if path_entry and '\n' not in path_entry and len(path_entry) < 500:  # 跳过包含换行符或过长的路径
-                    search_paths.append(path_entry)
+                    if self.os_type == "harmonyos" and self._is_android_affinity_path(path_entry):
+                        continue
+                    _push(path_entry)
         
         # 添加Android NDK路径
-        if 'ANDROID_NDK_HOME' in os.environ:
+        if self.os_type != "harmonyos" and 'ANDROID_NDK_HOME' in os.environ:
             ndk_home = os.environ['ANDROID_NDK_HOME']
             if '\n' not in ndk_home and len(ndk_home) < 500:  # 确保路径有效
                 ndk_paths = [
@@ -903,10 +994,11 @@ class Add2lineResolver:
                     f"{ndk_home}/toolchains/aarch64-linux-android-4.9/prebuilt/darwin-x86_64/bin",
                     f"{ndk_home}/toolchains/aarch64-linux-android-4.9/prebuilt/windows-x86_64/bin"
                 ]
-                search_paths.extend([p for p in ndk_paths if Path(p).exists()])
+                for p in ndk_paths:
+                    _push(p)
         
         # 添加Android SDK路径
-        if 'ANDROID_SDK_HOME' in os.environ:
+        if self.os_type != "harmonyos" and 'ANDROID_SDK_HOME' in os.environ:
             sdk_home = os.environ['ANDROID_SDK_HOME']
             if '\n' not in sdk_home and len(sdk_home) < 500:  # 确保路径有效
                 sdk_paths = [
@@ -914,7 +1006,8 @@ class Add2lineResolver:
                     f"{sdk_home}/tools",
                     f"{sdk_home}/tools/bin"
                 ]
-                search_paths.extend([p for p in sdk_paths if Path(p).exists()])
+                for p in sdk_paths:
+                    _push(p)
         
         # 添加LLVM路径
         if 'LLVM_HOME' in os.environ:
@@ -924,7 +1017,8 @@ class Add2lineResolver:
                     f"{llvm_home}/bin",
                     f"{llvm_home}/tools/bin"
                 ]
-                search_paths.extend([p for p in llvm_paths if Path(p).exists()])
+                for p in llvm_paths:
+                    _push(p)
         
         # 添加常见工具链路径
         common_toolchain_paths = [
@@ -938,45 +1032,41 @@ class Add2lineResolver:
             "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin",  # Xcode工具链
             "/Applications/Xcode.app/Contents/Developer/usr/bin"  # Xcode开发者工具
         ]
-        search_paths.extend([p for p in common_toolchain_paths if Path(p).exists()])
+        for p in common_toolchain_paths:
+            _push(p)
 
-        # 同步 IDE / SDK 默认安装路径（与 CLI 检测层保持一致）：
+        # 非 HarmonyOS 场景下，补充 IDE / SDK 默认安装路径（与 CLI 检测层保持一致）：
         #   Android Studio NDK / Xcode (xcrun) / DevEco Studio OpenHarmony SDK / Homebrew 多版本 / Linux LLVM 发行版包
-        # 采用懒导入避免与 cli.main 的循环依赖；闭源 / 打包场景缺失 cli 包时安全降级。
-        try:
-            from cli.main import _candidate_tool_dirs_from_ides as _cli_ide_paths  # type: ignore
-            for ide_path, _ide_labels in _cli_ide_paths():
-                p = str(ide_path)
-                if p and p not in search_paths and len(p) < 500:
-                    search_paths.append(p)
-        except Exception as exc:  # pragma: no cover - 仅做防御性降级
-            logger.debug(f"未加载 CLI 端 IDE 路径探测器: {exc}")
+        # HarmonyOS 已在前面单独加入 OpenHarmony SDK 搜索，避免 Android NDK 路径先到先得。
+        if self.os_type != "harmonyos":
+            try:
+                from cli.main import _candidate_tool_dirs_from_ides as _cli_ide_paths  # type: ignore
+                for ide_path, _ide_labels in _cli_ide_paths():
+                    _push(str(ide_path))
+            except Exception as exc:  # pragma: no cover - 仅做防御性降级
+                logger.debug(f"未加载 CLI 端 IDE 路径探测器: {exc}")
 
-        # 去重并过滤无效路径
-        valid_paths = []
-        seen_paths = set()
-        for path in search_paths:
-            if path and Path(path).exists() and path not in seen_paths and len(path) < 500:
-                valid_paths.append(path)
-                seen_paths.add(path)
-        
-        logger.debug(f"扩展搜索路径: {valid_paths}")
-        return valid_paths
+        logger.debug(f"扩展搜索路径: {search_paths}")
+        return search_paths
     
     def _find_tool_in_paths(self, tool_name: str, search_paths: List[str]) -> Optional[str]:
         """在指定路径中查找工具"""
-        # 首先尝试使用which命令
-        try:
-            result = subprocess.run(["which", tool_name], capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                tool_path = result.stdout.strip()
-                if self._test_tool_availability(tool_name, tool_path):
-                    return tool_path
-        except Exception:
-            pass
-        
+        # HarmonyOS 场景下不直接相信 which 的结果：
+        # 本机 PATH 里常会同时存在 Android NDK 的 llvm-addr2line，容易把 OpenHarmony 解析任务带偏。
+        if self.os_type != "harmonyos":
+            try:
+                result = subprocess.run(["which", tool_name], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    tool_path = result.stdout.strip()
+                    if self._test_tool_availability(tool_name, tool_path):
+                        return tool_path
+            except Exception:
+                pass
+
         # 在扩展路径中查找
         for search_path in search_paths:
+            if self.os_type == "harmonyos" and self._is_android_affinity_path(search_path):
+                continue
             tool_path = Path(search_path) / tool_name
             if tool_path.exists() and tool_path.is_file():
                 if self._test_tool_availability(tool_name, str(tool_path)):
@@ -1067,7 +1157,8 @@ class Add2lineResolver:
     
     def _show_environment_info(self):
         """显示当前环境信息，帮助调试"""
-        logger.info(f"当前操作系统: {self.os_type}")
+        logger.info(f"宿主机操作系统: {self.host_os_type}")
+        logger.info(f"解析目标平台: {self.os_type}")
         
         # 显示PATH信息
         if 'PATH' in os.environ:
@@ -1338,19 +1429,20 @@ class Add2lineResolver:
         )
         result = Add2lineResult(
             resolved_threads=resolved_threads,
-            os_type=meta_info.get("os_type", "unknown"),
-            library_path=library_dir_display or "",
+            resolved_registers=None,
             success_count=success_count,
             total_count=len(stack_frames),
             errors=errors,
-            tool_name="log_symbolicated_passthrough",
-            tool_path=None,
-            tools_available=self.resolver_tools or None,
-            resolution_source="log_symbolicated_passthrough",
             crash_thread_id=str(meta_info.get("crash_thread_id") or "") or None,
             crash_thread_name=str(meta_info.get("crash_thread_name") or "").strip() or None,
             crash_thread_is_main_thread=None,
             crash_thread_has_business_frames=bool(resolved_frames),
+            os_type=meta_info.get("os_type", "unknown"),
+            library_path=library_dir_display or "",
+            tool_name="log_symbolicated_passthrough",
+            tool_path=None,
+            tools_available=self.resolver_tools or None,
+            resolution_source="log_symbolicated_passthrough",
         )
         if filtered_count > 0:
             logger.info("log_symbolicated_passthrough 过滤噪音帧: %s", filtered_count)
@@ -1455,11 +1547,6 @@ class Add2lineResolver:
             resolved_function=semantic,
             resolved_file=self._normalize_resolved_file_name(frame.get("file")),
             resolved_line=Add2lineResolver._coerce_frame_line(frame.get("line")),
-            thread_tid=str(meta["tid"]) if meta.get("tid") is not None else None,
-            thread_name=str(meta["name"]).strip() if meta.get("name") else None,
-            thread_index=meta.get("thread_index"),
-            thread_is_crash_thread=meta.get("is_crash_thread"),
-            thread_is_main_thread=meta.get("is_main_thread"),
             resolution_kind=resolution_kind,
         )
 
@@ -1534,11 +1621,6 @@ class Add2lineResolver:
             line=Add2lineResolver._coerce_frame_line(frame.get("line")),
             raw_log_line=Add2lineResolver._coerce_frame_line(frame.get("raw_log_line")),
             module=module,
-            thread_tid=str(meta["tid"]) if meta.get("tid") is not None else None,
-            thread_name=str(meta["name"]).strip() if meta.get("name") else None,
-            thread_index=meta.get("thread_index"),
-            thread_is_crash_thread=is_crash_thread,
-            thread_is_main_thread=meta.get("is_main_thread"),
         )
 
         if not address:
@@ -1655,6 +1737,89 @@ class Add2lineResolver:
 
         unresolved = ResolvedFrame(**base_kw, resolution_kind="unresolved")
         return unresolved, False, f"无法解析地址: {address}"
+
+    def _build_resolved_registers(
+        self,
+        crash_data: Dict[str, Any],
+        library_files: List[Path],
+        selected_tool: Optional[str],
+    ) -> Optional[Dict[str, "ResolvedRegister"]]:
+        """符号化 01.registers.address_map 中 kind=code 且 module 命中 library_dir 的寄存器。
+
+        未命中 library_dir 的项（如系统 so）不写入 02；不计入栈帧 success_count。
+        """
+        registers = crash_data.get("registers") if isinstance(crash_data, dict) else None
+        if not isinstance(registers, dict):
+            return None
+        address_map = registers.get("address_map")
+        if not isinstance(address_map, dict) or not address_map:
+            return None
+        if not library_files:
+            return None
+
+        out: Dict[str, ResolvedRegister] = {}
+        for name, info in address_map.items():
+            if not isinstance(info, dict) or info.get("kind") != "code":
+                continue
+            va = str(info.get("va") or "").strip()
+            module = info.get("module")
+            module_str = module if isinstance(module, str) else ""
+            offset = info.get("offset")
+            offset_str = str(offset).strip() if offset is not None else ""
+
+            target_libs = match_libraries_for_module(
+                module_str if module_str else None, library_files
+            )
+            # 仅 library_dir 命中才写入（系统库等跳过）
+            if not target_libs:
+                continue
+
+            address_to_use = offset_str if offset_str else va
+            base = ResolvedRegister(
+                address=va,
+                module=module_str or None,
+                offset=offset_str or None,
+                kind="code",
+                resolution_kind="unresolved",
+            )
+            if not address_to_use:
+                out[str(name)] = base
+                continue
+
+            resolved: Optional[ResolvedFrame] = None
+            for lib_file in target_libs:
+                if selected_tool:
+                    tool_path = (
+                        self.resolver_tools.get(selected_tool)
+                        if isinstance(selected_tool, str)
+                        else selected_tool
+                    )
+                    if tool_path:
+                        resolved = self._resolve_address_with_tool(
+                            address_to_use, str(lib_file), selected_tool
+                        )
+                        if resolved and (resolved.resolved_function or resolved.resolved_file):
+                            break
+                if not resolved:
+                    for tool_name in self.resolver_tools:
+                        if tool_name == selected_tool:
+                            continue
+                        resolved = self._resolve_address_with_tool(
+                            address_to_use, str(lib_file), tool_name
+                        )
+                        if resolved and (resolved.resolved_function or resolved.resolved_file):
+                            break
+                if resolved and (resolved.resolved_function or resolved.resolved_file):
+                    break
+
+            if resolved and (resolved.resolved_function or resolved.resolved_file):
+                base.resolved_function = resolved.resolved_function
+                base.resolved_file = resolved.resolved_file
+                base.resolved_line = resolved.resolved_line
+                base.resolution_kind = "addr2line"
+            out[str(name)] = base
+
+        return out or None
 
     def _resolve_stack_trace_by_threads(
         self,
@@ -1832,22 +1997,28 @@ class Add2lineResolver:
 
         total_count = frame_count_resolvable_out if frame_count_resolvable_out > 0 else 0
 
+        resolved_registers = self._build_resolved_registers(
+            crash_data, library_files, selected_tool
+        )
+
         result = Add2lineResult(
             resolved_threads=resolved_threads,
-            os_type=crash_os_type,
-            library_path=library_dir,
+            resolved_registers=resolved_registers,
             success_count=success_count,
             total_count=total_count,
             errors=errors,
-            tool_name=selected_tool_name,
-            tool_path=selected_tool_path,
-            tools_available=self.resolver_tools or None,
             crash_thread_id=str(crash_thread_id) if crash_thread_id is not None else None,
             crash_thread_name=str(crash_thread_name).strip() if crash_thread_name else None,
             crash_thread_is_main_thread=crash_thread_is_main_thread,
             crash_thread_has_business_frames=crash_thread_has_business_frames,
             frame_count_total=frame_count_total,
             frame_count_resolvable=frame_count_resolvable,
+            os_type=crash_os_type,
+            library_path=library_dir,
+            tool_name=selected_tool_name,
+            tool_path=selected_tool_path,
+            tools_available=self.resolver_tools or None,
+            resolution_source=_resolution_source_for_tool(selected_tool_name),
         )
         logger.info(
             "多线程解析完成: success=%s total(02输出)=%s threads=%s "
@@ -1914,7 +2085,18 @@ class Add2lineResolver:
             lib_arg = library_dir if library_dir is not None else ""
             lib_norm = lib_arg.strip()
             self._emit_progress(f"📁 [add2line_resolver] 库路径: {lib_norm or '(未指定)'}")
-            crash_os_type = meta_info.get("os_type", "unknown")
+            crash_os_type = self._normalize_os_type(meta_info.get("os_type", "unknown")) or "unknown"
+            if crash_os_type in ['harmonyos', 'android', 'ios', 'linux', 'windows', 'macos'] and crash_os_type != self.os_type:
+                logger.info(
+                    "检测到崩溃平台为 %s，重新按崩溃平台探测堆栈地址解析工具（原解析平台: %s，宿主机: %s）",
+                    crash_os_type,
+                    self.os_type,
+                    self.host_os_type,
+                )
+                self._restore_env_snapshot()
+                self.os_type = crash_os_type
+                self.resolver_tools = self._find_resolver_tools()
+                self.primary_tool = self._select_primary_tool()
             lib_path_ok = bool(lib_norm) and Path(lib_norm).exists()
 
             if not lib_path_ok:
@@ -1967,21 +2149,21 @@ class Add2lineResolver:
                 logger.info(f"使用指定的库文件: {library_dir}")
             elif library_path.is_dir():
                 library_files = find_library_files_in_dir(
-                    library_dir, meta_info.get("os_type", "unknown"),
+                    library_dir, crash_os_type,
                 )
                 if not library_files:
                     logger.warning("未找到库文件")
                     return json.dumps({
                         "error": "未找到库文件",
                         "library_dir": library_dir,
-                        "os_type": meta_info.get('os_type', 'unknown')
+                        "os_type": crash_os_type
                     }, ensure_ascii=False, indent=2)
                 logger.info(f"在目录中找到 {len(library_files)} 个库文件")
             else:
                 raise ValueError(f"指定的路径既不是文件也不是目录: {library_dir}")
             
             logger.info(f"库目录: {library_dir}")
-            crash_os_type = meta_info.get('os_type', 'unknown')
+            crash_os_type = self._normalize_os_type(meta_info.get('os_type', 'unknown')) or 'unknown'
             logger.info(f"检测到操作系统: {crash_os_type}")
             
             # 根据崩溃日志的OS类型选择工具（支持所有平台）
@@ -2224,16 +2406,15 @@ class Add2lineResolver:
                 name=thread0.get("name"),
                 thread_index=thread0.get("thread_index") if thread0.get("thread_index") is not None else 0,
             )
+            resolved_registers = self._build_resolved_registers(
+                crash_data, library_files, selected_tool
+            )
             result = Add2lineResult(
                 resolved_threads=flat_threads,
-                os_type=meta_info.get('os_type', 'unknown'),
-                library_path=library_dir,
+                resolved_registers=resolved_registers,
                 success_count=success_count,
                 total_count=len(stack_frames),
                 errors=errors,
-                tool_name=selected_tool_name,
-                tool_path=selected_tool_path,
-                tools_available=self.resolver_tools or None,
                 crash_thread_id=str(meta_info.get("crash_thread_id") or "") or None,
                 crash_thread_name=str(meta_info.get("crash_thread_name") or "").strip() or None,
                 crash_thread_is_main_thread=(
@@ -2242,6 +2423,12 @@ class Add2lineResolver:
                     else None
                 ),
                 crash_thread_has_business_frames=bool(resolved_frames),
+                os_type=meta_info.get('os_type', 'unknown'),
+                library_path=library_dir,
+                tool_name=selected_tool_name,
+                tool_path=selected_tool_path,
+                tools_available=self.resolver_tools or None,
+                resolution_source=_resolution_source_for_tool(selected_tool_name),
             )
             
             logger.info(f"解析完成: {success_count}/{len(stack_frames)} 个地址成功解析（其中跳过 {filtered_count} 个不在 library_dir 中的库帧）")
@@ -3437,7 +3624,7 @@ def add2line_resolver(
             }
             如果提供，将优先使用这些路径
         config_file (Optional[str]): 可选的配置文件路径，如果不提供，将尝试从默认位置读取
-            配置文件格式见 tools/configs/add2line_resolver_config.local.example.json
+            配置文件格式见 configs/add2line_resolver_config.local.example.json
         max_frames (Optional[int]): 最大处理的堆栈帧数量，None 表示不限制（用于过滤噪音信息）
         quick_mode (bool): 快速模式（跳过慢速兜底策略，优先吞吐）
         

@@ -10,12 +10,17 @@ from typing import List, Optional
 
 from tools.crash_parser.android import _android_stack_sample_hint
 from tools.crash_parser.format_detect import detect_os_type
+from tools.crash_parser.log_sections import detect_raw_log_sections, extract_build_ids
 from tools.crash_parser.meta import extract_crash_info, extract_meta_info
 from tools.crash_parser.platform_threads import (
     apply_android_thread_metadata,
     parse_threads_android_harmony_tid,
     parse_threads_ios,
     parse_threads_single_block,
+)
+from tools.crash_parser.register_analyzer import (
+    build_registers_section,
+    enrich_registers_from_backtrace,
 )
 from tools.crash_parser.types import (
     CrashAnalysisResult,
@@ -67,6 +72,21 @@ def parse_crash_core(
 
     crash_info = extract_crash_info(content)
     meta_info = extract_meta_info(content)
+
+    # 推断性分析已迁移到 02b/04a_crash_diagnosis 模块
+    # signal_semantics 和 address_pattern 不再写入 01
+
+    build_ids = extract_build_ids(content)
+    registers, reg_module_bases = build_registers_section(
+        content, crash_info.crash_address
+    )
+    registers, bt_bases = enrich_registers_from_backtrace(registers, threads)
+    # 合并寄存器命中 so 的装载基址（不全量 maps）
+    merged_bases = dict(meta_info.module_base_addresses or {})
+    for mod, base in {**(reg_module_bases or {}), **(bt_bases or {})}.items():
+        if mod and base and mod not in merged_bases:
+            merged_bases[mod] = base
+
     meta_info = replace(
         meta_info,
         thread_count_total=thread_count_total_val,
@@ -75,6 +95,8 @@ def parse_crash_core(
         frames_removed_by_library_dir_filter=(
             removed_by_lib_filter if lib_filter_applied else None
         ),
+        build_ids=build_ids,
+        module_base_addresses=merged_bases or None,
     )
 
     parse_status = "ok"
@@ -94,6 +116,8 @@ def parse_crash_core(
         "卡顿",
         "fatal signal",
         "cmdline:",
+        "fault addr",
+        "signal ",
     ]
     has_header_hint = any(m in content_lower for m in header_markers)
     if _android_stack_sample_hint(content):
@@ -108,12 +132,16 @@ def parse_crash_core(
 
     raw_content = content if opts.save_raw_content else ""
 
+    raw_log_sections = detect_raw_log_sections(content) or None
+
     return CrashAnalysisResult(
-        threads=threads,
         crash_info=crash_info,
         meta_info=meta_info,
+        threads=threads,
         raw_content=raw_content,
-        parse_status=parse_status,
+        registers=registers,
         crash_backtrace_sum_count=crash_backtrace_count,
         crash_backtrace_index_set=crash_seg_req,
+        raw_log_sections=raw_log_sections,
+        parse_status=parse_status,
     )

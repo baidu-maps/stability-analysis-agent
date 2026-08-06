@@ -1,6 +1,6 @@
 # Crash log input formats
 
-This document describes what `--crash-log` accepts: **file extensions**, **how content is read**, and **which crash-report shapes** `crash_log_parser` can extract. Implementation lives under `tools/crash_parser/` (registry in `parsers.py`).
+This document describes what `--crash-log-file` / `--crash-log-content` / `--crash-log-dir` accept: **file extensions**, **how content is read**, and **which crash-report shapes** `crash_log_parser` can extract. Implementation lives under `tools/crash_parser/` (registry in `parsers.py`).
 
 ---
 
@@ -11,7 +11,7 @@ The CLI does **not** whitelist extensions. Any readable path works; parsing is *
 | Input | Supported |
 |-------|-----------|
 | File path (e.g. `.crash`, `.txt`, `.log`, `.json`, no extension) | Yes |
-| `--crash-log -` (stdin) | Yes |
+| `--crash-log-file -` (stdin) | Yes |
 | UTF-8 / UTF-8-BOM / UTF-16 text | Yes (auto fallback) |
 | RTF crash export | Yes (converted to plain text before parse) |
 | Binary / invalid encoding | Best-effort decode with errors ignored |
@@ -117,6 +117,6 @@ Do **not** fold vendor JSON field names into `stack_extract.py` regex paths; kee
 
 ## 6. Related docs
 
-- [CLI Commands Reference](../cli/CLI_COMMANDS_REFERENCE.md) — `--crash-log`, `--scope parse_log_only`
+- [CLI Commands Reference](../cli/CLI_COMMANDS_REFERENCE.md) — `--crash-log-file`, `--scope parse_log_only`
 - [CLI Guide](../cli/CLI_GUIDE.md) — end-to-end examples
 - Chinese summary: [CRASH_LOG_FORMATS.zh-CN.md](./CRASH_LOG_FORMATS.zh-CN.md)

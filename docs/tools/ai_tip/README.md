@@ -48,7 +48,7 @@
 ### 3.2 _get_guidance_for_prompt 内部逻辑
 
 - **有向量库时**：调用 `vector_db_analyzer.get_guidance_blocks(rule_ids, pattern_ids)`，按规则/模式命中查询表 `analysis_guidance_blocks`，得到若干条指导片段（含兜底：`pattern_id`/`rule_id` 为空的通用片段）；按 `priority`、`block_type` 排序后，将每条 `content` 用 `\n\n` 拼接成一大段。
-- **无向量库或查询结果为空**：从 **`default_guidance_blocks.json`** 加载默认片段列表（查找路径：仓库内 `tools/configs/default_guidance_blocks.json` 或当前工作目录下 `configs/default_guidance_blocks.json`），同样按顺序拼接各条 `content`。
+- **无向量库或查询结果为空**：从 **`default_guidance_blocks.json`** 加载默认片段列表（查找路径：仓库内 `configs/default_guidance_blocks.json` 或当前工作目录下 `configs/default_guidance_blocks.json`），同样按顺序拼接各条 `content`。
 - **占位符替换**：对上述拼接后的整段文本做替换：
   - `{{crash_function_name}}` → 从 `prompt_data["crash_func"]["name"]` 或 `prompt_data["crash_summary"]["function"]` 取，缺省为「崩溃函数」。
   - `{{related_funcs_desc}}` → 从 `prompt_data["related_fun"]` 取前若干项函数名拼接（如「`funcA`、`funcB` 等」），无则为「同一类中的其他函数」。
@@ -96,6 +96,6 @@
 | 拼装完整提示词（顺序/图模式） | `agent/ai_stability_agent.py` | `_build_full_prompt`、`_get_guidance_for_prompt` |
 | 规则/向量召回与 memory_context | 同上 | `_render_memory_context` |
 | 指导片段表与 API | `tools/core/rag/metadata_store.py`、`vector_database_integration.py` | `analysis_guidance_blocks`、`get_guidance_blocks`、`add_guidance_block` |
-| 默认指导片段 JSON | `tools/configs/default_guidance_blocks.json` | 兜底内容 |
+| 默认指导片段 JSON | `configs/default_guidance_blocks.json` | 兜底内容 |
 
 CLI 将上述最终提示词通过 `TOOL_OUTPUT:ai_prompt:` 或 `TOOL_OUTPUT:ai_analysis:` 输出，并写入报告目录下按轮次子目录 **round_N/05_ai_prompt.md**（单轮为 round_0，多轮为 round_0、round_1、…）。详见 `doc/cli_reports/README.md`。

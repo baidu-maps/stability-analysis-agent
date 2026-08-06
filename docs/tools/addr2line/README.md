@@ -9,7 +9,7 @@
 
 配置与示例以 **`add2line_resolver_config.local.json`** 为主（见下文加载顺序）；仓库内提供示例：
 
-- `tools/configs/add2line_resolver_config.local.example.json`
+- `configs/add2line_resolver_config.local.example.json`
 
 ## 2. 配置文件说明
 
@@ -18,7 +18,7 @@
 解析器默认按候选路径**依次查找**该文件名（先找到者生效），例如：
 
 - 当前工作目录下 `configs/add2line_resolver_config.local.json`（便于发布产物同目录配置）
-- 仓库内 `tools/configs/add2line_resolver_config.local.json`
+- 仓库内 `configs/add2line_resolver_config.local.json`
 - 用户目录 `~/.config/stability-analysis-agent/add2line_resolver_config.local.json`
 
 也可通过环境变量 **`STABILITY_AGENT_ADD2LINE_CONFIG_FILE`** 指定单一绝对路径，覆盖上述候选列表。
@@ -29,7 +29,7 @@
 - **`tool_paths`**：额外搜索路径，为 **字符串数组**；每项必须是**目录**的绝对路径（目录内需能直接找到 `llvm-addr2line`、`addr2line`、`atos` 等之一）。交互式 CLI 的「手动设置符号化工具绝对路径」允许用户输入**可执行文件的绝对路径**，保存时会写入其**父目录**到 `tool_paths`。
 - **`environment_vars`**（可选）：键为环境变量名，值为**工具链安装根目录**（如 `ANDROID_NDK_HOME` 指向 NDK 根路径）。解析器对已知键名会推导其下的 `bin` 等子路径。该块常由 CLI **「自动获取」**或**快速开始**前的静默自动写入生成；高级用户也可手编 JSON 维护。
 
-示例与字段注释见：`tools/configs/add2line_resolver_config.local.example.json`。
+示例与字段注释见：`configs/add2line_resolver_config.local.example.json`。
 
 ### 2.2 与交互式 CLI 的关系
 

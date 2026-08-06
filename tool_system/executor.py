@@ -34,6 +34,7 @@ class ConfigDrivenExecutor:
         """
         self.registry = registry
         self.config = config
+        self.last_execution_events: List[Dict[str, Any]] = []
 
         # 初始化 LLM 适配器
         if llm_adapter is None:
@@ -174,7 +175,9 @@ class ConfigDrivenExecutor:
             config=self.config.metadata
         )
 
-        return workflow.solve(problem, context)
+        result = workflow.solve(problem, context)
+        self.last_execution_events = list(context.execution_events)
+        return result
 
     def execute_workflow_stream(self, name: str, problem: Dict[str, Any]) -> Generator[str, None, None]:
         """执行工作流（流式版本）"""

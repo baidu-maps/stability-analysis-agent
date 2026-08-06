@@ -1,0 +1,107 @@
+{
+  "version": "1.0.0",
+  "description": "证据模板库 —— 按故障模式关联的典型证据模式和修复策略",
+  "templates": [
+    {
+      "fault_pattern": "null_deref",
+      "evidence_indicators": [
+        "SIGSEGV + 故障地址 < 0x1000",
+        "EXC_BAD_ACCESS (code=1, address=0x0)",
+        "栈顶函数解引用操作 (->member, *ptr)"
+      ],
+      "typical_root_causes": ["未初始化指针", "对象已释放", "API返回null未检查"],
+      "fix_strategies": ["添加 null 检查", "使用 optional/nullable 类型", "确认对象生命周期"]
+    },
+    {
+      "fault_pattern": "use_after_free",
+      "evidence_indicators": [
+        "ASan: heap-use-after-free",
+        "GWP-ASan: use-after-free",
+        "故障地址含 0x6b6b (freed memory fill)",
+        "栈中含 destructor + 异步回调"
+      ],
+      "typical_root_causes": ["异步回调持有裸指针", "observer未反注册", "容器迭代中删除"],
+      "fix_strategies": ["使用 weak_ptr/weak引用", "析构时注销所有回调", "使用 copy-on-write 迭代"]
+    },
+    {
+      "fault_pattern": "double_free",
+      "evidence_indicators": [
+        "ASan: double-free",
+        "malloc: double free detected",
+        "栈中连续出现 free/delete"
+      ],
+      "typical_root_causes": ["所有权不清晰", "智能指针+手动delete混用", "异常路径重复释放"],
+      "fix_strategies": ["统一使用智能指针管理", "释放后置空指针", "RAII 资源管理"]
+    },
+    {
+      "fault_pattern": "stack_overflow",
+      "evidence_indicators": [
+        "crash_reason 含 'stack overflow'",
+        "栈中同一函数重复出现 3+ 次",
+        "SIGSEGV + SP 附近的地址"
+      ],
+      "typical_root_causes": ["递归无终止条件", "互递归无深度限制", "栈帧过大(大数组)"],
+      "fix_strategies": ["添加递归深度限制", "改为迭代实现", "大数组改为堆分配"]
+    },
+    {
+      "fault_pattern": "deadlock",
+      "evidence_indicators": [
+        "ANR/Freeze + 主线程阻塞在 lock",
+        "多线程持有不同锁等待对方",
+        "pthread_mutex_lock 长时间不返回"
+      ],
+      "typical_root_causes": ["AB-BA 锁序", "锁内同步调用", "条件变量虚假唤醒未重检"],
+      "fix_strategies": ["统一锁序规范", "使用 try_lock + 超时", "减小锁粒度"]
+    },
+    {
+      "fault_pattern": "data_race",
+      "evidence_indicators": [
+        "TSan: data race",
+        "同一变量在多线程无保护读写",
+        "崩溃位置随机变化(非固定地址)"
+      ],
+      "typical_root_causes": ["共享变量无锁保护", "STL容器多线程读写", "全局单例非线程安全"],
+      "fix_strategies": ["加 mutex/atomic 保护", "使用线程安全容器", "thread_local 隔离"]
+    },
+    {
+      "fault_pattern": "buffer_overflow",
+      "evidence_indicators": [
+        "ASan: heap-buffer-overflow / stack-buffer-overflow",
+        "写入超出分配大小",
+        "canary/guard page 被触发"
+      ],
+      "typical_root_causes": ["循环边界错误(off-by-one)", "memcpy/strcpy长度不匹配", "动态数组未扩容"],
+      "fix_strategies": ["使用 bounded 函数(strncpy等)", "添加长度校验", "使用 std::vector/std::string"]
+    },
+    {
+      "fault_pattern": "abort_assert",
+      "evidence_indicators": [
+        "SIGABRT + abort/assert in stack",
+        "__assert_fail / __assert_rtn",
+        "crash_reason 含 assertion"
+      ],
+      "typical_root_causes": ["业务逻辑前置条件不满足", "系统框架 precondition 违规", "资源耗尽触发 fatal"],
+      "fix_strategies": ["检查并修复触发assert的条件", "添加更早的错误处理", "改 assert 为错误恢复"]
+    },
+    {
+      "fault_pattern": "heap_corruption",
+      "evidence_indicators": [
+        "malloc/free 内部崩溃",
+        "metadata/freelist 损坏",
+        "崩溃位置在 allocator 内部(jemalloc/tcmalloc)"
+      ],
+      "typical_root_causes": ["越界写踩邻接堆块", "UAF后被重新分配覆写", "多线程非原子操作"],
+      "fix_strategies": ["启用 ASan 定位越界写入源", "使用带 guard page 的分配器", "code review 邻近内存操作"]
+    },
+    {
+      "fault_pattern": "type_confusion",
+      "evidence_indicators": [
+        "dynamic_cast 返回 null 后解引用",
+        "vtable 指针异常",
+        "reinterpret_cast 类型不匹配"
+      ],
+      "typical_root_causes": ["向下转型未检查", "对象被错误类型覆写", "多态继承层级不一致"],
+      "fix_strategies": ["dynamic_cast 后检查 nullptr", "使用 variant/tagged union", "避免 reinterpret_cast"]
+    }
+  ]
+}

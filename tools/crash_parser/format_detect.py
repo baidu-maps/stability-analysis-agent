@@ -13,6 +13,37 @@ _IOS_OS_VERSION_RE = re.compile(r"^\s*OS Version:\s*iOS\b", re.MULTILINE | re.IG
 _IOS_HW_MODEL_RE = re.compile(
     r"^\s*Hardware Model:\s*(iPhone|iPad|iPod)\b", re.MULTILINE | re.IGNORECASE
 )
+_HARMONY_NATIVE_PC_LINE_RE = re.compile(
+    r"(?m)^\s*(?:native:\s*)?#\d+\s+pc\s+[0-9a-fA-Fx]+\s+\S+",
+    re.IGNORECASE,
+)
+
+
+def _detect_harmony_native_stack(content: str) -> bool:
+    """
+    鸿蒙 / OpenHarmony native PC 栈常见形态：
+    - ``#00 pc ... /data/storage/.../bundle/libs/...``
+    - ``#00 pc ... /system/lib/ld-musl-aarch64.so.1``
+
+    这类日志在没有显式 ``Harmony`` / ``OpenHarmony`` 关键词时，容易被通用 C++
+    兜底误判成 iOS，因此这里单独提前识别。
+    """
+    if not content:
+        return False
+    cl = content.lower()
+    if not _HARMONY_NATIVE_PC_LINE_RE.search(content):
+        return False
+    if any(
+        marker in cl
+        for marker in (
+            "/data/storage/",
+            "/bundle/libs/",
+            "ld-musl-aarch64.so.1",
+            "ld-musl-aarch64.so",
+        )
+    ):
+        return True
+    return False
 
 
 def _detect_apple_ios_truncated_crash(content: str) -> bool:
@@ -119,6 +150,10 @@ def detect_os_type(content: str) -> str:
         or "com.ohos." in content_lower
         or re.search(r"\bohos\b", content_lower)
     ):
+        return "harmonyos"
+
+    # 鸿蒙 native #pc 栈：没有显式 Harmony 关键字时，也先识别为 HarmonyOS。
+    if _detect_harmony_native_stack(content):
         return "harmonyos"
 
     # Android 相关特征（避免使用过于宽泛的 'art' 单独匹配）

@@ -76,6 +76,8 @@ class TestCodeLocationTrace(unittest.TestCase):
                     {
                         "thread_id": "1",
                         "thread_name": "main",
+                        "tid": "1",
+                        "name": "main",
                         "is_crash_thread": True,
                         "is_main_thread": True,
                         "frames": [
@@ -84,10 +86,6 @@ class TestCodeLocationTrace(unittest.TestCase):
                                 "resolved_function": "Worker::Loop()",
                                 "resolved_file": "proj/src/crash.cpp",
                                 "resolved_line": 5,
-                                "thread_tid": "1",
-                                "thread_name": "main",
-                                "thread_is_crash_thread": True,
-                                "thread_is_main_thread": True,
                             }
                         ],
                     }
@@ -134,6 +132,8 @@ class TestCodeLocationTrace(unittest.TestCase):
                     {
                         "thread_id": "worker-tid",
                         "thread_name": "worker",
+                        "tid": "worker-tid",
+                        "name": "worker",
                         "is_crash_thread": False,
                         "is_main_thread": False,
                         "frames": [
@@ -142,10 +142,6 @@ class TestCodeLocationTrace(unittest.TestCase):
                                 "resolved_function": "Worker::Loop()",
                                 "resolved_file": "proj/src/queue.cpp",
                                 "resolved_line": 4,
-                                "thread_tid": "worker-tid",
-                                "thread_name": "worker",
-                                "thread_is_crash_thread": False,
-                                "thread_is_main_thread": False,
                             }
                         ],
                     }
@@ -158,16 +154,12 @@ class TestCodeLocationTrace(unittest.TestCase):
                 }
             )
             self.assertNotIn("error", out)
-            summary = out.get("crash_summary") or {}
-            self.assertNotIn("crash_line_number", summary)
-            self.assertNotIn("crash_line_code", summary)
-            self.assertNotIn("stack_address", summary)
-            self.assertNotIn("analysis_entry", summary)
-            self.assertEqual(summary.get("crash_thread", {}).get("id"), "main-tid")
-            loc = summary.get("crash_location") or {}
-            self.assertIn("location_type", loc)
-            self.assertNotIn("line", loc)
-            self.assertNotIn("file", loc)
+            # 解耦重构后：crash_summary 不再写入 03 输出
+            # 验证 03 输出中确实不含 crash_summary
+            self.assertNotIn("crash_summary", out)
+            # 验证 graph 和 location_trace 仍存在
+            self.assertIn("graph", out)
+            self.assertIn("location_trace", out)
 
 
 if __name__ == "__main__":

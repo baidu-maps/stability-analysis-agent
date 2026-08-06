@@ -1,7 +1,7 @@
 <h1 align="center">Stability Analysis Agent</h1>
 <p align="center">
-  <strong>🐛 When your app crashes, sa-agent fixes it end-to-end — from the bug ticket to the verified, packaged fix.</strong><br>
-  <sub>An open-source Agent for <b>app-stability repair</b>. It solves stability problems class by class; <b>Crash fix is what ships first</b>. ANR / OOM / Freeze / memory leak follow the same framework as they mature.</sub>
+  <strong>🐛 When your app crashes <em>or freezes</em>, sa-agent turns the log into evidence — then into a fix.</strong><br>
+  <sub>An open-source Agent for <b>app-stability repair</b>. Deterministic toolchain first (registers · ANR · memory · business path), LLM patch second. <b>Crash auto-fix ships today</b>; ANR / OOM / Freeze analysis already runs on the same pipeline.</sub>
 </p>
 <p align="center">
   <a href="https://pypi.org/project/stability-analysis-agent/"><img src="https://img.shields.io/pypi/v/stability-analysis-agent.svg" alt="PyPI"></a>
@@ -9,10 +9,20 @@
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python"></a>
   <a href="https://pypi.org/project/stability-analysis-agent/#files"><img src="https://img.shields.io/badge/wheel-py3--none--any-success.svg" alt="Wheel"></a>
   <a href="./CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"></a>
+  <a href="./CHANGELOG.md"><img src="https://img.shields.io/badge/Maintained-yes-success.svg" alt="Maintained"></a>
   <a href="./stability-analysis-agent-skill/"><img src="https://img.shields.io/badge/skills-claude%20code%20%7C%20cursor-purple.svg" alt="Skill Pack"></a>
 </p>
 <p align="center">
   <b>English</b> | <a href="./README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
+  <sub>
+    <b>Maintenance:</b> actively maintained ·
+    meaningful changes → <a href="https://github.com/baidu-maps/stability-analysis-agent/releases">GitHub Releases</a>
+    (aim for about monthly when there is substance; not a calendar SLA) ·
+    see <a href="./CHANGELOG.md">CHANGELOG</a>
+  </sub>
 </p>
 
 ---
@@ -20,26 +30,31 @@
 ### What this is — and what isn't
 
 `Stability Analysis Agent` is an **app-stability repair framework**. It treats
-crashes, ANRs, OOMs, freezes, memory leaks, watchdog kills — every class of
-stability problem — as a first-class repair target.
+crashes, ANRs, OOMs, freezes, memory pressure, watchdog kills — every class of
+stability problem — as a first-class analysis (and eventually repair) target.
 
-It does **not** ship generic-prompt tooling. The Agent reads a real crash log,
-runs the native toolchain (`addr2line` / `atos`), reads source context, and
-**auto-fixes** the offending code with backup. Then it hands control off to
-the rest of the closed loop (verify / package / ship).
+It does **not** ship generic-prompt tooling. The Agent reads a real crash /
+AppFreeze / ANR log, runs the native toolchain (`addr2line` / `atos`),
+builds a **deterministic evidence chain** (PC → symbols → optional disassembly →
+registers → ANR hotspots / EventHandler → memory clues → pre-crash business path),
+then — for Crash — **auto-fixes** the offending code with backup. Verify /
+package / ship stay in the closed-loop Skills.
 
-It does **not** ship every workflow at once. The framework is open-ended
-long-term, but the first production scope is **Crash fix**. ANR, OOM and Freeze
-are on the roadmap — when those land they get their own dedicated workflows
-under the same framework, not a v2 product. Today: **Crash in, Crash fixed,
-Crash shipped**.
+It does **not** claim every stability class is fully auto-fixed yet.
+**Crash auto-fix is production-ready.** ANR / Freeze / memory-pressure /
+timeline diagnosis already land as structured reports (`04a`–`04e`) and feed
+the LLM prompt — dedicated auto-fix workflows for those classes keep maturing
+under the same framework, not as a separate “v2 product”.
 
 ## Why we are not another AI coding tool
 
 | | Cursor / Copilot / Claude Code | Stability Analysis Agent |
 |---|---|---|
-| **What it does to a crash log** | Reads it like any other text — analyzes, sometimes suggests a fix | **Auto-fixes** it: parse → symbolize → read source → produce a patch → apply locally with backup |
-| **Native toolchain (`addr2line` / `atos`)** | Cannot run them | First-class integration — addresses get resolved before any LLM call |
+| **What it does to a crash / ANR log** | Reads it like any other text — analyzes, sometimes suggests a fix | **Tool-first**: parse → symbolize → evidence compass → (Crash) patch + apply with backup |
+| **Native toolchain (`addr2line` / `atos`)** | Cannot run them | First-class — addresses resolve *before* any LLM call |
+| **Registers / fault address / near-null** | Guess from the log text | Deterministic register & fault-pattern diagnosis (`04a`) |
+| **ANR / AppFreeze / freeze** | Paste the traces and hope | Dedicated ANR workflow: hotspots, EventHandler queue, IPC hints (`04c`) |
+| **“What was the user doing?”** | Manual logcat archaeology | Pre-crash timeline + business-path extraction (`04e`) |
 | **Knowledge accumulation** | Stateless across conversations | RAG rule table + vector DB, patterns improve over time |
 | **Multi-step reasoning** | Single prompt, one shot | LangGraph state machine — Agent can request more context and re-invoke tools |
 | **Bug-tracker integration** | None out of the box | `bug-platform-fetcher` Skill wires in any ticket system |
@@ -51,18 +66,16 @@ Crash shipped**.
 > **Scope of "auto-fix"**, in this repo:
 > `parse → symbolize → extract code context → propose patch → apply locally with backup`. After that the Agent **hands off** to a human or to the closed-loop Skills (verify / package) — it does not push to `main`, open PRs, or bypass code review. The Loop is open, not headless.
 
-### "Crash fix" today, more tomorrow
+### What you get today
 
-Current scope = **Crash fix**. Supported crash kinds include null pointer,
-div-zero, abort, double free, deadlocks / race conditions / atomic failures,
-stack overflow, OOM-on-crash dumps, etc. The closed loop below describes
-how we wire Crash fix.
-
-Planned next (each as its own workflow under the same framework, no v2):
-
-- **ANR** analysis — Android `am_anr`, iOS watchdog, Harmony AppFreeze.
-- **OOM / memory** analysis — heap snapshot diffing.
-- **Freeze / hang** detection — stack sampling + thread state.
+| Layer | Status | What you can run |
+|-------|--------|------------------|
+| **Crash auto-fix** | ✅ GA | Null deref, abort, double-free, races, stack overflow, … → patch + apply |
+| **Crash evidence diagnosis** | ✅ GA | Registers, maps, optional PC disassembly, evidence compass (`04a`) |
+| **ANR / AppFreeze / freeze analysis** | ✅ GA (analysis) | Auto-route to `anr_freeze_analysis`; hotspots + EventHandler (`04c`) |
+| **Memory pressure / OOM clues** | ✅ GA (sidepath) | Log-side RSS/PSS/heap hints + fault-mode match (`04d`); heap-diff auto-fix still planned |
+| **Pre-crash business path** | ✅ GA (sidepath) | logcat / HiLog / ASI timeline → lifecycle & click path (`04e`) |
+| **ANR / OOM / Freeze auto-fix** | 🚧 maturing | Same framework; patch workflows land class-by-class |
 
 [Full roadmap →](#roadmap)
 
@@ -99,6 +112,7 @@ and `sa-agent` becomes an end-to-end stability engineering agent.
 | You need to… | Jump to |
 |---|---|
 | Auto-fix the crash log you already have | [Quick Start — 60 seconds](#quick-start) |
+| Diagnose ANR / AppFreeze without `.so` or an API key | `--scope parse_stack_only` → see [Evidence-driven diagnosis](#evidence-driven-diagnosis-why-developers-stick-around) |
 | Pull a ticket from your bug tracker and let the Agent auto-fix | `4) 根据缺陷管理平台自动修复` (run `bug-platform-fetcher`) → `1) 快速开始修复` |
 | Verify the fix with your project's tests | `6) 自动验证修复结果` (run `automation-testing`) |
 | Ship a fixed artifact to CI / a release channel | `7) 自动生成修复后的新包` (run `cicd-pipeline`) |
@@ -133,7 +147,8 @@ The presets ship as skeletons — only `SKILL.md` + `skill.json`. You fill in th
 
 ### Pick what you need to know next
 
-- 🙋 **"I just want to auto-fix a crash log."** → [Quick Start](#quick-start) — 60 seconds, no LLM key required.
+- 🙋 **"I just want to auto-fix a crash log."** → [Quick Start](#quick-start) — 60 seconds, no LLM key required for diagnosis.
+- 🔬 **"I want registers / ANR / business path without calling the LLM."** → [Evidence-driven diagnosis](#evidence-driven-diagnosis-why-developers-stick-around).
 - 🛠 **"I want to script `sa-agent` from my own tool / IDE / CI."** → [Python API](#python-api) + [Daemon Mode](#daemon-mode).
 - 🧩 **"I want to extend the agent with my own Tool / Workflow / Skill."** → [For Developers](#for-developers--four-ways-to-contribute).
 
@@ -211,18 +226,61 @@ input your own paths through the same flow.
 
 | Feature | Description |
 |---------|-------------|
-| **End-to-End Auto-Fix Loop** | Crash → auto-fix (parse + symbolize + patch + apply) → verify → ship, stitched from 4 `Skill` presets |
-| **Crash-Fix Focus, Framework-Depth** | Ships Crash fix first; ANR / OOM / Freeze plug into the same framework as dedicated workflows |
-| **Address Symbolization** | Resolves raw addresses to function names & line numbers via `addr2line` / `atos` (runs *before* the LLM) |
-| **Structured Log Parsing** | Auto-detects iOS / Android / macOS / Linux / Windows; classifies Crash / ANR / OOM / freeze; extracts signal, threads, key frames |
-| **Source Code Context** | Reads source files around the crash site so the Agent sees real code, not just addresses |
-| **RAG Knowledge Base** | Rule table (fast path) + vector retrieval (ChromaDB) with feedback loop |
-| **`sa-agent` Auto-Fix Core** | Direct / LangChain / LangGraph engines — all run the same auto-fix pipeline, no LLM needed for the deterministic parts |
-| **Tool + Workflow System** | Pluggable architecture — register custom tools and workflows via config or decorators |
-| **Skill System** | Discover / install / lint / init / run Claude-style `SKILL.md` skills, or bridge them into the existing Tool / Workflow runtime |
-| **`extensions/` plugins** | Drop-in user-level Tool / Workflow directory at `~/.config/stability-analysis-agent/extensions/` |
-| **External Agent Skill Pack** | Bundled [`stability-analysis-agent-skill/`](./stability-analysis-agent-skill/) — teach Claude Code / Cursor how to call `sa-agent` |
-| **Multiple Interfaces** | CLI, HTTP Daemon (streaming / SSE), Python API |
+| **End-to-End Auto-Fix Loop** | Crash → auto-fix (parse + symbolize + patch + apply) → verify → ship, stitched from Skill presets |
+| **Three-Level Root Cause Library** | 68 fault-mode rules with L1→L2→L3 classification (type → mechanism → specific cause); deterministic matching *before* any LLM call |
+| **Evidence Grading (Tier 1–5)** | Every conclusion carries a confidence label: detector report (HIGH) > register+address (HIGH) > multi-stack (MEDIUM) > single feature (LOW) > speculation (LOW) |
+| **Signal Sub-Code Semantics** | SEGV_MAPERR, SEGV_ACCERR, BUS_ADRALN, FPE_INTDIV, ILL_ILLOPC — 20+ sub-codes decoded to human-readable root-cause hints at parse time |
+| **Crash Address Pattern Analysis** | Near-zero → null pointer; 0x6b6b → UAF (freed-memory fill); 0xDEADBEEF → debug poison; stack/heap region classification |
+| **Register Correlation** | Extracts ARM64/ARM32/x86_64 register dumps; detects NULL registers, UAF patterns, crash-address matches |
+| **Stack Layer Classification** | Separates crash frame / first non-runtime / first app frame — prevents system-frame misattribution |
+| **Selective Knowledge Loading** | Module→knowledge-domain routing (14 mappings); RAG only searches relevant patterns, reducing noise |
+| **Deterministic Pre-Analysis** | `null_pointer` / `abort` / `divide_by_zero` / `stack_overflow` / `ASan report` confirmed with 100% confidence *before* LLM |
+| **Responsibility Attribution** | Per-platform path rules (Android/iOS/HarmonyOS/macOS/Linux) classify modules as application / system / vendor / third-party |
+| **Business Flow Analysis** | Pre-crash logcat/HiLog/syslog → operation path inference (lifecycle → network → database → user_action → crash) |
+| **EventHandler + Binder Chain** | ANR queue-depth analysis + IPC call-graph traversal + deadlock-cycle detection |
+| **Stack Hotspot Statistics** | Function frequency counting, blocking-indicator detection (mutex/futex/IO), repeated call-pattern discovery |
+| **Optional Disassembly** | `llvm-objdump` / `objdump` wrapper — PC-nearby instructions, access direction, involved registers (only when binary provided) |
+| **Structured Report Schema** | 7-section output format enforced on LLM: fault info → 3-level root cause → evidence chain → confidence → responsibility → fix → follow-up |
+| **Crash + ANR on one CLI** | Auto `log_kind` routing: Crash → `crash_analysis`; AppFreeze / ANR traces → `anr_freeze_analysis`; mixed cases handled by confidence-based primary/secondary |
+| **Address Symbolization** | `addr2line` / `atos` resolve raw addresses to function + line *before* any LLM call |
+| **Structured Log Parsing** | iOS / Android / macOS / Linux / Windows / Harmony; Crash · ANR · OOM · Freeze classification |
+| **RAG Knowledge Base** | Rule table (fast path) + vector retrieval (ChromaDB) + three-level fault-mode library + evidence templates |
+| **Tool + Workflow + Skill** | Pluggable tools/workflows + Claude-style skills + `extensions/` drop-ins |
+| **External Agent Skill Pack** | Teach Claude Code / Cursor to call `sa-agent` correctly |
+| **Multiple Interfaces** | CLI, HTTP Daemon (SSE), Python API |
+
+### Evidence-driven diagnosis (why developers stick around)
+
+Paste a log. Get **structured reports**, not a wall of model prose. Even with
+`--scope parse_stack_only` and **no library / no LLM key**, you still get
+actionable JSON:
+
+| Report | What it answers |
+|--------|-----------------|
+| `01` parse | Signal + sub-code semantics, threads, `log_kind` (crash / app_freeze / anr_trace / oom…), **address pattern analysis** |
+| `02` maps | Memory map / module layout when present |
+| `03` symbolize | Function + file:line (or skipped cleanly without `.so`), **stack layer classification** (crash frame / non-runtime / app frame) |
+| **`04a` crash diagnosis** | **Three-level root cause** (L1→L2→L3), fault pattern, **registers**, near-null, optional **disassembly**, **evidence compass** (PC → symbol → insn → reg), **deterministic facts**, **evidence grade (Tier 1–5)** |
+| **`04c` ANR / Freeze** | Stack hotspots, **EventHandler** queue (incl. Harmony AppFreeze dump), **Binder/IPC chain** (deadlock detection), blocking indicators |
+| **`04d` memory pressure** | RSS/PSS/heap/FD clues + leak-mode keyword match (sidepath / `--force-memory-analysis`) |
+| **`04e` business path** | Pre-crash logcat / HiLog / ASI timeline → **lifecycle & operation path inference** (*what the user was doing*) |
+| `05` RAG memory | **Fault-mode library match** (68 rules) + evidence grade + knowledge-domain routing + similar patterns |
+| `06` / `07` | Structured 7-section report (when LLM engaged): fault info → 3-level root cause → evidence chain → confidence → responsibility → fix → follow-up |
+
+```bash
+# Crash evidence only — no code-root, no API key
+sa-agent --crash-log ./app.crash --library-dir ./lib --scope parse_stack_only
+
+# Harmony AppFreeze / Android ANR — no .so required
+sa-agent --crash-log ./appfreeze.txt --scope parse_stack_only
+
+# Force memory / timeline sidepaths on a rich dump
+sa-agent --crash-log ./crashInfos.txt --scope parse_stack_only \
+  --force-memory-analysis --force-timeline-analysis
+```
+
+Design notes: [docs/architecture/fault_mode_library.md](./docs/architecture/fault_mode_library.md) ·
+CLI report layout: [docs/cli/CLI_COMMANDS_REFERENCE.md](./docs/cli/CLI_COMMANDS_REFERENCE.md).
 
 ## Architecture
 
@@ -275,15 +333,35 @@ input your own paths through the same flow.
    └──────────────────────────────────────────────────────────────────┘
 ```
 
-**Auto-Fix Pipeline:**
+**Diagnosis + Auto-Fix Pipeline:**
 
 ```
-Crash Log → Parse → Symbolize → Read Source → Propose Patch → Apply Locally (with backup)
-                                  ▲                              │
-                                  │         RAG (rules + vectors) │
-                                  └────────   Request more context ┘
-                                                            ↓
-                                                       Fix Report + Patched Files
+Crash / ANR / AppFreeze Log
+        │
+        ▼
+   Parse (01) ──log_kind──▶ crash_analysis  or  anr_freeze_analysis
+        │          │
+        │          ├─ Signal sub-code semantics (SEGV_MAPERR → UAF/OOB hint)
+        │          └─ Address pattern analysis (near-zero / 0x6b / poison)
+        │
+        ▼
+   Maps (02) → Symbolize (03) → Stack Layer Classification
+        │                          (crash_frame / non_runtime / app_frame)
+        │
+        ├─▶ 04a evidence  (registers · fault analysis · disasm · evidence compass)
+        │       ├─ Deterministic Analyzer (null ptr / abort / SIGFPE = 100% facts)
+        │       ├─ Three-Level Fault Mode Matcher (68 rules: L1→L2→L3)
+        │       ├─ Evidence Grader (Tier 1–5, HIGH/MEDIUM/LOW)
+        │       └─ Responsibility Attribution (app / system / vendor / 3rd-party)
+        │
+        ├─▶ 04c ANR       (hotspots · EventHandler queue · Binder/IPC deadlock)
+        ├─▶ 04d memory    (pressure / OOM clues · leak fault-modes)  [sidepath]
+        └─▶ 04e timeline  (business-path inference from logcat/HiLog) [sidepath]
+        │
+        ▼
+   Code context (04b) → RAG (05: selective knowledge routing) → LLM (06: 7-section report) → Apply (07)
+                              ▲
+                              └── request more context (context_loop)
 ```
 
 > For detailed architecture diagrams, see [docs/architecture/ARCHITECTURE_DIAGRAM.md](./docs/architecture/ARCHITECTURE_DIAGRAM.md).
@@ -439,6 +517,8 @@ After that, ask your agent to auto-fix a crash with Stability Analysis Agent —
 
 We're building this in the open. Here's where we are — and where the framework, not just the Agent, is heading.
 
+**Release cadence:** the project is **actively maintained**. We publish a PyPI / GitHub Release when there is a meaningful batch of fixes or features — typically on the order of **about once a month** when the tree is moving, and quieter when it is not. We do **not** promise a fixed calendar date. Track progress in [`CHANGELOG.md`](./CHANGELOG.md) and [Releases](https://github.com/baidu-maps/stability-analysis-agent/releases); PR review expectations are in [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+
 | Milestone | Status | First shipped |
 |---|---|---|
 | **Framework** | | |
@@ -450,9 +530,12 @@ We're building this in the open. Here's where we are — and where the framework
 | Crash auto-fix (parse + symbolize + patch + apply) | ✅ GA | v1.0 (core), v1.2.8 (closed-loop presets) |
 | **`bug-platform-fetcher` / `automation-testing` / `cicd-pipeline` presets** | ✅ GA | v1.2.8 |
 | **Same framework, new stability class** | | |
-| ANR auto-fix (Android `am_anr`, iOS watchdog, Harmony AppFreeze) | 🚧 in design | next minor |
-| OOM / memory auto-fix (heap snapshot diffing) | 📋 planned | next minor |
-| Freeze / hang auto-fix (stack sampling + thread state) | 📋 planned | TBD |
+| ANR / AppFreeze / freeze **analysis** (hotspots, EventHandler, IPC) | ✅ GA | current |
+| Memory-pressure / OOM **clues** (log-side `04d`) | ✅ GA (sidepath) | current |
+| Pre-crash business-path / timeline (`04e`) | ✅ GA (sidepath) | current |
+| Crash evidence compass + registers + optional disassembly (`04a`) | ✅ GA | current |
+| ANR / Freeze **auto-fix** (patch apply) | 🚧 maturing | next minors |
+| OOM / memory **auto-fix** (heap snapshot diff) | 📋 planned | next minors |
 | **Community presets** | | |
 | engine-build, iOS-XCUITest, Hypium (more Skill presets) | 🎯 community-driven | open |
 | Sentry, Bugsnag, Azure DevOps, Linear, Jira Cloud, 飞书 (more bug platforms) | 🎯 community-driven | open |
@@ -463,8 +546,9 @@ For the long-form version (deferred ideas, RFCs, design notes), see [docs/ROADMA
 
 | Layer | Supported |
 |---|---|
-| **Stability class (current scope)** | Crash — null pointer, div-zero, abort, double free, deadlocks / race conditions / atomic failures, stack overflow, OOM-on-crash dumps, etc. |
-| **Stability class (planned)** | ANR, OOM / memory, Freeze / hang |
+| **Stability class (auto-fix)** | Crash — null pointer, div-zero, abort, double free, deadlocks / races / atomics, stack overflow, … |
+| **Stability class (analysis)** | ANR / AppFreeze / freeze · memory pressure / OOM clues · pre-crash business path · register / disasm evidence |
+| **Stability class (planned auto-fix)** | ANR patch · heap-diff OOM fix · deeper Freeze auto-repair |
 | **OS** | macOS · iOS · Android · Harmony · Linux · Windows |
 | **Crash log formats** | Apple `.crash` · Android logcat / tombstone · Harmony `Stacktrace:` · native `#NN pc` · JSON exports from Sentry, Firebase Crashlytics, Bugsnag, Bugly, 自建 APM, etc. |
 | **Python** | 3.9 · 3.10 · 3.11 · 3.12 |
@@ -541,10 +625,10 @@ sa-agent
 
 | Value | Behavior |
 |-------|----------|
-| `full` (default) | Parse + symbolize + read source + LLM auto-fix (produces a patch and applies it locally with backup). |
-| `gen_prompt_only` | Run the full toolchain but skip the LLM call; emit a reusable prompt file. |
-| `parse_stack_only` | Only parse + symbolize. `--code-root` not needed. |
-| `parse_log_only` | Only parse the crash log. Neither `--library-dir` nor `--code-root` is needed. |
+| `full` (default) | Parse + maps + symbolize + diagnosis family (`04a` + conditional `04c`/`04d`/`04e`) + code + LLM auto-fix. |
+| `gen_prompt_only` | Same toolchain through prompt file; skip LLM. |
+| `parse_stack_only` | Parse + maps + symbolize + diagnosis (`04a` / ANR `04c` …). No `--code-root` / LLM. Ideal for ANR dumps without `.so`. |
+| `parse_log_only` | Parse only (`01`, incl. `log_kind`). |
 
 ### Supported crash log files and platforms
 
@@ -681,6 +765,7 @@ stability-analysis-agent/
 | Roadmap (long-form) | [docs/ROADMAP.md](./docs/ROADMAP.md) |
 | System Architecture | [docs/architecture/README.md](./docs/architecture/README.md) |
 | Architecture Diagram | [docs/architecture/ARCHITECTURE_DIAGRAM.md](./docs/architecture/ARCHITECTURE_DIAGRAM.md) |
+| Fault modes · evidence · ANR / memory / timeline | [docs/architecture/fault_mode_library.md](./docs/architecture/fault_mode_library.md) |
 | Tool System Overview | [docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md](./docs/tools/tool_system/TOOL_SYSTEM_OVERVIEW.md) |
 | Tool Extension Guide | [docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md](./docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md) |
 | Workflow System | [docs/workflows/WORKFLOWS.md](./docs/workflows/WORKFLOWS.md) |
@@ -716,16 +801,16 @@ python3 test/cli/test_report_paths.py
 No. In this repo, "auto-fix" means: `parse → symbolize → read source → propose a patch → apply locally with backup`. After that, control returns to you or to the closed-loop Skills (verify / package). The Agent does **not** open PRs, merge to main, or bypass code review. The Auto-Fix Loop is open, not headless. ([#why-we-are-not-another-ai-coding-tool](#why-we-are-not-another-ai-coding-tool) has the same disclaimer.)
 
 **Q: Symbolization failed?**
-Ensure `--library-dir` contains the binary files (`.dylib` / `.so`) along with their debug symbols (`.dSYM` directories or DWARF info). In interactive mode, use **Settings → Configure stack symbolization tools** with **Auto-detect** or **Manually set absolute path to the symbolizer** (executable or directory). You can also edit `~/.config/stability-analysis-agent/add2line_resolver_config.local.json` (see `tools/configs/add2line_resolver_config.local.example.json`).
+Ensure `--library-dir` contains the binary files (`.dylib` / `.so`) along with their debug symbols (`.dSYM` directories or DWARF info). In interactive mode, use **Settings → Configure stack symbolization tools** with **Auto-detect** or **Manually set absolute path to the symbolizer** (executable or directory). You can also edit `~/.config/stability-analysis-agent/add2line_resolver_config.local.json` (see `configs/add2line_resolver_config.local.example.json`).
 
 **Q: The LLM step failed (or I have no LLM key). Can I still use `sa-agent`?**
-Yes. Use `--scope gen_prompt_only` to run the full toolchain (parse + symbolize + read source) without calling the LLM. The structured JSON output is useful on its own — paste it into a chat or hand it to a human reviewer.
+Yes. Use `--scope gen_prompt_only` for a reusable prompt, or `--scope parse_stack_only` for diagnosis-only JSON (`04a` / `04c` / …) with **zero** API key. Structured reports are useful on their own — paste into a chat or hand to a reviewer.
 
 **Q: Code context extraction returns empty?**
 Ensure `--code-root` points to the source directory that contains the files listed in the symbolized stack trace.
 
-**Q: Will ANR / OOM / Freeze be supported soon?**
-They sit on the same framework as Crash auto-fix; each gets its own dedicated workflow as it matures. See [Roadmap](#roadmap) and [docs/ROADMAP.md](./docs/ROADMAP.md). Crash ships first because the toolchain (parse + symbolize + LLM patch) is already production-grade there.
+**Q: Do you support ANR / OOM / Freeze?**
+**Analysis: yes.** AppFreeze / Android ANR traces auto-route to the ANR workflow (`04c`); memory-pressure and pre-crash timeline are sidepaths (`04d` / `04e`). **Auto-fix patches** for those classes are still maturing — Crash auto-fix is what ships as GA today. See [What you get today](#what-you-get-today) and [Roadmap](#roadmap).
 
 **Q: How do I use this from Claude Code or Cursor?**
 Install the Python package (`pip install stability-analysis-agent`), then copy [`stability-analysis-agent-skill/`](./stability-analysis-agent-skill/) into your agent's skill directory (e.g. `~/.claude/skills/stability-analysis-agent`). See [Use with External AI Agents](#use-with-external-ai-agents-claude--cursor) above.
@@ -776,5 +861,5 @@ The most useful first PRs are usually:
 
 <p align="center">
   If this project helped you auto-fix even one crash, consider giving it a <b>Star</b> — it helps other teams find us.<br>
-  📣 Star <b>and</b> file an Issue if you'd like to see a stability class supported (ANR, OOM, Freeze) or a platform wired in (Sentry, Bugsnag, ADO, Linear, Jira Cloud, 飞书, 自建…) — that signal shapes the [roadmap](./docs/ROADMAP.md).
+  📣 Star <b>and</b> file an Issue if you want deeper ANR/OOM auto-fix, a new APM adapter, or a bug-platform Skill (Sentry, Bugsnag, ADO, Linear, Jira Cloud, 飞书, 自建…) — that signal shapes the [roadmap](./docs/ROADMAP.md).
 </p>

@@ -17,12 +17,14 @@ python3 cli/main.py [参数...]
 
 | 参数 | 是否必填 | 作用 |
 |------|----------|------|
-| `--crash-log PATH` | 分析时**必填**（向量库子命令除外） | 崩溃日志文件路径；`-` 表示从 **stdin** 读取。不限后缀（`.crash` / `.txt` / `.log` / `.json` 等），按**内容**选解析器。详见 [崩溃日志格式说明](../tools/CRASH_LOG_FORMATS.zh-CN.md)。 |
+| `--crash-log-file PATH` | 分析时**必填**（向量库子命令除外） | 崩溃日志文件路径；`-` 表示从 **stdin** 读取。不限后缀（`.crash` / `.txt` / `.log` / `.json` 等），按**内容**选解析器。详见 [崩溃日志格式说明](../tools/CRASH_LOG_FORMATS.zh-CN.md)。 |
+| `--crash-log-content TEXT` | 否 | 直接传入崩溃日志文本；适合脚本、短日志或上游已读入文本内容的场景。 |
+| `--crash-log-dir DIR` | 否 | 批量分析目录中的崩溃日志文件；当前会递归收集目录下所有文件并逐个分析。 |
 | `--library-dir DIR` | 建议填写 | 符号库目录，供 `add2line_resolver`（如 `atos` / `addr2line`）解析堆栈。 |
 | `--code-root DIR` | 建议填写 | 代码根目录；可**多次**指定，在多根目录下查找源码。 |
 | `--config PATH` | 否 | `SystemConfig` JSON 文件；不指定时使用内置默认工具链 + `crash_analysis` 工作流。 |
 | `--scope {full,gen_prompt_only,parse_stack_only,parse_log_only}` | 否 | Agent 执行流程范围，默认 `full`。详见下方“`--scope` 取值”。 |
-| `--prompt-mode {analysis,fix}` | 否 | `05_ai_prompt.md` / LLM 输入的提示词输出模式，默认 `analysis`。详见下方“`--prompt-mode` 取值”。 |
+| `--prompt-mode {analysis,fix}` | 否 | `round_0/06_ai_prompt.md` / LLM 输入的提示词输出模式，默认 `analysis`。详见下方“`--prompt-mode` 取值”。 |
 | `--agent-loop {single,context_loop}` | 否 | Agent 编排模式。未指定时随 `--prompt-mode`：`analysis`→`context_loop`，其它→`single`。`context_loop` 允许模型请求补充函数源码并继续多轮分析，独立于 `--engine`。 |
 | `--max-agent-rounds N` | 否 | `context_loop` 最多 LLM 轮数。默认：`analysis` 模式 `3` 轮，其它模式 `1` 轮；显式指定时以参数为准（硬上限 `8`）。 |
 | `--max-context-requests-per-round N` | 否 | `context_loop` 每轮最多处理的源码补充请求数，默认 `5`，硬上限 `16`。 |
@@ -34,14 +36,20 @@ python3 cli/main.py [参数...]
 
 | 取值 | 工具链装配 | 是否调用 LLM | 是否生成提示词文件 |
 |------|------------|--------------|--------------------|
-| `full`（默认） | parser + addr2line + code_content_provider | 是 | 是（同时作为 LLM 输入） |
-| `gen_prompt_only` | parser + addr2line + code_content_provider | 否 | 是（落盘到 `round_0/05_ai_prompt.md`） |
-| `parse_stack_only` | parser + addr2line | 否 | 否 |
-| `parse_log_only` | parser | 否 | 否 |
+| `full`（默认） | 01 解析 → 02 maps → 03 符号化 → 04a 诊断（条件 04c/04d/04e）→ 04b 源码 → 05 向量记忆 → LLM → 可选改码 | 是 | 是（`round_0/06_ai_prompt.md`，同时作为 LLM 输入） |
+| `gen_prompt_only` | 同上（到提示词为止） | 否 | 是（`round_0/06_ai_prompt.md`） |
+| `parse_stack_only` | 01 → 02 maps → 03 符号化 → 04a（条件 04c/04d/04e） | 否 | 否 |
+| `parse_log_only` | 仅 01 解析 | 否 | 否 |
+
+条件旁路说明：
+
+- **04c** ANR/Freeze：`log_kind` 属 ANR 族，或 `--force-anr-analysis`（ANR 流量可走专用 workflow）
+- **04d** 内存压力：OOM 族 / `oom_suspected`，或 `--force-memory-analysis`
+- **04e** 日志时序：检测到 logcat/HiLog/ASI 等业务日志信号，或 `--force-timeline-analysis`
 
 #### `--prompt-mode` 取值
 
-`--prompt-mode` 只控制 `round_0/05_ai_prompt.md` 和 LLM 输入中的“输出契约”，不控制是否自动应用修复。自动应用修复仍由 `--apply-ai-fixes` 和模型输出中是否存在可提取的完整修复代码共同决定。
+`--prompt-mode` 只控制 `round_0/06_ai_prompt.md` 和 LLM 输入中的“输出契约”，不控制是否自动应用修复。自动应用修复仍由 `--apply-ai-fixes` 和模型输出中是否存在可提取的完整修复代码共同决定。
 
 | 取值 | 行为 |
 |------|------|
@@ -55,7 +63,7 @@ python3 cli/main.py [参数...]
 | 取值 | 行为 |
 |------|------|
 | （省略） | 随 `--prompt-mode`：`analysis`→`context_loop`，`fix` 等→`single`。 |
-| `single` | 只调用一次 LLM；`round_0/05_ai_prompt.md` 作为输入，`round_0/06_ai_gen_res.md` 保存模型输出。 |
+| `single` | 只调用一次 LLM；`round_0/06_ai_prompt.md` 作为输入，`round_0/07_ai_gen_res.md` 保存模型输出。 |
 | `context_loop` | 当模型在输出中返回 `agent_can_fetch_more=true` 和 `context_requests[]` 时，Agent 按请求定位函数源码，在首轮 prompt 基座上追加 `## 其它代码上下文` 后继续询问；`round_N/05b_pre_round_add_res.json` 记录该轮补充结果。直到 `agent_can_fetch_more=false`、请求耗尽或达到 `--max-agent-rounds`。兼容旧字段 `need_more_context`。 |
 
 ### 1.2 传给工作流的问题上下文（内部字段）
@@ -67,19 +75,23 @@ python3 cli/main.py [参数...]
 | `--vector-db-path` | `./vector_db` | 向量数据库目录。 |
 | `--vector-db-max-results` | `3` | 向量检索最大条数。 |
 | `--vector-db-record-usage` | 关闭 | 分析时检索是否累加 `hit_count`（默认**只读**，避免污染库；显式加此 flag 才写入）。 |
-| `--include-memory-in-05` / `--no-include-memory-in-05` | 关闭 | 是否将向量库检索得到的「规则与经验模式参考」并入 `05_ai_prompt.md` / LLM 输入；默认只写 `04_memory_context.json`，不并入 05。 |
+| `--include-memory-in-05` / `--no-include-memory-in-05` | 关闭 | 是否将向量库检索得到的「规则与经验模式参考」并入 `06_ai_prompt.md` / LLM 输入；默认只写 `05_memory_context.json`，不并入提示词。 |
 | `--rule-confidence-threshold` | `0.85` | 规则高置信阈值。 |
 
 ### 1.3 最小示例（完整分析 + AI）
 
 ```bash
 python3 cli/main.py \
-  --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
+  --crash-log-file examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
   --code-root examples/crash_cases/demo_basic/code_dir
 ```
 
-LLM 密钥与默认厂商/模型来自 **`tools/configs/agent_config.json`**；若存在 **`tools/configs/agent_config.local.json`**，则与 `cli/main.py` 中 `_load_agent_config_file()` 行为一致：**仅读取 local 文件**（不与其合并）。智谱等在实现上通过 **OpenAI 兼容客户端**调用，因此需在环境中安装 **`openai`** Python 包（见 `pyproject.toml` / `requirements.txt`）。
+LLM 配置模板见 **`configs/agent_config.local.example.json`**。实际密钥与默认厂商/模型：
+- **源码树**：`<仓库根>/configs/agent_config.local.json`
+- **安装后的 CLI**：`~/.config/stability-analysis-agent/agent_config.local.json`
+
+与 `cli/main.py` 中 `_agent_config_file()` 行为一致（两种模式互不回退，不与 example 合并）。智谱等在实现上通过 **OpenAI 兼容客户端**调用，因此需在环境中安装 **`openai`** Python 包（见 `pyproject.toml` / `requirements.txt`）。
 
 ### 1.4 支持的崩溃日志格式（摘要）
 
@@ -91,7 +103,7 @@ LLM 密钥与默认厂商/模型来自 **`tools/configs/agent_config.json`**；�
 | Sentry / Crashlytics / Bugsnag JSON | 平台导出 event JSON | `sentry_event_json` / `firebase_crashlytics_json` / `bugsnag_event_json` |
 | 其它 JSON 栈数组 | Bugly、自建 APM | `generic_json_stack_export` |
 
-- **不能**把上一轮输出的 `01_crash_log_parser.json` 当作 `--crash-log` 输入。
+- **不能**把上一轮输出的 `01_crash_log_parser.json` 当作 `--crash-log-file` 输入。
 - 完整说明与扩展方式：[../tools/CRASH_LOG_FORMATS.zh-CN.md](../tools/CRASH_LOG_FORMATS.zh-CN.md)
 
 ---
@@ -118,13 +130,34 @@ LLM 密钥与默认厂商/模型来自 **`tools/configs/agent_config.json`**；�
 | 行为 | 说明 |
 |------|------|
 | 终端 / `--output-file` | 与 `--output-format` 一致，为面向阅读的摘要（markdown/json/text）。 |
-| `cli_reports/.../` | 每次分析成功后会尽量写入：`01_crash_log_parser.json`（所有 scope）、`02_add2line_resolver.json`（`full`/`gen_prompt_only`/`parse_stack_only`）、`03_code_content_provider.json`（`full`/`gen_prompt_only`）、`03b_code_location_trace.json`（`full`/`gen_prompt_only`，`03` 生成过程中的代码定位审计轨迹，**仅供调试/二次消费，不写入** `05_ai_prompt.md`）、`04_memory_context.json`（`full`/`gen_prompt_only`，`vector_memory_retriever` **只读**检索快照；默认不并入 `05`，仅在 `--include-memory-in-05` 时追加到提示词，且**默认不回写**向量库）、`round_0/05_ai_prompt.md`（`full`/`gen_prompt_only`）、`round_0/06_ai_gen_res.md`（仅 `full`）。若启用 `--agent-loop context_loop` 且产生多轮，会继续写入 `round_1/`、`round_2/` 等目录，每轮包含 `05_ai_prompt.md`、`05b_pre_round_add_res.json`（上一轮 `context_requests` 的补充结果审计）、`06_ai_gen_res.md` 与可选 `06b_next_round_ai_request.json`，同时写入 `agent_rounds_summary.json`。若执行了改码逻辑，还会写入 `07b_fix_extract_debug.json.json`（提取阶段：含 `fix_plan` 与覆盖率统计）与 `07_apply_ai_fixes.json`（应用结果）。`final_output.md` 仅在 `--scope full` 下生成，且内容为最终一轮模型原始返回。 |
+| `cli_reports/.../` | 运行开始时先写入 `00_run_request.json` 与状态为 `running` 的 `00_run_summary.json`；结束后更新阶段状态、耗时、错误与产物清单。主要产物编号如下（与 `--scope` 相关）： |
+
+**`cli_reports` 产物编号（当前实现）**
+
+| 文件 | scope | 说明 |
+|------|-------|------|
+| `01_crash_log_parser.json` | 全部 | 解析结果（含 `log_kind`） |
+| `02_memory_maps.json` | ≥ `parse_stack_only` | 内存映射（有则写） |
+| `03_add2line_resolver.json` | ≥ `parse_stack_only` | 符号化堆栈 |
+| `04a_crash_diagnosis.json` | ≥ `parse_stack_only` | 崩溃诊断（含 `evidence_compass` / 反汇编字段） |
+| `04b_code_content_provider.json` | `full` / `gen_prompt_only` | 崩溃点源码上下文 |
+| `04b2_code_location_trace.json` | 有 location_trace 时 | 定位审计旁路（不并入提示词） |
+| `04c_anr_freeze_diagnosis.json` | 条件 | ANR/Freeze |
+| `04d_memory_pressure_diagnosis.json` | 条件 | 内存压力/OOM |
+| `04e_log_timeline.json` | 条件 | 崩溃前时序/业务路径 |
+| `05_memory_context.json` | `full` / `gen_prompt_only` | 向量记忆检索快照（默认不并入提示词） |
+| `round_0/06_ai_prompt.md` | `full` / `gen_prompt_only` | LLM / 可复用提示词 |
+| `round_0/07_ai_gen_res.md` | `full` 且 LLM 成功 | 模型输出 |
+| `08_apply_ai_fixes.json` | 改码执行时 | 自动改码结果 |
+| `final_output.md` | 通常 `full` | 人类可读汇总 |
+
+多轮 `context_loop` 时另有 `round_N/`、`05b_pre_round_add_res.json`、`06b_next_round_ai_request.json`、`agent_rounds_summary.json`。旧报告可能仍使用 `02_add2line` / `03_code` / `04_memory` / `05_ai_prompt` 等历史命名，CLI 读取时做兼容。
 
 ---
 
 ## 4. 向量数据库（RAG）运维（独占子流程）
 
-以下任一参数出现时，CLI **只执行对应向量库逻辑并退出**，**不会**再要求 `--crash-log` 或跑崩溃分析：
+以下任一参数出现时，CLI **只执行对应向量库逻辑并退出**，**不会**再要求 `--crash-log-file` / `--crash-log-content` / `--crash-log-dir` 或跑崩溃分析：
 
 | 参数 | 作用 |
 |------|------|
@@ -202,13 +235,13 @@ python3 cli/main.py cancel <run_id> --daemon http://127.0.0.1:8765
 
 | 场景 | 建议参数 |
 |------|----------|
-| 完整分析 + 默认改码 + 默认备份 | `--crash-log ... --library-dir ... --code-root ...` |
+| 完整分析 + 默认改码 + 默认备份 | `--crash-log-file ... --library-dir ... --code-root ...` |
 | 分析且改码，但不要磁盘备份（Git 撤销） | 在上行基础上加 `--no-backup-original-sources` |
 | 只分析、不改源码 | `--no-apply-ai-fixes` |
 | 提示词偏证据分析（默认） | `--prompt-mode analysis` |
 | 提示词要求完整修复代码 | `--prompt-mode fix` |
 | 只要工具链、不要 LLM | `--scope gen_prompt_only` |
-| 仅解析 + 符号化 | `--scope parse_stack_only` |
+| 仅解析 + 符号化 + 诊断 | `--scope parse_stack_only` |
 | 仅解析崩溃日志 | `--scope parse_log_only` |
 | 向量库统计 | `--vector-db-stats` |
 | 初始化向量库 | `--init-vector-db` |

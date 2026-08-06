@@ -1,6 +1,6 @@
 # 崩溃日志输入格式说明
 
-本文说明 `--crash-log` 支持哪些**文件类型**、**读取方式**，以及 `crash_log_parser` 能识别哪些**平台/格式**的崩溃内容。实现位于 `tools/crash_parser/`（注册表见 `parsers.py`）。
+本文说明 `--crash-log-file` / `--crash-log-content` / `--crash-log-dir` 支持哪些**输入方式**，以及 `crash_log_parser` 能识别哪些**平台/格式**的崩溃内容。实现位于 `tools/crash_parser/`（注册表见 `parsers.py`）。
 
 ---
 
@@ -10,8 +10,10 @@ CLI **不按后缀白名单过滤**，只要能读成文本即可；能否解析
 
 | 输入方式 | 是否支持 |
 |----------|----------|
-| 任意文件路径（如 `.crash`、`.txt`、`.log`、`.json`、无后缀） | 支持 |
-| `--crash-log -`（stdin） | 支持 |
+| 任意文件路径（如 `.crash`、`.txt`、`.log`、`.json`、无后缀） | `--crash-log-file` 支持 |
+| 直接传入文本 | `--crash-log-content` 支持 |
+| 目录批量分析 | `--crash-log-dir` 支持 |
+| `--crash-log-file -`（stdin） | 支持 |
 | UTF-8 / UTF-8-BOM / UTF-16 | 支持（自动回退） |
 | RTF 崩溃导出 | 支持（先转纯文本再解析） |
 | 二进制 / 乱码 | 尽力解码，可能丢字 |
@@ -22,7 +24,7 @@ CLI **不按后缀白名单过滤**，只要能读成文本即可；能否解析
 
 ## 2. 解析器如何选择
 
-1. 读文件得到字符串（`cli/main.py` → `_read_crash_log`）
+1. 读文件/文本得到字符串（`cli/main.py` → `_read_crash_log` / 输入源解析）
 2. 检测 OS 线索（`format_detect.detect_os_type`）
 3. 按 `parsers.PARSERS` 顺序，**第一个** `can_handle` 为真的解析器处理
 

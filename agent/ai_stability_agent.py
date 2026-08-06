@@ -1702,7 +1702,7 @@ class FullStabilityAnalyzer:
                 if not authorization:
                     raise RuntimeError(
                         f"缺少鉴权：请设置环境变量（建议 {', '.join(env_key_candidates[:3])}）"
-                        f"或在 tools/configs/agent_config.local.json 中配置 llm_config.providers.{provider}"
+                        f"或在 configs/agent_config.local.json 中配置 llm_config.providers.{provider}"
                     )
                 if auth_prefix and not str(authorization).startswith(auth_prefix):
                     authorization = f"{auth_prefix}{authorization}"
@@ -2299,7 +2299,8 @@ class FullStabilityAnalyzer:
     def _load_default_guidance_blocks(self) -> List[Dict[str, Any]]:
         """Load default guidance blocks from JSON (fallback when no vector DB or no hits)."""
         candidates = [
-            Path(__file__).resolve().parents[3] / "tools" / "configs" / "default_guidance_blocks.json",
+            Path(__file__).resolve().parents[1] / "configs" / "default_guidance_blocks.json",
+            Path(__file__).resolve().parents[1] / "tools" / "configs" / "default_guidance_blocks.json",  # legacy
             Path.cwd() / "configs" / "default_guidance_blocks.json",
         ]
         for path in candidates:

@@ -16,8 +16,8 @@
 
 ### 配置文件
 
-- **`tools/configs/agent_config.json`**：主配置文件，包含模型配置、默认模型等
-- **`tools/configs/agent_config.local.json`**：本地配置文件，用于存放 API 密钥等敏感信息（不入库）
+- **`configs/agent_config.local.example.json`**：主配置文件，包含模型配置、默认模型等
+- **`configs/agent_config.local.json`**：本地配置文件，用于存放 API 密钥等敏感信息（不入库）
 
 ### 测试结果文件
 
@@ -127,7 +127,7 @@ python3 test/llm/test_llm_connection.py --all
 
 #### 智谱 BigModel
 
-在 `tools/configs/agent_config.local.json` 中配置：
+在 `configs/agent_config.local.json` 中配置：
 
 ```json
 {
@@ -151,7 +151,7 @@ export BIGMODEL_API_KEY="your-api-key-here"
 
 #### 百度千帆
 
-在 `tools/configs/agent_config.local.json` 中配置：
+在 `configs/agent_config.local.json` 中配置：
 
 ```json
 {
@@ -173,7 +173,7 @@ export BAIDU_QIANFAN_AUTHORIZATION="Bearer your-token-here"
 
 ### 2. 默认模型配置
 
-在 `tools/configs/agent_config.local.json` 中配置：
+在 `configs/agent_config.local.json` 中配置：
 
 ```json
 {
@@ -334,7 +334,7 @@ python3 test/llm/test_llm_connection.py --all
 
 - [测试目录说明](../../TEST_README.md)
 - [CLI 指南](../../cli/CLI_GUIDE.md)
-- [配置文件说明](../../../tools/configs/agent_config.json)
+- [配置文件说明](../../../configs/agent_config.local.example.json)
 
 ## 🔄 更新日志
 

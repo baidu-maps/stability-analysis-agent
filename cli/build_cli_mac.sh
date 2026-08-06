@@ -182,7 +182,7 @@ fi
 # 7. 复制配置模板
 #    仅复制公共配置模板，不复制用户本地密钥文件 *.local.json
 # --------------------------------------------------------------------------- #
-CONFIG_SRC_DIR="$ROOT_DIR/tools/configs"
+CONFIG_SRC_DIR="$ROOT_DIR/configs"
 for cfg in \
   "agent_config.local.example.json" \
   "add2line_resolver_config.local.example.json"

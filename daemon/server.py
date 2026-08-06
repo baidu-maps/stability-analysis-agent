@@ -66,7 +66,10 @@ def _get_ts_executor():
                     ToolConfig(name="add2line_resolver", enabled=True),
                     ToolConfig(name="code_content_provider", enabled=True),
                 ],
-                workflows=[WorkflowConfig(name="crash_analysis", enabled=True)],
+                workflows=[
+                    WorkflowConfig(name="crash_analysis", enabled=True),
+                    WorkflowConfig(name="anr_freeze_analysis", enabled=True),
+                ],
             )
             llm_adapter = None
             api_key = os.environ.get("WENXIN_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -235,6 +238,35 @@ def _persist_result(run: RunState) -> None:
         run.events.put(RunEvent(run.run_id, "artifact_write_error", {"error": str(e)}))
 
 
+def _emit_stdout_line(run: RunState, stdout_acc: list[str], line: str) -> None:
+    text = line.rstrip("\n")
+    stdout_acc.append(text + "\n")
+    if text.startswith("AI_STREAM_DATA:"):
+        payload_text = text[len("AI_STREAM_DATA:"):].strip()
+        try:
+            payload = json.loads(payload_text)
+            run.events.put(
+                RunEvent(
+                    run.run_id,
+                    "ai_stream",
+                    {
+                        "payload": payload,
+                        "raw": text,
+                    },
+                )
+            )
+            return
+        except Exception as exc:
+            run.events.put(
+                RunEvent(
+                    run.run_id,
+                    "stream_error",
+                    {"which": "ai_stream", "error": str(exc), "raw": text},
+                )
+            )
+    run.events.put(RunEvent(run.run_id, "stdout", {"line": text}))
+
+
 def _run_worker(run: RunState, req: RunRequest) -> None:
     run.status = "running"
     run.started_at = time.time()
@@ -259,17 +291,28 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
             p.stdin.write(stdin_text)
             p.stdin.close()
 
-        def _pump(stream, event_type: str):
+        stdout_acc: list[str] = []
+
+        def _pump_stdout(stream):
             try:
                 for line in iter(stream.readline, ""):
                     if not line:
                         break
-                    run.events.put(RunEvent(run.run_id, event_type, {"line": line.rstrip("\n")}))
+                    _emit_stdout_line(run, stdout_acc, line)
             except Exception as e:
-                run.events.put(RunEvent(run.run_id, "stream_error", {"which": event_type, "error": str(e)}))
+                run.events.put(RunEvent(run.run_id, "stream_error", {"which": "stdout", "error": str(e)}))
 
-        t_out = threading.Thread(target=_pump, args=(p.stdout, "stdout"), daemon=True)
-        t_err = threading.Thread(target=_pump, args=(p.stderr, "stderr"), daemon=True)
+        def _pump_stderr(stream):
+            try:
+                for line in iter(stream.readline, ""):
+                    if not line:
+                        break
+                    run.events.put(RunEvent(run.run_id, "stderr", {"line": line.rstrip("\n")}))
+            except Exception as e:
+                run.events.put(RunEvent(run.run_id, "stream_error", {"which": "stderr", "error": str(e)}))
+
+        t_out = threading.Thread(target=_pump_stdout, args=(p.stdout,), daemon=True)
+        t_err = threading.Thread(target=_pump_stderr, args=(p.stderr,), daemon=True)
         t_out.start()
         t_err.start()
 
@@ -281,18 +324,22 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
         try:
             remaining_out = p.stdout.read() if p.stdout else ""
             if remaining_out:
-                run.events.put(RunEvent(run.run_id, "stdout", {"line": remaining_out.rstrip("\n")}))
+                for line in remaining_out.splitlines():
+                    _emit_stdout_line(run, stdout_acc, line + "\n")
         except Exception:
             pass
 
         status = "done" if exit_code == 0 else "error"
         run.status = status
 
-        # 聚合最终 stdout（由 stdout pump 已经发过逐行；这里再读一次文件落盘用）
-        # 为简化，我们从事件队列无法回放；因此改为直接读取 artifact：CLI 输出本就可读，且 daemon 会落盘。
-        # 这里用 run.result.output 记录一个简版：由客户端通过 /result 获取（daemon 会从文件读取）。
-        # 为保证 /result 可用，这里重新运行一次 capture（仅使用 communicate 的残余无法可靠）
-        # 方案：改为在 pump 的同时累计 stdout
+        output_text = "".join(stdout_acc)
+        run.result = RunResult(
+            run_id=run.run_id,
+            status=run.status,
+            output_format=req.output_format,
+            output=output_text,
+            error=None if exit_code == 0 else f"process exit {exit_code}",
+        )
     except Exception as e:
         run.status = "error"
         run.error = str(e)
@@ -345,12 +392,10 @@ def _start_run(req_dict: Dict[str, Any]) -> RunState:
 
             def _pump_stdout(stream):
                 try:
-                    while True:
-                        chunk = stream.read(512)
-                        if not chunk:
+                    for line in iter(stream.readline, ""):
+                        if not line:
                             break
-                        stdout_acc.append(chunk)
-                        run.events.put(RunEvent(run.run_id, "stdout", {"chunk": chunk}))
+                        _emit_stdout_line(run, stdout_acc, line)
                 except Exception as e:
                     run.events.put(RunEvent(run.run_id, "stream_error", {"which": "stdout", "error": str(e)}))
 
@@ -541,10 +586,25 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = _read_json_body(self)
                 executor = _get_ts_executor()
-                result = executor.execute_workflow("crash_analysis", {
-                    "crash_log": body.get("crash_log", ""),
+                crash_log = body.get("crash_log", "")
+                force_anr = bool(body.get("force_anr_analysis") or body.get("force_anr"))
+                try:
+                    from tools.crash_parser.log_kind_classifier import (
+                        classify_log_kind,
+                        workflow_name_for_log_kind,
+                    )
+                    workflow_name = workflow_name_for_log_kind(
+                        classify_log_kind(crash_log).log_kind,
+                        force_anr=force_anr,
+                    )
+                except Exception:
+                    workflow_name = "anr_freeze_analysis" if force_anr else "crash_analysis"
+                result = executor.execute_workflow(workflow_name, {
+                    "crash_log": crash_log,
                     "library_dir": body.get("library_dir"),
                     "code_roots": body.get("code_roots", []),
+                    "force_anr_analysis": force_anr,
+                    "scope": body.get("scope", "full"),
                 })
                 _json_response(self, HTTPStatus.OK, result)
             except Exception as e:
@@ -577,5 +637,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 

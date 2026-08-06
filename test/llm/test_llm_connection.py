@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 大模型连接测试脚本
-测试tools/configs/agent_config.local.json中配置的大模型是否能正常连接和使用
+测试 configs/agent_config.local.json 中配置的大模型是否能正常连接和使用
 """
 
 import json
@@ -12,9 +12,9 @@ import time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
-# 添加tools目录到Python路径
-tools_dir = Path(__file__).parent.parent.parent / "tools"
-sys.path.insert(0, str(tools_dir))
+# 仓库根目录
+REPO_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 # 测试结果文件路径
 test_result_file = Path(__file__).parent / "test_llm_connection_res.json"
@@ -30,9 +30,12 @@ DEFAULT_TEST_RESULT_TEMPLATE: Dict[str, Any] = {
 }
 
 def load_agent_config() -> Dict[str, Any]:
-    """加载AI Agent配置文件"""
-    local_path = tools_dir / "configs" / "agent_config.local.json"
-    config_path = local_path
+    """加载AI Agent配置文件（源码树调试：仅仓库根 configs/agent_config.local.json）。"""
+    config_path = REPO_ROOT / "configs" / "agent_config.local.json"
+    if not config_path.exists():
+        print(f"❌ 未找到配置文件: {config_path}")
+        print("   请复制 configs/agent_config.local.example.json 为 agent_config.local.json 并填入密钥。")
+        sys.exit(1)
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
@@ -139,7 +142,7 @@ def get_qianfan_authorization(config: Dict[str, Any]) -> Optional[str]:
     获取百度千帆 authorization。
     优先级：
     1) 环境变量 BAIDU_QIANFAN_AUTHORIZATION
-    2) 配置文件 tools/configs/agent_config.local.json 的 llm_config.providers.baidu_qianfan.authorization
+    2) 配置文件 configs/agent_config.local.json 的 llm_config.providers.baidu_qianfan.authorization
     """
     env_auth = os.getenv("BAIDU_QIANFAN_AUTHORIZATION")
     if env_auth:
@@ -152,7 +155,7 @@ def get_zhipu_authorization(config: Dict[str, Any]) -> Optional[str]:
     获取智谱 BigModel authorization。
     优先级：
     1) 环境变量 ZHIPU_API_KEY / BIGMODEL_API_KEY
-    2) 配置文件 tools/configs/agent_config.local.json 的 llm_config.providers.zhipu_bigmodel.api_key
+    2) 配置文件 configs/agent_config.local.json 的 llm_config.providers.zhipu_bigmodel.api_key
     """
     env_key = os.getenv("ZHIPU_API_KEY") or os.getenv("BIGMODEL_API_KEY")
     if env_key:

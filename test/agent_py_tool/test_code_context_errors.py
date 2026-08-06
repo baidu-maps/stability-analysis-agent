@@ -91,7 +91,7 @@ class TestCodeContextErrors(unittest.TestCase):
         self.assertTrue(meta.get("pipeline_skipped"))
         msg = code_context_skip_pipeline_message({"graph": {"nodes": []}}, scope="gen_prompt_only")
         # 文案中应提示跳过 05 提示词生成
-        self.assertIn("05_ai_prompt.md", msg)
+        self.assertIn("06_ai_prompt.md", msg)
 
 
 if __name__ == "__main__":

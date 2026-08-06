@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Optional
 
@@ -15,6 +16,7 @@ from tools.crash_parser.android import (
 from tools.crash_parser.format_detect import (
     _detect_apple_ios_freeze_report,
     _detect_apple_ios_truncated_crash,
+    _detect_harmony_native_stack,
     _detect_ios_mach_tool_export,
     _detect_ios_pre_parsed_symbolized_crash,
     detect_os_type,
@@ -23,6 +25,8 @@ from tools.crash_parser.format_detect import (
 )
 from tools._stack_symbol_utils import looks_like_cpp_qualified_stack
 from tools.crash_parser.types import CrashInfo, MetaInfo
+
+logger = logging.getLogger(__name__)
 
 def extract_crash_info(content: str) -> CrashInfo:
     """提取崩溃信息"""
@@ -137,6 +141,19 @@ def extract_crash_info(content: str) -> CrashInfo:
         if crash_reason == "unknown" and pattern in content_lower:
             crash_reason = reason
             break
+
+    if not signal:
+        # Android tombstone: signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr ...
+        full_sig = re.search(
+            r"signal\s+(\d+)\s*\((\w+)\)\s*,\s*code\s+(-?\d+)\s*(?:\((\w+)\))?",
+            header_scope,
+            re.IGNORECASE,
+        )
+        if full_sig:
+            sig_name = full_sig.group(2).upper()
+            code_name = full_sig.group(4)
+            signal = f"{sig_name} ({code_name})" if code_name else f"{full_sig.group(1)} ({sig_name})"
+            crash_reason = signal_reason_map.get(sig_name, crash_reason)
 
     if not signal:
         signal_patterns = [
@@ -447,7 +464,17 @@ def extract_meta_info(content: str) -> MetaInfo:
     
     # 如果没有检测到OS类型，根据内容特征推断（勿用裸子串 dyld：iOS Binary Images 含 libdyld.dylib）
     if os_type == "unknown":
-        if _IOS_OS_VERSION_RE.search(content) or _IOS_HW_MODEL_RE.search(content):
+        if _detect_harmony_native_stack(content):
+            os_type = "harmonyos"
+        elif (
+            "harmonyos" in content.lower()
+            or "openharmony" in content.lower()
+            or "build info:mro" in content.lower()
+            or "com.ohos." in content.lower()
+            or re.search(r"\bohos\b", content.lower())
+        ):
+            os_type = "harmonyos"
+        elif _IOS_OS_VERSION_RE.search(content) or _IOS_HW_MODEL_RE.search(content):
             os_type = "ios"
         elif _detect_apple_ios_truncated_crash(content):
             os_type = "ios"
@@ -537,12 +564,13 @@ def extract_meta_info(content: str) -> MetaInfo:
     if ability_match:
         ability_name = "EntryAbility"
 
-    # ANR / freeze 线索
-    anr_suspected = False
-    if re.search(r'\bANR\b', content, re.IGNORECASE) or "appfreeze" in content.lower():
-        anr_suspected = True
-    if _android_heuristic_anr_stack(content):
-        anr_suspected = True
+    # 强分类 log_kind（并兼容 anr_suspected / oom_suspected）
+    from tools.crash_parser.log_kind_classifier import classify_log_kind
+
+    kind = classify_log_kind(content)
+    meta_fields = kind.to_meta_fields()
+    anr_suspected = True if meta_fields.get("anr_suspected") else None
+    oom_suspected = True if meta_fields.get("oom_suspected") else None
 
     return MetaInfo(
         os_type=os_type,
@@ -558,5 +586,9 @@ def extract_meta_info(content: str) -> MetaInfo:
         symbol_path=symbol_path,
         ability_name=ability_name,
         process_name=process_name,
-        anr_suspected=anr_suspected if anr_suspected else None,
+        anr_suspected=anr_suspected,
+        oom_suspected=oom_suspected,
+        log_kind=kind.log_kind,
+        log_kind_confidence=kind.confidence,
+        log_kind_reasons=list(kind.reasons) if kind.reasons else None,
     )

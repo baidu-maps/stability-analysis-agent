@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **配置目录**：示例与本地配置从 `tools/configs/` 迁至仓库根目录 `configs/`。`agent_config.local.json` / `add2line_resolver_config.local.json` 继续被 `.gitignore` 忽略，勿提交密钥。
+- **LLM 配置加载**：`STABILITY_AGENT_CONFIG_DIR`（若设置）优先；否则开源源码树读 `<仓库根>/configs/agent_config.local.json`；安装后的 CLI 读 `~/.config/stability-analysis-agent/agent_config.local.json`。闭源工作区通过入口自动将 `STABILITY_AGENT_CONFIG_DIR` 指向其 `configs/`。
+
 ## [1.2.8] - 2026-07-15
 
 ### Added

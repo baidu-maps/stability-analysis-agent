@@ -20,7 +20,7 @@ sa-agent \
   --scope gen_prompt_only
 ```
 
-输出：`cli_reports/<timestamp>/round_0/05_ai_prompt.md`
+输出：`cli_reports/<timestamp>/round_0/06_ai_prompt.md`
 
 ## 3. Demo — 完整 AI 分析
 

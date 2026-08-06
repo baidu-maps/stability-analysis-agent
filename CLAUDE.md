@@ -28,7 +28,7 @@ python3 cli/main.py \
   --crash-log <path> --library-dir <path> --code-root <path> \
   --scope gen_prompt_only
 
-# parse_stack_only: parse log + addr2line only (no code-root required)
+# parse_stack_only: parse + symbolize + 04a diagnosis (no code-root required)
 python3 cli/main.py \
   --crash-log <path> --library-dir <path> \
   --scope parse_stack_only
@@ -48,8 +48,8 @@ python3 cli/main.py --daemon http://127.0.0.1:8765 \
 `--scope` controls how deep the agent runs (default `full`):
 
 - `full`: parse + symbolize + extract code context + LLM analysis (and optional auto-fix).
-- `gen_prompt_only`: full toolchain, but skip LLM call; produces a reusable prompt file.
-- `parse_stack_only`: only parse + symbolize.
+- `parse_stack_only`: parse + maps + symbolize + 04a diagnosis (optional 04c/04d/04e).
+- `gen_prompt_only`: full toolchain, but skip LLM call; produces `round_0/06_ai_prompt.md`.
 - `parse_log_only`: only parse the crash log.
 
 ### Start Daemon
@@ -107,8 +107,8 @@ python3 cli/main.py \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
   --code-root examples/crash_cases/demo_basic/code_dir \
   --scope gen_prompt_only
-# Output: cli_reports/<timestamp>/01~03 (+ optional 03b/04) JSON + round_0/05_ai_prompt.md
-# 03b = 03b_code_location_trace.json（03 代码定位审计，非 repo_search）
+# Output: cli_reports/<timestamp>/01~04a (+ optional 04b/04b2/04c/04d/04e/05) + round_0/06_ai_prompt.md
+# 04b2 = 04b2_code_location_trace.json（代码定位审计，非 repo_search）
 ```
 
 ## Architecture
@@ -131,22 +131,24 @@ python3 cli/main.py \
 - `examples/` - Demo crash cases (mac / ios / multithread)
 - `test/` - Test suite
 
-### `05_ai_prompt.md` generation (do not change without explicit request)
+### Prompt file generation (`round_0/06_ai_prompt.md`; do not change without explicit request)
 
-**Unless the user’s task or prompt explicitly asks to change it, do not modify how `round_0/05_ai_prompt.md` is built.** Keep the current assembly logic; do not inject new sections or extra content into this file from new tools, sidecar reports, or ad-hoc prompt appendices.
+**Unless the user’s task or prompt explicitly asks to change it, do not modify how `round_0/06_ai_prompt.md` is built** (historically also referred to as `05_ai_prompt.md` / `05_ai_final_tip`). Keep the current assembly logic; do not inject new sections or extra content into this file from new tools, sidecar reports, or ad-hoc prompt appendices—except via each diagnosis module’s existing `prompt_section_zh` injection path already wired in `_build_prompt_final_tip`.
 
-- **Producer**: `workflows/crash_analysis_workflow.py` → `_build_prompt_final_tip()`; CLI writes `result["final_tip"]` via `cli/main.py` → `_write_cli_report()`.
-- **Inputs today**: structured content from `01` / `02` / `03` (parse, symbolize, code context) using the existing section order and wording in `_build_prompt_final_tip`.
-- **Optional merge into `05`**: only `memory_context` from `04_memory_context.json` when non-empty (from `vector_memory_retriever`). If `memory_context` is empty, do not add a “规则与经验模式参考” block.
-- **Do not merge into `05`**: `03b_code_location_trace.json`、LangGraph `repo_search_results`，或其它工具旁路产出，除非用户明确要求写入提示词。
-- **Sidecar artifacts**（`03b_code_location_trace.json` 等）仅供调试与二次消费；不得默认 alter `05`。
+- **Producer**: `workflows/crash_analysis_workflow.py` → `_build_prompt_final_tip()`; CLI writes `result["final_tip"]` via `cli/main.py` → `_write_cli_report()` as `round_0/06_ai_prompt.md`.
+- **Inputs today**: structured content from parse / symbolize / code context (`01` / `03` / `04b`) using the existing section order and wording in `_build_prompt_final_tip`.
+- **Optional merge into prompt**: only `memory_context` from `05_memory_context.json` when non-empty and `--include-memory-in-05` (from `vector_memory_retriever`). If empty / flag off, do not add a “规则与经验模式参考” block.
+- **Do not merge into prompt skeleton**: `04b2_code_location_trace.json`、LangGraph `repo_search_results`，或其它调试旁路；`04c`/`04d`/`04e` 仅通过各自 `prompt_section_zh` 注入。
+- **Sidecar artifacts**（`04b2` / `04c` / `04d` / `04e` 等）仅供调试与二次消费；不得默认 alter 提示词骨架。
 
-When adding features (new tools, RAG, repo search, LangGraph nodes), wire them to separate report files or state/TOOL_OUTPUT—not into `05`—unless the user clearly asks to change `05`’s structure or contents.
+When adding features (new tools, RAG, repo search, LangGraph nodes), wire them to separate report files or state/TOOL_OUTPUT—not into the prompt file—unless the user clearly asks to change its structure or contents.
 
 ### Configuration
-- `tools/configs/agent_config.json` - LLM provider template (no keys, safe to commit)
-- `tools/configs/agent_config.local.json` - Local overrides with real keys (gitignored)
-- `tools/configs/add2line_resolver_config.local.example.json` - Example local add2line config (safe paths)
+- `configs/agent_config.local.example.json` - LLM provider template (no keys, safe to commit)
+- `configs/agent_config.local.json` - Local overrides with real keys (gitignored); used when running from the open-source tree
+- `STABILITY_AGENT_CONFIG_DIR` - Optional override directory (closed-source checkout sets this to its `configs/`)
+- `~/.config/stability-analysis-agent/agent_config.local.json` - Installed CLI path when not in a source tree and no override
+- `configs/add2line_resolver_config.local.example.json` - Example local add2line config (safe paths)
 - `~/.config/stability-analysis-agent/add2line_resolver_config.local.json` - Local toolchain paths (gitignored); resolver loads this filename from several candidate locations (see `tools/add2line_resolver_tool.py`)
 - Environment variables: `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, etc.
 

@@ -31,7 +31,7 @@ class StackFrame:
 
 @dataclass
 class CrashInfo:
-    """崩溃信息"""
+    """崩溃信息（纯提取，不含推断）"""
     thread_type: str  # "main" 或 "background"
     crash_reason: str
     signal: Optional[str] = None
@@ -56,7 +56,12 @@ class MetaInfo:
     symbol_path: Optional[str] = None  # 符号文件路径（如dSYM、pdb等）
     ability_name: Optional[str] = None  # Harmony Ability 名称（如 EntryAbility）
     process_name: Optional[str] = None  # 进程名（如 com.example.app）
-    anr_suspected: Optional[bool] = None  # 是否疑似 ANR / freeze
+    anr_suspected: Optional[bool] = None  # 是否疑似 ANR / freeze（兼容；由 log_kind 推导）
+    oom_suspected: Optional[bool] = None  # 是否疑似 OOM / 内存压力（由 log_kind 推导）
+    # 强分类：native_crash|java_crash|anr_*|oom_*|mixed_*|unknown
+    log_kind: Optional[str] = None
+    log_kind_confidence: Optional[float] = None
+    log_kind_reasons: Optional[List[str]] = None
     # Harmony/Android 等多 Tid 块：日志中识别到的线程块总数；单栈或其它平台多为 1
     thread_count_total: Optional[int] = None
     # 实际写入 threads 的数量（受 CrashParseOptions.max_threads 等限制）
@@ -72,6 +77,8 @@ class MetaInfo:
     crash_thread_name: Optional[str] = None
     # Harmony 线程提取模式：full_by_threads（全量 body.stacks）| selective（限量精选）
     harmony_extraction_mode: Optional[str] = None
+    # so → BuildId（Android tombstone ``build id:`` / 栈行尾）
+    build_ids: Optional[Dict[str, str]] = None
 
 @dataclass
 class ThreadStack:
@@ -82,7 +89,7 @@ class ThreadStack:
     thread_index: Optional[int]
     is_crash_thread: bool  # 平台归因 / 日志标注的崩溃线程
     frames: List[StackFrame]
-    stack_layers: List[str]  # 该线程栈中出现的层级，如 ["native", "arkts"]
+    stack_domains: List[str]  # 该线程栈覆盖的运行时域，如 ["native", "arkts"]（与 StackLayerClassifier 的帧角色分层不同）
     has_native_frames: bool
     has_arkts_frames: bool  # 是否含 ArkTS/JS 帧
     has_java_frames: bool  # 是否含 Java 帧
@@ -94,16 +101,27 @@ class ThreadStack:
 
 @dataclass
 class CrashAnalysisResult:
-    """崩溃分析结果（按线程分组）"""
-    threads: List[ThreadStack]
+    """崩溃分析结果（按线程分组）。
+
+    JSON 字段顺序（asdict）：
+    crash_info → meta_info → threads → registers → 栈段计数 →
+    raw_content → raw_log_sections → parse_status（状态置末）。
+    """
     crash_info: CrashInfo
     meta_info: MetaInfo
-    raw_content: str
-    parse_status: str = "ok"  # 解析状态：ok / partial_log / error
+    threads: List[ThreadStack]
+    # 寄存器 dump + 与 crash_address 的关联分析（无 dump 时为 None）
+    registers: Optional[Dict[str, Any]] = None
     # 日志中检测到的含 backtrace: 的栈块数量（Tid 分块等模式下为 1，且可能未按 backtrace 分段）
     crash_backtrace_sum_count: int = 1
     # 用户请求解析第几段（1-based，见 CrashParseOptions.crash_segment_index）
     crash_backtrace_index_set: int = 1
+    # 原始日志全文（默认不落盘，由 save_raw_content 控制）
+    raw_content: str = ""
+    # 原始日志中识别到的段落标记（紧挨 raw_content；非全文镜像）
+    raw_log_sections: Optional[List[str]] = None
+    # 整次解析状态，置于末尾便于扫读
+    parse_status: str = "ok"  # ok / partial_log / error
 
 
 @dataclass
@@ -201,14 +219,18 @@ def _maybe_filter_threads_by_library_dir(
 
 
 def _thread_layer_summary(frames: List[StackFrame]) -> Dict[str, Any]:
-    """根据帧的 layer / language 计算线程的层级与语言摘要"""
-    layers = sorted(set(f.layer for f in frames if getattr(f, "layer", None)))
+    """根据帧的 layer / language 计算线程的运行时域与语言摘要。
+
+    ``stack_domains``：native / arkts / java 等运行时域（横切）。
+    勿与 ``rag.stack_layer_classifier.StackLayerClassifier`` 的帧角色分层混淆。
+    """
+    domains = sorted(set(f.layer for f in frames if getattr(f, "layer", None)))
     languages = sorted(set(f.language for f in frames if getattr(f, "language", None)))
     return {
-        "stack_layers": layers,
-        "has_native_frames": "native" in layers,
+        "stack_domains": domains,
+        "has_native_frames": "native" in domains,
         # ArkTS 既可能通过 layer 标识，也可能仅通过 language 标识
-        "has_arkts_frames": ("arkts" in layers) or ("arkts" in languages),
+        "has_arkts_frames": ("arkts" in domains) or ("arkts" in languages),
         "has_java_frames": "java" in languages,
         "has_objc_frames": "objc" in languages,
         "has_swift_frames": "swift" in languages,

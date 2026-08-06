@@ -1,0 +1,90 @@
+{
+  "version": "1.0.0",
+  "description": "模块名→知识域映射表，用于 RAG 检索前的选择性知识加载",
+  "mappings": [
+    {
+      "module_pattern": "libace|arkui|librender|libflutter|flutter_engine",
+      "knowledge_domain": "ui_framework",
+      "tags": ["lifecycle", "rendering", "layout", "animation"],
+      "description": "UI 框架相关模块"
+    },
+    {
+      "module_pattern": "libweb|webkit|chromium|libcef|WebKit|WKWebView",
+      "knowledge_domain": "webview",
+      "tags": ["js_bridge", "rendering", "memory", "network"],
+      "description": "WebView / 浏览器内核模块"
+    },
+    {
+      "module_pattern": "pthread|dispatch|libdispatch|std::thread|libconcurrency|WorkerThread",
+      "knowledge_domain": "concurrency",
+      "tags": ["deadlock", "race_condition", "sync", "thread_pool"],
+      "description": "并发/线程同步相关模块"
+    },
+    {
+      "module_pattern": "malloc|jemalloc|tcmalloc|scudo|libmemory|free|mimalloc",
+      "knowledge_domain": "memory_allocator",
+      "tags": ["heap_corruption", "double_free", "overflow", "use_after_free"],
+      "description": "内存分配器模块"
+    },
+    {
+      "module_pattern": "sqlite|leveldb|rocksdb|realm|FMDB|CoreData",
+      "knowledge_domain": "database",
+      "tags": ["corruption", "locking", "io", "transaction"],
+      "description": "数据库相关模块"
+    },
+    {
+      "module_pattern": "libssl|libcrypto|Security\\.framework|boringssl|openssl",
+      "knowledge_domain": "crypto_security",
+      "tags": ["cert", "handshake", "buffer", "key_management"],
+      "description": "加密/安全模块"
+    },
+    {
+      "module_pattern": "libnetwork|CFNetwork|libcurl|okhttp|libhttpclient|AFNetworking",
+      "knowledge_domain": "networking",
+      "tags": ["timeout", "buffer", "protocol", "connection"],
+      "description": "网络通信模块"
+    },
+    {
+      "module_pattern": "AVFoundation|libavcodec|MediaCodec|libmedia|libffmpeg|VideoToolbox",
+      "knowledge_domain": "media",
+      "tags": ["codec", "buffer", "sync", "pipeline"],
+      "description": "音视频/媒体处理模块"
+    },
+    {
+      "module_pattern": "CoreGraphics|libskia|libhwui|libGPU|Metal|libvulkan|libEGL|libGLES",
+      "knowledge_domain": "graphics",
+      "tags": ["gpu", "texture", "render_pipeline", "shader"],
+      "description": "图形渲染模块"
+    },
+    {
+      "module_pattern": "JavaScriptCore|libv8|hermes|libark_js|libquickjs",
+      "knowledge_domain": "js_runtime",
+      "tags": ["gc", "jit", "binding", "type_error"],
+      "description": "JavaScript 运行时模块"
+    },
+    {
+      "module_pattern": "libipc|libbinder|libmessagehandler|EventHandler",
+      "knowledge_domain": "ipc_messaging",
+      "tags": ["binder", "message_queue", "timeout", "serialization"],
+      "description": "进程间通信/消息机制模块"
+    },
+    {
+      "module_pattern": "libsensor|CoreMotion|libcamera|libinput",
+      "knowledge_domain": "hardware_io",
+      "tags": ["sensor", "camera", "input", "driver"],
+      "description": "硬件/传感器 IO 模块"
+    },
+    {
+      "module_pattern": "libzip|libz|libcompression|liblzma",
+      "knowledge_domain": "compression",
+      "tags": ["buffer", "overflow", "format", "corruption"],
+      "description": "压缩/解压模块"
+    },
+    {
+      "module_pattern": "libprotobuf|libjson|libxml|rapidjson|cJSON",
+      "knowledge_domain": "serialization",
+      "tags": ["parsing", "buffer", "format", "overflow"],
+      "description": "序列化/反序列化模块"
+    }
+  ]
+}

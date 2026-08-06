@@ -17,6 +17,7 @@ __all__ = [
     "iOSCrashAnalyzeWorkflow",
     "AndroidCrashAnalyzeWorkflow",
     "GenericCrashAnalyzeWorkflow",
+    "AnrFreezeAnalysisWorkflow",
     "register_all_workflows",
 ]
 
@@ -32,6 +33,7 @@ def register_all_workflows(registry=None):
         GenericCrashAnalyzeWorkflow,
         iOSCrashAnalyzeWorkflow,
     )
+    from .anr_freeze_workflow import AnrFreezeAnalysisWorkflow
 
     if registry is None:
         registry = get_registry()
@@ -60,17 +62,29 @@ def register_all_workflows(registry=None):
         is_tool=False,
         module="workflows",
     )
+    registry.register(
+        "anr_freeze_analysis",
+        AnrFreezeAnalysisWorkflow(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=False,
+        module="workflows",
+    )
 
 
 def __getattr__(name: str) -> Any:
     if name not in _LAZY_CLASS_NAMES:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if name == "AnrFreezeAnalysisWorkflow":
+        from .anr_freeze_workflow import AnrFreezeAnalysisWorkflow
+        return AnrFreezeAnalysisWorkflow
     from . import crash_analysis_workflow as _mod
 
     return getattr(_mod, name)
 
 
 if TYPE_CHECKING:
+    from .anr_freeze_workflow import AnrFreezeAnalysisWorkflow
     from .crash_analysis_workflow import (
         AndroidCrashAnalyzeWorkflow,
         BaseCrashAnalysisWorkflow,

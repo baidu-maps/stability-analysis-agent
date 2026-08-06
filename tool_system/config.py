@@ -199,6 +199,7 @@ def create_default_config() -> SystemConfig:
             WorkflowConfig(name="ios_crash_analyze", enabled=True),
             WorkflowConfig(name="android_crash_analyze", enabled=True),
             WorkflowConfig(name="crash_analysis", enabled=True),
+            WorkflowConfig(name="anr_freeze_analysis", enabled=True),
         ],
         llm=LLMConfig(
             engine="direct",

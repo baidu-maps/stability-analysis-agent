@@ -183,8 +183,9 @@ config.json
 secrets.json
 *.key
 *.pem
-tools/configs/agent_config.local.json
-tools/configs/add2line_resolver_config.local.json
+# Local LLM / toolchain secrets (never commit; covers configs/ and legacy tools/configs/)
+**/agent_config.local.json
+**/add2line_resolver_config.local.json
 test/llm/test_llm_connection_res.json
 
 .venv_compare_ts/

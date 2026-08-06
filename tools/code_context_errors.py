@@ -171,7 +171,7 @@ def code_context_skip_pipeline_message(code_context: Any, *, scope: str = "full"
     scope_norm = str(scope or "full").strip() or "full"
     tail = "已终止后续流程"
     if scope_norm == "gen_prompt_only":
-        tail = "已跳过提示词生成（05_ai_prompt.md）及大模型调用"
+        tail = "已跳过提示词生成（06_ai_prompt.md）及大模型调用"
     elif scope_norm == "full":
         tail = "已跳过 AI 分析、自动改码及大模型调用"
     if fail:

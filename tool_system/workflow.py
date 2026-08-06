@@ -6,7 +6,9 @@ Workflow 接口定义 - 问题类型解决方案
 
 from __future__ import annotations
 
+import datetime
 import logging
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -96,6 +98,29 @@ class WorkflowContext:
         self.llm = llm_adapter
         self.tools = tool_registry
         self.config = config
+        self.execution_events: List[Dict[str, Any]] = []
+
+    def _record_execution_event(
+        self,
+        *,
+        kind: str,
+        name: str,
+        started_at: str,
+        started_perf: float,
+        status: str,
+        error: Optional[str] = None,
+    ) -> None:
+        event: Dict[str, Any] = {
+            "kind": kind,
+            "name": name,
+            "status": status,
+            "started_at": started_at,
+            "finished_at": datetime.datetime.now().astimezone().isoformat(),
+            "duration_ms": max(0, int(round((time.perf_counter() - started_perf) * 1000))),
+        }
+        if error:
+            event["error"] = error
+        self.execution_events.append(event)
 
     def call_llm(self,
                  prompt: str,
@@ -114,7 +139,28 @@ class WorkflowContext:
         """
         if messages is None:
             messages = [{"role": "user", "content": prompt}]
-        return self.llm.chat(messages, **kwargs)
+        started_at = datetime.datetime.now().astimezone().isoformat()
+        started_perf = time.perf_counter()
+        try:
+            response = self.llm.chat(messages, **kwargs)
+        except Exception as exc:
+            self._record_execution_event(
+                kind="llm",
+                name="llm_analysis",
+                started_at=started_at,
+                started_perf=started_perf,
+                status="failed",
+                error=str(exc),
+            )
+            raise
+        self._record_execution_event(
+            kind="llm",
+            name="llm_analysis",
+            started_at=started_at,
+            started_perf=started_perf,
+            status="success",
+        )
+        return response
 
     def call_llm_stream(self,
                         prompt: str,
@@ -151,7 +197,28 @@ class WorkflowContext:
         if isinstance(tool, type):
             tool = tool()
 
-        return tool.execute(input_data)
+        started_at = datetime.datetime.now().astimezone().isoformat()
+        started_perf = time.perf_counter()
+        try:
+            result = tool.execute(input_data)
+        except Exception as exc:
+            self._record_execution_event(
+                kind="tool",
+                name=tool_name,
+                started_at=started_at,
+                started_perf=started_perf,
+                status="failed",
+                error=str(exc),
+            )
+            raise
+        self._record_execution_event(
+            kind="tool",
+            name=tool_name,
+            started_at=started_at,
+            started_perf=started_perf,
+            status="success",
+        )
+        return result
 
     def get_tool_definition(self, tool_name: str) -> Optional[Any]:
         """获取工具定义"""

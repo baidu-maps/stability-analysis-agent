@@ -8533,10 +8533,22 @@ class CodeContentProvider:
         crash_is_main = add2line_data.get("crash_thread_is_main_thread")
         crash_has_business = add2line_data.get("crash_thread_has_business_frames")
 
+        # 从 selected_frame 获取线程归属（兼容新旧格式）
+        # 新格式：frame 不含 thread_* 字段，需从 resolved_threads 中查找所属线程
         selected_tid = str(selected_frame.get("thread_tid") or "").strip() or None
         selected_name = str(selected_frame.get("thread_name") or "").strip() or None
         selected_is_crash = selected_frame.get("thread_is_crash_thread")
         selected_is_main = selected_frame.get("thread_is_main_thread")
+
+        # 新格式兼容：若 frame 不含 thread_* 字段，从 resolved_threads 查找
+        if selected_tid is None and selected_is_crash is None:
+            owner_thread = self._find_owning_thread(add2line_data, selected_frame)
+            if owner_thread:
+                selected_tid = str(owner_thread.get("tid") or "").strip() or None
+                selected_name = str(owner_thread.get("name") or "").strip() or None
+                selected_is_crash = bool(owner_thread.get("is_crash_thread"))
+                selected_is_main = owner_thread.get("is_main_thread")
+
         if selected_is_crash is None and crash_thread_id and selected_tid:
             selected_is_crash = selected_tid == crash_thread_id
 
@@ -8604,6 +8616,32 @@ class CodeContentProvider:
                 selected_frame.get("resolved_file") or selected_frame.get("file") or ""
             ).strip() or None,
         )
+
+    @staticmethod
+    def _find_owning_thread(
+        add2line_data: Dict[str, Any],
+        frame: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """在 resolved_threads 中找到包含给定 frame 的线程（按 address+function 匹配）。"""
+        if not frame or not isinstance(add2line_data, dict):
+            return None
+        resolved_threads = add2line_data.get("resolved_threads") or []
+        if not isinstance(resolved_threads, list):
+            return None
+        frame_addr = (frame.get("address") or "").strip().lower()
+        frame_fn = (frame.get("resolved_function") or frame.get("function") or "").strip()
+        for rt in resolved_threads:
+            if not isinstance(rt, dict):
+                continue
+            for f in rt.get("frames") or []:
+                if not isinstance(f, dict):
+                    continue
+                f_addr = (f.get("address") or "").strip().lower()
+                f_fn = (f.get("resolved_function") or f.get("function") or "").strip()
+                if frame_addr and f_addr == frame_addr:
+                    if not frame_fn or f_fn == frame_fn:
+                        return rt
+        return None
 
     def _enrich_resolved_frames_symbol_locations(
         self,
@@ -8901,7 +8939,8 @@ class CodeContentProvider:
                     "无法在该线程上确认崩溃源码行。"
                 )
             cs.pop("owner_class_context", None)
-            result_dict["crash_summary"] = cs
+            # 解耦重构：不再将 crash_summary 写入 03 输出
+            # result_dict["crash_summary"] = cs
             result_dict.pop("crash_func", None)
 
         graph_dict = result_dict.get("graph") or {}
@@ -8949,7 +8988,8 @@ class CodeContentProvider:
             if skel_node.get("skeleton", "").strip():
                 nodes_list.append(skel_node)
                 cs["owner_class_node_id"] = skel_node["id"]
-                result_dict["crash_summary"] = cs
+                # 解耦重构：不再将 crash_summary 写入 03 输出
+                # result_dict["crash_summary"] = cs
 
         graph_dict["nodes"] = nodes_list
         graph_dict["edges"] = edges_list
@@ -8999,8 +9039,10 @@ class CodeContentProvider:
         if result_dict.get("extraction_warnings"):
             diagnostics["extraction_warnings"] = result_dict.pop("extraction_warnings")
         result_dict["diagnostics"] = diagnostics
-        if isinstance(cs, dict):
-            result_dict["crash_summary"] = _build_readable_crash_summary(cs)
+        # 解耦重构：crash_summary 不再写入 03 输出，由 prompt builder 从 01+02 独立构建
+        # if isinstance(cs, dict):
+        #     result_dict["crash_summary"] = _build_readable_crash_summary(cs)
+        result_dict.pop("crash_summary", None)
         if extra_top_level:
             result_dict.update(extra_top_level)
 

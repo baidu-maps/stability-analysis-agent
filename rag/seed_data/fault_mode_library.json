@@ -1,0 +1,1433 @@
+[
+  {
+    "rule_id": "fm_nullptr_uaf_callback",
+    "rule_name": "空指针：UAF回调（析构后异步回调访问已释放对象）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=destructor|~Destroy|invoke|callback",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "nullptr_uaf_callback",
+      "root_cause_l1": "空指针解引用",
+      "root_cause_l2": "对象生命周期错误",
+      "root_cause_l3": "UAF回调——析构后异步回调仍访问已释放对象",
+      "evidence_tier": 2,
+      "fix_direction": "回调注册时使用weak_ptr或ensure注销；析构时取消所有挂起回调",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.9,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_nullptr_access_after_destructor",
+    "rule_name": "空指针：析构后访问（对象销毁后成员被访问）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=~[A-Z]|destructor|Release|Destroy",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "nullptr_post_destructor",
+      "root_cause_l1": "空指针解引用",
+      "root_cause_l2": "对象生命周期错误",
+      "root_cause_l3": "析构后访问——对象已销毁但仍通过悬空指针访问成员",
+      "evidence_tier": 2,
+      "fix_direction": "明确所有权模型，使用shared_ptr/unique_ptr管理生命周期",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.88,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_nullptr_weak_ref_expired",
+    "rule_name": "空指针：weak引用失效（weak_ptr/弱引用过期后解引用）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=weak_ptr|weakref|expired|lock",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "nullptr_weak_expired",
+      "root_cause_l1": "空指针解引用",
+      "root_cause_l2": "对象生命周期错误",
+      "root_cause_l3": "weak引用失效——weak_ptr.lock()返回空后未检查直接使用",
+      "evidence_tier": 2,
+      "fix_direction": "weak_ptr::lock()返回值必须判空；考虑使用shared_from_this模式",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.87,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_nullptr_api_return_unchecked",
+    "rule_name": "空指针：API返回null未检查",
+    "trigger_condition": "signal~=SIGSEGV AND crash_address~=0x0",
+    "required_features": [
+      "signal",
+      "crash_address"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "nullptr_api_unchecked",
+      "root_cause_l1": "空指针解引用",
+      "root_cause_l2": "入参校验缺失",
+      "root_cause_l3": "API返回null未检查——函数返回值为空指针但调用方未校验",
+      "evidence_tier": 3,
+      "fix_direction": "对所有可能返回nullptr的API调用增加空值检查；使用optional或错误码",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.85,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_nullptr_container_empty_access",
+    "rule_name": "空指针：容器empty时front/back访问",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=front|back|begin|operator\\[\\]",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "nullptr_container_empty",
+      "root_cause_l1": "空指针解引用",
+      "root_cause_l2": "入参校验缺失",
+      "root_cause_l3": "容器empty时front/back——在空容器上调用front()/back()或解引用begin()",
+      "evidence_tier": 3,
+      "fix_direction": "访问容器元素前检查empty()；使用at()替代operator[]",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.84,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_nullptr_race_null_set",
+    "rule_name": "空指针：另一线程置空（竞态导致指针被异步置空）",
+    "trigger_condition": "signal~=SIGSEGV AND thread_type~=worker|background|thread",
+    "required_features": [
+      "signal",
+      "thread_type"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "nullptr_race_nullify",
+      "root_cause_l1": "空指针解引用",
+      "root_cause_l2": "多线程竞态",
+      "root_cause_l3": "另一线程置空——指针在无锁保护下被其他线程设为null",
+      "evidence_tier": 2,
+      "fix_direction": "指针访问需加锁或使用atomic<shared_ptr>；考虑RCU模式",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.83,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_nullptr_async_release",
+    "rule_name": "空指针：异步释放（异步任务中释放导致主线程空指针）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=async|dispatch|post|schedule",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "nullptr_async_release",
+      "root_cause_l1": "空指针解引用",
+      "root_cause_l2": "多线程竞态",
+      "root_cause_l3": "异步释放——异步任务先于使用方释放了对象",
+      "evidence_tier": 2,
+      "fix_direction": "使用shared_ptr延长生命周期到异步操作完成；禁止裸指针跨线程传递",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.85,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_nullptr_incomplete_construction",
+    "rule_name": "空指针：构造未完成即访问",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=constructor|Init|Initialize|Setup",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "nullptr_incomplete_ctor",
+      "root_cause_l1": "空指针解引用",
+      "root_cause_l2": "初始化顺序错误",
+      "root_cause_l3": "构造未完成即访问——对象构造函数未执行完毕就被外部引用",
+      "evidence_tier": 3,
+      "fix_direction": "使用两阶段初始化或工厂模式；禁止在构造函数中泄漏this指针",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.82,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_nullptr_static_init_order",
+    "rule_name": "空指针：静态初始化顺序（跨翻译单元静态变量初始化顺序未定义）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=__cxx_global_var_init|__static_initialization|_GLOBAL_",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "nullptr_static_init_order",
+      "root_cause_l1": "空指针解引用",
+      "root_cause_l2": "初始化顺序错误",
+      "root_cause_l3": "静态初始化顺序——跨翻译单元static对象初始化顺序不确定(static init order fiasco)",
+      "evidence_tier": 3,
+      "fix_direction": "使用Meyers单例(函数内静态局部变量)替代全局静态对象；或使用construct-on-first-use惯用法",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.8,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_nullptr_null_deref_general",
+    "rule_name": "空指针：通用空指针解引用（crash_reason明确包含null pointer）",
+    "trigger_condition": "signal~=SIGSEGV AND crash_reason~=null pointer|NULL.*dereference",
+    "required_features": [
+      "signal",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "nullptr_general",
+      "root_cause_l1": "空指针解引用",
+      "root_cause_l2": "入参校验缺失",
+      "root_cause_l3": "通用空指针解引用——指针为NULL时直接解引用",
+      "evidence_tier": 4,
+      "fix_direction": "定位指针来源，在使用前增加空值校验；优先使用引用替代指针",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.86,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_nullptr_objc_nil_msg",
+    "rule_name": "空指针：ObjC nil消息发送导致崩溃（unrecognized selector to nil）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=objc_msgSend|objc_retain|objc_release",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "nullptr_objc_nil",
+      "root_cause_l1": "空指针解引用",
+      "root_cause_l2": "入参校验缺失",
+      "root_cause_l3": "ObjC对象为nil时发送消息导致崩溃（常见于属性访问或方法调用）",
+      "evidence_tier": 3,
+      "fix_direction": "发送消息前判空或使用respondsToSelector；检查delegate/dataSource是否已释放",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.86,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_nullptr_virtual_call_null",
+    "rule_name": "空指针：通过空指针调用虚函数（vtable访问地址0）",
+    "trigger_condition": "signal~=SIGSEGV AND crash_address~=0x[0-9a-f]{1,4}$",
+    "required_features": [
+      "signal",
+      "crash_address"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "nullptr_virtual_call",
+      "root_cause_l1": "空指针解引用",
+      "root_cause_l2": "对象生命周期错误",
+      "root_cause_l3": "通过空指针调用虚函数——对象指针为null但调用了虚方法导致vtable偏移访问低地址",
+      "evidence_tier": 3,
+      "fix_direction": "确保对象在调用虚方法前有效；使用shared_ptr或检查指针非空",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.83,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_uaf_lambda_raw_ptr",
+    "rule_name": "UAF：lambda捕获裸指针（异步lambda持有裸指针，对象已释放）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=lambda|operator\\(\\)|std::__invoke",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "uaf_lambda_raw_ptr",
+      "root_cause_l1": "释放后使用",
+      "root_cause_l2": "跨线程生命周期",
+      "root_cause_l3": "lambda捕获裸指针——异步lambda按值捕获裸指针/this，执行时对象已析构",
+      "evidence_tier": 2,
+      "fix_direction": "lambda捕获使用weak_ptr并在执行时lock()检查；或捕获shared_ptr延长生命周期",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.89,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_uaf_shared_ptr_cross_thread",
+    "rule_name": "UAF：shared_ptr跨线程循环引用导致意外释放",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=shared_ptr|use_count|release|destroy",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "uaf_shared_ptr_cycle",
+      "root_cause_l1": "释放后使用",
+      "root_cause_l2": "跨线程生命周期",
+      "root_cause_l3": "shared_ptr跨线程循环——循环引用被某一端打破时另一线程仍在使用",
+      "evidence_tier": 2,
+      "fix_direction": "打破循环引用使用weak_ptr；跨线程传递shared_ptr时使用atomic_load/store",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.85,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_uaf_observer_not_unregistered",
+    "rule_name": "UAF：observer未反注册（观察者析构时未从被观察者移除）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=Notify|Observer|Listener|OnEvent|Broadcast",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "uaf_observer_dangling",
+      "root_cause_l1": "释放后使用",
+      "root_cause_l2": "回调时序错误",
+      "root_cause_l3": "observer未反注册——观察者已销毁但仍在通知列表中被回调",
+      "evidence_tier": 2,
+      "fix_direction": "析构时必须从Subject注销；使用weak_ptr观察者列表或ScopedObserver自动注销",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.88,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_uaf_delegate_dangling",
+    "rule_name": "UAF：delegate野指针（委托对象已释放但仍被调用）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=delegate|Delegate|performSelector|respondTo",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "uaf_delegate_dangling",
+      "root_cause_l1": "释放后使用",
+      "root_cause_l2": "回调时序错误",
+      "root_cause_l3": "delegate野指针——delegate/target对象已dealloc但发起方仍持有裸指针调用",
+      "evidence_tier": 2,
+      "fix_direction": "delegate使用weak属性；析构/dealloc时将delegate置nil；或改用block+weak模式",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.87,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_uaf_iterator_erase",
+    "rule_name": "UAF：迭代中删除（遍历容器时删除元素导致迭代器失效）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=erase|remove|iterator|operator\\+\\+",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "uaf_iterator_erase",
+      "root_cause_l1": "释放后使用",
+      "root_cause_l2": "容器迭代失效",
+      "root_cause_l3": "迭代中删除——在for循环遍历容器时erase元素导致迭代器悬空",
+      "evidence_tier": 3,
+      "fix_direction": "使用erase返回的新迭代器；或collect-then-remove模式；或使用remove_if",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.86,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_uaf_resize_invalidate",
+    "rule_name": "UAF：resize导致迭代器/指针失效",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=push_back|emplace_back|resize|insert|reserve",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "uaf_resize_invalidate",
+      "root_cause_l1": "释放后使用",
+      "root_cause_l2": "容器迭代失效",
+      "root_cause_l3": "resize导致迭代器失效——vector扩容后之前保存的指针/迭代器/引用全部悬空",
+      "evidence_tier": 3,
+      "fix_direction": "扩容后重新获取迭代器；使用索引代替指针；或预先reserve足够容量",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.85,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_uaf_cross_thread_ref",
+    "rule_name": "UAF：跨线程引用释放（一个线程释放对象，另一线程仍在使用引用）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=free|delete|Release AND thread_type~=worker|background",
+    "required_features": [
+      "signal",
+      "stack_functions",
+      "thread_type"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "uaf_cross_thread_ref",
+      "root_cause_l1": "释放后使用",
+      "root_cause_l2": "跨线程生命周期",
+      "root_cause_l3": "跨线程引用释放——生产者线程释放资源时消费者线程仍在持有并使用引用",
+      "evidence_tier": 2,
+      "fix_direction": "使用shared_ptr共享所有权；或明确的线程间交接协议(hand-off)",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.87,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_double_free_smart_ptr_manual",
+    "rule_name": "Double Free：手动delete+智能指针双重管理",
+    "trigger_condition": "signal~=SIGABRT AND stack_functions~=free|delete|deallocate AND crash_reason~=double free|heap.*corrupt",
+    "required_features": [
+      "signal",
+      "stack_functions",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "double_free_smart_manual",
+      "root_cause_l1": "重复释放",
+      "root_cause_l2": "所有权不清",
+      "root_cause_l3": "手动delete+智能指针双重管理——对象同时被裸delete和智能指针管理导致二次释放",
+      "evidence_tier": 2,
+      "fix_direction": "统一使用unique_ptr或shared_ptr管理所有权；禁止混合手动new/delete与智能指针",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.9,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_double_free_destructor_repeat",
+    "rule_name": "Double Free：析构函数中重复free",
+    "trigger_condition": "signal~=SIGABRT AND stack_functions~=destructor|~[A-Z].*::~|free|operator delete",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "double_free_dtor_repeat",
+      "root_cause_l1": "重复释放",
+      "root_cause_l2": "所有权不清",
+      "root_cause_l3": "析构函数中重复free——析构函数释放了已被其他路径释放的内存",
+      "evidence_tier": 2,
+      "fix_direction": "释放后立即置空指针；使用unique_ptr自动管理；禁止多路径释放同一资源",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.88,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_double_free_move_semantics",
+    "rule_name": "Double Free：移动后仍使用源对象导致重复释放",
+    "trigger_condition": "signal~=SIGABRT AND crash_reason~=double free AND stack_functions~=move|swap|transfer",
+    "required_features": [
+      "signal",
+      "crash_reason",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "double_free_moved_from",
+      "root_cause_l1": "重复释放",
+      "root_cause_l2": "所有权不清",
+      "root_cause_l3": "移动后使用源对象——std::move后源对象未置空，析构时重复释放内部资源",
+      "evidence_tier": 3,
+      "fix_direction": "移动构造/赋值中将源对象指针置null；确保moved-from状态析构安全",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.85,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_double_free_exception_path",
+    "rule_name": "Double Free：异常路径导致重复释放",
+    "trigger_condition": "signal~=SIGABRT AND crash_reason~=double free AND stack_functions~=exception|throw|catch|unwind",
+    "required_features": [
+      "signal",
+      "crash_reason",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "double_free_exception",
+      "root_cause_l1": "重复释放",
+      "root_cause_l2": "所有权不清",
+      "root_cause_l3": "异常路径重复释放——异常展开时析构函数释放了try块中已手动释放的资源",
+      "evidence_tier": 3,
+      "fix_direction": "使用RAII管理资源；确保所有异常路径不会重复释放；try块中释放后立即置null",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.83,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_stack_overflow_infinite_recursion",
+    "rule_name": "栈溢出：递归无终止条件",
+    "trigger_condition": "crash_reason~=stack overflow|Stack overflow AND stack_functions~=recursive|Recursive",
+    "required_features": [
+      "crash_reason",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "stack_overflow_infinite_recursion",
+      "root_cause_l1": "栈空间耗尽",
+      "root_cause_l2": "无限递归",
+      "root_cause_l3": "递归无终止条件——递归函数缺少base case或终止条件永远不满足",
+      "evidence_tier": 2,
+      "fix_direction": "增加明确的递归终止条件；限制最大递归深度；改用迭代实现",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.91,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_stack_overflow_mutual_recursion",
+    "rule_name": "栈溢出：互递归（A调B调A无限循环）",
+    "trigger_condition": "crash_reason~=stack overflow AND signal~=SIGSEGV",
+    "required_features": [
+      "crash_reason",
+      "signal"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "stack_overflow_mutual_recursion",
+      "root_cause_l1": "栈空间耗尽",
+      "root_cause_l2": "无限递归",
+      "root_cause_l3": "互递归——两个或多个函数互相调用形成无终止循环",
+      "evidence_tier": 2,
+      "fix_direction": "重构为统一入口的迭代状态机；或在互调路径中加入深度计数器",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.87,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_stack_overflow_large_alloc",
+    "rule_name": "栈溢出：大数组分配在栈上",
+    "trigger_condition": "signal~=SIGSEGV AND crash_reason~=stack|guard page",
+    "required_features": [
+      "signal",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "stack_overflow_large_frame",
+      "root_cause_l1": "栈空间耗尽",
+      "root_cause_l2": "栈帧过大",
+      "root_cause_l3": "大数组分配在栈上——函数内定义超大局部数组或alloca过大导致单帧超出栈容量",
+      "evidence_tier": 3,
+      "fix_direction": "将大数组改为堆分配(vector/new)；减小线程栈上的临时缓冲区尺寸",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.84,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_stack_overflow_deep_call_chain",
+    "rule_name": "栈溢出：非递归但调用链过深（正常递归有终止但深度超限）",
+    "trigger_condition": "crash_reason~=stack overflow|thread.*stack AND signal~=SIGSEGV|SIGBUS",
+    "required_features": [
+      "crash_reason",
+      "signal"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "stack_overflow_deep_chain",
+      "root_cause_l1": "栈空间耗尽",
+      "root_cause_l2": "栈帧过大",
+      "root_cause_l3": "调用链过深——正常递归或层层嵌套调用导致总深度超出线程栈限制",
+      "evidence_tier": 3,
+      "fix_direction": "增大线程栈大小(pthread_attr_setstacksize)；或重构为迭代+显式栈",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.82,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_oob_loop_boundary",
+    "rule_name": "越界：循环边界错误（for循环条件不正确导致多访问一次）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=operator\\[\\]|at\\(|__range_check",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "oob_loop_boundary",
+      "root_cause_l1": "越界访问",
+      "root_cause_l2": "数组越界",
+      "root_cause_l3": "循环边界错误——for循环使用<=而非<或计算终止条件时差一",
+      "evidence_tier": 3,
+      "fix_direction": "使用range-based for或标准算法；检查循环条件是否应为<而非<=",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.85,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_oob_off_by_one",
+    "rule_name": "越界：off-by-one错误",
+    "trigger_condition": "signal~=SIGSEGV AND crash_reason~=out of range|bounds|index",
+    "required_features": [
+      "signal",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "oob_off_by_one",
+      "root_cause_l1": "越界访问",
+      "root_cause_l2": "数组越界",
+      "root_cause_l3": "off-by-one——下标计算差一导致读写数组末尾后一个元素",
+      "evidence_tier": 3,
+      "fix_direction": "审计索引计算是否有+1/-1偏差；使用at()或assert(index < size)",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.84,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_oob_strcpy_no_len_check",
+    "rule_name": "越界：strcpy无长度检查（缓冲区溢出）",
+    "trigger_condition": "signal~=SIGSEGV|SIGABRT AND stack_functions~=strcpy|strcat|sprintf|gets",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "oob_strcpy_overflow",
+      "root_cause_l1": "越界访问",
+      "root_cause_l2": "缓冲区溢出",
+      "root_cause_l3": "strcpy无长度检查——使用不安全字符串函数(strcpy/strcat/sprintf)且源串超出目标缓冲区",
+      "evidence_tier": 2,
+      "fix_direction": "替换为strncpy/strlcpy/snprintf等带长度限制的版本；优先使用std::string",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.88,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_oob_memcpy_wrong_len",
+    "rule_name": "越界：memcpy长度错误",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=memcpy|memmove|memset|bcopy",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "oob_memcpy_len",
+      "root_cause_l1": "越界访问",
+      "root_cause_l2": "缓冲区溢出",
+      "root_cause_l3": "memcpy长度错误——memcpy/memmove的length参数超出源或目标缓冲区实际大小",
+      "evidence_tier": 3,
+      "fix_direction": "确保memcpy长度不超过min(src_size, dst_size)；使用带边界检查的安全封装",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.86,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_oob_vector_no_bounds_check",
+    "rule_name": "越界：vector[i]无bounds check",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=vector|operator\\[\\]|_M_range_check",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "oob_vector_subscript",
+      "root_cause_l1": "越界访问",
+      "root_cause_l2": "容器越界",
+      "root_cause_l3": "vector[i]无bounds check——使用operator[]下标访问但未验证i<size()",
+      "evidence_tier": 3,
+      "fix_direction": "使用at()触发越界异常；或在访问前assert(i < vec.size())",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.86,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_oob_map_iterator_invalid",
+    "rule_name": "越界：map迭代器失效（修改容器后使用已失效迭代器）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=map|unordered_map|tree|_Rb_tree|hashtable",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "oob_map_iterator",
+      "root_cause_l1": "越界访问",
+      "root_cause_l2": "容器越界",
+      "root_cause_l3": "map迭代器失效——对map/unordered_map修改(insert/erase)后继续使用旧迭代器",
+      "evidence_tier": 3,
+      "fix_direction": "rehash/erase后重新获取迭代器；unordered_map插入可能导致所有迭代器失效",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.84,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_concurrency_no_lock_shared_var",
+    "rule_name": "并发：无锁共享变量（数据竞态）",
+    "trigger_condition": "signal~=SIGSEGV|SIGABRT AND thread_type~=worker|background AND stack_functions~=read|write|operator|access",
+    "required_features": [
+      "signal",
+      "thread_type",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "concurrency_data_race_nolock",
+      "root_cause_l1": "并发安全违规",
+      "root_cause_l2": "数据竞态",
+      "root_cause_l3": "无锁共享变量——多线程同时读写同一变量且无任何同步保护",
+      "evidence_tier": 2,
+      "fix_direction": "对共享变量加mutex保护或改用atomic；使用ThreadSanitizer定位竞态",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.85,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_concurrency_stl_multithread",
+    "rule_name": "并发：STL容器多线程读写",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=std::vector|std::map|std::list|std::deque|std::unordered",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "concurrency_stl_race",
+      "root_cause_l1": "并发安全违规",
+      "root_cause_l2": "数据竞态",
+      "root_cause_l3": "STL容器多线程读写——STL容器非线程安全，多线程同时读写导致内部状态损坏",
+      "evidence_tier": 2,
+      "fix_direction": "容器访问加锁；使用concurrent_queue等线程安全容器；或每线程独立容器+合并",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.87,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_concurrency_deadlock_abba",
+    "rule_name": "并发：AB-BA锁序死锁",
+    "trigger_condition": "stack_functions~=pthread_mutex_lock|std::mutex::lock|__lll_lock_wait AND thread_type~=worker|main",
+    "required_features": [
+      "stack_functions",
+      "thread_type"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "concurrency_deadlock_abba",
+      "root_cause_l1": "并发安全违规",
+      "root_cause_l2": "死锁",
+      "root_cause_l3": "AB-BA锁序——两个线程以相反顺序获取两把锁形成循环等待",
+      "evidence_tier": 2,
+      "fix_direction": "统一全局锁获取顺序；使用std::lock同时获取多把锁；加死锁检测日志",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.88,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_concurrency_deadlock_self",
+    "rule_name": "并发：自锁（同一线程对非递归锁二次加锁）",
+    "trigger_condition": "stack_functions~=pthread_mutex_lock|mutex::lock AND crash_reason~=deadlock|recursive lock",
+    "required_features": [
+      "stack_functions",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "concurrency_deadlock_self",
+      "root_cause_l1": "并发安全违规",
+      "root_cause_l2": "死锁",
+      "root_cause_l3": "自锁——同一线程对非递归互斥锁重入加锁导致永久阻塞",
+      "evidence_tier": 2,
+      "fix_direction": "改用recursive_mutex；或重构API消除嵌套锁需求；拆分内部/外部接口",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.89,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_concurrency_condvar_misuse",
+    "rule_name": "并发：条件变量误用（丢失唤醒或虚假唤醒未处理）",
+    "trigger_condition": "stack_functions~=condition_variable|pthread_cond_wait|cond_wait AND crash_reason~=deadlock|hang|timeout",
+    "required_features": [
+      "stack_functions",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "concurrency_condvar_misuse",
+      "root_cause_l1": "并发安全违规",
+      "root_cause_l2": "死锁",
+      "root_cause_l3": "条件变量误用——wait未配合谓词循环，notify在wait之前到达导致丢失唤醒",
+      "evidence_tier": 3,
+      "fix_direction": "wait必须在while(predicate)循环中；notify前修改共享状态并持锁；区分notify_one/all",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.84,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_concurrency_detach_access",
+    "rule_name": "并发：detach后访问（分离线程结束后主线程访问其资源）",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=detach|thread.*detach",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "concurrency_detach_uaf",
+      "root_cause_l1": "并发安全违规",
+      "root_cause_l2": "线程生命周期",
+      "root_cause_l3": "detach后访问——线程detach后其栈变量或线程局部存储被外部访问",
+      "evidence_tier": 2,
+      "fix_direction": "detach线程不应共享栈变量；使用join代替detach或通过shared_ptr共享数据",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.86,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_concurrency_join_missing",
+    "rule_name": "并发：join缺失（线程对象析构时仍joinable导致terminate）",
+    "trigger_condition": "signal~=SIGABRT AND stack_functions~=std::terminate|~thread|thread.*destruct",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "concurrency_join_missing",
+      "root_cause_l1": "并发安全违规",
+      "root_cause_l2": "线程生命周期",
+      "root_cause_l3": "join缺失——std::thread对象在joinable状态下析构触发std::terminate",
+      "evidence_tier": 2,
+      "fix_direction": "确保thread析构前调用join()或detach()；使用jthread(C++20)自动join",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.9,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_concurrency_race_string",
+    "rule_name": "并发：std::string多线程读写竞态",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=basic_string|string|__sso|_M_mutate|_M_data",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "concurrency_string_race",
+      "root_cause_l1": "并发安全违规",
+      "root_cause_l2": "数据竞态",
+      "root_cause_l3": "std::string多线程读写——多线程同时修改同一string对象导致内部缓冲区损坏",
+      "evidence_tier": 2,
+      "fix_direction": "string访问需加锁保护；或每线程独立string后merge；避免引用同一string",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.86,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_concurrency_rwlock_starvation",
+    "rule_name": "并发：读写锁饥饿导致超时崩溃",
+    "trigger_condition": "stack_functions~=pthread_rwlock|shared_mutex|shared_lock AND crash_reason~=timeout|watchdog|hang",
+    "required_features": [
+      "stack_functions",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "concurrency_rwlock_starvation",
+      "root_cause_l1": "并发安全违规",
+      "root_cause_l2": "死锁",
+      "root_cause_l3": "读写锁饥饿——大量读锁持续持有导致写锁永远获取不到（或反之）",
+      "evidence_tier": 3,
+      "fix_direction": "使用写优先策略的rwlock；限制读锁持有时间；考虑RCU替代方案",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.8,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_concurrency_spinlock_no_yield",
+    "rule_name": "并发：自旋锁长时间持有导致其他线程饥饿",
+    "trigger_condition": "stack_functions~=spin_lock|spinlock|OSSpinLock AND crash_reason~=timeout|watchdog",
+    "required_features": [
+      "stack_functions",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "concurrency_spinlock_starvation",
+      "root_cause_l1": "并发安全违规",
+      "root_cause_l2": "数据竞态",
+      "root_cause_l3": "自旋锁长时间持有——临界区过长或优先级反转导致spinning线程饥饿",
+      "evidence_tier": 3,
+      "fix_direction": "短临界区用spinlock，长操作改用mutex；iOS废弃OSSpinLock改用os_unfair_lock",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.81,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_illegal_dynamic_cast_null",
+    "rule_name": "非法操作：dynamic_cast失败解引用",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=dynamic_cast|__dynamic_cast|bad_cast",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "illegal_dynamic_cast_null",
+      "root_cause_l1": "非法操作",
+      "root_cause_l2": "类型转换错误",
+      "root_cause_l3": "dynamic_cast失败解引用——dynamic_cast返回nullptr后未检查直接使用",
+      "evidence_tier": 3,
+      "fix_direction": "dynamic_cast结果必须判空；考虑visitor模式或variant替代向下转型",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.86,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_illegal_reinterpret_cast",
+    "rule_name": "非法操作：reinterpret_cast类型不兼容",
+    "trigger_condition": "signal~=SIGBUS|SIGSEGV AND stack_functions~=reinterpret_cast|bit_cast",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "illegal_reinterpret_cast",
+      "root_cause_l1": "非法操作",
+      "root_cause_l2": "类型转换错误",
+      "root_cause_l3": "reinterpret_cast类型不兼容——强制类型转换违反strict aliasing或对齐要求",
+      "evidence_tier": 3,
+      "fix_direction": "使用memcpy或std::bit_cast(C++20)替代reinterpret_cast；确保对齐和类型兼容",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.83,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_illegal_integer_div_zero",
+    "rule_name": "非法操作：整数除零",
+    "trigger_condition": "signal~=SIGFPE AND crash_reason~=divide.*zero|arithmetic|FPE_INTDIV",
+    "required_features": [
+      "signal",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "illegal_int_div_zero",
+      "root_cause_l1": "非法操作",
+      "root_cause_l2": "除零",
+      "root_cause_l3": "整数除零——除数为0触发SIGFPE",
+      "evidence_tier": 3,
+      "fix_direction": "除法前校验除数非零；提前返回或使用默认值",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.92,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_illegal_float_exception",
+    "rule_name": "非法操作：浮点异常",
+    "trigger_condition": "signal~=SIGFPE AND crash_reason~=float|FPE_FLTDIV|FPE_FLTOVF|FPE_FLTINV",
+    "required_features": [
+      "signal",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "illegal_float_exception",
+      "root_cause_l1": "非法操作",
+      "root_cause_l2": "除零",
+      "root_cause_l3": "浮点异常——浮点除零、溢出或无效操作(NaN)触发SIGFPE",
+      "evidence_tier": 3,
+      "fix_direction": "浮点运算前检查操作数合法性；使用fpclassify/isnan/isinf防护",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.88,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_abort_assert_business",
+    "rule_name": "主动终止：业务逻辑assert失败",
+    "trigger_condition": "signal~=SIGABRT AND stack_functions~=assert|Assert|__assert_fail|__assert_rtn",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "abort_assert_business",
+      "root_cause_l1": "主动终止",
+      "root_cause_l2": "断言失败",
+      "root_cause_l3": "业务逻辑assert——代码中的断言条件不满足，通常表明逻辑不变式被违反",
+      "evidence_tier": 3,
+      "fix_direction": "分析assert条件为何不满足；修复导致不变式破坏的上游逻辑",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.89,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_abort_precondition_system",
+    "rule_name": "主动终止：系统框架precondition失败",
+    "trigger_condition": "signal~=SIGABRT AND stack_functions~=precondition|fatalError|NSException|UIKit|Foundation",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "abort_precondition_system",
+      "root_cause_l1": "主动终止",
+      "root_cause_l2": "断言失败",
+      "root_cause_l3": "系统框架precondition——违反系统框架前置条件(如主线程UI操作/参数范围)",
+      "evidence_tier": 3,
+      "fix_direction": "遵守框架API约定；UI操作调度到主线程；检查参数是否符合文档要求",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.87,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_abort_cpp_exception",
+    "rule_name": "主动终止：C++异常未捕获",
+    "trigger_condition": "signal~=SIGABRT AND stack_functions~=__cxa_throw|std::terminate|unhandled_exception|__cxa_call_unexpected",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "abort_cpp_exception",
+      "root_cause_l1": "主动终止",
+      "root_cause_l2": "异常未捕获",
+      "root_cause_l3": "C++ exception——抛出的C++异常无匹配catch处理，触发std::terminate",
+      "evidence_tier": 2,
+      "fix_direction": "增加对应异常类型的catch处理；或在异常源头修复根因避免抛出",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.9,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_abort_objc_exception",
+    "rule_name": "主动终止：ObjC异常未捕获",
+    "trigger_condition": "signal~=SIGABRT AND stack_functions~=objc_exception_throw|NSException|__exceptionPreprocess",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "abort_objc_exception",
+      "root_cause_l1": "主动终止",
+      "root_cause_l2": "异常未捕获",
+      "root_cause_l3": "ObjC exception——NSException被抛出但无@try/@catch捕获，进程终止",
+      "evidence_tier": 2,
+      "fix_direction": "增加@try/@catch或修复导致异常的API误用(如越界、nil插入NSDictionary)",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.89,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_heap_corruption_adjacent_overwrite",
+    "rule_name": "内存破坏：写越界踩邻接块（堆损坏）",
+    "trigger_condition": "signal~=SIGABRT|SIGSEGV AND crash_reason~=heap.*corrupt|malloc.*abort|free.*invalid",
+    "required_features": [
+      "signal",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "heap_corruption_adjacent",
+      "root_cause_l1": "内存破坏",
+      "root_cause_l2": "堆损坏",
+      "root_cause_l3": "写越界踩邻接块——堆上缓冲区写溢出覆盖了相邻内存块的元数据",
+      "evidence_tier": 1,
+      "fix_direction": "使用AddressSanitizer定位越界写入点；检查所有memcpy/buffer操作的长度",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.87,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_heap_corruption_freelist",
+    "rule_name": "内存破坏：free list损坏",
+    "trigger_condition": "signal~=SIGABRT AND stack_functions~=malloc|free|calloc|realloc|szone_error",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "heap_corruption_freelist",
+      "root_cause_l1": "内存破坏",
+      "root_cause_l2": "堆损坏",
+      "root_cause_l3": "free list损坏——堆管理器内部链表被覆写，后续malloc/free时检测到不一致",
+      "evidence_tier": 1,
+      "fix_direction": "内存损坏通常是上游越界写入导致；使用ASan/MallocGuard定位首次溢出点",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.85,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_heap_corruption_use_after_free_write",
+    "rule_name": "内存破坏：释放后写入导致堆元数据损坏",
+    "trigger_condition": "signal~=SIGABRT AND crash_reason~=heap.*corrupt|invalid.*free AND stack_functions~=free|delete|malloc",
+    "required_features": [
+      "signal",
+      "crash_reason",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "heap_corruption_uaf_write",
+      "root_cause_l1": "内存破坏",
+      "root_cause_l2": "堆损坏",
+      "root_cause_l3": "释放后写入——对已free的内存执行写操作破坏了堆管理器内部结构",
+      "evidence_tier": 1,
+      "fix_direction": "释放后立即置空指针；使用ASan的use-after-free检测；统一所有权避免悬空写入",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.86,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_stack_corruption_local_overflow",
+    "rule_name": "内存破坏：局部数组溢出（栈损坏）",
+    "trigger_condition": "signal~=SIGABRT|SIGSEGV AND crash_reason~=stack.*smash|stack.*corrupt|buffer overflow|__stack_chk_fail",
+    "required_features": [
+      "signal",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "stack_corruption_local_overflow",
+      "root_cause_l1": "内存破坏",
+      "root_cause_l2": "栈损坏",
+      "root_cause_l3": "局部数组溢出——栈上局部数组写越界覆盖了返回地址或其他栈帧数据",
+      "evidence_tier": 1,
+      "fix_direction": "使用-fstack-protector编译选项检测；审计所有栈上数组的写入边界",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.89,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_stack_corruption_canary",
+    "rule_name": "内存破坏：canary被覆盖（栈保护触发）",
+    "trigger_condition": "signal~=SIGABRT AND stack_functions~=__stack_chk_fail|__fortify_fail|__stack_chk_guard",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "stack_corruption_canary",
+      "root_cause_l1": "内存破坏",
+      "root_cause_l2": "栈损坏",
+      "root_cause_l3": "canary被覆盖——栈保护金丝雀值被缓冲区溢出覆写，编译器插入的检查触发abort",
+      "evidence_tier": 1,
+      "fix_direction": "定位覆写canary的缓冲区操作；检查函数内所有字符串/数组操作是否越界",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.91,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_concurrency_atomic_non_atomic_mix",
+    "rule_name": "并发：同一变量混合原子与非原子访问",
+    "trigger_condition": "signal~=SIGSEGV AND stack_functions~=atomic|load|store|fetch_add|compare_exchange",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "concurrency_mixed_atomic",
+      "root_cause_l1": "并发安全违规",
+      "root_cause_l2": "数据竞态",
+      "root_cause_l3": "混合原子与非原子访问——同一变量部分路径用atomic操作，部分路径直接读写",
+      "evidence_tier": 2,
+      "fix_direction": "统一使用atomic操作或统一加锁；禁止对同一变量混用两种访问模式",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.84,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_concurrency_dispatch_sync_deadlock",
+    "rule_name": "并发：dispatch_sync在当前队列导致死锁（GCD）",
+    "trigger_condition": "stack_functions~=dispatch_sync|dispatch_barrier_sync AND crash_reason~=deadlock|EXC_CRASH",
+    "required_features": [
+      "stack_functions",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "concurrency_gcd_sync_deadlock",
+      "root_cause_l1": "并发安全违规",
+      "root_cause_l2": "死锁",
+      "root_cause_l3": "dispatch_sync在当前队列——对串行队列(含主队列)执行同步派发到自身导致死锁",
+      "evidence_tier": 2,
+      "fix_direction": "使用dispatch_async替代；或检查是否已在目标队列上直接执行",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.9,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_heap_corruption_wild_write",
+    "rule_name": "内存破坏：野指针写入（写入已释放或未分配内存导致堆损坏）",
+    "trigger_condition": "signal~=SIGABRT|SIGBUS AND crash_reason~=heap|corrupt|invalid.*pointer AND stack_functions~=memcpy|memset|strcpy|write",
+    "required_features": [
+      "signal",
+      "crash_reason",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "heap_corruption_wild_write",
+      "root_cause_l1": "内存破坏",
+      "root_cause_l2": "堆损坏",
+      "root_cause_l3": "野指针写入——通过悬空/未初始化指针执行写操作破坏堆数据",
+      "evidence_tier": 1,
+      "fix_direction": "排查指针来源确保有效性；使用ASan检测；初始化所有指针变量",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.84,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_illegal_sigill_instruction",
+    "rule_name": "非法操作：执行非法CPU指令（SIGILL）",
+    "trigger_condition": "signal~=SIGILL AND crash_reason~=illegal instruction|ILL_ILLOPC|ILL_ILLOPN",
+    "required_features": [
+      "signal",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "illegal_sigill_cpu",
+      "root_cause_l1": "非法操作",
+      "root_cause_l2": "类型转换错误",
+      "root_cause_l3": "执行非法CPU指令——代码段被覆写、指令集不兼容或控制流劫持到数据区",
+      "evidence_tier": 2,
+      "fix_direction": "检查编译目标架构与运行时CPU是否匹配；排查代码段是否被覆写",
+      "responsibility": "undetermined"
+    },
+    "confidence_score": 0.83,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_nullptr_ios_dealloc_race",
+    "rule_name": "空指针：iOS对象dealloc后被访问（autorelease时序问题）",
+    "trigger_condition": "signal~=SIGSEGV AND platform~=iOS|ios AND stack_functions~=dealloc|autorelease|objc_release",
+    "required_features": [
+      "signal",
+      "platform",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "nullptr_ios_dealloc_race",
+      "root_cause_l1": "空指针解引用",
+      "root_cause_l2": "对象生命周期错误",
+      "root_cause_l3": "iOS对象dealloc后访问——ARC环境下autorelease pool drain时机不当导致对象提前释放",
+      "evidence_tier": 2,
+      "fix_direction": "确保对象在使用期间有强引用持有；注意@autoreleasepool作用域",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.85,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_uaf_segv_maperr_0x6b",
+    "rule_name": "UAF: SEGV_MAPERR + 0x6b 地址特征",
+    "trigger_condition": "signal~=SIGSEGV AND signal~=SEGV_MAPERR|MAPERR|code 1",
+    "required_features": [
+      "signal"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "uaf_segv_maperr_0x6b",
+      "root_cause_l1": "释放后使用",
+      "root_cause_l2": "堆对象释放后访问",
+      "root_cause_l3": "对象已释放（内存被 0x6b 填充），指针未置空导致二次访问",
+      "evidence_tier": 2,
+      "fix_direction": "检查对象生命周期管理，尤其跨线程传递场景；使用 weak_ptr 或释放后置空",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.92,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_nullptr_segv_accerr_stack_guard",
+    "rule_name": "栈溢出: SEGV_ACCERR + guard page 触碰",
+    "trigger_condition": "signal~=SIGSEGV AND signal~=SEGV_ACCERR|ACCERR|code 2",
+    "required_features": [
+      "signal"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "stack_overflow_guard_page",
+      "root_cause_l1": "栈空间耗尽",
+      "root_cause_l2": "栈溢出触碰 guard page",
+      "root_cause_l3": "函数调用深度过大或栈帧过大，触碰只读 guard page",
+      "evidence_tier": 3,
+      "fix_direction": "检查递归深度或局部变量大小；考虑增大线程栈大小或改为堆分配",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.82,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_sigbus_unaligned_arm",
+    "rule_name": "非对齐访问: SIGBUS + BUS_ADRALN",
+    "trigger_condition": "signal~=SIGBUS AND signal~=BUS_ADRALN|ADRALN|code 1",
+    "required_features": [
+      "signal"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "unaligned_access",
+      "root_cause_l1": "非法操作",
+      "root_cause_l2": "非对齐内存访问",
+      "root_cause_l3": "ARM 平台对未对齐地址执行多字节读写（如 int* 指向奇数地址）",
+      "evidence_tier": 2,
+      "fix_direction": "使用 memcpy 代替直接指针转型读写；检查结构体对齐和打包属性",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.9,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_sigill_code_corruption",
+    "rule_name": "代码损坏: SIGILL + ILL_ILLOPC",
+    "trigger_condition": "signal~=SIGILL AND signal~=ILL_ILLOPC|ILLOPC|code 1",
+    "required_features": [
+      "signal"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "code_corruption_illegal_opcode",
+      "root_cause_l1": "非法操作",
+      "root_cause_l2": "非法操作码",
+      "root_cause_l3": "CPU 遇到无法解码的指令，可能是跳转到数据区、内存损坏或 JIT 编译错误",
+      "evidence_tier": 2,
+      "fix_direction": "检查函数指针是否有效；排查堆/栈溢出覆盖代码段；确认 JIT 编译正确性",
+      "responsibility": "undetermined"
+    },
+    "confidence_score": 0.88,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_sigfpe_intdiv_zero",
+    "rule_name": "整数除零: SIGFPE + FPE_INTDIV",
+    "trigger_condition": "signal~=SIGFPE AND signal~=FPE_INTDIV|INTDIV|code 1",
+    "required_features": [
+      "signal"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "integer_divide_by_zero",
+      "root_cause_l1": "非法操作",
+      "root_cause_l2": "除零异常",
+      "root_cause_l3": "整数除法/取模运算中除数为零",
+      "evidence_tier": 1,
+      "fix_direction": "在除法前检查除数是否为零；审查除数来源的上游逻辑",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.95,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_uaf_deadbeef_poison",
+    "rule_name": "UAF/未初始化: 地址含 debug poison 值",
+    "trigger_condition": "signal~=SIGSEGV AND crash_reason~=dead|beef|baad|cdcd|dddd",
+    "required_features": [
+      "signal",
+      "crash_reason"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "debug_poison_access",
+      "root_cause_l1": "释放后使用",
+      "root_cause_l2": "访问已释放或未初始化内存",
+      "root_cause_l3": "崩溃地址含调试填充值（0xDEADBEEF/0xCDCDCDCD等），说明访问了已释放或从未初始化的指针",
+      "evidence_tier": 2,
+      "fix_direction": "检查指针初始化和生命周期管理；在 Debug 模式下复现以获取 ASan 报告",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.88,
+    "enabled": true
+  },
+  {
+    "rule_id": "fm_sigabrt_fortify",
+    "rule_name": "buffer overflow: SIGABRT + __fortify_fail",
+    "trigger_condition": "signal~=SIGABRT AND stack_functions~=__fortify_fail|__stack_chk_fail",
+    "required_features": [
+      "signal",
+      "stack_functions"
+    ],
+    "conclusion_type": "fault_mode",
+    "conclusion_payload": {
+      "pattern": "buffer_overflow_fortify",
+      "root_cause_l1": "越界访问",
+      "root_cause_l2": "缓冲区溢出",
+      "root_cause_l3": "FORTIFY_SOURCE 检测到缓冲区写越界（strcpy/memcpy/sprintf等不安全函数）",
+      "evidence_tier": 1,
+      "fix_direction": "使用 bounded 版本函数（strncpy/snprintf等）；检查缓冲区大小与实际写入长度",
+      "responsibility": "application"
+    },
+    "confidence_score": 0.95,
+    "enabled": true
+  }
+]

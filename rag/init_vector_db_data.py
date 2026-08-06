@@ -1105,7 +1105,9 @@ def init_strategies(analyzer: AIStabilityAnalyzerWithVectorDB) -> None:
 def init_guidance_blocks(analyzer: AIStabilityAnalyzerWithVectorDB) -> None:
     """从 default_guidance_blocks.json 加载并写入指导片段表。"""
     print("正在初始化指导片段表...")
-    path = PROJECT_ROOT / "tools" / "configs" / "default_guidance_blocks.json"
+    path = PROJECT_ROOT / "configs" / "default_guidance_blocks.json"
+    if not path.exists():
+        path = PROJECT_ROOT / "tools" / "configs" / "default_guidance_blocks.json"
     if not path.exists():
         print(f"  跳过：未找到 {path}")
         return
@@ -1128,9 +1130,36 @@ def init_guidance_blocks(analyzer: AIStabilityAnalyzerWithVectorDB) -> None:
     print(f"  已写入 {n_ok} 条指导片段（共 {len(blocks)} 条配置）")
 
 
+def init_fault_modes(analyzer: AIStabilityAnalyzerWithVectorDB) -> None:
+    """从 fault_mode_library.json 加载三级故障模式规则并写入 RuleStore。"""
+    print("正在初始化三级故障模式库...")
+    path = PROJECT_ROOT / "rag" / "seed_data" / "fault_mode_library.json"
+    if not path.exists():
+        print(f"  跳过：未找到 {path}")
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"  加载失败: {e}")
+        return
+    fault_modes = data.get("fault_modes", []) if isinstance(data, dict) else data
+    n_ok = 0
+    for rule in fault_modes:
+        try:
+            rule_id = rule.get("rule_id")
+            if not rule_id:
+                continue
+            analyzer.add_rule(rule)
+            n_ok += 1
+        except Exception as e:
+            print(f"  写入 rule {rule.get('rule_id')} 失败: {e}")
+    print(f"  已写入 {n_ok} 条故障模式规则（共 {len(fault_modes)} 条）")
+
+
 def main() -> int:
     print("=" * 60)
-    print("Stability Analysis Agent 向量数据库初始化（规则+模式+证据+策略+指导片段）")
+    print("Stability Analysis Agent 向量数据库初始化（规则+模式+证据+策略+指导片段+故障模式库）")
     print("=" * 60)
     try:
         analyzer = AIStabilityAnalyzerWithVectorDB()
@@ -1138,6 +1167,7 @@ def main() -> int:
         print("🗑  清空现有向量库与元数据后写入静态种子…")
         analyzer.clear_all()
         init_rules(analyzer)
+        init_fault_modes(analyzer)
         init_patterns(analyzer)
         init_evidence(analyzer)
         init_strategies(analyzer)

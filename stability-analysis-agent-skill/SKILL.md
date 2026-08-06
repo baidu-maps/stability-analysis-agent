@@ -57,8 +57,8 @@ pip install -e .
 | scope | 需要 LLM | 典型用途 |
 |-------|----------|----------|
 | `parse_log_only` | 否 | 只解析日志结构，无需库目录 |
-| `parse_stack_only` | 否 | 解析 + 符号化 |
-| `gen_prompt_only` | 否 | 完整工具链 + 生成 `05_ai_prompt.md`，**无需 API Key** |
+| `parse_stack_only` | 否 | 解析 + maps + 符号化 + 04a 诊断（条件 04c/d/e） |
+| `gen_prompt_only` | 否 | 完整工具链 + 生成 `06_ai_prompt.md`，**无需 API Key** |
 | `full`（默认） | 是 | 完整分析 + AI 推理 |
 
 ## 常用命令
@@ -110,12 +110,15 @@ sa-agent \
 | 文件 | 含义 |
 |------|------|
 | `01_crash_log_parser.json` | 结构化解析结果 |
-| `02_add2line_resolver.json` | 符号化后的堆栈 |
-| `03_code_content_provider.json` | 崩溃点源码上下文 |
-| `03b_code_location_trace.json` | 代码定位审计（旁路，默认不并入 05） |
-| `04_memory_context.json` | RAG 检索上下文 |
-| `round_0/05_ai_prompt.md` | 发给 LLM 的提示词 |
-| `round_0/06_ai_gen_res.md` | LLM 分析结果 |
+| `02_memory_maps.json` | 内存映射（有则写） |
+| `03_add2line_resolver.json` | 符号化后的堆栈 |
+| `04a_crash_diagnosis.json` | 崩溃诊断（含证据罗盘） |
+| `04b_code_content_provider.json` | 崩溃点源码上下文 |
+| `04b2_code_location_trace.json` | 代码定位审计（旁路，默认不并入提示词） |
+| `04c` / `04d` / `04e` | 条件旁路：ANR / 内存压力 / 日志时序 |
+| `05_memory_context.json` | RAG 检索上下文 |
+| `round_0/06_ai_prompt.md` | 发给 LLM 的提示词 |
+| `round_0/07_ai_gen_res.md` | LLM 分析结果 |
 | `final_output.md` | 终端可读汇总 |
 
 ## LLM 配置

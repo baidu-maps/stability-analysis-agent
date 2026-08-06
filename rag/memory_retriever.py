@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""规则 + 向量库检索，生成供 05 提示词使用的 memory_context。"""
+"""规则 + 向量库检索 + 故障模式匹配 + 证据分级，生成供 05 提示词使用的 memory_context。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from rag.feature_extractor import build_pattern_query, extract_features
+from rag.feature_extractor import build_pattern_query, extract_features, extract_module_list
 from rag.runtime import RAG_INSTALL_HINT, get_ai_stability_analyzer_class, rag_stack_available
 
 logger = logging.getLogger(__name__)
@@ -19,9 +19,25 @@ def render_memory_context(
     pattern_hits: List[Dict[str, Any]],
     evidence_map: Dict[str, Any],
     strategy_hits: List[Dict[str, Any]],
+    fault_mode_context: str = "",
+    evidence_grade_context: str = "",
+    stack_layers_context: str = "",
 ) -> str:
     """将检索结果渲染为可拼入 05 的 Markdown 文本。"""
     parts: List[str] = []
+
+    # 故障模式匹配结果（三级根因）
+    if fault_mode_context:
+        parts.append(fault_mode_context)
+
+    # 证据分级
+    if evidence_grade_context:
+        parts.append(evidence_grade_context)
+
+    # 调用栈分层
+    if stack_layers_context:
+        parts.append(stack_layers_context)
+
     if rule_hits:
         lines = []
         for item in rule_hits[:3]:
@@ -60,9 +76,11 @@ def collect_memory_context(
     rule_confidence_threshold: float = 0.85,
     vector_db_max_results: int = 3,
     vector_db_readonly: bool = True,
+    crash_log_content: str = "",
 ) -> Dict[str, Any]:
     """
-    规则优先 + 向量兜底。RAG 栈不可用时返回 skipped 结果（不抛异常）。
+    增强检索流程：故障模式匹配→证据分级→选择性知识加载→渲染增强。
+    RAG 栈不可用时返回 skipped 结果（不抛异常）。
     """
     base: Dict[str, Any] = {
         "success": True,
@@ -76,6 +94,11 @@ def collect_memory_context(
         "decision_trace": [],
         "vector_used": False,
         "vector_db_readonly": bool(vector_db_readonly),
+        # 新增字段
+        "fault_mode_matches": [],
+        "evidence_grade": None,
+        "stack_layers": None,
+        "knowledge_domains": [],
     }
     analyzer_cls = get_ai_stability_analyzer_class()
     if not rag_stack_available() or analyzer_cls is None:
@@ -97,6 +120,53 @@ def collect_memory_context(
         strategy_hits: List[Dict[str, Any]] = []
         vector_used = False
 
+        # === 新增：三级故障模式匹配 ===
+        fault_mode_context = ""
+        fault_mode_matches_raw: List[Dict[str, Any]] = []
+        try:
+            from rag.fault_mode_matcher import FaultModeMatcher
+            fm_matcher = FaultModeMatcher(analyzer)
+            fm_matches = fm_matcher.match(features, max_results=3)
+            if fm_matches:
+                fault_mode_context = fm_matcher.render_fault_mode_context(fm_matches)
+                fault_mode_matches_raw = [
+                    {
+                        "rule_id": m.rule_id,
+                        "root_cause_l1": m.root_cause_l1,
+                        "root_cause_l2": m.root_cause_l2,
+                        "root_cause_l3": m.root_cause_l3,
+                        "pattern": m.pattern,
+                        "evidence_tier": m.evidence_tier,
+                        "fix_direction": m.fix_direction,
+                        "responsibility": m.responsibility,
+                        "confidence_score": m.confidence_score,
+                    }
+                    for m in fm_matches
+                ]
+                decision_trace.append({
+                    "stage": "fault_mode",
+                    "result": "hit",
+                    "matched_count": len(fm_matches),
+                })
+        except Exception as e:
+            logger.debug("Fault mode matching skipped: %s", e)
+
+        # === 新增：选择性知识加载（模块路由） ===
+        knowledge_domains: List[str] = []
+        vector_filter: Optional[Dict[str, Any]] = None
+        try:
+            from rag.module_knowledge_router import ModuleKnowledgeRouter
+            from pathlib import Path
+            mapping_file = str(Path(__file__).parent / "seed_data" / "module_knowledge_mapping.json")
+            router = ModuleKnowledgeRouter(mapping_file=mapping_file)
+            modules = extract_module_list(resolved_stack, parse_result)
+            route_result = router.route(modules)
+            knowledge_domains = route_result.get("domains", [])
+            vector_filter = router.get_vector_filter(route_result)
+        except Exception as e:
+            logger.debug("Module knowledge routing skipped: %s", e)
+
+        # === 原有规则检索逻辑 ===
         if high_conf_hits:
             decision_trace.append(
                 {
@@ -107,6 +177,7 @@ def collect_memory_context(
             )
         else:
             query_text, _signature = build_pattern_query(parse_result, resolved_stack, code_context)
+            # 使用模块路由过滤（如果可用）
             pattern_hits = analyzer.retrieve_patterns(
                 query_text,
                 n_results=int(vector_db_max_results),
@@ -125,8 +196,60 @@ def collect_memory_context(
                 }
             )
 
+        # === 新增：证据分级 ===
+        evidence_grade_context = ""
+        evidence_grade_raw: Optional[Dict[str, Any]] = None
+        try:
+            from rag.evidence_grader import EvidenceGrader
+            grader = EvidenceGrader()
+            grade = grader.grade(features, rule_hits, pattern_hits, crash_log_content)
+            evidence_grade_context = grader.render_evidence_grade(grade)
+            evidence_grade_raw = {
+                "tier": grade.tier,
+                "confidence_label": grade.confidence_label,
+                "tier_description": grade.tier_description,
+                "reasoning": grade.reasoning,
+                "evidence_chain": [
+                    {"source": e.source, "description": e.description, "tier": e.tier}
+                    for e in grade.evidence_chain
+                ],
+            }
+        except Exception as e:
+            logger.debug("Evidence grading skipped: %s", e)
+
+        # === 新增：调用栈分层 ===
+        stack_layers_context = ""
+        stack_layers_raw: Optional[Dict[str, Any]] = None
+        try:
+            from rag.stack_layer_classifier import StackLayerClassifier
+            from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
+            classifier = StackLayerClassifier()
+            frames = (
+                flatten_resolved_frames_from_stack(resolved_stack)
+                if isinstance(resolved_stack, dict)
+                else []
+            )
+            layers = classifier.classify(frames)
+            stack_layers_context = classifier.render_stack_layers(layers)
+            stack_layers_raw = {
+                "crash_frame": layers.crash_frame,
+                "first_non_runtime": layers.first_non_runtime,
+                "first_app_frame": layers.first_app_frame,
+                "summary": layers.summary,
+                "annotations": [
+                    {"index": a.frame_index, "function": a.function, "module": a.module, "layer": a.layer}
+                    for a in layers.annotations[:20]
+                ],
+            }
+        except Exception as e:
+            logger.debug("Stack layer classification skipped: %s", e)
+
+        # === 渲染增强的 memory_context ===
         memory_context = render_memory_context(
-            rule_hits, pattern_hits, evidence_map, strategy_hits
+            rule_hits, pattern_hits, evidence_map, strategy_hits,
+            fault_mode_context=fault_mode_context,
+            evidence_grade_context=evidence_grade_context,
+            stack_layers_context=stack_layers_context,
         )
         base.update(
             {
@@ -137,6 +260,10 @@ def collect_memory_context(
                 "strategy_hits": strategy_hits,
                 "decision_trace": decision_trace,
                 "vector_used": vector_used,
+                "fault_mode_matches": fault_mode_matches_raw,
+                "evidence_grade": evidence_grade_raw,
+                "stack_layers": stack_layers_raw,
+                "knowledge_domains": knowledge_domains,
                 "user_message": (
                     "已从向量库只读检索规则/经验参考"
                     if memory_context and vector_db_readonly

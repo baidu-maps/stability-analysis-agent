@@ -77,18 +77,23 @@
 
 | 文件 | scope 条件 | 内容 |
 |------|------------|------|
-| `01_crash_log_parser.json` | 总是（有 parse 结果时） | 信号、线程、帧、log_format |
-| `02_add2line_resolver.json` | full / gen_prompt_only / parse_stack_only | 符号化堆栈 |
-| `03_code_content_provider.json` | full / gen_prompt_only | 崩溃点源码片段 |
-| `03b_code_location_trace.json` | 有 location_trace 时 | 定位审计旁路 |
-| `04_memory_context.json` | full / gen_prompt_only | RAG 规则与向量命中 |
-| `round_0/05_ai_prompt.md` | full / gen_prompt_only | LLM 输入提示词 |
-| `round_0/06_ai_gen_res.md` | full 且 LLM 成功 | 模型分析输出 |
+| `01_crash_log_parser.json` | 总是（有 parse 结果时） | 信号、线程、帧、log_format、log_kind |
+| `02_memory_maps.json` | ≥ parse_stack_only（有 maps 时） | 内存映射 |
+| `03_add2line_resolver.json` | full / gen_prompt_only / parse_stack_only | 符号化堆栈 |
+| `04a_crash_diagnosis.json` | ≥ parse_stack_only | 崩溃诊断 / evidence_compass |
+| `04b_code_content_provider.json` | full / gen_prompt_only | 崩溃点源码片段 |
+| `04b2_code_location_trace.json` | 有 location_trace 时 | 定位审计旁路 |
+| `04c_anr_freeze_diagnosis.json` | ANR 族或 force | ANR/Freeze |
+| `04d_memory_pressure_diagnosis.json` | OOM 族或 force | 内存压力 |
+| `04e_log_timeline.json` | 业务日志信号或 force | 崩溃前时序 |
+| `05_memory_context.json` | full / gen_prompt_only | RAG 规则与向量命中 |
+| `round_0/06_ai_prompt.md` | full / gen_prompt_only | LLM 输入提示词 |
+| `round_0/07_ai_gen_res.md` | full 且 LLM 成功 | 模型分析输出 |
 | `agent_rounds_summary.json` | context_loop 多轮时 | 各轮摘要 |
-| `07_apply_ai_fixes.json` | 启用自动改码时 | 补丁应用结果 |
-| `final_output.md` | 通常有 | 人类可读汇总 |
+| `08_apply_ai_fixes.json` | 启用自动改码时 | 补丁应用结果 |
+| `final_output.md` | 通常 full | 人类可读汇总 |
 
-`05_ai_prompt.md` 默认由 `01`/`02`/`03` 拼装；仅当 `--include-memory-in-05` 且 `04` 非空时并入 RAG 段落。
+`06_ai_prompt.md` 默认由 `01`/`03`/`04b` 等拼装；仅当 `--include-memory-in-05` 且 `05_memory_context` 非空时并入 RAG 段落。`04c`/`04d`/`04e`/`04b2` 为旁路，默认不改提示词骨架（经各诊断的 `prompt_section_zh` 注入）。
 
 ## 配置路径
 

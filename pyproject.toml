@@ -63,5 +63,10 @@ Changelog = "https://github.com/baidu-maps/stability-analysis-agent/blob/main/CH
 packages = ["agent", "tools", "rag", "workflows", "daemon", "tool_system", "skill_system", "protocol", "prompts", "cli", "services"]
 output-dir = "output/dist"
 
+# Ship example templates next to the cli package (never include *.local.json secrets)
+[tool.hatch.build.targets.wheel.force-include]
+"configs/agent_config.local.example.json" = "cli/configs/agent_config.local.example.json"
+"configs/add2line_resolver_config.local.example.json" = "cli/configs/add2line_resolver_config.local.example.json"
+
 [tool.hatch.build.targets.sdist]
 output-dir = "output/dist"
