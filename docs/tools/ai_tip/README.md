@@ -98,4 +98,4 @@
 | 指导片段表与 API | `tools/core/rag/metadata_store.py`、`vector_database_integration.py` | `analysis_guidance_blocks`、`get_guidance_blocks`、`add_guidance_block` |
 | 默认指导片段 JSON | `configs/default_guidance_blocks.json` | 兜底内容 |
 
-CLI 将上述最终提示词通过 `TOOL_OUTPUT:ai_prompt:` 或 `TOOL_OUTPUT:ai_analysis:` 输出，并写入报告目录下按轮次子目录 **round_N/05_ai_prompt.md**（单轮为 round_0，多轮为 round_0、round_1、…）。详见 `doc/cli_reports/README.md`。
+CLI 将上述最终提示词通过 `TOOL_OUTPUT:ai_prompt:` 或 `TOOL_OUTPUT:ai_analysis:` 输出，并写入报告目录下按轮次子目录 **round_N/06_ai_prompt.md**（单轮为 round_0，多轮为 round_0、round_1、…；旧报告可能仍为 `05_ai_prompt.md`）。详见 [CLI 报告说明](../cli/CLI_COMMANDS_REFERENCE.md)。

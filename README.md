@@ -19,6 +19,8 @@
 <p align="center">
   <sub>
     <b>Maintenance:</b> actively maintained ·
+    <b>latest:</b> <a href="https://pypi.org/project/stability-analysis-agent/1.2.9/">v1.2.9</a>
+    (evidence diagnosis <code>04a</code>–<code>04e</code>, ANR workflow, report renumbering) ·
     meaningful changes → <a href="https://github.com/baidu-maps/stability-analysis-agent/releases">GitHub Releases</a>
     (aim for about monthly when there is substance; not a calendar SLA) ·
     see <a href="./CHANGELOG.md">CHANGELOG</a>
@@ -81,9 +83,10 @@ under the same framework, not as a separate “v2 product”.
 
 ## Closed-Loop Workflow
 
-The four Skill presets shipped in `v1.2.8` are the **backbone** of Crash-fix
-auto-repair — not a collection of disconnected features. Wire them together,
-and `sa-agent` becomes an end-to-end stability engineering agent.
+The three Skill presets shipped in `v1.2.8` (`bug-platform-fetcher`,
+`automation-testing`, `cicd-pipeline`) are the **backbone** of Crash-fix
+auto-repair — not a collection of disconnected features. Wire them together
+with `sa-agent`, and you get an end-to-end stability engineering loop.
 
 ```
                 ┌──────────────────────  AUTO-FIX  LOOP  ──────────────────────┐
@@ -530,10 +533,10 @@ We're building this in the open. Here's where we are — and where the framework
 | Crash auto-fix (parse + symbolize + patch + apply) | ✅ GA | v1.0 (core), v1.2.8 (closed-loop presets) |
 | **`bug-platform-fetcher` / `automation-testing` / `cicd-pipeline` presets** | ✅ GA | v1.2.8 |
 | **Same framework, new stability class** | | |
-| ANR / AppFreeze / freeze **analysis** (hotspots, EventHandler, IPC) | ✅ GA | current |
-| Memory-pressure / OOM **clues** (log-side `04d`) | ✅ GA (sidepath) | current |
-| Pre-crash business-path / timeline (`04e`) | ✅ GA (sidepath) | current |
-| Crash evidence compass + registers + optional disassembly (`04a`) | ✅ GA | current |
+| ANR / AppFreeze / freeze **analysis** (hotspots, EventHandler, IPC) | ✅ GA | v1.2.9 |
+| Memory-pressure / OOM **clues** (log-side `04d`) | ✅ GA (sidepath) | v1.2.9 |
+| Pre-crash business-path / timeline (`04e`) | ✅ GA (sidepath) | v1.2.9 |
+| Crash evidence compass + registers + optional disassembly (`04a`) | ✅ GA | v1.2.9 |
 | ANR / Freeze **auto-fix** (patch apply) | 🚧 maturing | next minors |
 | OOM / memory **auto-fix** (heap snapshot diff) | 📋 planned | next minors |
 | **Community presets** | | |
@@ -697,7 +700,7 @@ sa-agent
 
 Then enter `设置` -> `配置大模型` / `配置堆栈地址解析工具`. Checks and guidance run contextually in flow. For stack symbolization: **Auto-detect (recommended)** and **Manually set absolute path to the symbolizer** (executable or directory containing it). When you choose **Quick start** and the run needs symbolization, the CLI also tries the same silent auto-write as **Auto-detect** first to avoid repeating setup.
 
-Default local config directory:
+Default local config directory (installed CLI):
 
 ```bash
 ~/.config/stability-analysis-agent/
@@ -705,6 +708,8 @@ Default local config directory:
 
 - `agent_config.local.json` for LLM vendor selection (`active_provider` key), credentials, and model
 - `add2line_resolver_config.local.json` for symbolizer search paths (`tool_paths` = directories; optional `environment_vars` for toolchain roots such as NDK, often filled by auto-detect)
+
+Templates live in the repo under [`configs/`](./configs/) (e.g. `agent_config.local.example.json`). For editable checkouts, the loader prefers `STABILITY_AGENT_CONFIG_DIR` if set, otherwise `<repo>/configs/agent_config.local.json`. Do not commit `*.local.json` with real keys.
 
 If you prefer manual editing, edit these files directly in that directory.
 

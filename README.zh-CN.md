@@ -7,7 +7,7 @@
 
 [English](./README.md) | **简体中文**
 
-**维护状态：** 持续维护中 · 有实质性改动时发布 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases)（活跃期大约每月一档，非日历 SLA）· 详见 [CHANGELOG.md](./CHANGELOG.md)
+**维护状态：** 持续维护中 · **最新版 [v1.2.9](https://pypi.org/project/stability-analysis-agent/1.2.9/)**（证据诊断 `04a`–`04e`、ANR 专用 workflow、报告编号对齐）· 有实质性改动时发布 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases)（活跃期大约每月一档，非日历 SLA）· 详见 [CHANGELOG.md](./CHANGELOG.md)
 
 ---
 
@@ -546,10 +546,10 @@ cp -R stability-analysis-agent/stability-analysis-agent-skill .cursor/skills/sta
 | Crash 自动修复（解析 + 符号化 + patch + 落盘）                                              | ✅ GA     | v1.0（核心）→ v1.2.8（闭环预置） |
 | `bug-platform-fetcher` **/** `automation-testing` **/** `cicd-pipeline` **预置** | ✅ GA     | v1.2.8                 |
 | **同一框架，新稳定性类**                                                                 |          |                        |
-| ANR / AppFreeze / 卡死**分析**（热点、EventHandler、IPC）                                | ✅ GA     | 当前                     |
-| 内存压力 / OOM **线索**（日志侧 `04d`）                                                   | ✅ GA（旁路） | 当前                     |
-| 崩溃前业务路径 / 时序（`04e`）                                                            | ✅ GA（旁路） | 当前                     |
-| Crash 证据罗盘 + 寄存器 + 可选反汇编（`04a`）                                                | ✅ GA     | 当前                     |
+| ANR / AppFreeze / 卡死**分析**（热点、EventHandler、IPC）                                | ✅ GA     | v1.2.9                 |
+| 内存压力 / OOM **线索**（日志侧 `04d`）                                                   | ✅ GA（旁路） | v1.2.9                 |
+| 崩溃前业务路径 / 时序（`04e`）                                                            | ✅ GA（旁路） | v1.2.9                 |
+| Crash 证据罗盘 + 寄存器 + 可选反汇编（`04a`）                                                | ✅ GA     | v1.2.9                 |
 | ANR / Freeze **自动改码**（patch 落盘）                                                | 🚧 打磨中   | 后续小版本                  |
 | OOM / 内存 **自动改码**（heap snapshot diff）                                          | 📋 计划中   | 后续小版本                  |
 | **社区预置**                                                                       |          |                        |
@@ -736,7 +736,7 @@ sa-agent
 
 进入后，在 `设置` 中选择 `配置大模型` 或 `配置堆栈地址解析工具`，流程会自动检测当前环境并给出引导。堆栈符号化向导支持 **“自动获取”** 和 **“手动设置符号化工具绝对路径”** 两种方式（可填写可执行文件路径，也可填写工具所在目录）；当你选择“快速开始分析”且流程需要符号化时，CLI 还会先静默尝试一次与“自动获取”相同的配置写入，以减少重复操作。
 
-默认本地配置目录：
+默认本地配置目录（安装后的 CLI）：
 
 ```bash
 ~/.config/stability-analysis-agent/
@@ -744,6 +744,8 @@ sa-agent
 
 - `agent_config.local.json`：配置大模型 **厂商 / 密钥 / 模型**（对应 `llm_config.active_provider` 与 `llm_config.providers`）
 - `add2line_resolver_config.local.json`：配置符号化工具搜索路径（`tool_paths` 为工具所在目录；可选 `environment_vars` 为 NDK/LLVM 等安装根，常由自动获取写入）
+
+仓库内模板在 [`configs/`](./configs/)（如 `agent_config.local.example.json`）。可编辑安装时：若设置了 `STABILITY_AGENT_CONFIG_DIR` 则优先该目录，否则读 `<仓库根>/configs/agent_config.local.json`。请勿把带真实密钥的 `*.local.json` 提交进仓库。
 
 若你偏好手动编辑，也可直接修改以上配置文件。
 

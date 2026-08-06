@@ -52,7 +52,7 @@
 - 全部命令参考（完整参数手册）
 - 命令快速示例（最小可运行）
 
-`6 / 7` 两个闭环入口只负责模板引导与依赖提示（指向 `automation-testing-skill` 与 `cicd-pipeline-skill`），不会把 Skill 自动拼进 `05_ai_prompt.md`；它们的更合理接入点是“修复候选产出后进入验证分支”以及“验证通过后进入打包分支”。详见 `docs/skills/CLOSE_LOOP_SKILL_TEMPLATES.md`。
+`6 / 7` 两个闭环入口只负责模板引导与依赖提示（指向 `automation-testing-skill` 与 `cicd-pipeline-skill`），不会把 Skill 自动拼进 `06_ai_prompt.md`；它们的更合理接入点是“修复候选产出后进入验证分支”以及“验证通过后进入打包分支”。详见 `docs/skills/CLOSE_LOOP_SKILL_TEMPLATES.md`。
 
 `4` 这一项迁移自闭源版的"输入 iCafe 编号自动修复"，**只抽象出"工单号 → crash 上下文"这个模式**，不预置任何具体平台（Jira / iCafe / WorkTile / 飞书 / 自建系统）的 API 调用。详见 `docs/skills/BUG_PLATFORM_FETCHER_TEMPLATE.md`。
 

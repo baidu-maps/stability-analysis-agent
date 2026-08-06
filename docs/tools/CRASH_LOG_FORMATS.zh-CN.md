@@ -81,7 +81,7 @@ JSON 要点：
 - 仅含 `library_dir` 内 so（`libace_compatible.z.so` 等系统/平台库不写入 02）
 - `crash_thread_id` / `frame_count_total` / `frame_count_resolvable`：统计与归因线程 ID
 - `max_frames` 预算按 **崩溃线程 → 含 library_dir 库帧的线程** 优先消耗
-- **03 代码图输出**：`graph.nodes[]` 继续全局去重；线程归属写在 `graph.edges[]`、`graph.call_chain_from_add2line[]` 和顶层 `thread_context[]` 中（`thread_id` / `is_crash_thread` / `is_main_thread` / `has_business_frames`）。`05_ai_prompt.md` 据此按线程展示函数调用关系，并区分“平台归因崩溃线程”和“当前业务分析入口线程”。
+- **03 代码图输出**：`graph.nodes[]` 继续全局去重；线程归属写在 `graph.edges[]`、`graph.call_chain_from_add2line[]` 和顶层 `thread_context[]` 中（`thread_id` / `is_crash_thread` / `is_main_thread` / `has_business_frames`）。`06_ai_prompt.md` 据此按线程展示函数调用关系，并区分“平台归因崩溃线程”和“当前业务分析入口线程”。
 - `01` 中 `frames[].raw_log_line` 为**原始崩溃日志文件**的 1-based 行号：在格式化 JSON 里 `call_stack` 常整段挤在同一行（如第 53 行），则该栈内各 `#NN pc` 帧会显示相同行号
 
 **后缀无关**（`.txt` / `.log` / `.json` 均可，只要内容匹配）。
