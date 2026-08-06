@@ -5,8 +5,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stability-analysis-agent"
-version = "1.2.8"
-description = "Stability Analysis Agent: AI-assisted crash log analysis toolchain (CLI, daemon, analyzers, agent)"
+version = "1.2.9"
+description = "Agent framework that builds evidence chains from Crash/ANR/OOM logs, auto-fixes Crash code, and plugs into test verification & bug trackers"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }

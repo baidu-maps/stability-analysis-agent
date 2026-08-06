@@ -4,10 +4,25 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.2.9] - 2026-08-06
+
+### Added
+
+- **证据驱动诊断流水线**：崩溃证据诊断（`04a`）、ANR/Freeze（`04c`）、内存压力/OOM 线索（`04d`）、崩溃前业务时序（`04e`）；含证据罗盘（PC → 符号 → 反汇编 → 寄存器）。
+- **`log_kind` 强分类与 ANR 专用 workflow**：AppFreeze / ANR traces 自动路由 `anr_freeze_analysis`；支持 `--force-anr-analysis` / `--force-memory-analysis` / `--force-timeline-analysis` / `--force-disassembly`。
+- **确定性与平台增强**：三级故障模式库、证据分级、信号子码语义、地址特征模式、寄存器关联、栈分层、模块知识路由、责任归属、热点栈统计、反汇编门控、鸿蒙 EventHandler dump 解析、Binder/IPC 弱提示。
+- **报告编号对齐**：`01` 解析 → `02` maps → `03` 符号化 → `04a`–`04e` 诊断族 → `05` 向量记忆 → `round_*/06` 提示词 / `07` AI 结果 → `08` 改码。
+
 ### Changed
 
+- **`parse_stack_only`**：包含 maps + 符号化 + 诊断族（不再仅解析/符号化）；`04e` 默认仅在检测到 logcat/HiLog/ASI 等业务日志信号时运行。
 - **配置目录**：示例与本地配置从 `tools/configs/` 迁至仓库根目录 `configs/`。`agent_config.local.json` / `add2line_resolver_config.local.json` 继续被 `.gitignore` 忽略，勿提交密钥。
-- **LLM 配置加载**：`STABILITY_AGENT_CONFIG_DIR`（若设置）优先；否则开源源码树读 `<仓库根>/configs/agent_config.local.json`；安装后的 CLI 读 `~/.config/stability-analysis-agent/agent_config.local.json`。闭源工作区通过入口自动将 `STABILITY_AGENT_CONFIG_DIR` 指向其 `configs/`。
+- **LLM 配置加载**：`STABILITY_AGENT_CONFIG_DIR`（若设置）优先；否则开源源码树读 `<仓库根>/configs/agent_config.local.json`；安装后的 CLI 读 `~/.config/stability-analysis-agent/agent_config.local.json`。
+
+### Documentation
+
+- `README.md` / `README.zh-CN.md`：证据链能力、维护状态与发版节奏（有意义则发版，活跃期约每月一档，非日历 SLA）。
+- `docs/cli/CLI_COMMANDS_REFERENCE.md`、`docs/architecture/fault_mode_library.md`、Skill 包参考文档同步新报告编号与 scope 语义。
 
 ## [1.2.8] - 2026-07-15
 
