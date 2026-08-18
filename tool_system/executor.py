@@ -128,6 +128,22 @@ class ConfigDrivenExecutor:
                 tool = tool()
                 self._tool_instances[name] = tool
 
+        return self._execute_tool_with_validation(name, tool, input_data)
+
+    @staticmethod
+    def _validate_tool_input(name: str, tool: Any,
+                             input_data: Dict[str, Any]) -> None:
+        """Validate tool input before allowing a direct tool invocation."""
+        validate_input = getattr(tool, "validate_input", None)
+        if callable(validate_input):
+            valid, error_msg = validate_input(input_data)
+            if not valid:
+                raise ValueError(f"Tool '{name}' input validation failed: {error_msg}")
+
+    @classmethod
+    def _execute_tool_with_validation(cls, name: str, tool: Any,
+                                      input_data: Dict[str, Any]) -> Dict[str, Any]:
+        cls._validate_tool_input(name, tool, input_data)
         return tool.execute(input_data)
 
     def execute_tool_stream(self, name: str, input_data: Dict[str, Any]) -> Generator[str, None, None]:
@@ -138,11 +154,12 @@ class ConfigDrivenExecutor:
 
         # 如果工具支持流式执行
         if hasattr(tool, "execute_stream"):
+            self._validate_tool_input(name, tool, input_data)
             for chunk in tool.execute_stream(input_data):
                 yield chunk
         else:
             # 否则返回普通结果
-            result = tool.execute(input_data)
+            result = self._execute_tool_with_validation(name, tool, input_data)
             yield str(result)
 
     # ==================== Workflow 执行 ====================
@@ -175,6 +192,10 @@ class ConfigDrivenExecutor:
             config=self.config.metadata
         )
 
+        valid, error_msg = workflow.validate_problem(problem)
+        if not valid:
+            raise ValueError(f"Workflow '{name}' input validation failed: {error_msg}")
+
         result = workflow.solve(problem, context)
         self.last_execution_events = list(context.execution_events)
         return result
@@ -192,6 +213,9 @@ class ConfigDrivenExecutor:
                 tool_registry=self.registry,
                 config=self.config.metadata
             )
+            valid, error_msg = workflow.validate_problem(problem)
+            if not valid:
+                raise ValueError(f"Workflow '{name}' input validation failed: {error_msg}")
             for chunk in workflow.solve_stream(problem, context):
                 yield chunk
         else:

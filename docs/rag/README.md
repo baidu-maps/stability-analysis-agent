@@ -98,6 +98,38 @@ print(result)
 
 目前不支持在配置中直接切换到其他向量后端（如 Milvus、Weaviate、Pinecone 等）。
 
+## 修复后写入向量知识库
+
+**默认不自动写库**。仅在 `scope=full` 且 `08_apply_ai_fixes.json` 中 `success=true` 时，由用户确认是否将案例写入向量库。
+
+| 入口 | 行为 |
+|------|------|
+| **CLI 交互** | 修复成功后提示「是否将此次修复案例写入向量知识库？」（默认否） |
+| **CLI 非交互** | 默认跳过；`--save-to-vector-db` 强制写入，`--no-save-to-vector-db` 显式跳过 |
+| **Web 面板** | 改码完成后结果区展示「写入 / 暂不」，调用 Daemon API 写库 |
+| **Daemon 子进程** | 固定 `--no-interactive --no-save-to-vector-db`，不在子进程弹窗 |
+
+写库实现：`rag/case_writer.py`（从报告目录构建 pattern + evidence）+ `rag/vector_store_config.py`（`local` / `remote` 配置）。
+
+- **local**（本期）：ChromaDB + SQLite，默认路径 `~/.config/stability-analysis-agent/vector_db`
+- **remote**（预留）：配置 `mode=remote` 时返回 501 / 明确报错
+
+路径优先级：`--vector-db-path` > `STABILITY_AGENT_VECTOR_DB_PATH` > `web_preferences.vector_db.local_path` > 默认目录。
+
+审计落盘：`reports/.../09_vector_db_commit.json`（`status`、`pattern_id`、`vector_db_path`）。
+
+CLI 示例：
+
+```bash
+# 交互确认（TTY）
+python3 cli/main.py --crash-log ... --library-dir ... --code-root ... --scope full
+
+# 脚本强制写入
+python3 cli/main.py ... --scope full --save-to-vector-db --no-interactive
+```
+
+Web / Daemon：`POST /runs/<run_id>/vector-db/commit`（见 [DAEMON_SERVER_GUIDE.md](../cli/DAEMON_SERVER_GUIDE.md)）。
+
 ## 当前接入状态说明
 
 当前仓库中的 `rag/` 已具备完整实现与初始化脚本；但统一入口 `cli/main.py` 尚未暴露历史文档中的 `--init-vector-db`、`--vector-db-stats` 这类参数。  

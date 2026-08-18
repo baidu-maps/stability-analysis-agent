@@ -4,7 +4,7 @@ set -euo pipefail
 REPO="/Users/liuhong_cd/baidu/personal-code/github-repos/stability-analysis-agent"
 MAPSDK="/Users/liuhong_cd/baidu/mapclient/mapsdk-vector/engine-dev"
 CRASH="/Users/liuhong_cd/baidu/mapclient/stability-analysis-agent/crash_cases/ios/uni_pub_v20.16.0_A8.1.0_i7.1.0/openmap-client-2942/log/crash.rtf"
-OUT_BASE="${STABILITY_TRIALS_OUT:-$REPO/cli_reports/stability_trials_20260602}"
+OUT_BASE="${STABILITY_TRIALS_OUT:-$REPO/reports/stability_trials_20260602}"
 mkdir -p "$OUT_BASE"
 
 cd "$REPO"
@@ -18,7 +18,7 @@ for i in 1 2 3; do
     --code-root "/Users/liuhong_cd/baidu/mapclient/mapsdk-vector" \
     --scope full 2>&1 | tee "$OUT_BASE/trial_${i}_cli.log"
 
-  LATEST=$(ls -td "$REPO"/cli_reports/*_analysis_full_direct_crash 2>/dev/null | head -1)
+  LATEST=$(ls -td "$REPO"/reports/*_analysis_full_direct_crash "$REPO"/cli_reports/*_analysis_full_direct_crash 2>/dev/null | head -1)
   TRIAL_DIR="$OUT_BASE/trial_$i"
   mkdir -p "$TRIAL_DIR"
   cp "$LATEST/07_apply_ai_fixes.json" "$TRIAL_DIR/" 2>/dev/null || true

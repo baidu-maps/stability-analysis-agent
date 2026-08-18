@@ -13,6 +13,17 @@
   - 插件扩展（`--plugin-module`）
   - Skill 管理（`sa-agent skill ...`）
 
+### 本地面板（Web 壳）
+
+与 CLI 共用同一核心，适合「路径已就绪、浏览器一键 full 修复」：
+
+```bash
+python3 daemon/server.py --host 127.0.0.1 --port 8765
+open http://127.0.0.1:8765/
+```
+
+详见 [WEB_UI_GUIDE.md](./WEB_UI_GUIDE.md)、[DAEMON_SERVER_GUIDE.md](./DAEMON_SERVER_GUIDE.md)。测试见 [docs/testing/WEB_DAEMON_TESTS.md](../testing/WEB_DAEMON_TESTS.md)。
+
 ## 安装依赖
 
 - **Python**：最低 3.9，推荐 3.10–3.12（详见 [INSTALL_TROUBLESHOOTING.md](./INSTALL_TROUBLESHOOTING.md)）
@@ -22,6 +33,28 @@
 未安装 `[rag]` 时，崩溃分析主流程仍可用，相似案例向量检索会自动跳过。ML 栈导入失败、SSL、`nn` 未定义等见 [INSTALL_TROUBLESHOOTING.md](./INSTALL_TROUBLESHOOTING.md)。
 
 ## 快速开始
+
+### Native 内存泄漏采集包
+
+只有 sample/smaps/NMD/kernel/profiler、没有传统 Crash 日志时，使用独立子命令：
+
+```bash
+python3 cli/main.py native-leak \
+  --input /path/to/nativeleak_bundle \
+  --trace-db /path/to/trace.db \
+  --code-root /path/to/source
+```
+
+该流程会量化 PSS/DMA/GPU 增长趋势，细分 jemalloc/ArkTS/ashmem/anon/file mapping，关联 NMD size class 与未释放分配栈，并用 HarmonyOS DMA 标签定位 Image、PixelMap、XComponent、Web、Codec 或 NativeBuffer 生命周期。`--trace-db` 必须是可信 `trace_streamer` 生成的 SQLite；Agent 不执行采集包中的二进制。
+
+若同一次 OOM Crash 同时有泄漏采集包，可在原 Crash 命令追加：
+
+```bash
+--native-leak-dir /path/to/nativeleak_bundle \
+--native-leak-trace-db /path/to/trace.db
+```
+
+完整结构化证据写入 `04d_memory_pressure_diagnosis.json` 的 `native_leak_diagnosis` 字段，并只通过既有 `prompt_section_zh` 路径参与 LLM 分析，不改变 `round_0/06_ai_prompt.md` 的固定骨架。
 
 ### 1) 完整分析
 
@@ -124,6 +157,17 @@ python3 cli/main.py --daemon http://127.0.0.1:8765 \
 - 源码树与安装态互不回退，避免多来源导致行为不确定
 - 交互菜单中的 **「厂商」** 对应配置文件里的 **`active_provider`**：即当前启用哪一条 `providers` 下的配置。
 - `active_provider` 的值必须是 `llm_config.providers` 下的某个 key（例如 `openai` / `deepseek`）；自定义网关等可另取键名（菜单里称「自定义厂商或配置标识名」）。
+
+### LLM 路由模式（`llm_config.mode`）
+
+- **默认 `mode: "fixed"`**（也可省略该字段）：行为与历史版本一致，只用 `active_provider` 指向的厂商/模型。
+- **`mode: "auto"`**：扫描 `providers` 中密钥有效（非 `YOUR_*` 占位，或环境变量已设置）的条目；内置能力表分档 `default` / `strong` / `fast`；按分析阶段与诊断信号自动选档（路由规则在代码内，无需用户写 stage 表）。
+- `mode` 只有 `fixed` 和 `auto` 两种；`auto` 内部会按分析阶段和诊断信号在 `default` / `strong` / `fast` 档位中选择。
+- 可选 `routing.failover_enabled`：调用失败时切换下一候选（`auto` 默认开启 failover）。
+- 可选 `routing.health_check`：auto 时是否短探活（默认 `true`）；结果缓存于 `~/.cache/stability-analysis-agent/llm_health.json`。
+- 可选 `preferences.default_provider` / `strong_provider`：仅在健康池内作偏好。
+- CLI 覆盖：`--llm-mode {fixed,auto}`、`--llm-profile {default,strong,fast}`。`--llm-profile` 是高级覆盖，不是独立路由模式。
+- 运行结果见 `reports/.../00_run_summary.json` 的 **`llm`** 字段（`schema_version` ≥ 3）。
 
 ## 符号化工具（堆栈地址解析）
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""内存泄漏分析技能模板。
+"""内存泄漏分析技能入口。
 
-提供内存泄漏故障类型的分析框架骨架，供后续填充具体实现。
-参考华为 DFX Skills 的 jsleak-analysis / nativeleak-analysis 设计。
+Crash 日志走 04d 内存压力旁路；HarmonyOS Native 泄漏采集包由
+``tools.native_leak_diagnosis`` 执行完整的确定性分析。
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ SKILL_DESCRIPTION = """\
 - 系统报告内存不足
 - heap dump / memory profile 分析
 
-## 分析流程（框架，待完善）
+## 分析流程
 
 ### Step 1: 泄漏类型判定
 - PSS/RSS 持续增长 → Native 堆泄漏
@@ -76,10 +76,17 @@ SKILL_DESCRIPTION = """\
 - 输出根因 + 泄漏路径 + 修复建议
 
 ## 当前状态
-阶段 A 已接线（crash 主轨旁路，非独立 workflow）：
+阶段 A（Crash 主轨旁路）：
 - ``tools.memory_diagnosis.run_memory_pressure_diagnosis`` → ``04d_memory_pressure_diagnosis.json``
 - 触发：``log_kind ∈ {oom_kill, memory_pressure, mixed_oom_crash}`` / ``oom_suspected`` / ``--force-memory-analysis``
-- 完整 heap snapshot diff 仍待后续阶段
+
+阶段 B（HarmonyOS Native 泄漏）：
+- ``native_leak_analysis`` 独立 workflow 与 ``native_leak_analyzer`` Tool
+- sample 趋势、smaps 分类、NMD diff、native_hook 未释放调用栈、kernel DMA 归属
+- CLI：``sa-agent native-leak --input <dir> [--trace-db <db>]``
+- 可通过 ``--native-leak-dir`` 合并到 Crash 04d sidecar
+
+ArkTS heapsnapshot retainer-chain 分析仍需专用 heap snapshot 能力。
 """
 
 
@@ -87,10 +94,10 @@ def get_leak_skill_metadata() -> Dict[str, Any]:
     """返回技能元数据。"""
     return {
         "name": "memory-leak-analysis",
-        "version": "0.2.0",
-        "description": "内存压力/OOM 旁路诊断（阶段 A）+ 泄漏模式骨架",
+        "version": "1.0.0",
+        "description": "内存压力/OOM 旁路 + HarmonyOS Native 泄漏确定性分析",
         "type": "workflow",
-        "status": "wired_sidepath",
+        "status": "implemented",
         "fault_modes": LEAK_FAULT_MODES,
     }
 
@@ -101,13 +108,16 @@ def run_memory_leak_analysis(
     crash_log_content: str = "",
     *,
     force: bool = False,
+    native_leak_path: str = "",
+    native_leak_trace_db: str = "",
 ) -> Any:
-    """技能对外入口：委托 ``tools.memory_diagnosis``（阶段 A）。"""
+    """技能对外入口：委托 04d，并可合并 Native 泄漏采集证据。"""
     from tools.memory_diagnosis.core import run_memory_pressure_diagnosis
     return run_memory_pressure_diagnosis(
         parse_result,
         resolved_stack,
         crash_log_content,
         force=force,
+        native_leak_path=native_leak_path,
+        native_leak_trace_db=native_leak_trace_db,
     )
-

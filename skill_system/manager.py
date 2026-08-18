@@ -109,6 +109,43 @@ class SkillManager:
     def list(self) -> List[SkillSummary]:
         return [bundle.to_summary() for bundle in self.discover()]
 
+    def discover_installed(self) -> List[SkillBundle]:
+        """仅扫描 installed_root（Web UI / Agent 运行时使用的已安装 skill）。"""
+        root = self.installed_root
+        if not root.exists():
+            return []
+        bundles: List[SkillBundle] = []
+        seen: set[str] = set()
+        for skill_md in root.rglob("SKILL.md"):
+            try:
+                bundle = load_skill_bundle(skill_md)
+            except Exception:
+                continue
+            key = str(bundle.path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            bundles.append(bundle)
+        bundles.sort(key=lambda item: (item.command_name, str(item.path)))
+        return bundles
+
+    def list_installed(self) -> List[SkillSummary]:
+        return [bundle.to_summary() for bundle in self.discover_installed()]
+
+    def find_installed(self, name: str) -> Optional[SkillBundle]:
+        normalized = _normalize_name(name)
+        for bundle in self.discover_installed():
+            candidates = {
+                _normalize_name(bundle.command_name),
+                _normalize_name(bundle.display_name),
+                _normalize_name(bundle.frontmatter.name or ""),
+                _normalize_name(bundle.package.name or ""),
+                _normalize_name(bundle.path.name),
+            }
+            if normalized in candidates:
+                return bundle
+        return None
+
     def find(self, name: str) -> Optional[SkillBundle]:
         normalized = _normalize_name(name)
         for bundle in self.discover():
@@ -227,8 +264,11 @@ class SkillManager:
     def summaries_as_dicts(self) -> List[Dict[str, Any]]:
         return [summary.to_dict() for summary in self.list()]
 
+    def summaries_installed_as_dicts(self) -> List[Dict[str, Any]]:
+        return [summary.to_dict() for summary in self.list_installed()]
+
     def resolve(self, name: str) -> SkillBundle:
-        bundle = self.find(name)
+        bundle = self.find_installed(name) or self.find(name)
         if bundle is None:
             raise KeyError(f"未找到 skill: {name}")
         return bundle

@@ -181,7 +181,7 @@ registry.register(
 设置菜单中已暴露两个新能力：
 
 - **检查更新（升级 sa-agent 到最新版）**：调用 `cli.upgrade` 自动查询 PyPI、安装方式探测与升级。
-- **查看本地缓存 / 清理本地缓存（cli_reports）**：调用 `cli.report_paths`，只读概览或按"全部 / 仅最近 N 份"清理报告目录。
+- **查看本地缓存 / 清理本地缓存（reports）**：调用 `cli.report_paths`，只读概览或按"全部 / 仅最近 N 份"清理报告目录。
 
 ## 相关文档
 

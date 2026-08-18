@@ -1,0 +1,214 @@
+domain: api_fault
+version: "1.0"
+fault_modes:
+  - id: multimedia.no_permission
+    name: "多媒体权限不足"
+    level_1: APIFault
+    level_2: Multimedia
+    level_3: NoPermission
+    owner: Application
+    confidence: 0.85
+    evidence_patterns:
+      - "5400101"
+      - "permission"
+      - "no permission"
+    guidance:
+      - "检查 module.json5 中是否声明了所需权限"
+      - "运行时权限需要调用 requestPermission"
+    tags: [multimedia, permission, 5400101]
+
+  - id: multimedia.invalid_parameter
+    name: "多媒体参数无效"
+    level_1: APIFault
+    level_2: Multimedia
+    level_3: InvalidParameter
+    owner: Application
+    confidence: 0.82
+    evidence_patterns:
+      - "5400102"
+      - "invalid parameter"
+      - "parameter"
+    guidance:
+      - "检查 API 调用参数的类型和范围"
+      - "参考文档确认参数约束"
+    tags: [multimedia, parameter, 5400102]
+
+  - id: multimedia.io_error
+    name: "多媒体 I/O 错误"
+    level_1: APIFault
+    level_2: Multimedia
+    level_3: IOError
+    owner: Application
+    confidence: 0.75
+    evidence_patterns:
+      - "5400103"
+      - "io error"
+      - "I/O"
+    guidance:
+      - "检查文件路径是否存在且可访问"
+      - "检查存储空间是否充足"
+    tags: [multimedia, io, 5400103]
+
+  - id: multimedia.network_timeout
+    name: "多媒体网络超时"
+    level_1: APIFault
+    level_2: Multimedia
+    level_3: NetworkTimeout
+    owner: Application
+    confidence: 0.72
+    evidence_patterns:
+      - "5400104"
+      - "5411002"
+      - "timeout"
+      - "network"
+    guidance:
+      - "增加超时时间或实现重试逻辑"
+      - "检查网络连接状态"
+    tags: [multimedia, network, timeout, 5400104]
+
+  - id: multimedia.service_died
+    name: "多媒体服务异常退出"
+    level_1: APIFault
+    level_2: Multimedia
+    level_3: ServiceDied
+    owner: System
+    confidence: 0.70
+    evidence_patterns:
+      - "5400105"
+      - "service died"
+    guidance:
+      - "实现服务异常的错误处理和恢复逻辑"
+      - "检查是否有内存或资源泄漏导致服务崩溃"
+    tags: [multimedia, service, crash, 5400105]
+
+  - id: multimedia.unsupported_format
+    name: "多媒体格式不支持"
+    level_1: APIFault
+    level_2: Multimedia
+    level_3: UnsupportedFormat
+    owner: Application
+    confidence: 0.80
+    evidence_patterns:
+      - "5400106"
+      - "unsupported"
+      - "format"
+    guidance:
+      - "确认输入文件格式是否在支持列表中"
+      - "检查编解码器可用性"
+    tags: [multimedia, format, 5400106]
+
+  - id: multimedia.audio_interrupted
+    name: "音频被中断"
+    level_1: APIFault
+    level_2: Multimedia
+    level_3: AudioInterrupted
+    owner: System
+    confidence: 0.68
+    evidence_patterns:
+      - "5400107"
+      - "interrupted"
+      - "audio"
+    guidance:
+      - "处理音频焦点变化事件"
+      - "在中断结束后恢复播放"
+    tags: [multimedia, audio, interrupt, 5400107]
+
+  - id: multimedia.host_not_found
+    name: "主机名解析失败"
+    level_1: APIFault
+    level_2: Multimedia
+    level_3: HostNotFound
+    owner: Application
+    confidence: 0.78
+    evidence_patterns:
+      - "5411001"
+      - "host not found"
+      - "DNS"
+    guidance:
+      - "检查 URL 的主机名是否正确"
+      - "确认网络和 DNS 配置"
+    tags: [multimedia, dns, network, 5411001]
+
+  - id: common.permission_denied
+    name: "通用权限拒绝"
+    level_1: APIFault
+    level_2: Common
+    level_3: PermissionDenied
+    owner: Application
+    confidence: 0.85
+    evidence_patterns:
+      - "201"
+      - "401"
+      - "permission denied"
+      - "not granted"
+    guidance:
+      - "声明并申请所需权限"
+      - "运行时检查权限状态"
+    tags: [common, permission, 201, 401]
+
+  - id: common.invalid_parameter
+    name: "通用参数无效"
+    level_1: APIFault
+    level_2: Common
+    level_3: InvalidParameter
+    owner: Application
+    confidence: 0.80
+    evidence_patterns:
+      - "invalid param"
+      - "parameter error"
+      - "401"
+    guidance:
+      - "检查 API 参数类型、范围和必填项"
+    tags: [common, parameter]
+
+  - id: common.repeated_reset
+    name: "状态机重复重置"
+    level_1: APIFault
+    level_2: Common
+    level_3: RepeatedReset
+    owner: Application
+    confidence: 0.72
+    evidence_patterns:
+      - "repeated"
+      - "reset"
+      - "already"
+      - "state"
+    guidance:
+      - "检查状态机转换是否正确"
+      - "避免在错误状态下调用 API"
+    tags: [common, state_machine, reset]
+
+  - id: network.timeout
+    name: "网络超时"
+    level_1: APIFault
+    level_2: Network
+    level_3: Timeout
+    owner: Application
+    confidence: 0.72
+    evidence_patterns:
+      - "timeout"
+      - "timed out"
+      - "ETIMEDOUT"
+    guidance:
+      - "增加超时配置或实现重试"
+      - "检查服务端响应时间"
+    tags: [network, timeout]
+
+  - id: database.invalid_state
+    name: "数据库状态无效"
+    level_1: APIFault
+    level_2: Database
+    level_3: InvalidState
+    owner: Application
+    confidence: 0.75
+    evidence_patterns:
+      - "14800014"
+      - "14800013"
+      - "14800021"
+      - "already closed"
+      - "not open"
+    guidance:
+      - "检查数据库连接生命周期"
+      - "确认在组件销毁后不再访问数据库"
+      - "使用 try-finally 确保正确关闭"
+    tags: [database, state, lifecycle]

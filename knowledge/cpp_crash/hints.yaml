@@ -1,0 +1,157 @@
+domain: cpp_crash
+version: "1.0"
+# Historical crash signature hints (heuristic patterns)
+# These are quick-match patterns that boost confidence for specific scenarios
+fault_modes:
+  - id: hint.uncaught_exception
+    name: "C++ 未捕获异常"
+    level_1: NativeCrash
+    level_2: SIGABRT
+    level_3: UncaughtException
+    owner: Application
+    confidence: 0.86
+    evidence_patterns:
+      - "uncaught exception"
+      - "__cxa_throw"
+      - "terminate"
+      - "libc++abi"
+    guidance:
+      - "在业务代码中定位 throw 点并补捕获或入参校验"
+    tags: [exception, abort, hint]
+
+  - id: hint.js_oom
+    name: "JS 堆 OOM 触发崩溃"
+    level_1: NativeCrash
+    level_2: JSOOM
+    level_3: HeapExhaustion
+    owner: Runtime
+    confidence: 0.70
+    evidence_patterns:
+      - "FullGC"
+      - "OOMError"
+      - "heap.*limit"
+    guidance:
+      - "结合 JS Heap 快照确认泄漏"
+    tags: [oom, js_heap, hint]
+
+  - id: hint.vm_multi_thread
+    name: "跨线程 VM 对象访问"
+    level_1: NativeCrash
+    level_2: Threading
+    level_3: CrossThreadVMAccess
+    owner: Application
+    confidence: 0.72
+    evidence_patterns:
+      - "multi.*thread"
+      - "cross.*thread"
+      - "JSThread"
+    guidance:
+      - "JS 对象不可跨线程使用，使用 Worker/TaskPool 通信"
+    tags: [threading, vm, hint]
+
+  - id: hint.napi_async_object
+    name: "N-API 异步回调对象问题"
+    level_1: NativeCrash
+    level_2: NAPIBoundary
+    level_3: AsyncCallback
+    owner: Application
+    confidence: 0.65
+    evidence_patterns:
+      - "napi_async"
+      - "threadsafe_function"
+      - "callback.*thread"
+    guidance:
+      - "使用 napi_threadsafe_function 替代裸指针回调"
+    tags: [napi, async, callback, hint]
+
+  - id: hint.gc_delayed_corruption
+    name: "GC 阶段暴露的延迟内存破坏"
+    level_1: NativeCrash
+    level_2: SIGSEGV
+    level_3: DelayedCorruption
+    owner: Application
+    confidence: 0.74
+    evidence_patterns:
+      - "GC"
+      - "FullGC"
+      - "Runtime"
+      - "panda"
+    guidance:
+      - "不要归因于 GC；排查跨线程 env、UAF 和越界写"
+    tags: [gc, corruption, uaf, hint]
+
+  - id: hint.uv_close_misuse
+    name: "libuv handle close 生命周期问题"
+    level_1: NativeCrash
+    level_2: LibuvMisuse
+    level_3: HandleCloseAsync
+    owner: Application
+    confidence: 0.70
+    evidence_patterns:
+      - "uv_close"
+      - "uv_handle"
+      - "libuv"
+    guidance:
+      - "uv_close 是异步的，close 回调前不可释放 handle 内存"
+    tags: [libuv, lifecycle, async, hint]
+
+  - id: hint.fd_double_close
+    name: "文件描述符重复关闭"
+    level_1: NativeCrash
+    level_2: SIGABRT
+    level_3: FDDoubleClose
+    owner: Application
+    confidence: 0.72
+    evidence_patterns:
+      - "errno=9"
+      - "EBADF"
+      - "errno=22"
+      - "EINVAL"
+    guidance:
+      - "检查 fd 是否被多处 close"
+      - "使用 RAII 或引用计数管理 fd 生命周期"
+    tags: [fd, double_close, hint]
+
+  - id: hint.sqlite_bus
+    name: "sqlite SIGBUS (BUS_OBJERR)"
+    level_1: NativeCrash
+    level_2: SIGBUS
+    level_3: SQLiteMmapError
+    owner: Application
+    confidence: 0.82
+    evidence_patterns:
+      - "BUS_OBJERR"
+      - "sqlite"
+      - "mmap"
+    guidance:
+      - "避免用普通文件接口改写正在 mmap 的数据库文件"
+    tags: [sqlite, mmap, bus, hint]
+
+  - id: hint.gwp_asan
+    name: "GWP-ASan 检测报告"
+    level_1: NativeCrash
+    level_2: GWPASan
+    level_3: DetectorReport
+    owner: Application
+    confidence: 0.95
+    evidence_patterns:
+      - "GWP-ASan"
+      - "gwp_asan"
+    guidance:
+      - "查看 violation / free / alloc 三栈定位问题"
+    tags: [gwp_asan, detector, hint]
+
+  - id: hint.xcomponent_lifecycle
+    name: "XComponent 生命周期问题"
+    level_1: NativeCrash
+    level_2: Lifecycle
+    level_3: XComponentDestroyed
+    owner: Application
+    confidence: 0.68
+    evidence_patterns:
+      - "XComponent"
+      - "OnSurfaceDestroyed"
+      - "surface"
+    guidance:
+      - "在 OnSurfaceDestroyed 后不可再使用 Surface 资源"
+    tags: [xcomponent, surface, lifecycle, hint]

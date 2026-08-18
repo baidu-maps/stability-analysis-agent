@@ -7,7 +7,8 @@
 ```
 docs/
 ├── architecture/          # 架构设计
-├── cli/                   # CLI 使用指南
+├── cli/                   # CLI 使用指南（含本地面板、Daemon）
+├── testing/               # 测试分层、单元测试、AI 回归、Web/Daemon 契约
 ├── skills/                # Skill 系统
 ├── workflows/                # Workflow 系统
 ├── rag/                   # RAG 向量库
@@ -49,6 +50,16 @@ docs/
 | [cli/CLI_GUIDE.md](./cli/CLI_GUIDE.md) | CLI 主指南 |
 | [cli/CLI_COMMANDS_REFERENCE.md](./cli/CLI_COMMANDS_REFERENCE.md) | 参数参考 |
 | [cli/DAEMON_SERVER_GUIDE.md](./cli/DAEMON_SERVER_GUIDE.md) | Daemon 指南 |
+| [cli/WEB_UI_GUIDE.md](./cli/WEB_UI_GUIDE.md) | 本地面板（一键全流程修复、工作区、Skills） |
+
+### 测试
+
+| 文档 | 说明 |
+|------|------|
+| [testing/README.md](./testing/README.md) | 测试分层与提交/发布清单 |
+| [testing/UNIT_TESTS.md](./testing/UNIT_TESTS.md) | `test/` 目录与按模块运行 |
+| [testing/AI_REGRESSION.md](./testing/AI_REGRESSION.md) | AI 全流程代码回归（CLI / daemon 双入口） |
+| [testing/WEB_DAEMON_TESTS.md](./testing/WEB_DAEMON_TESTS.md) | Web 壳与 Daemon HTTP 契约测试 |
 
 ### Workflow
 
@@ -76,7 +87,7 @@ docs/
 | [tools/CRASH_LOG_FORMATS.zh-CN.md](./tools/CRASH_LOG_FORMATS.zh-CN.md) | 崩溃日志格式与平台支持（中文） |
 | [tools/addr2line/README.md](./tools/addr2line/README.md) | 地址解析工具 |
 | [tools/ai_tip/README.md](./tools/ai_tip/README.md) | 提示词拼装逻辑 |
-| [tools/llm/TEST_LLM_CONNECTION_GUIDE.md](./tools/llm/TEST_LLM_CONNECTION_GUIDE.md) | LLM 连接测试 |
+| [tools/llm/TEST_LLM_CONNECTION_GUIDE.md](./tools/llm/TEST_LLM_CONNECTION_GUIDE.md) | LLM 连接测试（见 [testing/README.md](./testing/README.md)） |
 | [tools/tool_system/TOOL_SYSTEM_OVERVIEW.md](./tools/tool_system/TOOL_SYSTEM_OVERVIEW.md) | Tool System 架构 |
 | [tools/tool_system/TOOL_SYSTEM_EXTENSION.md](./tools/tool_system/TOOL_SYSTEM_EXTENSION.md) | 扩展指南 |
 

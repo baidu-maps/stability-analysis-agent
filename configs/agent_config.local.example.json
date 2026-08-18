@@ -1,5 +1,5 @@
 {
-  "_comment": "复制本文件为 agent_config.local.json 并填入真实密钥。交互式 CLI 菜单中称「厂商」，对应此处 llm_config.active_provider（当前启用哪一条）与 llm_config.providers（各厂商/网关的配置键与内容）。一次只会调用一个 active_provider，建议只保留当前使用的节点。",
+  "_comment": "复制本文件为 agent_config.local.json 并填入真实密钥。llm_config.mode 只有 fixed 和 auto：fixed 只用 active_provider 指向的那一条（与历史行为一致）；auto 扫描 providers 中密钥有效的厂商，由内置策略分 default/strong/fast 并按阶段选用。routing.failover_enabled 控制调用失败是否切换；preferences 仅在健康池内作偏好。请只保留已填真实密钥的 providers 条目（占位符 YOUR_* 不会被 auto 选中）。",
   "_provider_guide": {
     "required_fields": ["model", "base_url", "auth_type"],
     "auth_type": "api_key | authorization | none",
@@ -30,7 +30,16 @@
     "stream_notes": "true（默认）使用 SSE 流式调用，与厂商 Web UI 相同的响应速度；设为 false 使用非流式调用。所有 openai_chat_completions_compatible 厂商（OpenAI/DeepSeek/GLM/千帆/通义千问/Kimi/MiniMax）均支持流式；anthropic_messages_compatible 和 openai_responses_compatible 不受此参数影响（使用各自的 HTTP 调用）。"
   },
   "llm_config": {
+    "mode": "fixed",
     "active_provider": "openai",
+    "routing": {
+      "failover_enabled": false,
+      "health_check": true
+    },
+    "preferences": {
+      "default_provider": null,
+      "strong_provider": null
+    },
     "provider_defaults": {
       "request_format": "openai_chat_completions_compatible",
       "auth_type": "api_key",

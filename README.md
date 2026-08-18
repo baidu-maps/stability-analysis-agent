@@ -19,7 +19,7 @@
 <p align="center">
   <sub>
     <b>Maintenance:</b> actively maintained ·
-    <b>latest:</b> <a href="https://pypi.org/project/stability-analysis-agent/1.2.9/">v1.2.9</a>
+    <b>latest:</b> <a href="https://pypi.org/project/stability-analysis-agent/1.3.0/">v1.3.0</a>
     (evidence diagnosis <code>04a</code>–<code>04e</code>, ANR workflow, report renumbering) ·
     meaningful changes → <a href="https://github.com/baidu-maps/stability-analysis-agent/releases">GitHub Releases</a>
     (aim for about monthly when there is substance; not a calendar SLA) ·
@@ -152,6 +152,7 @@ The presets ship as skeletons — only `SKILL.md` + `skill.json`. You fill in th
 
 - 🙋 **"I just want to auto-fix a crash log."** → [Quick Start](#quick-start) — 60 seconds, no LLM key required for diagnosis.
 - 🔬 **"I want registers / ANR / business path without calling the LLM."** → [Evidence-driven diagnosis](#evidence-driven-diagnosis-why-developers-stick-around).
+- 🖥 **"I want a browser UI for one-click full fix (local dev)."** → [Local Web UI](#local-web-ui).
 - 🛠 **"I want to script `sa-agent` from my own tool / IDE / CI."** → [Python API](#python-api) + [Daemon Mode](#daemon-mode).
 - 🧩 **"I want to extend the agent with my own Tool / Workflow / Skill."** → [For Developers](#for-developers--four-ways-to-contribute).
 
@@ -225,6 +226,25 @@ input your own paths through the same flow.
 > drop into menu item `4` and explore `automation-testing` / `cicd-pipeline`
 > after the auto-fix completes.
 
+### Local Web UI
+
+A **local browser shell** for developers who already have `library_dir` and `code_root` on disk. It is an internal/open-source convenience layer — not the final enterprise “upload log only” product.
+
+```bash
+# From a source checkout (or after pip install with daemon entry)
+python3 daemon/server.py --host 127.0.0.1 --port 8765
+open http://127.0.0.1:8765/
+```
+
+| Area | What it does |
+|------|----------------|
+| **Main** | Paste a crash log path or full log → **Run full pipeline fix** (`scope=full`, `apply_ai_fixes=true`, same reports as CLI) |
+| **Sidebar · Workspace** | Save `library_dir` + `code_roots` to `~/.config/stability-analysis-agent/web_preferences.json` |
+| **Sidebar · Installed Skills** | List skills under `~/.config/.../skills`; enable/disable; install from a local path or zip |
+| **After a successful fix** | Optional **Save to vector DB** card (`POST /runs/<id>/vector-db/commit`); CLI prompts the same choice (default: skip) |
+
+Parameter sweeps (`gen_prompt_only`, `parse_stack_only`, …) stay on the CLI. See [Web UI Guide](./docs/cli/WEB_UI_GUIDE.md) and [Daemon Server Guide](./docs/cli/DAEMON_SERVER_GUIDE.md).
+
 ## Key Features
 
 | Feature | Description |
@@ -247,10 +267,10 @@ input your own paths through the same flow.
 | **Crash + ANR on one CLI** | Auto `log_kind` routing: Crash → `crash_analysis`; AppFreeze / ANR traces → `anr_freeze_analysis`; mixed cases handled by confidence-based primary/secondary |
 | **Address Symbolization** | `addr2line` / `atos` resolve raw addresses to function + line *before* any LLM call |
 | **Structured Log Parsing** | iOS / Android / macOS / Linux / Windows / Harmony; Crash · ANR · OOM · Freeze classification |
-| **RAG Knowledge Base** | Rule table (fast path) + vector retrieval (ChromaDB) + three-level fault-mode library + evidence templates |
+| **RAG Knowledge Base** | Rule table (fast path) + vector retrieval (ChromaDB); after a successful apply-fix, **opt-in** write to the local vector store (CLI confirm / Web button; not automatic) |
 | **Tool + Workflow + Skill** | Pluggable tools/workflows + Claude-style skills + `extensions/` drop-ins |
 | **External Agent Skill Pack** | Teach Claude Code / Cursor to call `sa-agent` correctly |
-| **Multiple Interfaces** | CLI, HTTP Daemon (SSE), Python API |
+| **Multiple Interfaces** | CLI, HTTP Daemon (SSE), Local Web UI, Python API |
 
 ### Evidence-driven diagnosis (why developers stick around)
 
@@ -267,6 +287,7 @@ actionable JSON:
 | **`04c` ANR / Freeze** | Stack hotspots, **EventHandler** queue (incl. Harmony AppFreeze dump), **Binder/IPC chain** (deadlock detection), blocking indicators |
 | **`04d` memory pressure** | RSS/PSS/heap/FD clues + leak-mode keyword match (sidepath / `--force-memory-analysis`) |
 | **`04e` business path** | Pre-crash logcat / HiLog / ASI timeline → **lifecycle & operation path inference** (*what the user was doing*) |
+| **`04c`/`04f`/`04g`/`04h` sidecars** | Native crash hints + stack layering · AppFreeze Binder/system-stress · API error-code knowledge · JS/ArkTS fault modes |
 | `05` RAG memory | **Fault-mode library match** (68 rules) + evidence grade + knowledge-domain routing + similar patterns |
 | `06` / `07` | Structured 7-section report (when LLM engaged): fault info → 3-level root cause → evidence chain → confidence → responsibility → fix → follow-up |
 
@@ -503,7 +524,7 @@ mkdir -p .cursor/skills
 cp -R stability-analysis-agent/stability-analysis-agent-skill .cursor/skills/stability-analysis-agent
 ```
 
-After that, ask your agent to auto-fix a crash with Stability Analysis Agent — it should propose `sa-agent` commands, pick the right `--scope`, and read `cli_reports/<timestamp>/` outputs.
+After that, ask your agent to auto-fix a crash with Stability Analysis Agent — it should propose `sa-agent` commands, pick the right `--scope`, and read `reports/<timestamp>/` outputs.
 
 | Resource | Description |
 |----------|-------------|
@@ -533,10 +554,10 @@ We're building this in the open. Here's where we are — and where the framework
 | Crash auto-fix (parse + symbolize + patch + apply) | ✅ GA | v1.0 (core), v1.2.8 (closed-loop presets) |
 | **`bug-platform-fetcher` / `automation-testing` / `cicd-pipeline` presets** | ✅ GA | v1.2.8 |
 | **Same framework, new stability class** | | |
-| ANR / AppFreeze / freeze **analysis** (hotspots, EventHandler, IPC) | ✅ GA | v1.2.9 |
-| Memory-pressure / OOM **clues** (log-side `04d`) | ✅ GA (sidepath) | v1.2.9 |
-| Pre-crash business-path / timeline (`04e`) | ✅ GA (sidepath) | v1.2.9 |
-| Crash evidence compass + registers + optional disassembly (`04a`) | ✅ GA | v1.2.9 |
+| ANR / AppFreeze / freeze **analysis** (hotspots, EventHandler, IPC) | ✅ GA | v1.3.0 |
+| Memory-pressure / OOM **clues** (log-side `04d`) | ✅ GA (sidepath) | v1.3.0 |
+| Pre-crash business-path / timeline (`04e`) | ✅ GA (sidepath) | v1.3.0 |
+| Crash evidence compass + registers + optional disassembly (`04a`) | ✅ GA | v1.3.0 |
 | ANR / Freeze **auto-fix** (patch apply) | 🚧 maturing | next minors |
 | OOM / memory **auto-fix** (heap snapshot diff) | 📋 planned | next minors |
 | **Community presets** | | |
@@ -653,18 +674,22 @@ Full matrix, parser priority, and how to add adapters: **[docs/tools/CRASH_LOG_F
 
 ## Daemon Mode
 
-The daemon provides **streaming output (SSE)**, **process reuse** (no cold start), and **task cancellation** — ideal for IDE integration and high-frequency analysis:
+The daemon provides **streaming output (SSE)**, **process reuse** (no cold start), **task cancellation**, and hosts the **local Web UI** — ideal for IDE integration, the browser shell, and high-frequency analysis:
 
 ```bash
 # Start the daemon
 sa-agent --daemon-server --host 127.0.0.1 --port 8765
+# or: python3 daemon/server.py
 
-# Analyze via daemon
+# Open the local Web UI
+open http://127.0.0.1:8765/
+
+# Analyze via daemon (CLI)
 sa-agent --daemon http://127.0.0.1:8765 \
   --crash-log <crash-log> --library-dir <lib-dir> --code-root <code-root>
 ```
 
-> See [Daemon Server Guide](./docs/cli/DAEMON_SERVER_GUIDE.md) for the full HTTP API reference.
+> See [Daemon Server Guide](./docs/cli/DAEMON_SERVER_GUIDE.md) and [Web UI Guide](./docs/cli/WEB_UI_GUIDE.md).
 
 ## Python API
 
@@ -727,7 +752,8 @@ export STABILITY_AGENT_ADD2LINE_CONFIG_FILE="/abs/path/add2line_resolver_config.
 stability-analysis-agent/
 ├── agent/              # Auto-Fix core engine (LangGraph state machine)
 ├── cli/                # CLI entry point
-├── daemon/             # HTTP daemon (streaming, SSE)
+├── daemon/             # HTTP daemon (streaming, SSE, Web UI host, web preferences)
+├── web/                # Local Web UI static assets (one-click full fix + workspace + Skills)
 ├── tools/              # Tool implementations (parser, resolver, code provider)
 │   └── configs/        # Configuration templates
 ├── tool_system/        # Tool + Workflow registration & dispatch framework
@@ -749,7 +775,9 @@ stability-analysis-agent/
 │   └── crash_cases/
 │       ├── demo_basic/         # NullPtr, DivZero, Abort, DoubleFree, etc.
 │       └── demo_multithread/   # Race condition, deadlock, atomic failure, etc.
-├── test/               # Test suite
+├── test/               # Test suite (cli / daemon / web / rag / ai_regression / …)
+├── .github/workflows/  # CI, optional AI regression, PyPI publish
+├── .devcontainer/      # Codespaces / VS Code Dev Container (lightweight, no full [rag])
 ├── stability-analysis-agent-skill/  # External agent skill pack (Claude / Cursor)
 └── docs/               # Documentation
 ```
@@ -761,12 +789,16 @@ stability-analysis-agent/
 | CLI Guide | [docs/cli/CLI_GUIDE.md](./docs/cli/CLI_GUIDE.md) |
 | CLI Commands Reference | [docs/cli/CLI_COMMANDS_REFERENCE.md](./docs/cli/CLI_COMMANDS_REFERENCE.md) |
 | Daemon Server Guide | [docs/cli/DAEMON_SERVER_GUIDE.md](./docs/cli/DAEMON_SERVER_GUIDE.md) |
+| Local Web UI | [docs/cli/WEB_UI_GUIDE.md](./docs/cli/WEB_UI_GUIDE.md) |
+| Testing (unit, AI regression, Web/Daemon, CI) | [docs/testing/README.md](./docs/testing/README.md) |
+| PyPI Release (scripts + GitHub Actions) | [docs/scripts/PYPI_RELEASE_SCRIPTS.md](./docs/scripts/PYPI_RELEASE_SCRIPTS.md) |
+| Codespaces / Dev Container | [.devcontainer/README.md](./.devcontainer/README.md) |
 | External Agent Skill Pack | [stability-analysis-agent-skill/](./stability-analysis-agent-skill/) |
 | Skill System (sa-agent runtime) | [docs/skills/README.md](./docs/skills/README.md) |
 | Closed-Loop Skill Templates | [docs/skills/CLOSE_LOOP_SKILL_TEMPLATES.md](./docs/skills/CLOSE_LOOP_SKILL_TEMPLATES.md) |
 | Bug Platform Fetcher Template | [docs/skills/BUG_PLATFORM_FETCHER_TEMPLATE.md](./docs/skills/BUG_PLATFORM_FETCHER_TEMPLATE.md) |
 | Skill Template Reference | [docs/skills/SKILL_TEMPLATE.md](./docs/skills/SKILL_TEMPLATE.md) |
-| PyPI Release Scripts | [docs/scripts/PYPI_RELEASE_SCRIPTS.md](./docs/scripts/PYPI_RELEASE_SCRIPTS.md) |
+| AI code regression (redirect) | [docs/testing/AI_REGRESSION.md](./docs/testing/AI_REGRESSION.md) |
 | Roadmap (long-form) | [docs/ROADMAP.md](./docs/ROADMAP.md) |
 | System Architecture | [docs/architecture/README.md](./docs/architecture/README.md) |
 | Architecture Diagram | [docs/architecture/ARCHITECTURE_DIAGRAM.md](./docs/architecture/ARCHITECTURE_DIAGRAM.md) |
@@ -780,25 +812,52 @@ stability-analysis-agent/
 
 ## Testing
 
+Full guide: **[docs/testing/README.md](./docs/testing/README.md)** (unit tests, AI regression, Web/Daemon contracts, GitHub Actions).
+
+**Pre-commit (no LLM)** — same suite as [`.github/workflows/ci.yml`](./.github/workflows/ci.yml):
+
 ```bash
-# Regression tests
-python3 test/tool_system/test_regression.py
-
-# LLM connection test
-python3 test/llm/test_llm_connection.py --provider openai
-
-# Code content provider test
-python3 test/agent_py_tool/test_code_content_provider.py
-
-# Vector database test
-python3 test/agent_py_tool/test_vector_db.py
-
-# Skill System (parser, install, lint, runtime bridge, preset guardrails)
-python3 test/skill_system/test_skill_system.py
-
-# CLI report-paths helpers + extensions/ auto-discovery
-python3 test/cli/test_report_paths.py
+python3 -B -m unittest \
+  test.ai_regression.test_runner \
+  test.cli.test_report_paths \
+  test.cli.test_vector_db_commit_prompt \
+  test.rag.test_case_writer \
+  test.daemon.test_build_cli_cmd \
+  test.daemon.test_skills_api \
+  test.daemon.test_run_lifecycle \
+  test.daemon.test_vector_db_commit_api \
+  test.daemon.test_web_preferences \
+  test.skill_system.test_installed_skills_runtime \
+  test.web.test_web_contract
 ```
+
+**GitHub Actions:**
+
+| Workflow | When | What |
+|----------|------|------|
+| [CI](./.github/workflows/ci.yml) | PR / push to `main`/`master` | Deterministic suite (Python matrix) + toolchain spot checks |
+| [AI Regression](./.github/workflows/ai-regression.yml) | Manual run, or PR label `ai-regression` | Real LLM repair regression (needs API secret) |
+| [Publish PyPI](./.github/workflows/publish-pypi.yml) | Tag `v*`, or manual | Build + Trusted Publishing upload (gated by the deterministic suite) |
+
+**Codespaces:** [`.devcontainer/`](./.devcontainer/) — `pip install -e ".[test]"` on create; open via **Code → Codespaces**.
+
+**Spot checks:**
+
+```bash
+python3 test/tool_system/test_regression.py
+python3 test/skill_system/test_skill_system.py
+python3 test/llm/test_llm_connection.py --provider openai   # needs API key
+```
+
+**Release (real LLM, code regression):**
+
+```bash
+python3 scripts/run_ai_regression.py --case test/ai_regression/cases/demo_basic_nullptr.json
+# After Web/daemon changes, also:
+python3 scripts/run_ai_regression.py --case test/ai_regression/cases/demo_basic_nullptr.json --entrypoint daemon
+```
+
+See also [docs/testing/AI_REGRESSION.md](./docs/testing/AI_REGRESSION.md) and [docs/testing/WEB_DAEMON_TESTS.md](./docs/testing/WEB_DAEMON_TESTS.md).
 
 ## FAQ
 

@@ -1331,7 +1331,9 @@ def _extract_replacement_from_analysis(
         return None
     target_signature = sanitize_function_signature(str(target_signature or "").strip())
     simple_name = _extract_simple_function_name(target_signature)
-    for code in blocks:
+    # Structured reports usually quote the original function before the
+    # proposed repair, so the last matching definition is the useful one.
+    for code in reversed(blocks):
         idx = code.find(target_signature) if target_signature else -1
         if idx >= 0:
             block = _extract_function_block_from_code(code, idx)
@@ -1677,13 +1679,23 @@ class CodeFixer:
                     # 排除成员变量名模式 (m_ 前缀在初始化列表中常见)
                     if func_name.startswith("m_"):
                         continue
-                    sig = func_name + "("
+                    matched_node = next(
+                        (
+                            node
+                            for node in candidate_nodes
+                            if _extract_simple_function_name(str(node.get("signature") or ""))
+                            == func_name.split("::")[-1]
+                        ),
+                        None,
+                    )
+                    sig = str((matched_node or {}).get("signature") or "").strip() or (func_name + "(")
+                    target_file = str((matched_node or {}).get("file") or default_file)
                     # 确认能从此块提取出完整函数
                     block = _extract_function_block_from_code(code, m.start())
                     if block and block.strip():
                         # 去重
                         if not any(t.get("function_signature") == sig for t in targets):
-                            targets.append({"file": default_file, "function_signature": sig})
+                            targets.append({"file": target_file, "function_signature": sig})
             if not targets:
                 return None
         edits: List[Dict[str, Any]] = []

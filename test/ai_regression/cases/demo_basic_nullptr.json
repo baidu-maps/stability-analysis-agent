@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "demo_basic_nullptr",
+  "platforms": ["darwin"],
+  "example_root": "examples/crash_cases/demo_basic",
+  "inputs": {
+    "crash_log": "logs/mac/NullPtr_SIGSEGV_2026-08-11_21-49-04.crash",
+    "library_dir": "lib/mac",
+    "code_root": "code_dir"
+  },
+  "expected_patch": "test/ai_regression/expected/demo_basic_nullptr.patch",
+  "allowed_changed_files": [
+    "common/src/my_lib.cpp"
+  ],
+  "timeout_seconds": 600,
+  "agent_args": [
+    "--prompt-mode",
+    "analysis",
+    "--agent-loop",
+    "context_loop"
+  ]
+}

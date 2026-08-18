@@ -48,6 +48,7 @@ lerna-debug.log*
 *.vsix
 *.js.map
 *.js
+!web/*.js
 
 # IDE / AI coding tools
 .vscode/
@@ -94,6 +95,7 @@ examples/crash_cases/**/logs/execution_log.txt
 examples/crash_cases/**/*.pkl
 
 # Test artifacts
+/test/ai_regression/results/
 .pytest_cache/
 .coverage
 htmlcov/
@@ -153,7 +155,8 @@ dmypy.json
 # PyInstaller cache/config
 .pyinstaller/
 
-# CLI artifacts
+# Analysis report artifacts (canonical name: reports/; legacy cli_reports/ still ignored)
+/reports/
 /cli_reports/
 
 # Temporary files

@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Stability Analysis Agent</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <h1>Stability Agent</h1>
+        <p class="subtitle">本地一键修复</p>
+        <div class="health">
+          <span id="healthDot" class="dot unknown"></span>
+          <span id="healthText">连接中…</span>
+        </div>
+      </div>
+
+      <section class="sidebar-section">
+        <h2>工作区路径</h2>
+        <p class="hint">符号库与源码根目录（本机路径，保存后下次自动带入）</p>
+        <label class="field">
+          <span>符号库 library_dir</span>
+          <input id="wsLibraryDir" type="text" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span>源码 code_roots（每行一个）</span>
+          <textarea id="wsCodeRoots" rows="3"></textarea>
+        </label>
+        <button type="button" id="btnSaveWorkspace" class="btn ghost block">保存工作区</button>
+      </section>
+
+      <section class="sidebar-section">
+        <h2>已安装 Skills</h2>
+        <p class="hint">仅显示本机已安装的 skill；关闭后下次分析不会加载。</p>
+        <ul id="skillList" class="skill-list compact"></ul>
+        <form id="skillInstallForm" class="skill-install">
+          <input id="skillSource" type="text" placeholder="本地 skill 目录或 zip 路径" autocomplete="off" />
+          <button type="submit" class="btn primary sm block">安装</button>
+        </form>
+        <p id="skillOpMsg" class="meta"></p>
+      </section>
+
+      <section class="sidebar-section">
+        <h2>向量知识库</h2>
+        <p id="vectorDbInfo" class="hint">本地部署（加载中…）</p>
+      </section>
+    </aside>
+
+    <main class="main">
+      <header class="main-head">
+        <h2>崩溃修复</h2>
+        <p class="hint">输入崩溃日志路径，或粘贴日志内容。将自动执行 <strong>full</strong> 全流程并尝试改码修复。</p>
+      </header>
+
+      <div id="templateChips" class="chips" aria-label="模板"></div>
+
+      <form id="runForm" class="run-form">
+        <textarea
+          id="taskInput"
+          rows="6"
+          placeholder="示例：&#10;examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash&#10;&#10;或直接粘贴崩溃日志全文…"
+          autofocus
+        ></textarea>
+        <div class="actions">
+          <button type="submit" id="btnRun" class="btn primary lg">运行全流程修复</button>
+          <button type="button" id="btnCancel" class="btn danger" disabled>取消</button>
+        </div>
+      </form>
+
+      <div id="progress" class="progress hidden">
+        <div class="step" data-step="parse">解析</div>
+        <div class="step" data-step="symbolize">符号化</div>
+        <div class="step" data-step="diagnose">诊断</div>
+        <div class="step" data-step="ai">AI 分析</div>
+        <div class="step" data-step="fix">改码</div>
+      </div>
+
+      <p id="runMeta" class="meta"></p>
+
+      <section id="vectorDbCommit" class="card vector-db-card hidden">
+        <h3>写入向量知识库</h3>
+        <p class="hint">修复已完成。可将此次案例写入本地向量库，供后续相似崩溃检索。</p>
+        <p id="vectorDbCommitMsg" class="meta"></p>
+        <div class="actions">
+          <button type="button" id="btnVectorDbCommit" class="btn primary sm">写入</button>
+          <button type="button" id="btnVectorDbSkip" class="btn ghost sm">暂不</button>
+        </div>
+      </section>
+
+      <section class="card result-card">
+        <h3>结果</h3>
+        <pre id="resultSummary" class="result">等待运行…</pre>
+      </section>
+
+      <details class="console-details">
+        <summary>详细日志</summary>
+        <pre id="consoleLog" class="console"></pre>
+      </details>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

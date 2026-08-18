@@ -57,12 +57,13 @@ class TestCliReplayAndStreaming(unittest.TestCase):
             self.assertEqual(payload["crash_log"], "/tmp/demo.crash")
             self.assertEqual(payload["scope"], "full")
             summary = json.loads(summary_file.read_text(encoding="utf-8"))
-            self.assertEqual(summary["schema_version"], 2)
+            self.assertEqual(summary["schema_version"], 3)
             self.assertEqual(summary["status"], "success")
             self.assertNotIn("crash_log", summary)
+            self.assertIn("llm", summary)
             self.assertIn("01_crash_log_parser.json", summary["artifacts"])
             self.assertEqual(
-                summary["artifacts"]["02_add2line_resolver.json"]["status"],
+                summary["artifacts"]["03_add2line_resolver.json"]["status"],
                 "not_written",
             )
 

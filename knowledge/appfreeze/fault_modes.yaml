@@ -1,0 +1,167 @@
+domain: appfreeze
+version: "1.0"
+fault_modes:
+  - id: FREEZE-FM-01
+    name: "主线程同步耗时任务"
+    level_1: APPFREEZE
+    level_2: MainThreadBlock
+    level_3: SyncExpensiveTask
+    owner: Application
+    confidence: 0.72
+    evidence_patterns:
+      - "Current Running"
+      - "running_seconds"
+      - "EventHandler"
+    guidance:
+      - "将耗时任务移到 Worker/TaskPool"
+      - "避免在主线程执行同步 I/O 或长时间计算"
+    tags: [main_thread, sync, expensive]
+
+  - id: FREEZE-FM-02
+    name: "采样栈顶稳定，判定为阻塞"
+    level_1: APPFREEZE
+    level_2: MainThreadBlock
+    level_3: StableStackTop
+    owner: Application
+    confidence: 0.80
+    evidence_patterns:
+      - "3s/6s stack top unchanged"
+      - "BLOCKED"
+    guidance:
+      - "栈顶不变说明主线程卡在某个同步调用上"
+      - "检查该调用的阻塞源（锁、IPC、I/O）"
+    tags: [block, stable_stack, sampling]
+
+  - id: FREEZE-FM-03
+    name: "采样栈顶变化，判定为繁忙"
+    level_1: APPFREEZE
+    level_2: MainThreadBusy
+    level_3: ChangingStackTop
+    owner: Application
+    confidence: 0.78
+    evidence_patterns:
+      - "3s/6s stack top changed"
+      - "BUSY"
+    guidance:
+      - "栈顶变化说明主线程在执行但过于繁忙"
+      - "使用深度热点分析定位最频繁的业务函数"
+    tags: [busy, changing_stack, sampling]
+
+  - id: FREEZE-FM-04
+    name: "锁等待或互斥阻塞"
+    level_1: APPFREEZE
+    level_2: MainThreadBlock
+    level_3: LockContention
+    owner: Application
+    confidence: 0.76
+    evidence_patterns:
+      - "pthread_mutex"
+      - "futex"
+      - "std::mutex"
+      - "Monitor::Wait"
+      - "__psynch_mutex"
+      - "os_unfair_lock"
+    guidance:
+      - "沿锁等待链找到持有锁且栈更深的业务线程"
+      - "在持有侧缩短临界区"
+    tags: [lock, mutex, contention]
+
+  - id: FREEZE-FM-05
+    name: "Binder 环路死锁"
+    level_1: APPFREEZE
+    level_2: IPCDeadlock
+    level_3: BinderCycle
+    owner: Application/System
+    confidence: 0.88
+    evidence_patterns:
+      - "binder cycle"
+      - "deadlock"
+      - "BinderInvoker"
+      - "WaitForCompletion"
+    guidance:
+      - "解除 Binder IPC 的循环依赖"
+      - "不要把 IPC 框架本身当成根因"
+    tags: [binder, deadlock, ipc]
+
+  - id: FREEZE-FM-06
+    name: "FFRT/Binder 依赖环"
+    level_1: APPFREEZE
+    level_2: DependencyCycle
+    level_3: FFRTBinderCycle
+    owner: Application
+    confidence: 0.90
+    evidence_patterns:
+      - "dependency cycle"
+      - "ffrt"
+      - "FFRT"
+    guidance:
+      - "检查 FFRT/Binder 依赖环，解除互相等待的同步路径"
+      - "不要把 IPC 框架本身当成根因"
+    tags: [ffrt, dependency_cycle, binder]
+
+  - id: FREEZE-FM-07
+    name: "EventHandler 队列堆积"
+    level_1: APPFREEZE
+    level_2: QueueOverflow
+    level_3: EventHandlerBacklog
+    owner: Application
+    confidence: 0.70
+    evidence_patterns:
+      - "queue_depth"
+      - "pending_count"
+      - "Total event size"
+    guidance:
+      - "减少事件产生速率或提高处理速度"
+      - "检查是否有事件风暴或回调嵌套"
+    tags: [event_handler, queue, backlog]
+
+  - id: FREEZE-FM-08
+    name: "GC 长时间暂停"
+    level_1: APPFREEZE
+    level_2: RuntimePause
+    level_3: LongGC
+    owner: Runtime
+    confidence: 0.65
+    evidence_patterns:
+      - "gc"
+      - "garbage collection"
+      - "FullGC"
+      - "GC pause"
+    guidance:
+      - "减少对象分配压力"
+      - "避免创建大量短生命周期对象"
+    tags: [gc, runtime, pause]
+
+  - id: FREEZE-FM-11
+    name: "系统高负载或 Thermal Throttling"
+    level_1: APPFREEZE
+    level_2: SystemOverload
+    level_3: HighLoadOrThermal
+    owner: System
+    confidence: 0.85
+    evidence_patterns:
+      - "cpu.*8[5-9]|9[0-9]"
+      - "thermal throttling"
+      - "low memory"
+      - "hot_level"
+      - "MemAvailable.*[0-7][0-9]{2}\\s*MB"
+    guidance:
+      - "系统负载信息仅作为环境证据"
+      - "不直接作为源码修复目标"
+    tags: [system, thermal, high_load]
+
+  - id: FREEZE-FM-12
+    name: "对端 Binder 线程耗尽 (IPC FULL)"
+    level_1: APPFREEZE
+    level_2: IPCFull
+    level_3: BinderThreadPoolExhausted
+    owner: System
+    confidence: 0.80
+    evidence_patterns:
+      - "IPC FULL"
+      - "ready 0"
+      - "binder thread pool"
+    guidance:
+      - "检查对端服务为何无法及时处理 Binder 请求"
+      - "考虑增加 Binder 线程池容量或减少 IPC 频率"
+    tags: [binder, ipc_full, thread_pool]

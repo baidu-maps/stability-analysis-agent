@@ -7,6 +7,7 @@ from .models import (
     RunRequest,
     RunResult,
     normalize_run_code_roots,
+    run_request_from_dict,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "RunRequest",
     "RunResult",
     "normalize_run_code_roots",
+    "run_request_from_dict",
 ]

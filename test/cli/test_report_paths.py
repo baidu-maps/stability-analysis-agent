@@ -32,7 +32,7 @@ class TestCliReports(unittest.TestCase):
     def setUp(self):
         from cli.report_paths import summarize_cli_reports, clear_cli_reports
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name) / "cli_reports"
+        self.root = Path(self.tmp.name) / "reports"
         self.root.mkdir(parents=True)
         for idx in range(3):
             s = self.root / f"2026010{idx + 1}_000000_demo"
@@ -73,6 +73,28 @@ class TestCliReports(unittest.TestCase):
         result = self.clear(root=gone)
         self.assertEqual(result["removed"], 0)
         self.assertIn("目录不存在", result.get("skipped", ""))
+
+
+class TestLegacyMigration(unittest.TestCase):
+    def test_rename_cli_reports_to_reports(self):
+        from cli.report_paths import (
+            REPORTS_DIR_NAME,
+            LEGACY_REPORTS_DIR_NAME,
+            ensure_reports_migrated,
+            _migrated_bases,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            legacy = base / LEGACY_REPORTS_DIR_NAME
+            legacy.mkdir()
+            (legacy / "20260101_000000_demo").mkdir()
+            ((legacy / "20260101_000000_demo") / "01.json").write_text("x", encoding="utf-8")
+            _migrated_bases.discard(str(base.resolve()))
+            result = ensure_reports_migrated(base)
+            self.assertIn(result["action"], {"renamed", "copied"})
+            self.assertTrue((base / REPORTS_DIR_NAME / "20260101_000000_demo").is_dir())
+            self.assertFalse(legacy.exists())
 
 
 class TestExtensions(unittest.TestCase):

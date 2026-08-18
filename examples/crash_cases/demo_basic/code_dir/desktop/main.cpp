@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <ctime>
+#include <iomanip>
 #include <sstream>
 #include "../common/include/my_lib.h"
 
@@ -21,7 +22,7 @@ void write_execution_log(const std::string& crash_type, const std::string& messa
     }
 }
 
-// 函数源码: int main(int argc, char* argv[]) {
+int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cout << "Usage: ./crash_test <case_id>" << std::endl;
         return 1;
@@ -37,11 +38,7 @@ void write_execution_log(const std::string& crash_type, const std::string& messa
     switch (type) {
         case CrashType::NullPtr:
             write_execution_log("NullPtr", "即将执行空指针访问");
-            try {
-                crash_nullptr();  // 已修改为安全实现
-            } catch (const std::exception& e) {
-                write_execution_log("NullPtr", std::string("捕获异常: ") + e.what());
-            }
+            crash_nullptr();
             break;
         case CrashType::DanglingPtr:
             write_execution_log("DanglingPtr", "即将执行悬空指针访问");

@@ -1,0 +1,107 @@
+domain: js_heap
+version: "1.0"
+fault_modes:
+  - id: JS-FM-01
+    name: "全局对象/模块长期持有对象"
+    level_1: JSHeapLeak
+    level_2: GlobalRetention
+    level_3: GlobalHandleOrModule
+    owner: Application
+    confidence: 0.78
+    evidence_patterns:
+      - "globalhandler"
+      - "global"
+      - "global_env"
+      - "sourcetextmodule"
+      - "source_text_module"
+    guidance:
+      - "检查全局变量或模块级变量是否持有不再需要的对象"
+      - "使用 WeakRef 或在适当时机置 null 释放引用"
+      - "检查单例模式中的缓存是否有上限"
+    tags: [global, module, retention, ROOT_GLOBAL_HANDLE, ROOT_VM]
+
+  - id: JS-FM-02
+    name: "事件监听器未解除"
+    level_1: JSHeapLeak
+    level_2: ListenerLeak
+    level_3: EventListenerNotRemoved
+    owner: Application
+    confidence: 0.78
+    evidence_patterns:
+      - "listener"
+      - "addEventListener"
+      - "EventEmitter"
+      - "on("
+    guidance:
+      - "在组件销毁时移除所有事件监听器"
+      - "使用 AbortController 或 once 选项管理监听器生命周期"
+      - "检查 aboutToDisappear/onDestroy 中是否有遗漏的 removeEventListener"
+    tags: [listener, event, retention, ROOT_GLOBAL_HANDLE]
+
+  - id: JS-FM-03
+    name: "定时器或异步任务长期持有对象"
+    level_1: JSHeapLeak
+    level_2: AsyncRetention
+    level_3: TimerOrAsyncChain
+    owner: Application
+    confidence: 0.78
+    evidence_patterns:
+      - "timer"
+      - "setInterval"
+      - "setTimeout"
+      - "async"
+    guidance:
+      - "在组件销毁时 clearInterval/clearTimeout"
+      - "检查未被取消的定时器或重复执行的异步任务"
+    tags: [timer, async, interval, ROOT_FRAME]
+
+  - id: JS-FM-04
+    name: "Promise/异步链长期持有对象"
+    level_1: JSHeapLeak
+    level_2: AsyncRetention
+    level_3: PromiseChainRetention
+    owner: Application
+    confidence: 0.78
+    evidence_patterns:
+      - "promise"
+      - "Promise"
+      - "then"
+      - "await"
+    guidance:
+      - "检查未 resolve/reject 的 Promise 是否持有大对象"
+      - "避免在 Promise 链中闭包捕获不必要的外部变量"
+    tags: [promise, async, chain, ROOT_FRAME]
+
+  - id: JS-FM-05
+    name: "N-API 引用未释放"
+    level_1: JSHeapLeak
+    level_2: NativeRetention
+    level_3: NAPILocalHandle
+    owner: Native
+    confidence: 0.78
+    evidence_patterns:
+      - "napi"
+      - "localhandle"
+      - "NativePointer"
+      - "LocalHandle"
+    guidance:
+      - "检查 Native 层的 napi_ref 是否在不需要时调用 napi_delete_reference"
+      - "确认 LocalHandleScope 在使用后正确关闭"
+    tags: [napi, native, handle, ROOT_LOCAL_HANDLE]
+
+  - id: JS-FM-06
+    name: "栈帧/函数闭包长期持有对象"
+    level_1: JSHeapLeak
+    level_2: ClosureRetention
+    level_3: FrameOrClosureRetention
+    owner: Application
+    confidence: 0.78
+    evidence_patterns:
+      - "frame"
+      - "function"
+      - "closure"
+    guidance:
+      - "检查闭包中是否捕获了不必要的大对象"
+      - "长生命周期的回调函数检查其引用的外部变量"
+      - "考虑将大对象的引用在使用后显式置 null"
+    tags: [closure, frame, function, ROOT_FRAME]

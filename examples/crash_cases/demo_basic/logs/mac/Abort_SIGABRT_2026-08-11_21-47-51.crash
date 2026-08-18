@@ -1,0 +1,20 @@
+=== 崩溃报告 ===
+时间: 2026-08-11_21-47-51
+平台: mac
+崩溃类型: Abort_SIGABRT
+进程ID: 43095
+崩溃地址: 0x1807f45e8
+
+=== 堆栈跟踪 ===
+#0 0x1807f45e8 0   libsystem_kernel.dylib              0x00000001807f45e8 __pthread_kill + 8
+#1 0x1040ea65c 1   libmylib.dylib                      0x00000001040ea65c _Z14signal_handleriP9__siginfoPv + 496
+#2 0x1808397a4 2   libsystem_platform.dylib            0x00000001808397a4 _sigtramp + 56
+#3 0x18082f8d8 3   libsystem_pthread.dylib             0x000000018082f8d8 pthread_kill + 296
+#4 0x180736790 4   libsystem_c.dylib                   0x0000000180736790 abort + 148
+#5 0x1040eb348 5   libmylib.dylib                      0x00000001040eb348 _Z12crash_sigbusv + 0
+#6 0x1040be048 6   crash_test                          0x00000001040be048 main + 1424
+#7 0x180473da4 7   dyld                                0x0000000180473da4 start + 6992
+
+=== 系统信息 ===
+编译时间: Aug 11 2026 21:47:49
+编译器: Apple LLVM 17.0.0 (clang-1700.0.13.5)

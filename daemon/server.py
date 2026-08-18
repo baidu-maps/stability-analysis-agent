@@ -20,21 +20,29 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CLI_ENTRY = PROJECT_ROOT / "cli" / "main.py"
-DEFAULT_REPORT_DIR = PROJECT_ROOT / "cli_reports"
+WEB_ROOT = PROJECT_ROOT / "web"
+DEFAULT_REPORT_DIR = PROJECT_ROOT / "reports"
 
 # 允许从任意 cwd 直接运行：python3 daemon/server.py
+sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT.parent))
 
-from stability_analyzer_agent.protocol.models import RunEvent, RunRequest, RunResult, normalize_run_code_roots
-from stability_analyzer_agent.protocol.version import PROTOCOL_VERSION
+from protocol.models import (
+    RunEvent,
+    RunRequest,
+    RunResult,
+    normalize_run_code_roots,
+    run_request_from_dict,
+)
+from protocol.version import PROTOCOL_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +50,7 @@ from stability_analyzer_agent.protocol.version import PROTOCOL_VERSION
 # ---------------------------------------------------------------------------
 _ts_executor = None
 _ts_lock = threading.Lock()
+_worktree_setup_lock = threading.Lock()
 
 
 def _get_ts_executor():
@@ -53,7 +62,7 @@ def _get_ts_executor():
         if _ts_executor is not None:
             return _ts_executor
         try:
-            from stability_analyzer_agent.tool_system import (
+            from tool_system import (
                 ToolAndWorkflowRegistry, SystemConfig, LLMConfig,
                 ToolConfig, WorkflowConfig, ConfigDrivenExecutor,
                 LLMAdapterFactory, register_all_tools_and_workflows,
@@ -102,9 +111,15 @@ class RunState:
     exit_code: Optional[int] = None
     error: Optional[str] = None
     output_format: str = "markdown"
+    report_dir: Optional[str] = None
+    workspace_dir: Optional[str] = None
+    original_code_roots: List[str] = field(default_factory=list)
+    isolated_code_roots: List[str] = field(default_factory=list)
+    workspace_manifest: Optional[str] = None
+    patch_path: Optional[str] = None
 
     process: Optional[subprocess.Popen] = None
-    events: "queue.Queue[RunEvent]" = queue.Queue()
+    events: "queue.Queue[RunEvent]" = field(default_factory=queue.Queue)
     result: Optional[RunResult] = None
 
 
@@ -178,8 +193,11 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
             cmd += ["--output-format", req.output_format]
         return cmd, None
 
-    # analysis 模式
-    if req.crash_log_content is not None:
+    # analysis 模式：crash_log_dir 优先；否则 file / content
+    crash_log_dir = (getattr(req, "crash_log_dir", None) or "").strip()
+    if crash_log_dir:
+        cmd += ["--crash-log-dir", crash_log_dir]
+    elif req.crash_log_content is not None:
         cmd += ["--crash-log", "-"]
         stdin_text = req.crash_log_content
     elif req.crash_log:
@@ -198,9 +216,11 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
     if req.output_format:
         cmd += ["--output-format", req.output_format]
 
-    # 执行引擎（默认 sequential；当选择 langgraph 时让 CLI 走 FullStabilityAnalyzer）
-    if getattr(req, "engine", None):
-        cmd += ["--engine", str(req.engine)]
+    engine = str(getattr(req, "engine", None) or "direct")
+    if engine == "sequential":
+        engine = "direct"
+    if engine and engine != "direct":
+        cmd += ["--engine", engine]
 
     scope = str(getattr(req, "scope", "full") or "full")
     if scope and scope != "full":
@@ -222,10 +242,48 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
     if req.streaming:
         cmd += ["--streaming"]
 
+    if not bool(getattr(req, "apply_ai_fixes", True)):
+        cmd += ["--no-apply-ai-fixes"]
+    if not bool(getattr(req, "backup_original_sources", True)):
+        cmd += ["--no-backup-original-sources"]
+
+    if bool(getattr(req, "force_disassembly", False)):
+        cmd += ["--force-disassembly"]
+    if bool(getattr(req, "force_anr_analysis", False)):
+        cmd += ["--force-anr-analysis"]
+    if bool(getattr(req, "force_memory_analysis", False)):
+        cmd += ["--force-memory-analysis"]
+    if bool(getattr(req, "force_timeline_analysis", False)):
+        cmd += ["--force-timeline-analysis"]
+
+    native_leak_dir = getattr(req, "native_leak_dir", None)
+    if native_leak_dir:
+        cmd += ["--native-leak-dir", str(native_leak_dir)]
+    native_leak_trace_db = getattr(req, "native_leak_trace_db", None)
+    if native_leak_trace_db:
+        cmd += ["--native-leak-trace-db", str(native_leak_trace_db)]
+
+    llm_mode = getattr(req, "llm_mode", None)
+    if llm_mode in {"fixed", "auto"}:
+        cmd += ["--llm-mode", str(llm_mode)]
+    llm_profile = getattr(req, "llm_profile", None)
+    if llm_profile in {"default", "strong", "fast"}:
+        cmd += ["--llm-profile", str(llm_profile)]
+    if bool(getattr(req, "include_memory_in_05", False)):
+        cmd += ["--include-memory-in-05"]
+
+    cmd += ["--no-interactive", "--no-save-to-vector-db"]
+
     return cmd, stdin_text
 
 
 def _persist_result(run: RunState) -> None:
+    try:
+        from cli.report_paths import ensure_reports_migrated
+
+        ensure_reports_migrated(PROJECT_ROOT)
+    except Exception:
+        pass
     DEFAULT_REPORT_DIR.mkdir(exist_ok=True)
     suffix = {"json": "json", "markdown": "md", "text": "txt"}.get(run.output_format, "txt")
     out_path = DEFAULT_REPORT_DIR / f"{run.run_id}.{suffix}"
@@ -238,9 +296,26 @@ def _persist_result(run: RunState) -> None:
         run.events.put(RunEvent(run.run_id, "artifact_write_error", {"error": str(e)}))
 
 
+def _capture_report_dir_from_line(run: RunState, line: str) -> None:
+    text = str(line or "").strip()
+    if not text:
+        return
+    marker = "report 已保存到:"
+    if marker in text:
+        run.report_dir = text.split(marker, 1)[1].strip()
+        return
+    if "reports/" in text and "report" in text.lower():
+        import re
+
+        m = re.search(r"(reports/[^\s]+)", text)
+        if m:
+            run.report_dir = m.group(1).strip().rstrip("/")
+
+
 def _emit_stdout_line(run: RunState, stdout_acc: list[str], line: str) -> None:
     text = line.rstrip("\n")
     stdout_acc.append(text + "\n")
+    _capture_report_dir_from_line(run, text)
     if text.startswith("AI_STREAM_DATA:"):
         payload_text = text[len("AI_STREAM_DATA:"):].strip()
         try:
@@ -267,12 +342,100 @@ def _emit_stdout_line(run: RunState, stdout_acc: list[str], line: str) -> None:
     run.events.put(RunEvent(run.run_id, "stdout", {"line": text}))
 
 
+def _subprocess_env_for_run(run_id: Optional[str] = None) -> dict:
+    """子进程环境：透传 Web UI 中禁用的 skill 列表给 CLI。"""
+    from daemon.web_preferences import load_web_preferences
+
+    env = os.environ.copy()
+    disabled = [str(x).strip() for x in (load_web_preferences().get("disabled_skills") or []) if str(x).strip()]
+    if disabled:
+        env["STABILITY_AGENT_DISABLED_SKILLS"] = ",".join(disabled)
+    if run_id:
+        env["STABILITY_AGENT_RUN_ID"] = run_id
+    return env
+
+
+def _prepare_isolated_run(run: RunState, req: RunRequest):
+    code_roots = normalize_run_code_roots(req)
+    should_isolate = bool(req.apply_ai_fixes) and str(req.scope or "full") == "full" and bool(code_roots)
+    if not should_isolate:
+        return req, None
+
+    from services.git_worktree_manager import prepare_isolated_workspace
+
+    # Git serializes parts of worktree administration through shared metadata.
+    # Keep setup short and deterministic when several runs target the same repo.
+    with _worktree_setup_lock:
+        workspace = prepare_isolated_workspace(run.run_id, code_roots)
+    run.workspace_dir = str(workspace.root)
+    run.original_code_roots = list(workspace.original_code_roots)
+    run.isolated_code_roots = list(workspace.isolated_code_roots)
+    run.events.put(
+        RunEvent(
+            run.run_id,
+            "workspace_prepared",
+            workspace.to_dict(),
+        )
+    )
+    isolated_req = replace(
+        req,
+        code_root=None,
+        code_roots=list(workspace.isolated_code_roots),
+    )
+    return isolated_req, workspace
+
+
+def _write_run_workspace_artifacts(run: RunState, workspace) -> None:
+    from services.git_worktree_manager import write_workspace_artifacts
+
+    if run.report_dir:
+        report_dir = Path(run.report_dir).expanduser()
+        if not report_dir.is_absolute():
+            report_dir = PROJECT_ROOT / report_dir
+        report_dir = report_dir.resolve()
+    else:
+        report_dir = (DEFAULT_REPORT_DIR / run.run_id).resolve()
+        run.report_dir = str(report_dir)
+    artifacts = write_workspace_artifacts(workspace, report_dir)
+    run.workspace_manifest = artifacts.get("manifest_path")
+    run.patch_path = artifacts.get("patch_path")
+    run.events.put(
+        RunEvent(
+            run.run_id,
+            "workspace_artifacts_written",
+            {
+                "workspace_dir": run.workspace_dir,
+                "manifest_path": run.workspace_manifest,
+                "patch_path": run.patch_path,
+            },
+        )
+    )
+
+
 def _run_worker(run: RunState, req: RunRequest) -> None:
     run.status = "running"
     run.started_at = time.time()
     run.events.put(RunEvent(run.run_id, "run_started", {"request": req.to_dict()}))
 
-    cmd, stdin_text = _build_cli_cmd(req)
+    workspace = None
+    try:
+        effective_req, workspace = _prepare_isolated_run(run, req)
+    except Exception as exc:
+        run.status = "error"
+        run.error = f"failed to prepare isolated Git worktree: {exc}"
+        run.finished_at = time.time()
+        run.result = RunResult(
+            run_id=run.run_id,
+            status="error",
+            output_format=req.output_format,
+            output="",
+            error=run.error,
+        )
+        run.events.put(RunEvent(run.run_id, "workspace_error", {"error": run.error}))
+        run.events.put(RunEvent(run.run_id, "run_finished", {"status": run.status, "exit_code": None}))
+        return
+
+    cmd, stdin_text = _build_cli_cmd(effective_req)
     run.events.put(RunEvent(run.run_id, "process_spawn", {"cmd": cmd, "cwd": str(PROJECT_ROOT)}))
 
     try:
@@ -284,6 +447,7 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env=_subprocess_env_for_run(run.run_id),
         )
         run.process = p
 
@@ -307,6 +471,7 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
                 for line in iter(stream.readline, ""):
                     if not line:
                         break
+                    _capture_report_dir_from_line(run, line)
                     run.events.put(RunEvent(run.run_id, "stderr", {"line": line.rstrip("\n")}))
             except Exception as e:
                 run.events.put(RunEvent(run.run_id, "stream_error", {"which": "stderr", "error": str(e)}))
@@ -320,6 +485,11 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
         run.exit_code = exit_code
         run.finished_at = time.time()
 
+        # Ensure report-dir discovery and all streamed output are complete before
+        # generating workspace artifacts.
+        t_out.join()
+        t_err.join()
+
         # 读取剩余输出（保险）
         try:
             remaining_out = p.stdout.read() if p.stdout else ""
@@ -329,7 +499,7 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
         except Exception:
             pass
 
-        status = "done" if exit_code == 0 else "error"
+        status = "canceled" if run.status == "canceled" else ("done" if exit_code == 0 else "error")
         run.status = status
 
         output_text = "".join(stdout_acc)
@@ -340,6 +510,14 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
             output=output_text,
             error=None if exit_code == 0 else f"process exit {exit_code}",
         )
+        if workspace is not None:
+            try:
+                _write_run_workspace_artifacts(run, workspace)
+            except Exception as exc:
+                run.events.put(
+                    RunEvent(run.run_id, "workspace_artifact_error", {"error": str(exc)})
+                )
+        _persist_result(run)
     except Exception as e:
         run.status = "error"
         run.error = str(e)
@@ -350,112 +528,265 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
 
 
 def _start_run(req_dict: Dict[str, Any]) -> RunState:
-    # 旧字段（skip_ai / parse_stack_only）兼容：静默归并为 scope 后再丢弃。
-    if "scope" not in req_dict:
-        legacy_skip_ai = bool(req_dict.get("skip_ai", False))
-        legacy_parse_stack_only = bool(req_dict.get("parse_stack_only", False))
-        if legacy_parse_stack_only:
-            req_dict["scope"] = "parse_stack_only"
-        elif legacy_skip_ai:
-            req_dict["scope"] = "gen_prompt_only"
-    req_dict.pop("skip_ai", None)
-    req_dict.pop("parse_stack_only", None)
-    req = RunRequest(**req_dict)
+    req = run_request_from_dict(req_dict)
     run = RUNS.create_run(req)
 
-    # 在 worker 中累计 stdout（用于 /result 与落盘）
-    stdout_acc: list[str] = []  # chunk list
-
     def worker():
-        run.status = "running"
-        run.started_at = time.time()
-        run.events.put(RunEvent(run.run_id, "run_started", {"request": req.to_dict()}))
-
-        cmd, stdin_text = _build_cli_cmd(req)
-        run.events.put(RunEvent(run.run_id, "process_spawn", {"cmd": cmd, "cwd": str(PROJECT_ROOT)}))
-
-        try:
-            p = subprocess.Popen(
-                cmd,
-                cwd=str(PROJECT_ROOT),
-                stdin=subprocess.PIPE if stdin_text is not None else None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-            run.process = p
-
-            if stdin_text is not None and p.stdin is not None:
-                p.stdin.write(stdin_text)
-                p.stdin.close()
-
-            def _pump_stdout(stream):
-                try:
-                    for line in iter(stream.readline, ""):
-                        if not line:
-                            break
-                        _emit_stdout_line(run, stdout_acc, line)
-                except Exception as e:
-                    run.events.put(RunEvent(run.run_id, "stream_error", {"which": "stdout", "error": str(e)}))
-
-            def _pump_stderr(stream):
-                try:
-                    for line in iter(stream.readline, ""):
-                        if not line:
-                            break
-                        line = line.rstrip("\n")
-                        run.events.put(RunEvent(run.run_id, "stderr", {"line": line}))
-                except Exception as e:
-                    run.events.put(RunEvent(run.run_id, "stream_error", {"which": "stderr", "error": str(e)}))
-
-            t_out = threading.Thread(target=_pump_stdout, args=(p.stdout,), daemon=True)
-            t_err = threading.Thread(target=_pump_stderr, args=(p.stderr,), daemon=True)
-            t_out.start()
-            t_err.start()
-
-            exit_code = p.wait()
-            run.exit_code = exit_code
-            run.finished_at = time.time()
-            run.status = "done" if exit_code == 0 else "error"
-
-            output_text = "".join(stdout_acc)
-            run.result = RunResult(
-                run_id=run.run_id,
-                status=run.status,
-                output_format=req.output_format,
-                output=output_text,
-                error=None if exit_code == 0 else f"process exit {exit_code}",
-            )
-            _persist_result(run)
-        except Exception as e:
-            run.status = "error"
-            run.error = str(e)
-            run.finished_at = time.time()
-            run.result = RunResult(
-                run_id=run.run_id,
-                status="error",
-                output_format=req.output_format,
-                output="\n".join(stdout_acc),
-                error=str(e),
-            )
-        finally:
-            run.events.put(RunEvent(run.run_id, "run_finished", {"status": run.status, "exit_code": run.exit_code}))
+        _run_worker(run, req)
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
     return run
 
 
+def _skill_manager():
+    from skill_system.manager import SkillManager
+
+    return SkillManager()
+
+
+def _static_content_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    return {
+        ".html": "text/html; charset=utf-8",
+        ".js": "application/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".ico": "image/x-icon",
+        ".json": "application/json; charset=utf-8",
+        ".md": "text/markdown; charset=utf-8",
+    }.get(suffix, "application/octet-stream")
+
+
+def _serve_web_static(handler: BaseHTTPRequestHandler, url_path: str) -> bool:
+    """Serve files under web/. Returns True if handled."""
+    raw = url_path.split("?", 1)[0]
+    if raw in ("/", ""):
+        rel = "index.html"
+    elif raw.startswith("/"):
+        rel = raw[1:]
+    else:
+        rel = raw
+
+    if ".." in Path(rel).parts:
+        return False
+
+    candidate = (WEB_ROOT / rel).resolve()
+    try:
+        candidate.relative_to(WEB_ROOT.resolve())
+    except ValueError:
+        return False
+    if not candidate.is_file():
+        return False
+
+    data = candidate.read_bytes()
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", _static_content_type(candidate))
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Cache-Control", "no-cache")
+    handler.end_headers()
+    handler.wfile.write(data)
+    return True
+
+
+def _handle_skills_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
+    if path == "/skills":
+        try:
+            manager = _skill_manager()
+            _json_response(handler, HTTPStatus.OK, {"skills": _skills_with_prefs(manager)})
+        except Exception as e:
+            _json_response(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
+        return True
+
+    if path.startswith("/skills/"):
+        name = path[len("/skills/"):].strip("/")
+        if not name or "/" in name:
+            return False
+        try:
+            manager = _skill_manager()
+            bundle = manager.resolve(name)
+            payload = {
+                "summary": bundle.to_summary().to_dict(),
+                "frontmatter": bundle.frontmatter.to_dict(),
+                "package": bundle.package.to_dict(),
+                "body": bundle.body,
+            }
+            _json_response(handler, HTTPStatus.OK, payload)
+        except KeyError as e:
+            _json_response(handler, HTTPStatus.NOT_FOUND, {"error": str(e)})
+        except Exception as e:
+            _json_response(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
+        return True
+
+    return False
+
+
+def _handle_skills_post(handler: BaseHTTPRequestHandler, path: str) -> bool:
+    if path == "/skills/install":
+        try:
+            body = _read_json_body(handler)
+            source = body.get("source")
+            if not source:
+                _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": "missing source"})
+                return True
+            manager = _skill_manager()
+            result = manager.install_from_path(
+                source,
+                overwrite=bool(body.get("overwrite", False)),
+            )
+            _json_response(handler, HTTPStatus.OK, result.to_dict())
+        except FileNotFoundError as e:
+            _json_response(handler, HTTPStatus.NOT_FOUND, {"error": str(e)})
+        except FileExistsError as e:
+            _json_response(handler, HTTPStatus.CONFLICT, {"error": str(e)})
+        except Exception as e:
+            _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": str(e)})
+        return True
+
+    if path == "/skills/lint":
+        try:
+            body = _read_json_body(handler)
+            source = body.get("source")
+            if not source:
+                _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": "missing source"})
+                return True
+            manager = _skill_manager()
+            issues = [issue.to_dict() for issue in manager.lint(source)]
+            _json_response(handler, HTTPStatus.OK, {"issues": issues})
+        except FileNotFoundError as e:
+            _json_response(handler, HTTPStatus.NOT_FOUND, {"error": str(e)})
+        except Exception as e:
+            _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": str(e)})
+        return True
+
+    if path == "/skills/uninstall":
+        try:
+            body = _read_json_body(handler)
+            name = body.get("name")
+            if not name:
+                _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": "missing name"})
+                return True
+            manager = _skill_manager()
+            ok = manager.uninstall(str(name))
+            if not ok:
+                _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"skill not found: {name}"})
+                return True
+            _json_response(handler, HTTPStatus.OK, {"ok": True, "name": name})
+        except Exception as e:
+            _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": str(e)})
+        return True
+
+    return False
+
+
+def _handle_web_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
+    if path == "/web/preferences":
+        try:
+            from daemon.web_preferences import load_web_preferences
+
+            _json_response(handler, HTTPStatus.OK, load_web_preferences())
+        except Exception as e:
+            _json_response(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
+        return True
+    return False
+
+
+def _handle_web_post(handler: BaseHTTPRequestHandler, path: str) -> bool:
+    if path == "/web/preferences":
+        try:
+            from daemon.web_preferences import load_web_preferences, save_web_preferences, toggle_skill
+
+            body = _read_json_body(handler)
+            if "skill" in body and "enabled" in body:
+                prefs = toggle_skill(str(body["skill"]), enabled=bool(body["enabled"]))
+            else:
+                prefs = save_web_preferences(body)
+            _json_response(handler, HTTPStatus.OK, prefs)
+        except Exception as e:
+            _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": str(e)})
+        return True
+    return False
+
+
+def _skills_with_prefs(manager) -> list:
+    from daemon.web_preferences import load_web_preferences
+
+    disabled = set(load_web_preferences().get("disabled_skills") or [])
+    out = []
+    for summary in manager.summaries_installed_as_dicts():
+        item = dict(summary)
+        name = str(item.get("command_name") or item.get("display_name") or "")
+        item["enabled"] = name not in disabled
+        out.append(item)
+    return out
+
+
+def _resolve_report_dir(raw: Optional[str]) -> Optional[Path]:
+    if not raw:
+        return None
+    p = Path(str(raw).strip()).expanduser()
+    if not p.is_absolute():
+        p = (PROJECT_ROOT / p).resolve()
+    return p if p.is_dir() else None
+
+
+def _handle_run_vector_db_commit(handler: BaseHTTPRequestHandler, path: str) -> bool:
+    prefix = "/runs/"
+    suffix = "/vector-db/commit"
+    if not path.startswith(prefix) or not path.endswith(suffix):
+        return False
+    middle = path[len(prefix): -len(suffix)].strip("/")
+    if not middle or "/" in middle:
+        return False
+    run_id = middle
+    run = RUNS.get(run_id)
+    if not run:
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
+        return True
+    if run.status not in ("done", "error"):
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "run_not_finished", "status": run.status})
+        return True
+    report_dir = _resolve_report_dir(run.report_dir)
+    if report_dir is None:
+        _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": "report_dir_missing"})
+        return True
+    try:
+        from daemon.web_preferences import load_web_preferences
+        from rag.case_writer import commit_from_report_dir, write_commit_audit
+        from rag.vector_store_config import VectorStoreNotImplementedError
+
+        prefs = load_web_preferences()
+        result = commit_from_report_dir(
+            report_dir,
+            vector_db_config=prefs.get("vector_db"),
+        )
+        audit_status = "committed" if result.get("ok") else ("skipped" if result.get("skipped") else "failed")
+        write_commit_audit(report_dir, {"status": audit_status, "result": result, "source": "web"})
+        if result.get("ok"):
+            _json_response(handler, HTTPStatus.OK, result)
+        elif result.get("skipped"):
+            _json_response(handler, HTTPStatus.BAD_REQUEST, result)
+        else:
+            code = HTTPStatus.NOT_IMPLEMENTED if "not implemented" in str(result.get("error", "")).lower() else HTTPStatus.BAD_REQUEST
+            _json_response(handler, code, result)
+    except VectorStoreNotImplementedError as exc:
+        _json_response(handler, HTTPStatus.NOT_IMPLEMENTED, {"ok": False, "error": str(exc)})
+    except Exception as exc:
+        _json_response(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+    return True
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "AIStabilityDaemon/0.1"
 
     def log_message(self, format: str, *args: Any) -> None:
-        # 降噪：默认不输出到 stderr
         return
 
     def do_GET(self) -> None:
-        if self.path == "/health":
+        path = self.path.split("?", 1)[0]
+
+        if path == "/health":
             _json_response(
                 self,
                 HTTPStatus.OK,
@@ -463,12 +794,18 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "protocol_version": PROTOCOL_VERSION,
                     "pid": os.getpid(),
+                    "web_ui": True,
                 },
             )
             return
 
-        # --- tool-system 直连端点（ConfigDrivenExecutor）---
-        if self.path in ("/tool-system/tools", "/tool-system/workflows"):
+        if _handle_skills_get(self, path):
+            return
+
+        if _handle_web_get(self, path):
+            return
+
+        if path in ("/tool-system/tools", "/tool-system/workflows"):
             try:
                 executor = _get_ts_executor()
                 active = executor.list_active()
@@ -477,8 +814,8 @@ class Handler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
             return
 
-        if self.path.startswith("/runs/") and self.path.endswith("/events"):
-            run_id = self.path.split("/")[2]
+        if path.startswith("/runs/") and path.endswith("/events"):
+            run_id = path.split("/")[2]
             run = RUNS.get(run_id)
             if not run:
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
@@ -490,12 +827,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.end_headers()
 
-            # 先发一个 hello
             hello = RunEvent(run_id, "events_opened", {}).to_dict()
             self.wfile.write(f"data: {json.dumps(hello, ensure_ascii=False)}\n\n".encode("utf-8"))
             self.wfile.flush()
 
-            # 持续输出事件直到 run 结束且队列清空
             while True:
                 try:
                     ev = run.events.get(timeout=1.0)
@@ -506,7 +841,6 @@ class Handler(BaseHTTPRequestHandler):
                 except queue.Empty:
                     if run.status in ("done", "error", "canceled"):
                         break
-                    # keepalive
                     keep = RunEvent(run_id, "keepalive", {}).to_dict()
                     self.wfile.write(f"data: {json.dumps(keep, ensure_ascii=False)}\n\n".encode("utf-8"))
                     self.wfile.flush()
@@ -514,8 +848,8 @@ class Handler(BaseHTTPRequestHandler):
                     break
             return
 
-        if self.path.startswith("/runs/") and self.path.endswith("/result"):
-            run_id = self.path.split("/")[2]
+        if path.startswith("/runs/") and path.endswith("/result"):
+            run_id = path.split("/")[2]
             run = RUNS.get(run_id)
             if not run:
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
@@ -526,8 +860,8 @@ class Handler(BaseHTTPRequestHandler):
             _json_response(self, HTTPStatus.OK, run.result.to_dict())
             return
 
-        if self.path.startswith("/runs/"):
-            run_id = self.path.split("/")[2]
+        if path.startswith("/runs/"):
+            run_id = path.split("/")[2]
             run = RUNS.get(run_id)
             if not run:
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
@@ -544,14 +878,25 @@ class Handler(BaseHTTPRequestHandler):
                     "exit_code": run.exit_code,
                     "error": run.error,
                     "output_format": run.output_format,
+                    "report_dir": run.report_dir,
+                    "workspace_dir": run.workspace_dir,
+                    "original_code_roots": run.original_code_roots,
+                    "isolated_code_roots": run.isolated_code_roots,
+                    "workspace_manifest": run.workspace_manifest,
+                    "patch_path": run.patch_path,
                 },
             )
+            return
+
+        if _serve_web_static(self, path):
             return
 
         _json_response(self, HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self) -> None:
-        if self.path == "/runs":
+        path = self.path.split("?", 1)[0]
+
+        if path == "/runs":
             try:
                 body = _read_json_body(self)
                 run = _start_run(body)
@@ -560,8 +905,8 @@ class Handler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(e)})
             return
 
-        if self.path.startswith("/runs/") and self.path.endswith("/cancel"):
-            run_id = self.path.split("/")[2]
+        if path.startswith("/runs/") and path.endswith("/cancel"):
+            run_id = path.split("/")[2]
             run = RUNS.get(run_id)
             if not run:
                 _json_response(self, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
@@ -581,8 +926,16 @@ class Handler(BaseHTTPRequestHandler):
             _json_response(self, HTTPStatus.OK, {"run_id": run_id, "status": run.status})
             return
 
-        # --- tool-system 直连端点（ConfigDrivenExecutor）---
-        if self.path == "/tool-system/analyze":
+        if _handle_run_vector_db_commit(self, path):
+            return
+
+        if _handle_skills_post(self, path):
+            return
+
+        if _handle_web_post(self, path):
+            return
+
+        if path == "/tool-system/analyze":
             try:
                 body = _read_json_body(self)
                 executor = _get_ts_executor()
@@ -611,6 +964,23 @@ class Handler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
             return
 
+        if path == "/tool-system/native-leak":
+            try:
+                body = _read_json_body(self)
+                executor = _get_ts_executor()
+                result = executor.execute_workflow("native_leak_analysis", {
+                    "native_leak_path": body.get("path") or body.get("native_leak_dir"),
+                    "native_leak_trace_db": body.get("trace_db") or body.get("native_leak_trace_db"),
+                    "code_roots": body.get("code_roots", []),
+                    "scope": body.get("scope", "gen_prompt_only"),
+                    "max_callchains": body.get("max_callchains", 5),
+                    "min_callchain_percentage": body.get("min_callchain_percentage", 0.0),
+                })
+                _json_response(self, HTTPStatus.OK, result)
+            except Exception as e:
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
+            return
+
         _json_response(self, HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
 
@@ -619,6 +989,13 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
+
+    try:
+        from cli.report_paths import ensure_reports_migrated
+
+        ensure_reports_migrated(PROJECT_ROOT)
+    except Exception:
+        pass
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
 
@@ -629,12 +1006,17 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _shutdown)
 
     print(f"daemon listening on http://{args.host}:{args.port} (protocol={PROTOCOL_VERSION})")
+    print(f"  Web UI:         http://{args.host}:{args.port}/")
     print(f"  Run API:         POST /runs  GET /runs/<id>  GET /runs/<id>/events  POST /runs/<id>/cancel")
-    print(f"  Tool System API: POST /tool-system/analyze  GET /tool-system/tools  GET /tool-system/workflows")
+    print("                   POST /runs/<id>/vector-db/commit")
+    print("  Web preferences: GET/POST /web/preferences")
+    print("  Skills API:      GET /skills  GET /skills/<name>")
+    print("                   POST /skills/install  POST /skills/lint  POST /skills/uninstall")
+    print("  Tool System API: POST /tool-system/analyze  POST /tool-system/native-leak")
+    print("                   GET /tool-system/tools  GET /tool-system/workflows")
     httpd.serve_forever()
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -1,0 +1,144 @@
+domain: jank_analysis
+version: "1.0"
+fault_modes:
+  - id: JANK-FM-01
+    name: "主线程业务函数超时"
+    level_1: JankDrop
+    level_2: MainThreadTimeout
+    level_3: BusinessFunctionSlow
+    owner: Application
+    confidence: 0.75
+    evidence_patterns:
+      - "business"
+      - "app_function"
+      - "main_thread"
+      - "deadline exceeded"
+    guidance:
+      - "将耗时业务逻辑移到 Worker 或异步执行"
+      - "拆分大函数为更小的可中断任务"
+    tags: [main_thread, business, timeout]
+
+  - id: JANK-FM-02
+    name: "ArkUI Build 阶段超时"
+    level_1: JankDrop
+    level_2: UIFramework
+    level_3: BuildPhaseSlow
+    owner: Application
+    confidence: 0.72
+    evidence_patterns:
+      - "Build"
+      - "ArkUI"
+      - "component tree"
+    guidance:
+      - "减少组件树深度和组件数量"
+      - "使用 LazyForEach 延迟构建列表项"
+      - "避免在 Build 阶段做复杂计算"
+    tags: [arkui, build, component]
+
+  - id: JANK-FM-03
+    name: "Layout/Measure 阶段超时"
+    level_1: JankDrop
+    level_2: UIFramework
+    level_3: LayoutMeasureSlow
+    owner: Application
+    confidence: 0.72
+    evidence_patterns:
+      - "Layout"
+      - "Measure"
+      - "layout"
+      - "measure"
+    guidance:
+      - "减少嵌套布局层级"
+      - "避免约束冲突导致的多次 measure"
+      - "使用 RelativeContainer 替代深层嵌套"
+    tags: [layout, measure, ui]
+
+  - id: JANK-FM-04
+    name: "Render/Draw 阶段超时"
+    level_1: JankDrop
+    level_2: RenderingPipeline
+    level_3: RenderDrawSlow
+    owner: Application
+    confidence: 0.72
+    evidence_patterns:
+      - "Render"
+      - "Draw"
+      - "render"
+      - "paint"
+    guidance:
+      - "减少过度绘制"
+      - "简化复杂自定义绘制逻辑"
+      - "使用 renderGroup 合并渲染"
+    tags: [render, draw, paint]
+
+  - id: JANK-FM-05
+    name: "Fence/Display/VSYNC 阻塞"
+    level_1: JankDrop
+    level_2: DisplayPipeline
+    level_3: FenceVsyncBlocking
+    owner: System
+    confidence: 0.70
+    evidence_patterns:
+      - "fence"
+      - "VSYNC"
+      - "display"
+      - "compositor"
+    guidance:
+      - "检查 GPU 负载和合成器状态"
+      - "减少动画和过渡效果的复杂度"
+    tags: [fence, vsync, display, gpu]
+
+  - id: JANK-FM-06
+    name: "GC 暂停"
+    level_1: JankDrop
+    level_2: RuntimePause
+    level_3: GCPause
+    owner: Runtime
+    confidence: 0.68
+    evidence_patterns:
+      - "gc"
+      - "GC"
+      - "garbage"
+      - "mark"
+      - "sweep"
+    guidance:
+      - "减少帧内对象分配数量"
+      - "避免创建大量临时对象"
+      - "预分配对象池"
+    tags: [gc, pause, memory]
+
+  - id: JANK-FM-07
+    name: "I/O 等待"
+    level_1: JankDrop
+    level_2: IOBlocking
+    level_3: IOWait
+    owner: Application
+    confidence: 0.70
+    evidence_patterns:
+      - "io_wait"
+      - "read"
+      - "write"
+      - "disk"
+      - "file"
+    guidance:
+      - "将 I/O 操作移到异步线程"
+      - "使用缓存减少文件读写次数"
+    tags: [io, blocking, disk]
+
+  - id: JANK-FM-08
+    name: "线程调度/CPU 抢占"
+    level_1: JankDrop
+    level_2: Scheduling
+    level_3: CPUPreemption
+    owner: System
+    confidence: 0.60
+    evidence_patterns:
+      - "sched"
+      - "preempt"
+      - "runnable"
+      - "sleeping"
+      - "cpu_idle"
+    guidance:
+      - "检查是否有高优先级任务抢占 UI 线程"
+      - "考虑调整线程优先级或绑核策略"
+    tags: [scheduling, cpu, preemption]

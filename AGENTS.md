@@ -52,30 +52,44 @@ python3 cli/main.py --daemon http://127.0.0.1:8765 \
 - `gen_prompt_only`: full toolchain, but skip LLM call; produces `round_0/06_ai_prompt.md`.
 - `parse_log_only`: only parse the crash log.
 
-### Start Daemon
+### Start Daemon (local Web UI)
 
 ```bash
 python3 daemon/server.py --host 127.0.0.1 --port 8765
+# Browser: http://127.0.0.1:8765/  — see docs/cli/WEB_UI_GUIDE.md
 ```
 
 ### Run Tests
 
+See **[docs/testing/README.md](docs/testing/README.md)** for the full matrix (unit, AI regression, Web/Daemon).
+
+**Pre-commit (no LLM):**
+
 ```bash
-# AI Agent tool tests
-cd test/agent_py_tool
-python3 test_code_content_provider.py
-python3 test_stop_functionality.py
-python3 test_vector_db.py
+python3 -B -m unittest \
+  test.ai_regression.test_runner \
+  test.cli.test_report_paths \
+  test.daemon.test_build_cli_cmd \
+  test.daemon.test_skills_api \
+  test.daemon.test_run_lifecycle \
+  test.daemon.test_web_preferences \
+  test.skill_system.test_installed_skills_runtime \
+  test.web.test_web_contract \
+  test.tools.test_diagnosis_infrastructure \
+  test.tools.test_cpp_crash \
+  test.tools.test_appfreeze \
+  test.tools.test_js_crash \
+  test.tools.test_js_heap \
+  test.tools.test_jank_analysis \
+  test.tools.test_api_fault
+```
 
-# LLM connection tests
-cd test/llm
-python3 test_llm_connection.py --all
+**Spot checks:**
 
-# VSCode integration test (30s timeout)
+```bash
+cd test/agent_py_tool && python3 test_code_content_provider.py
+cd test/llm && python3 test_llm_connection.py --all
 AI_STABILITY_TEST_TIMEOUT_SECONDS=30 python3 test/test_vscode_ai_agent_integration.py
-
-# Fast mode (skip AI analysis)
-AI_STABILITY_TEST_FAST=1 python3 test/llm/test_vscode_simulation.py
 ```
 
 ### Package Installation
@@ -107,7 +121,7 @@ python3 cli/main.py \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
   --code-root examples/crash_cases/demo_basic/code_dir \
   --scope gen_prompt_only
-# Output: cli_reports/<timestamp>/01~04a (+ optional 04b/04b2/04c/04d/04e/05) + round_0/06_ai_prompt.md
+# Output: reports/<timestamp>/01~04a (+ optional 04b/04b2/04c/04d/04e/05) + round_0/06_ai_prompt.md
 # 04b2 = 04b2_code_location_trace.json（代码定位审计，非 repo_search）
 ```
 
@@ -159,4 +173,4 @@ When adding features (new tools, RAG, repo search, LangGraph nodes), wire them t
 - CLI usage: `docs/cli/`
 - Tool implementation: `docs/tools/`
 - Developer guides: `docs/scripts/`
-- Do NOT create `.md` files in `test/`, `tools/`, `cli_reports/`, or repo root (except standard files like README, CHANGELOG, etc.)
+- Do NOT create `.md` files in `test/`, `tools/`, `reports/`, or repo root (except standard files like README, CHANGELOG, etc.)

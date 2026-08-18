@@ -276,7 +276,7 @@ done
 ```bash
 python3 -c "
 from services.code_fixer import _extract_code_blocks, _extract_replacement_from_analysis
-text = open('cli_reports/<latest>/round_0/06_ai_gen_res.md').read()
+text = open('reports/<latest>/round_0/06_ai_gen_res.md').read()
 blocks = _extract_code_blocks(text)
 print(f'代码块数: {len(blocks)}')
 result = _extract_replacement_from_analysis(text, '<target_function>(')

@@ -28,6 +28,13 @@ from .fix_code_extractor_tool import FixCodeExtractorTool
 from .fix_code_applier_tool import FixCodeApplierTool
 from .vector_memory_retriever_tool import VectorMemoryRetrieverTool
 from .repo_search_tool import RepoSearchTool
+from .native_leak_diagnosis import NativeLeakAnalyzerTool
+from .js_heap import JsHeapAnalyzerTool
+from .js_crash import JsCrashDiagnosisTool
+from .jank_analysis import JankAnalyzerTool
+from .cpp_crash import CppCrashDiagnosisTool
+from .appfreeze import AppFreezeDiagnosisTool
+from .api_fault import ApiFaultDiagnosisTool
 
 __all__ = [
     # Tool classes
@@ -47,6 +54,7 @@ __all__ = [
     "FixCodeApplierTool",
     "VectorMemoryRetrieverTool",
     "RepoSearchTool",
+    "NativeLeakAnalyzerTool",
     # Registration helper
     "register_all_tools",
 ]
@@ -131,3 +139,62 @@ def register_all_tools(registry=None):
         is_tool=True,
         module="tools",
     )
+    registry.register(
+        "native_leak_analyzer",
+        NativeLeakAnalyzerTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    registry.register(
+        "js_heap_analyzer",
+        JsHeapAnalyzerTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    registry.register(
+        "js_crash_diagnosis",
+        JsCrashDiagnosisTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    registry.register(
+        "jank_analyzer",
+        JankAnalyzerTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    registry.register(
+        "cpp_crash_diagnosis",
+        CppCrashDiagnosisTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    registry.register(
+        "appfreeze_diagnosis",
+        AppFreezeDiagnosisTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    registry.register(
+        "api_fault_diagnosis",
+        ApiFaultDiagnosisTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    from tools.diagnosis.knowledge import register_builtin_knowledge
+
+    register_builtin_knowledge()

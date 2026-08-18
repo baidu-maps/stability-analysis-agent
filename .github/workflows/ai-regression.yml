@@ -1,0 +1,66 @@
+name: AI Regression
+
+# Optional: real LLM end-to-end repair check. Does not block every PR by default.
+on:
+  workflow_dispatch:
+    inputs:
+      entrypoint:
+        description: "Agent entrypoint (cli or daemon)"
+        required: true
+        default: cli
+        type: choice
+        options:
+          - cli
+          - daemon
+  pull_request:
+    types: [labeled]
+
+concurrency:
+  group: ai-regression-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ai-regression:
+    name: AI repair regression (${{ github.event.inputs.entrypoint || 'cli' }})
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ai-regression'))
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package (core + rag + test)
+        run: |
+          python -m pip install -U pip
+          python -m pip install -e ".[test,rag]"
+
+      - name: Require LLM API key
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          WENXIN_API_KEY: ${{ secrets.WENXIN_API_KEY }}
+        run: |
+          if [ -z "${DEEPSEEK_API_KEY}${OPENAI_API_KEY}${WENXIN_API_KEY}" ]; then
+            echo "No LLM API key configured (DEEPSEEK_API_KEY / OPENAI_API_KEY / WENXIN_API_KEY)."
+            echo "Add a repository secret, then re-run this workflow."
+            exit 1
+          fi
+
+      - name: Run AI code regression
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          WENXIN_API_KEY: ${{ secrets.WENXIN_API_KEY }}
+        run: |
+          ENTRYPOINT="${{ github.event.inputs.entrypoint || 'cli' }}"
+          python scripts/run_ai_regression.py \
+            --case test/ai_regression/cases/demo_basic_nullptr.json \
+            --entrypoint "${ENTRYPOINT}"

@@ -1,0 +1,230 @@
+domain: js_crash
+version: "1.0"
+fault_modes:
+  - id: JSC-FM-01
+    name: "TypeError - Null/undefined 属性访问"
+    level_1: JSCrash
+    level_2: TypeError
+    level_3: NullPropertyAccess
+    owner: Application
+    confidence: 0.88
+    evidence_patterns:
+      - "Cannot read propert"
+      - "is not an object"
+      - "null"
+      - "undefined"
+    guidance:
+      - "增加空值判断或使用可选链操作符 ?."
+      - "检查异步回调中的对象生命周期"
+    tags: [null, undefined, property]
+
+  - id: JSC-FM-02
+    name: "TypeError - 调用非函数"
+    level_1: JSCrash
+    level_2: TypeError
+    level_3: NotCallable
+    owner: Application
+    confidence: 0.85
+    evidence_patterns:
+      - "is not a function"
+      - "is not callable"
+    guidance:
+      - "检查回调/函数引用是否正确赋值"
+      - "确认 API 版本变更是否导致方法移除"
+    tags: [function, callback, type_error]
+
+  - id: JSC-FM-03
+    name: "ReferenceError - 未定义标识符"
+    level_1: JSCrash
+    level_2: ReferenceError
+    level_3: UndefinedIdentifier
+    owner: Application
+    confidence: 0.90
+    evidence_patterns:
+      - "is not defined"
+      - "ReferenceError"
+    guidance:
+      - "检查变量/函数名拼写和作用域"
+      - "确认模块导入是否正确"
+    tags: [reference, undefined, scope]
+
+  - id: JSC-FM-04
+    name: "SyntaxError - 语法/解析错误"
+    level_1: JSCrash
+    level_2: SyntaxError
+    level_3: ParseError
+    owner: Application
+    confidence: 0.92
+    evidence_patterns:
+      - "SyntaxError"
+      - "Unexpected token"
+      - "unexpected"
+    guidance:
+      - "检查代码语法，特别是 JSON.parse 的输入"
+      - "确认编译/打包产物完整性"
+    tags: [syntax, parse, token]
+
+  - id: JSC-FM-05
+    name: "RangeError - 栈溢出/数组越界"
+    level_1: JSCrash
+    level_2: RangeError
+    level_3: StackOverflow
+    owner: Application
+    confidence: 0.82
+    evidence_patterns:
+      - "Maximum call stack"
+      - "stack overflow"
+      - "RangeError"
+      - "out of range"
+    guidance:
+      - "检查递归终止条件"
+      - "大数组操作考虑分批处理"
+    tags: [recursion, stack_overflow, range]
+
+  - id: JSC-FM-06
+    name: "URIError - URI 编码错误"
+    level_1: JSCrash
+    level_2: URIError
+    level_3: MalformedURI
+    owner: Application
+    confidence: 0.85
+    evidence_patterns:
+      - "URIError"
+      - "URI malformed"
+      - "decodeURI"
+    guidance:
+      - "对 URI 输入做合法性校验"
+      - "使用 try-catch 包裹 decodeURI/decodeURIComponent"
+    tags: [uri, encoding]
+
+  - id: JSC-FM-07
+    name: "OutOfMemoryError - JS 堆内存耗尽"
+    level_1: JSCrash
+    level_2: OOM
+    level_3: HeapExhaustion
+    owner: Application
+    confidence: 0.80
+    evidence_patterns:
+      - "OutOfMemory"
+      - "out of memory"
+      - "heap"
+      - "OOM"
+    guidance:
+      - "使用 heap snapshot 定位内存泄漏"
+      - "减少大对象分配和全局引用"
+    tags: [oom, memory, heap]
+
+  - id: JSC-FM-08
+    name: "BusinessError - 系统 API 报错"
+    level_1: JSCrash
+    level_2: BusinessError
+    level_3: APIError
+    owner: Application
+    confidence: 0.75
+    evidence_patterns:
+      - "BusinessError"
+      - "error code"
+      - "errCode"
+    guidance:
+      - "查询对应 API 错误码文档"
+      - "增加 API 调用的错误处理"
+    tags: [api, business_error, error_code]
+
+  - id: JSC-FM-09
+    name: "装饰器/初始化错误"
+    level_1: JSCrash
+    level_2: InitializationError
+    level_3: DecoratorFailure
+    owner: Application
+    confidence: 0.72
+    evidence_patterns:
+      - "@Provide"
+      - "@Consume"
+      - "super()"
+      - "decorator"
+      - "initialization"
+    guidance:
+      - "检查 @Provide/@Consume 配对是否正确"
+      - "确认组件初始化顺序和 super() 调用"
+    tags: [decorator, initialization, provide_consume]
+
+  - id: JSC-FM-10
+    name: "Detached ArrayBuffer"
+    level_1: JSCrash
+    level_2: TypeError
+    level_3: DetachedArrayBuffer
+    owner: Application
+    confidence: 0.85
+    evidence_patterns:
+      - "detached"
+      - "ArrayBuffer"
+      - "transfered"
+    guidance:
+      - "ArrayBuffer 一旦 transfer 后不可再使用"
+      - "检查跨线程通信中的 Transferable 对象"
+    tags: [arraybuffer, transfer, worker]
+
+  - id: JSC-FM-11
+    name: "循环引用"
+    level_1: JSCrash
+    level_2: TypeError
+    level_3: CircularReference
+    owner: Application
+    confidence: 0.80
+    evidence_patterns:
+      - "circular"
+      - "Converting circular structure"
+      - "JSON.stringify"
+    guidance:
+      - "使用 replacer 参数或 structuredClone 处理循环引用"
+      - "检查数据结构是否有意外的循环"
+    tags: [circular, json, stringify]
+
+  - id: JSC-FM-12
+    name: "WebviewController 未关联"
+    level_1: JSCrash
+    level_2: StateError
+    level_3: WebviewNotAssociated
+    owner: Application
+    confidence: 0.82
+    evidence_patterns:
+      - "WebviewController"
+      - "not bindto"
+      - "not bindTo"
+      - "not associated"
+    guidance:
+      - "确保 WebviewController 已与 Web 组件关联后再调用方法"
+      - "在 onAppear/onPageShow 回调中初始化"
+    tags: [webview, controller, lifecycle]
+
+  - id: JSC-FM-13
+    name: "TerminationError - VM 强制终止"
+    level_1: JSCrash
+    level_2: TerminationError
+    level_3: VMForceTerminated
+    owner: Runtime
+    confidence: 0.70
+    evidence_patterns:
+      - "TerminationError"
+      - "terminated"
+      - "force"
+    guidance:
+      - "检查是否因超时或资源限制被强制终止"
+      - "优化长时间运行的 JS 任务"
+    tags: [termination, vm, timeout]
+
+  - id: JSC-FM-14
+    name: "N-API handle 越界"
+    level_1: JSCrash
+    level_2: NAPIError
+    level_3: HandleOutOfScope
+    owner: Native
+    confidence: 0.68
+    evidence_patterns:
+      - "napi"
+      - "handle scope"
+      - "Receiver is not JSObject"
+    guidance:
+      - "检查 N-API 引用的 HandleScope 生命周期"
+      - "确认 napi_value 未在 scope 之外使用"
+    tags: [napi, handle, scope]

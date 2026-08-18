@@ -59,7 +59,7 @@ bash scripts/pypi_release/publish_pypi.sh --test
 ```bash
 python3 -m venv .venv_testpypi_verify
 source .venv_testpypi_verify/bin/activate
-pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple "stability-analysis-agent[rag]==1.2.9"
+pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple "stability-analysis-agent[rag]==1.3.0"
 sa-agent --help
 ```
 
@@ -115,4 +115,44 @@ python3 -m twine upload --repository-url https://upload.pypi.org/legacy/ output/
 - Never commit tokens to git
 - Rotate tokens after accidental exposure
 - Prefer project-scoped API tokens with minimum required permissions
+- For GitHub Actions, prefer **Trusted Publishing (OIDC)** over long-lived tokens
 
+## GitHub Actions（自动发布）
+
+独立流水线：[`.github/workflows/publish-pypi.yml`](../../.github/workflows/publish-pypi.yml)（**不**写在 `ci.yml` 里）。
+
+| 触发 | 行为 |
+|------|------|
+| 推送 tag `v*`（如 `v1.3.0`） | 跑确定性套件 → 构建 → 上传 **正式 PyPI** |
+| Actions 页手动 `workflow_dispatch` | 可选 `testpypi` / `pypi`；可勾选跳过测试（紧急） |
+
+**版本对齐**：tag 名去掉 `v` 前缀后必须与 `pyproject.toml` 的 `version` 一致，否则构建 job 失败。
+
+### 一次性配置（Trusted Publishing）
+
+1. 在 GitHub 仓库创建 Environments：`pypi`、`testpypi`（workflow 会引用同名 environment；可按需加审批保护）。
+2. 打开 [PyPI publishing settings](https://pypi.org/manage/account/publishing/)（TestPyPI 对应 test.pypi.org）：
+   - Owner / Repository：本仓库
+   - Workflow name：`publish-pypi.yml`
+   - Environment name：`pypi` 或 `testpypi`
+3. 首次上传前建议先手动跑一次 `workflow_dispatch` → `testpypi` 验证。
+
+### 推荐发版步骤
+
+```bash
+# 1) 改 pyproject.toml version，更新 CHANGELOG，合并到 main
+# 2) 确认 CI 已绿
+# 3) 打 tag 并推送（触发正式发布）
+git tag v1.2.10
+git push origin v1.2.10
+
+# 或：先手动发到 TestPyPI
+# GitHub → Actions → Publish PyPI → Run workflow → target=testpypi
+```
+
+本地脚本路径仍然可用（离线 / 无 Actions 时）：
+
+```bash
+bash scripts/pypi_release/publish_pypi.sh --test
+bash scripts/pypi_release/publish_pypi.sh --prod
+```

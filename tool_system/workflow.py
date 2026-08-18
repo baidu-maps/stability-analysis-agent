@@ -200,6 +200,11 @@ class WorkflowContext:
         started_at = datetime.datetime.now().astimezone().isoformat()
         started_perf = time.perf_counter()
         try:
+            validate_input = getattr(tool, "validate_input", None)
+            if callable(validate_input):
+                valid, error_msg = validate_input(input_data)
+                if not valid:
+                    raise ValueError(f"工具 '{tool_name}' 输入验证失败: {error_msg}")
             result = tool.execute(input_data)
         except Exception as exc:
             self._record_execution_event(

@@ -1,0 +1,15 @@
+--- a/common/src/my_lib.cpp
++++ b/common/src/my_lib.cpp
+@@ -184,7 +184,11 @@
+ void crash_nullptr() {
+     std::cout << "触发空指针崩溃..." << std::endl;
+     int* p = nullptr;
+-    *p = 42;  // 空指针写操作
++    if (p != nullptr) {
++        *p = 42;  // 安全的指针解引用
++    } else {
++        std::cerr << "错误: 尝试解引用空指针" << std::endl;
++    }
+ }
+ 
+ void crash_dangling() {

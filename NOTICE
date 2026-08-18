@@ -8,3 +8,9 @@ See the LICENSE file in the repository root for the full license text.
 When distributing a larger work that includes third-party components,
 retain and propagate their required copyright and license notices in
 accordance with the Apache License 2.0 and those components' licenses.
+
+The HarmonyOS native memory leak classification model and related domain
+knowledge in tools/native_leak_diagnosis were adapted from Huawei Device Co.,
+Ltd. developtools_dfx_skills nativeleak-analysis materials, licensed under
+the Apache License, Version 2.0. No bundled trace_streamer executable is
+redistributed by this project.

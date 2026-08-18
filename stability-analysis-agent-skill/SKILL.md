@@ -49,7 +49,7 @@ pip install -e .
 
 1. **确认输入**：`--crash-log`（必填）；符号化需 `--library-dir`；源码上下文需 `--code-root`（可多次指定）。
 2. **选择 scope**（见下表）。
-3. **执行命令**，报告写入 `./cli_reports/<timestamp>/`。
+3. **执行命令**，报告写入 `./reports/<timestamp>/`。
 4. **读报告**：先看 `01` → `02` → `03`；AI 结论看 `round_0/06_ai_gen_res.md` 或 `final_output.md`。
 
 ### `--scope` 快速选择
@@ -105,7 +105,7 @@ sa-agent \
 
 ## 报告目录结构
 
-运行后在 `./cli_reports/<timestamp>/` 生成：
+运行后在 `./reports/<timestamp>/` 生成：
 
 | 文件 | 含义 |
 |------|------|

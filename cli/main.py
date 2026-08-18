@@ -72,8 +72,10 @@ from cli.phase_spinner import PhaseSpinner
 from cli.upgrade import run_upgrade_check_interactive
 from cli.report_paths import (
     clear_cli_reports,
+    ensure_reports_migrated,
     format_bytes,
     print_cli_reports_overview,
+    report_root,
     summarize_cli_reports,
 )
 from tools.code_context_errors import (
@@ -385,92 +387,62 @@ def _build_llm_config_from_agent_config(
     engine: str,
     *,
     agent_cfg: Optional[dict] = None,
-) -> Optional[LLMConfig]:
+    cli_mode: Optional[str] = None,
+    force_profile: Optional[str] = None,
+    routing_ctx: Optional[Any] = None,
+    engage: bool = True,
+    return_router_state: bool = False,
+    health_check_override: Optional[bool] = None,
+):
+    """Build LLMConfig from agent_config.local.json.
+
+    Default mode is fixed (active_provider only). When return_router_state=True,
+    returns (LLMConfig|None, LLMRouterState).
+    """
+    from tool_system.llm.llm_router import (
+        build_llm_config_for_endpoint,
+        resolve_for_run,
+        resolve_mode_from_config,
+    )
+    from tool_system.llm.routing_policy import RoutingContext
+
     cfg = agent_cfg if agent_cfg is not None else _load_agent_config_file()
     llm_cfg = cfg.get("llm_config", {}) if isinstance(cfg, dict) else {}
-    providers = llm_cfg.get("providers", {}) if isinstance(llm_cfg, dict) else {}
-    if not isinstance(providers, dict):
-        return None
-    provider_defaults = llm_cfg.get("provider_defaults", {}) if isinstance(llm_cfg, dict) else {}
-    if not isinstance(provider_defaults, dict):
-        provider_defaults = {}
-
-    active_provider = llm_cfg.get("active_provider", "openai")
-    provider_cfg = {**provider_defaults, **(providers.get(active_provider, {}) or {})}
-    if not isinstance(provider_cfg, dict):
-        return None
+    if not isinstance(llm_cfg, dict):
+        llm_cfg = {}
 
     mapped_engine = engine if engine in ("direct", "langchain", "langgraph") else "direct"
-
-    default_models = {
-        "openai": "gpt-4o",
-        "zhipu_bigmodel": "glm-4",
-        "deepseek": "deepseek-chat",
-        "baidu_qianfan": "ernie-4.0-8k",
-    }
-    default_base_urls = {
-        "zhipu_bigmodel": "https://open.bigmodel.cn/api/paas/v4",
-        "deepseek": "https://api.deepseek.com/v1",
-        "baidu_qianfan": "https://qianfan.baidubce.com/v2",
-    }
-
-    auth_type = str(provider_cfg.get("auth_type") or "").strip().lower()
-    if not auth_type:
-        auth_type = "authorization" if (active_provider == "baidu_qianfan" or provider_cfg.get("authorization")) else "api_key"
-
-    if auth_type == "authorization":
-        secret = provider_cfg.get("authorization")
-    else:
-        secret = provider_cfg.get("api_key")
-    if _is_placeholder_secret(secret):
-        return None
-
-    model = provider_cfg.get("model") or default_models.get(active_provider, "gpt-4o")
-    base_url = provider_cfg.get("base_url") or default_base_urls.get(active_provider)
-    adapter_provider = str(provider_cfg.get("adapter_provider") or "").strip()
-    if not adapter_provider:
-        if active_provider == "baidu_qianfan":
-            adapter_provider = "baidu_qianfan"
-        elif active_provider == "deepseek":
-            adapter_provider = "deepseek"
-        else:
-            adapter_provider = "openai"
-
-    # Prevent duplicated "/chat/completions/chat/completions" in OpenAI-style clients.
-    if isinstance(base_url, str):
-        normalized_base_url = base_url.strip().rstrip("/")
-        if normalized_base_url.endswith("/chat/completions"):
-            normalized_base_url = normalized_base_url[: -len("/chat/completions")]
-        base_url = normalized_base_url
-
-    extra: Dict[str, Any] = {}
-    if adapter_provider == "deepseek":
-        extra["deepseek_api_key"] = secret
-        extra["deepseek_base_url"] = base_url or "https://api.deepseek.com/v1"
-    if auth_type == "authorization":
-        extra["authorization"] = secret
-        if active_provider == "baidu_qianfan":
-            extra["baidu_qianfan_authorization"] = secret
-
-    request_format = str(provider_cfg.get("request_format") or "openai_chat_completions_compatible").strip().lower()
-    extra["request_format"] = request_format
-    extra["auth_header"] = str(provider_cfg.get("auth_header") or "Authorization").strip() or "Authorization"
-    extra["auth_prefix"] = str(provider_cfg.get("auth_prefix") or "")
-    # 流式调用配置（默认 True，用户可在 provider 或 provider_defaults 中设为 false 关闭）
-    stream_val = provider_cfg.get("stream")
-    if stream_val is not None:
-        extra["stream"] = stream_val
-
-    return LLMConfig(
+    ctx = routing_ctx
+    if ctx is None:
+        ctx = RoutingContext(mode=resolve_mode_from_config(llm_cfg, cli_mode=cli_mode))
+    state = resolve_for_run(
+        llm_cfg,
         engine=mapped_engine,
-        provider=adapter_provider,
-        model=model,
-        api_key=secret,
-        base_url=base_url,
-        timeout=int(provider_cfg.get("request_timeout") or provider_cfg.get("timeout") or 120),
-        temperature=float(provider_cfg.get("temperature") or 0.7),
-        max_tokens=int(provider_cfg.get("max_tokens") or 4096),
-        extra=extra,
+        cli_mode=cli_mode,
+        force_profile=force_profile,
+        routing_ctx=ctx,
+        engage=engage,
+        health_check_override=health_check_override,
+    )
+    llm_config: Optional[LLMConfig] = None
+    if state.engaged and state.selected is not None:
+        llm_config = build_llm_config_for_endpoint(state.selected, engine=mapped_engine)
+    if return_router_state:
+        return llm_config, state
+    return llm_config
+
+
+def _legacy_build_llm_config_from_agent_config_fixed(
+    engine: str,
+    *,
+    agent_cfg: Optional[dict] = None,
+) -> Optional[LLMConfig]:
+    """Compatibility helper: force fixed mode resolution."""
+    return _build_llm_config_from_agent_config(
+        engine,
+        agent_cfg=agent_cfg,
+        cli_mode="fixed",
+        return_router_state=False,
     )
 
 
@@ -2433,22 +2405,67 @@ def _config_command_init() -> int:
     return 0
 
 
+def _llm_provider_inventory() -> List[Dict[str, Any]]:
+    cfg = _load_agent_config_file()
+    llm_cfg = cfg.get("llm_config", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(llm_cfg, dict):
+        return []
+    providers = llm_cfg.get("providers", {})
+    if not isinstance(providers, dict):
+        return []
+    defaults = llm_cfg.get("provider_defaults", {})
+    defaults = defaults if isinstance(defaults, dict) else {}
+    active = str(llm_cfg.get("active_provider") or "").strip()
+    try:
+        from tool_system.llm.endpoint_pool import discover_candidates
+        usable = {ep.provider_key for ep in discover_candidates(llm_cfg)}
+    except Exception:
+        usable = set()
+    result: List[Dict[str, Any]] = []
+    for key, raw in providers.items():
+        if not isinstance(key, str) or not key.strip():
+            continue
+        provider = {**defaults, **(raw if isinstance(raw, dict) else {})}
+        auth_type = str(provider.get("auth_type") or "").strip().lower()
+        auth_value = provider.get("authorization") if auth_type == "authorization" else provider.get("api_key")
+        has_model = bool(str(provider.get("model") or "").strip())
+        has_url = bool(str(provider.get("base_url") or "").strip())
+        has_auth = auth_type == "none" or not _is_placeholder_secret(auth_value)
+        if key in usable:
+            status = "可用候选"
+        elif has_model and has_url and has_auth:
+            status = "已配置，未检测"
+        elif has_model or has_url or auth_value:
+            status = "配置不完整"
+        else:
+            status = "未配置"
+        result.append({
+            "key": key,
+            "model": str(provider.get("model") or "").strip(),
+            "status": status,
+            "active": key == active,
+            "usable": key in usable,
+        })
+    return result
+
+
 def _print_llm_detection_summary(status: Dict[str, Any]) -> None:
     print("== 大模型配置检测 ==")
     print(f"- 配置文件: {_agent_config_file()}")
-    if status.get("llm_ok"):
-        print(f"- 状态: {_green('已配置（当前设置了密钥）')}")
-        print(f"- 当前启用厂商（active_provider）: {status.get('active_provider') or '未知'}")
-        model_disp = status.get("model") or "（未填写 model）"
-        print(f"- 当前模型: {model_disp}")
-        print("- 注: 仅检查了配置完整性，未验证联通性。如需验证，请选择「检测联通性」。")
-    else:
-        print(f"- 状态: {_red('未就绪（缺少厂商配置、密钥或未替换占位符等）')}")
-        ap = status.get("active_provider")
-        if ap:
-            print(f"- 当前启用厂商（active_provider）: {ap}（{_red('请检查密钥等字段是否有效')}）")
-        else:
-            print(f"- 当前启用厂商（active_provider）: {_red('未设置')}")
+    mode = str(status.get("mode") or "fixed")
+    print(f"- 路由模式: {'自动' if mode == 'auto' else '固定'}（{mode}）")
+    print(f"- 当前启用厂商: {status.get('active_provider') or '未设置'}")
+    inventory = status.get("providers") or _llm_provider_inventory()
+    usable_count = sum(1 for item in inventory if item.get("usable"))
+    print(f"- 配置条目: {len(inventory)} 个，可用候选: {usable_count} 个")
+    for item in inventory:
+        active_mark = "，当前启用" if item.get("active") else ""
+        model = item.get("model") or "未填写模型"
+        label = f"{item.get('key')} / {model}：{item.get('status')}{active_mark}"
+        print(f"  - {label if item.get('usable') else _yellow(label)}")
+    if not inventory:
+        print(f"  - {_red('未发现 providers 配置')}")
+    print("- 配置检查不等于联通性检查，请在菜单中选择具体厂商进行检测。")
     print("")
 
 
@@ -2483,14 +2500,22 @@ def _describe_llm_endpoint_for_display(llm_config: LLMConfig) -> str:
     return f"{base}{suffix}"
 
 
-def _connectivity_probe_via_llm_adapter(engine: str) -> Dict[str, Any]:
+def _connectivity_probe_via_llm_adapter(engine: str, provider_key: Optional[str] = None) -> Dict[str, Any]:
     """
     通过 LLMAdapterFactory 探测联通性，与正式分析共用同一 HTTP/SSL 栈。
     langchain 模式在 CLI 未注入 AgentExecutor 时回退为 direct 传输探测。
     菜单内联通性检测固定读取用户目录配置，与「大模型配置检测」一致。
     """
     user_cfg = _load_agent_config_file()
-    llm_config = _build_llm_config_from_agent_config(engine, agent_cfg=user_cfg)
+    if provider_key:
+        llm_cfg = user_cfg.get("llm_config") if isinstance(user_cfg, dict) else None
+        if isinstance(llm_cfg, dict):
+            user_cfg = dict(user_cfg)
+            llm_cfg = dict(llm_cfg)
+            llm_cfg["active_provider"] = provider_key
+            user_cfg["llm_config"] = llm_cfg
+    # 联通性检测固定探测指定 provider，不让 auto 模式替换目标。
+    llm_config = _build_llm_config_from_agent_config(engine, agent_cfg=user_cfg, cli_mode="fixed")
     if llm_config is None:
         raise RuntimeError("当前配置未就绪：请先完成厂商与密钥配置。")
 
@@ -2530,10 +2555,17 @@ def _connectivity_probe_via_llm_adapter(engine: str) -> Dict[str, Any]:
     }
 
 
-def _connectivity_request_format(engine: str) -> str:
+def _connectivity_request_format(engine: str, provider_key: Optional[str] = None) -> str:
     """读取当前配置下的 request_format（用于 SSL 预检选择 HTTP 栈）。"""
     user_cfg = _load_agent_config_file()
-    llm_config = _build_llm_config_from_agent_config(engine, agent_cfg=user_cfg)
+    if provider_key:
+        llm_cfg = user_cfg.get("llm_config") if isinstance(user_cfg, dict) else None
+        if isinstance(llm_cfg, dict):
+            user_cfg = dict(user_cfg)
+            llm_cfg = dict(llm_cfg)
+            llm_cfg["active_provider"] = provider_key
+            user_cfg["llm_config"] = llm_cfg
+    llm_config = _build_llm_config_from_agent_config(engine, agent_cfg=user_cfg, cli_mode="fixed")
     if llm_config is None:
         return "openai_chat_completions_compatible"
     return str((llm_config.extra or {}).get("request_format") or "openai_chat_completions_compatible").strip().lower()
@@ -2610,7 +2642,7 @@ def _print_connectivity_probe_failure(
     return False
 
 
-def _check_llm_connectivity() -> None:
+def _check_llm_connectivity(provider_key: Optional[str] = None, *, probe_all: bool = False) -> None:
     def _ack_result(*, skip_prompt: bool = False) -> None:
         if skip_prompt:
             return
@@ -2626,7 +2658,7 @@ def _check_llm_connectivity() -> None:
     from tool_system.llm.http_ssl import is_ssl_certificate_error, precheck_https_ssl_environment, uses_urllib_transport
 
     engine = _connectivity_engine_from_session()
-    request_format = _connectivity_request_format(engine)
+    request_format = _connectivity_request_format(engine, provider_key)
     use_urllib = uses_urllib_transport(request_format)
     transport = _connectivity_transport_label(request_format)
 
@@ -2652,7 +2684,7 @@ def _check_llm_connectivity() -> None:
     print(f"正在检测联通性（engine={engine}，最长约 10 秒，可按 Ctrl+C 取消）...")
     start = time.time()
     try:
-        probe = _connectivity_probe_via_llm_adapter(engine)
+        probe = _connectivity_probe_via_llm_adapter(engine, provider_key)
         elapsed = time.time() - start
         content = str(probe.get("response_preview") or "").strip()
         if len(content) > 80:
@@ -2670,6 +2702,25 @@ def _check_llm_connectivity() -> None:
         print(f"- 耗时: {elapsed:.2f}s")
         if content:
             print(f"- 响应片段: {content}")
+        # “检测全部”显式刷新所有候选的健康状态，供 auto 模式使用。
+        try:
+            from tool_system.llm.endpoint_pool import discover_candidates, probe_candidates
+            from tool_system.llm.llm_router import resolve_mode_from_config
+
+            user_cfg = _load_agent_config_file()
+            llm_cfg = user_cfg.get("llm_config", {}) if isinstance(user_cfg, dict) else {}
+            if probe_all and isinstance(llm_cfg, dict):
+                mode = resolve_mode_from_config(llm_cfg)
+                cands = discover_candidates(llm_cfg)
+                if len(cands) > 1:
+                    print(f"- 已配置其它厂商探活（mode={mode}，共 {len(cands)} 个）:")
+                    probed = probe_candidates(cands, engine=engine)
+                    for ep in probed:
+                        err = f" — {ep.health_error}" if ep.health_error else ""
+                        lat = f", {ep.health_latency_ms}ms" if ep.health_latency_ms is not None else ""
+                        print(f"  · {ep.provider_key}/{ep.model}: {ep.health_status}{lat}{err}")
+        except Exception as batch_exc:
+            logging.getLogger(__name__).debug("batch llm probe skipped: %s", batch_exc)
         _ack_result()
     except KeyboardInterrupt:
         print("\n已取消联通性检测。")
@@ -2684,82 +2735,135 @@ def _check_llm_connectivity() -> None:
         _ack_result(skip_prompt=handled_detail)
 
 
+def _configure_llm_routing_interactive() -> None:
+    """设置对用户可见的两种路由模式及自动模式的健康策略。"""
+    target = _agent_config_file()
+    data = _load_json_or_empty(target)
+    llm_cfg = data.get("llm_config") if isinstance(data, dict) else None
+    if not isinstance(llm_cfg, dict):
+        llm_cfg = {}
+        data["llm_config"] = llm_cfg
+    current = str(llm_cfg.get("mode") or "fixed").strip().lower()
+    if current == "strong_only":
+        current = "auto"
+    choice = _prompt_select(
+        "设置大模型路由模式",
+        [
+            ("back", "返回"),
+            ("fixed", "固定模式：只使用当前启用的大模型"),
+            ("auto", "自动模式：按分析阶段动态选择已配置的大模型"),
+        ],
+        default_index=1 if current == "fixed" else 2,
+    )
+    if choice == "back":
+        return
+    llm_cfg["mode"] = choice
+    routing = llm_cfg.get("routing") if isinstance(llm_cfg.get("routing"), dict) else {}
+    if choice == "auto":
+        routing["failover_enabled"] = _prompt_yes_no(
+            "调用失败时是否自动切换到其他可用大模型？",
+            bool(routing.get("failover_enabled", True)),
+        )
+        routing["health_check"] = _prompt_yes_no(
+            "自动模式运行前是否进行健康检查？",
+            routing.get("health_check", True) is not False,
+        )
+    llm_cfg["routing"] = routing
+    _write_json_pretty(target, data)
+    print(f"已设置大模型路由模式：{'自动' if choice == 'auto' else '固定'}")
+
+
+def _configure_llm_preferences_interactive() -> None:
+    target = _agent_config_file()
+    data = _load_json_or_empty(target)
+    llm_cfg = data.get("llm_config") if isinstance(data, dict) else None
+    if not isinstance(llm_cfg, dict):
+        return
+    inventory = [item for item in _llm_provider_inventory() if item.get("usable")]
+    if not inventory:
+        print("当前没有可用的大模型配置，请先完成厂商配置并设置有效密钥。")
+        return
+    keys = [str(item["key"]) for item in inventory]
+    prefs = llm_cfg.get("preferences") if isinstance(llm_cfg.get("preferences"), dict) else {}
+    options = [("none", "不设置偏好")] + [(key, key) for key in keys]
+    default_current = str(prefs.get("default_provider") or "none")
+    default_idx = next((i for i, (key, _) in enumerate(options) if key == default_current), 0)
+    default_provider = _prompt_select("选择自动模式的默认偏好", options, default_index=default_idx)
+    strong_current = str(prefs.get("strong_provider") or "none")
+    strong_idx = next((i for i, (key, _) in enumerate(options) if key == strong_current), 0)
+    strong_provider = _prompt_select("选择自动模式的强能力偏好", options, default_index=strong_idx)
+    prefs["default_provider"] = None if default_provider == "none" else default_provider
+    prefs["strong_provider"] = None if strong_provider == "none" else strong_provider
+    llm_cfg["preferences"] = prefs
+    _write_json_pretty(target, data)
+    print("已保存自动路由偏好。")
+
+
+def _select_llm_connectivity_target() -> Tuple[Optional[str], bool]:
+    inventory = _llm_provider_inventory()
+    if not inventory:
+        print("没有可检测的大模型配置，请先配置至少一个 provider。")
+        return None, False
+    options: List[Tuple[str, str]] = [("back", "返回")]
+    for item in inventory:
+        active = "，当前启用" if item.get("active") else ""
+        options.append((str(item["key"]), f"{item['key']} / {item.get('model') or '未填写模型'}（{item['status']}{active}）"))
+    options.append(("all", "检测全部已配置大模型"))
+    selected = _prompt_select("请选择要检测的大模型", options, default_index=1)
+    if selected == "back":
+        return None, False
+    if selected == "all":
+        # The first candidate supplies the initial request; the batch pass below
+        # refreshes every configured provider, including this one.
+        return str(inventory[0]["key"]), True
+    return selected, False
+
+
 def _configure_llm_only() -> None:
     _ensure_user_config_templates()
     while True:
         status = _doctor_status()
         _print_llm_detection_summary(status)
-
-        if status.get("llm_ok"):
-            rerun = _prompt_select(
-                "已检测到大模型配置完成，是否需要重新进入设置？",
-                [
-                    ("keep", "不用了，返回"),
-                    ("reconfig", "进入设置"),
-                    ("connectivity", "检测联通性（验证是否能连接到大模型）"),
-                ],
-                default_index=0,
-            )
-            if rerun == "keep":
-                return
-            if rerun == "connectivity":
-                _check_llm_connectivity()
-                print("")
-                continue
-            if rerun == "reconfig":
-                ext_actions = _get_llm_reconfig_extension_actions()
-                if ext_actions:
-                    sub_options: List[Tuple[str, str]] = [
-                        ("wizard", "交互向导：选择厂商并填写密钥"),
-                    ]
-                    sub_options.extend(ext_actions)
-                    sub_options.append(("back", "返回"))
-                    sub = _prompt_select(
-                        "进入设置方式",
-                        sub_options,
-                        default_index=0,
-                    )
-                    if sub == "back":
-                        continue
-                    if sub != "wizard":
-                        if _invoke_llm_reconfig_extension_action(sub):
-                            return
-                        continue
-        else:
-            print("请完成大模型配置。\n")
-            pre_opts: List[Tuple[str, str]] = [
-                ("reconfig", "进入设置"),
-            ]
-            pre_opts.extend(_get_llm_reconfig_extension_actions())
-            pre_opts.extend(
-                [
-                    ("connectivity", "检测联通性（验证是否能连接到大模型）"),
-                    ("back", "返回"),
-                ]
-            )
-            pre_action = _prompt_select(
-                "请选择下一步",
-                pre_opts,
-                default_index=0,
-            )
-            if pre_action == "back":
-                return
-            if pre_action == "connectivity":
-                _check_llm_connectivity()
-                print("")
-                continue
-            if pre_action not in {"reconfig", "connectivity", "back"}:
-                if _invoke_llm_reconfig_extension_action(pre_action):
-                    return
-                continue
-        print("")
-        print("—— 进入交互向导（将依次选择厂商、填写密钥等）——")
-        print("")
-        changed = _update_llm_config_interactive()
-        if changed:
+        ext_actions = _get_llm_reconfig_extension_actions()
+        options: List[Tuple[str, str]] = [
+            ("back", "返回设置"),
+            ("providers", "配置 / 修改大模型（厂商、密钥、模型）"),
+            ("connectivity", "检测大模型联通性"),
+            ("routing", f"设置路由模式（当前：{'自动' if status.get('mode') == 'auto' else '固定'}）"),
+            ("preferences", "设置自动路由偏好"),
+            ("manual", "手动编辑大模型配置文件"),
+        ]
+        options.extend(ext_actions)
+        action = _prompt_select("大模型与路由设置", options, default_index=0)
+        if action == "back":
             return
-        print("已取消向导，未保存修改。")
-        print("")
+        if action == "providers":
+            changed = _update_llm_config_interactive()
+            if not changed:
+                print("已取消向导，未保存修改。")
+            print("")
+            continue
+        if action == "connectivity":
+            provider_key, probe_all = _select_llm_connectivity_target()
+            if provider_key or probe_all:
+                _check_llm_connectivity(provider_key, probe_all=probe_all)
+            print("")
+            continue
+        if action == "routing":
+            _configure_llm_routing_interactive()
+            print("")
+            continue
+        if action == "preferences":
+            _configure_llm_preferences_interactive()
+            print("")
+            continue
+        if action == "manual":
+            _configure_llm_manual_panel()
+            print("")
+            continue
+        if action not in {"back", "providers", "connectivity", "routing", "preferences", "manual"}:
+            if _invoke_llm_reconfig_extension_action(action):
+                print("")
 
 
 def _configure_llm_manual_panel() -> None:
@@ -3209,6 +3313,33 @@ def _register_third_party_modules(registry: ToolAndWorkflowRegistry, modules: Li
             raise RuntimeError(f"插件模块 {m} 缺少 register_all(registry) 或 register(registry)")
 
 
+def _load_disabled_skill_names() -> set:
+    raw = os.environ.get("STABILITY_AGENT_DISABLED_SKILLS", "").strip()
+    if raw:
+        return {x.strip() for x in raw.split(",") if x.strip()}
+    try:
+        from daemon.web_preferences import load_web_preferences
+
+        return set(load_web_preferences().get("disabled_skills") or [])
+    except Exception:
+        return set()
+
+
+def _register_installed_skills(registry: ToolAndWorkflowRegistry) -> None:
+    """将已安装且未禁用的 skill 导出注册到 tool_system（与 Web UI 偏好一致）。"""
+    try:
+        from skill_system.manager import SkillManager
+
+        disabled = _load_disabled_skill_names()
+        manager = SkillManager()
+        bundles = [b for b in manager.discover_installed() if b.command_name not in disabled]
+        registered = manager.register_into_registry(registry, bundles=bundles)
+        if registered:
+            logging.getLogger(__name__).info("已注册 skill 导出: %s", ", ".join(registered))
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Skill 注册失败（已忽略）: %s", exc)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Stability Analysis Agent CLI (Tool System Unified)",
@@ -3267,6 +3398,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--feedback-comment", default="", help="反馈备注")
     p.add_argument("--vector-db-decay", type=float, default=None, help="执行置信度衰减（示例 0.01）")
     p.add_argument("--vector-db-gc", action="store_true", help="执行模式治理（低置信或高拒绝标记 deprecated）")
+    p.add_argument(
+        "--save-to-vector-db",
+        action="store_true",
+        help="修复成功后写入向量知识库（非交互强制；默认不写入）",
+    )
+    p.add_argument(
+        "--no-save-to-vector-db",
+        action="store_true",
+        help="修复成功后明确跳过向量知识库写入",
+    )
     p.add_argument("--gc-min-confidence", type=float, default=0.2, help="GC 最低置信阈值")
     p.add_argument("--gc-rejected-threshold", type=int, default=5, help="GC 拒绝次数阈值")
     p.add_argument("--output-format", default="markdown", choices=["markdown", "json", "text"], help="输出格式")
@@ -3291,6 +3432,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="是否基于 AI 建议回写源码（默认开启；仅在 --scope full 且 LLM 可用时生效，使用 --no-apply-ai-fixes 关闭）",
     )
     p.add_argument(
+        "--llm-mode",
+        dest="llm_mode",
+        choices=["fixed", "auto"],
+        default=None,
+        help="LLM 路由模式（默认读配置 llm_config.mode，配置缺省为 fixed）：fixed=仅 active_provider；auto=发现可用厂商并按内置策略选档",
+    )
+    p.add_argument(
+        "--llm-profile",
+        dest="llm_profile",
+        choices=["default", "strong", "fast"],
+        default=None,
+        help="强制使用路由档位（覆盖 auto 内置策略；fixed 模式下若池中仅有 active 则仍用该厂商）",
+    )
+    p.add_argument(
         "--force-disassembly",
         dest="force_disassembly",
         action="store_true",
@@ -3310,6 +3465,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="强制运行内存压力/OOM 旁路诊断（04d；默认仅 log_kind 属 OOM 族或 category=oom 时触发）",
+    )
+    p.add_argument(
+        "--native-leak-dir",
+        dest="native_leak_dir",
+        default=None,
+        help="可选 HarmonyOS Native 泄漏采集包目录；与 Crash/OOM 分析联动并写入 04d",
+    )
+    p.add_argument(
+        "--native-leak-trace-db",
+        dest="native_leak_trace_db",
+        default=None,
+        help="可选 trace_streamer native_hook SQLite；只读分析未释放调用栈",
     )
     p.add_argument(
         "--force-timeline-analysis",
@@ -3360,7 +3527,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="backup_original_sources",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="应用 AI 修复前是否在 cli_reports 下备份改前源码（默认开启；代码已由 Git 管理可用 --no-backup-original-sources 关闭）",
+        help="应用 AI 修复前是否在 reports 下备份改前源码（默认开启；代码已由 Git 管理可用 --no-backup-original-sources 关闭）",
     )
     p.add_argument(
         "--optimized",
@@ -3397,7 +3564,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--print-full-report",
         action="store_true",
         help=(
-            "将完整报告打印到标准输出（默认：在 stdout 为终端且已生成 cli_reports/final_output.md 时"
+            "将完整报告打印到标准输出（默认：在 stdout 为终端且已生成 reports/final_output.md 时"
             "仅打印摘要，避免与落盘内容重复；管道或非终端仍输出全文）"
         ),
     )
@@ -3470,6 +3637,92 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _print_vector_db_commit_summary(record_preview: Dict[str, Any]) -> None:
+    summary = record_preview.get("summary") if isinstance(record_preview, dict) else {}
+    if not isinstance(summary, dict):
+        summary = {}
+    signal = summary.get("signal") or "?"
+    crash_reason = summary.get("crash_reason") or "?"
+    top = summary.get("top_frame") if isinstance(summary.get("top_frame"), dict) else {}
+    func = top.get("function") or "?"
+    files = summary.get("fix_files") or []
+    print(f"信号: {signal} · 原因: {crash_reason} · 栈顶: {func}", file=sys.stderr)
+    if files:
+        print("已修改文件: " + ", ".join(str(x) for x in files[:5]), file=sys.stderr)
+
+
+def _maybe_commit_vector_db_after_fix(
+    args: argparse.Namespace,
+    report_dir: Optional[Path],
+    applied_fix_result: Optional[Dict[str, Any]],
+    *,
+    scope: str,
+) -> None:
+    if scope != "full" or report_dir is None:
+        return
+    if not isinstance(applied_fix_result, dict) or not applied_fix_result.get("success"):
+        return
+    if bool(getattr(args, "no_save_to_vector_db", False)):
+        return
+
+    from rag.case_writer import (
+        build_case_record_from_report,
+        commit_from_report_dir,
+        write_commit_audit,
+    )
+    from rag.runtime import rag_stack_available, RAG_INSTALL_HINT
+
+    preview = build_case_record_from_report(report_dir)
+    if preview is None:
+        return
+
+    should_commit = bool(getattr(args, "save_to_vector_db", False))
+    if not should_commit:
+        if getattr(args, "interactive", None) is False or not _is_tty_interactive():
+            write_commit_audit(
+                report_dir,
+                {"status": "skipped", "reason": "non_interactive_or_no_flag"},
+            )
+            return
+        _print_vector_db_commit_summary(preview)
+        should_commit = _prompt_yes_no(
+            "是否将此次修复案例写入向量知识库？",
+            default_yes=False,
+        )
+
+    if not should_commit:
+        write_commit_audit(report_dir, {"status": "skipped", "reason": "user_declined"})
+        return
+
+    if not rag_stack_available():
+        print(
+            f"WARNING: 向量数据库不可用，跳过写入。安装: {RAG_INSTALL_HINT}",
+            file=sys.stderr,
+        )
+        write_commit_audit(report_dir, {"status": "skipped", "reason": "rag_unavailable"})
+        return
+
+    result = commit_from_report_dir(
+        report_dir,
+        vector_db_path=str(getattr(args, "vector_db_path", "") or "") or None,
+    )
+    audit = {
+        "status": "committed" if result.get("ok") else "failed",
+        "result": result,
+    }
+    write_commit_audit(report_dir, audit)
+    if result.get("ok"):
+        print(
+            f"向量知识库已写入 pattern_id={result.get('pattern_id')} "
+            f"({result.get('vector_db_path')})",
+            file=sys.stderr,
+        )
+    elif result.get("skipped"):
+        print(f"INFO: 跳过向量库写入: {result.get('skipped_reason')}", file=sys.stderr)
+    else:
+        print(f"WARNING: 向量库写入失败: {result.get('error')}", file=sys.stderr)
+
+
 def _run_vector_db_command(args: argparse.Namespace) -> Optional[int]:
     need_vector_cmd = any(
         [
@@ -3510,7 +3763,8 @@ def _run_vector_db_command(args: argparse.Namespace) -> Optional[int]:
         snapshot = analyzer.export_snapshot()
         output_path = args.export_vector_db.strip() if isinstance(args.export_vector_db, str) else ""
         if not output_path:
-            output_path = str((_runtime_output_root() / "cli_reports" / "vector_db_snapshot.json").resolve())
+            ensure_reports_migrated(_runtime_output_root())
+            output_path = str((report_root() / "vector_db_snapshot.json").resolve())
         out_file = Path(output_path)
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3594,8 +3848,11 @@ def _build_report_dir(args: argparse.Namespace) -> Path:
         elif getattr(args, "crash_log_dir", None):
             crash_ref = str(Path(getattr(args, "crash_log_dir")).name or "dir")
     crash_name = _sanitize_report_name(Path(crash_ref).stem if crash_ref and crash_ref != "-" else "stdin")
-    dirname = f"{stamp}_{mode}_{args.engine}_{crash_name}"
-    return _runtime_output_root() / "cli_reports" / dirname
+    run_id = _sanitize_report_name(str(os.environ.get("STABILITY_AGENT_RUN_ID") or "").strip())
+    run_suffix = f"_{run_id}" if run_id else ""
+    dirname = f"{stamp}_{mode}_{args.engine}_{crash_name}{run_suffix}"
+    ensure_reports_migrated(_runtime_output_root())
+    return report_root() / dirname
 
 
 def _now_iso() -> str:
@@ -3675,9 +3932,12 @@ def _file_fingerprint(path_value: str) -> Dict[str, Any]:
 
 
 def _llm_request_snapshot(args: argparse.Namespace, scope: str) -> Dict[str, Any]:
+    from tool_system.llm.llm_router import resolve_mode_from_config
+
     config_source: Optional[str] = None
     llm_config: Optional[LLMConfig] = None
     provider_key: Optional[str] = None
+    llm_mode: str = "fixed"
     custom_config = str(getattr(args, "config", None) or "").strip()
     if custom_config:
         config_source = str(Path(custom_config).expanduser().resolve())
@@ -3688,8 +3948,39 @@ def _llm_request_snapshot(args: argparse.Namespace, scope: str) -> Dict[str, Any
     else:
         agent_cfg = _load_agent_config_file()
         config_source = str(_AGENT_CONFIG_LOAD_PATH or _agent_config_file())
+        llm_cfg = agent_cfg.get("llm_config", {}) if isinstance(agent_cfg, dict) else {}
+        llm_mode = resolve_mode_from_config(
+            llm_cfg if isinstance(llm_cfg, dict) else {},
+            cli_mode=getattr(args, "llm_mode", None),
+        )
         provider_key = _active_llm_provider_key(agent_cfg=agent_cfg)
-        llm_config = _build_llm_config_from_agent_config(args.engine, agent_cfg=agent_cfg)
+        # Snapshot uses fixed/active for display when mode=fixed; for auto use resolved endpoint
+        from tool_system.llm.routing_policy import RoutingContext
+
+        prompt_mode = str(getattr(args, "prompt_mode", "analysis") or "analysis")
+        route_ctx = RoutingContext(
+            prompt_mode=prompt_mode,
+            apply_ai_fixes=bool(getattr(args, "apply_ai_fixes", True)),
+            agent_loop=str(
+                getattr(args, "agent_loop", None)
+                or ("context_loop" if prompt_mode == "analysis" else "single")
+            ),
+            round_index=0,
+        )
+        built = _build_llm_config_from_agent_config(
+            args.engine,
+            agent_cfg=agent_cfg,
+            cli_mode=getattr(args, "llm_mode", None),
+            force_profile=getattr(args, "llm_profile", None),
+            routing_ctx=route_ctx,
+            engage=(scope == "full"),
+            return_router_state=True,
+            health_check_override=False,
+        )
+        llm_config, router_state = built  # type: ignore[misc]
+        if router_state is not None and router_state.selected is not None:
+            provider_key = router_state.selected.provider_key
+            llm_mode = router_state.mode
 
     enabled = scope == "full" and llm_config is not None
     endpoint = _describe_llm_endpoint_for_display(llm_config) if llm_config else None
@@ -3697,6 +3988,8 @@ def _llm_request_snapshot(args: argparse.Namespace, scope: str) -> Dict[str, Any
         endpoint = endpoint.split("?", 1)[0].split("#", 1)[0]
     snapshot: Dict[str, Any] = {
         "enabled": enabled,
+        "mode": llm_mode,
+        "llm_profile": getattr(args, "llm_profile", None),
         "provider": provider_key or (llm_config.provider if llm_config else None),
         "adapter_provider": llm_config.provider if llm_config else None,
         "model": llm_config.model if llm_config else None,
@@ -3727,7 +4020,7 @@ def _llm_request_snapshot(args: argparse.Namespace, scope: str) -> Dict[str, Any
 def _initial_run_summary(request_record: Dict[str, Any]) -> Dict[str, Any]:
     started_at = str(request_record.get("created_at") or _now_iso())
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": _run_id_from_request(request_record),
         "request_file": "00_run_request.json",
         "status": "running",
@@ -3747,6 +4040,11 @@ def _initial_run_summary(request_record: Dict[str, Any]) -> Dict[str, Any]:
         "errors": [],
         "warnings": [],
         "artifacts": {},
+        "llm": {
+            "engaged": None,
+            "mode": None,
+            "skip_reason": "running",
+        },
     }
 
 
@@ -3969,7 +4267,7 @@ def _final_run_summary(
         except (TypeError, ValueError):
             duration_ms = None
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": _run_id_from_request(request_record),
         "request_file": "00_run_request.json",
         "status": status,
@@ -3989,6 +4287,59 @@ def _final_run_summary(
         "errors": errors,
         "warnings": warnings,
         "artifacts": _artifact_manifest(report_dir, scope=scope),
+        "llm": _llm_summary_from_result(result, scope=scope, request_record=request_record),
+    }
+
+
+def _llm_summary_from_result(
+    result: Dict[str, Any],
+    *,
+    scope: str,
+    request_record: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build 00_run_summary.llm from workflow metadata or request snapshot."""
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    routing = metadata.get("llm_routing") if isinstance(metadata, dict) else None
+    if isinstance(routing, dict) and routing:
+        return routing
+    req_llm = None
+    if isinstance(request_record, dict):
+        req_llm = request_record.get("llm")
+    mode = None
+    if isinstance(req_llm, dict):
+        mode = req_llm.get("mode")
+    if scope != "full":
+        from tool_system.llm.llm_router import skipped_summary
+
+        return skipped_summary(scope=scope, mode=str(mode or "fixed"))
+    # full but no routing metadata
+    if isinstance(req_llm, dict) and req_llm.get("enabled"):
+        return {
+            "engaged": True,
+            "mode": req_llm.get("mode") or "fixed",
+            "requested_tier": None,
+            "selected": {
+                "provider": req_llm.get("provider"),
+                "model": req_llm.get("model"),
+                "profile": req_llm.get("llm_profile") or "default",
+            },
+            "reason": "from_request_snapshot",
+            "failover": {"occurred": False},
+            "pool": {"configured": 0, "healthy": 0, "candidates": []},
+            "calls": [],
+            "totals": {"call_count": 0, "duration_ms": 0},
+        }
+    return {
+        "engaged": False,
+        "skip_reason": "llm_unavailable_or_skipped",
+        "mode": mode or "fixed",
+        "requested_tier": None,
+        "selected": None,
+        "reason": None,
+        "failover": {"occurred": False},
+        "pool": {"configured": 0, "healthy": 0, "candidates": []},
+        "calls": [],
+        "totals": {"call_count": 0, "duration_ms": 0},
     }
 
 
@@ -4011,6 +4362,38 @@ def _write_cli_report(
             _write_json(report_dir / "00_run_request.json", request_record)
         if result.get("parse_result") is not None:
             _write_json(report_dir / "01_crash_log_parser.json", result.get("parse_result"))
+            # Native C++ evidence diagnosis is a sidecar; it must not alter the
+            # established prompt assembly or make the main report fail.
+            try:
+                from tools.cpp_crash.core import diagnose_cpp_crash
+
+                cpp_diagnosis = diagnose_cpp_crash(result.get("parse_result") or {})
+                _write_json(report_dir / "04c_cpp_crash_diagnosis.json", cpp_diagnosis)
+                from tools.appfreeze.core import analyze_appfreeze
+
+                appfreeze_diagnosis = analyze_appfreeze(
+                    result.get("parse_result") or {},
+                    raw_content=str(result.get("crash_log_content") or ""),
+                )
+                if appfreeze_diagnosis.get("freeze", {}).get("freeze_type") != "UNKNOWN":
+                    _write_json(report_dir / "04f_appfreeze_diagnosis.json", appfreeze_diagnosis)
+                api_fields = result.get("api_fault") or result.get("api_error")
+                if not isinstance(api_fields, dict):
+                    api_fields = result.get("parse_result") or {}
+                if any(api_fields.get(key) for key in ("error_code", "errorCode", "error_name", "errorName", "api", "api_name", "apiName")):
+                    from tools.api_fault.core import diagnose_api_fault
+
+                    _write_json(report_dir / "04g_api_fault_diagnosis.json", diagnose_api_fault(api_fields))
+                from tools.js_crash.core import diagnose_js_crash, looks_like_js_crash
+
+                parse_payload = result.get("parse_result") or {}
+                if looks_like_js_crash(parse_payload):
+                    _write_json(report_dir / "04h_js_crash_diagnosis.json", diagnose_js_crash(parse_payload))
+            except Exception as exc:
+                _write_json(
+                    report_dir / "04c_cpp_crash_diagnosis.json",
+                    {"status": "error", "error": str(exc)},
+                )
         # 02: 内存映射
         if result.get("memory_maps") is not None and result.get("memory_maps"):
             _write_json(report_dir / "02_memory_maps.json", result.get("memory_maps"))
@@ -4157,9 +4540,15 @@ def _write_cli_report(
                 execution_events=execution_events,
             )
             _write_json(report_dir / "00_run_summary.json", summary)
+            try:
+                from tools.diagnosis.report import write_report_manifest
+
+                write_report_manifest(report_dir, request=request_record, result=result)
+            except Exception as exc:
+                logger.warning("failed to write report manifest: %s", exc)
         return report_dir
     except Exception as exc:
-        print(f"警告: 写入 cli_reports 失败: {exc}", file=sys.stderr)
+        print(f"警告: 写入 reports 失败: {exc}", file=sys.stderr)
         return None
 
 
@@ -4252,6 +4641,8 @@ def _build_run_request_record(
         ),
         "use_ctags_index": bool(getattr(args, "use_ctags_index", False)),
         "include_memory_in_05": bool(getattr(args, "include_memory_in_05", False)),
+        "native_leak_dir": str(getattr(args, "native_leak_dir", None) or ""),
+        "native_leak_trace_db": str(getattr(args, "native_leak_trace_db", None) or ""),
         "code_context_timeout_sec": code_context_timeout,
         "find_source_timeout_sec": find_source_timeout,
         "uaf_nullptr_guard_policy": _effective_uaf_nullptr_guard_policy(),
@@ -4337,6 +4728,13 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
         argv += ["--crash-log-file", crash_log]
     else:
         raise ValueError("run_request 中缺少 crash_log，无法重放")
+
+    native_leak_dir = str(record.get("native_leak_dir") or "").strip()
+    native_leak_trace_db = str(record.get("native_leak_trace_db") or "").strip()
+    if native_leak_dir:
+        argv += ["--native-leak-dir", native_leak_dir]
+    if native_leak_trace_db:
+        argv += ["--native-leak-trace-db", native_leak_trace_db]
 
     library_dir = str(record.get("library_dir") or "").strip()
     if library_dir:
@@ -4435,7 +4833,7 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
 
 
 def _handle_replay_command(argv: List[str]) -> int:
-    parser = argparse.ArgumentParser(description="从 cli_reports 中重放一次历史分析")
+    parser = argparse.ArgumentParser(description="从 reports 中重放一次历史分析")
     parser.add_argument("report_dir", help="历史报告目录（含 00_run_request.json）")
     parser.add_argument("--dry-run", action="store_true", help="仅打印将要执行的命令，不真正重放")
     parser.add_argument("--show-request", action="store_true", help="打印读取到的 run_request 内容")
@@ -4832,6 +5230,8 @@ def _doctor_status() -> Dict[str, Any]:
         "llm_ok": llm_ok,
         "active_provider": active_provider,
         "model": model_val or None,
+        "mode": str(llm_cfg.get("mode") or "fixed").strip().lower() if isinstance(llm_cfg, dict) else "fixed",
+        "providers": _llm_provider_inventory(),
         "auth_field": auth_field,
         "tool_status": tool_status,
         "tools": tools,
@@ -4866,7 +5266,7 @@ def _resolve_scope_from_record(record: Dict[str, Any]) -> str:
 
 
 def _run_cache_overview_menu() -> None:
-    """设置菜单：查看 ``cli_reports/`` 占用与最近若干次会话，不修改磁盘。"""
+    """设置菜单：查看 ``reports/`` 占用与最近若干次会话，不修改磁盘。"""
     stats = print_cli_reports_overview()
     if not stats.get("exists", False):
         print("当前不需要清理。")
@@ -4880,12 +5280,12 @@ def _run_cache_overview_menu() -> None:
         return
 
     print(f"另有 {extras} 份历史报告未在上述预览中列出。")
-    print("如需进一步清理，请回到「设置」选择「清理本地缓存（cli_reports）」。")
+    print("如需进一步清理，请回到「设置」选择「清理本地缓存（reports）」。")
     print("")
 
 
 def _run_cache_clear_menu() -> None:
-    """设置菜单：清理 ``cli_reports/`` 下的历史会话子目录。"""
+    """设置菜单：清理 ``reports/`` 下的历史会话子目录。"""
     stats = summarize_cli_reports()
     print_cli_reports_overview()
 
@@ -5060,11 +5460,11 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                     "设置",
                     [
                         ("back", "返回"),
-                        ("cfg_llm", "配置大模型（厂商 / 密钥 / 模型）"),
+                        ("cfg_llm", "大模型与路由设置"),
                         ("cfg_add2line", "配置堆栈地址解析工具（addr2line / atos 等）"),
                         ("check_update", "检查更新（升级 sa-agent 到最新版）"),
-                        ("cache_overview", "查看本地缓存（cli_reports 占用）"),
-                        ("cache_clear", "清理本地缓存（cli_reports）"),
+                        ("cache_overview", "查看本地缓存（reports 占用）"),
+                        ("cache_clear", "清理本地缓存（reports）"),
                         ("advanced", "高级选项"),
                     ],
                     default_index=0,
@@ -5092,7 +5492,6 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                             "高级选项",
                             [
                                 ("back", "返回"),
-                                ("llm_manual", "手动编辑大模型配置文件"),
                                 ("add2line_manual", "手动编辑堆栈地址解析配置文件"),
                                 (
                                     "llm_timeout",
@@ -5116,10 +5515,6 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                         )
                         if adv == "back":
                             break
-                        if adv == "llm_manual":
-                            _configure_llm_manual_panel()
-                            print("")
-                            continue
                         if adv == "add2line_manual":
                             _configure_add2line_manual_panel()
                             print("")
@@ -5513,7 +5908,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
     try:
         _initialize_run_report(report_dir, request_record)
     except Exception as exc:
-        print(f"警告: 初始化 cli_reports 运行记录失败: {exc}", file=sys.stderr)
+        print(f"警告: 初始化 reports 运行记录失败: {exc}", file=sys.stderr)
     problem = {
         "crash_log": crash_log_content,
         "library_dir": args.library_dir,
@@ -5524,6 +5919,8 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         "force_disassembly": bool(getattr(args, "force_disassembly", False)),
         "force_anr_analysis": bool(getattr(args, "force_anr_analysis", False)),
         "force_memory_analysis": bool(getattr(args, "force_memory_analysis", False)),
+        "native_leak_dir": str(getattr(args, "native_leak_dir", None) or ""),
+        "native_leak_trace_db": str(getattr(args, "native_leak_trace_db", None) or ""),
         "force_timeline_analysis": bool(getattr(args, "force_timeline_analysis", False)),
         "prompt_mode": str(getattr(args, "prompt_mode", "analysis") or "analysis"),
         # 0 表示让 workflow 按 prompt_mode 决定默认轮数
@@ -5556,6 +5953,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
 
     registry = ToolAndWorkflowRegistry()
     register_all_tools_and_workflows(registry)
+    _register_installed_skills(registry)
 
     # 加载扩展：仓库自带示例 + 用户级 extensions/ 目录 + Python 入口点。
     try:
@@ -5613,17 +6011,49 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
             request_record["log_kind_preclassify"] = problem.get("log_kind_preclassify")
 
     llm_adapter = None
+    llm_router_state = None
     if call_llm:
         if config.llm is None:
-            llm_config = _build_llm_config_from_agent_config(args.engine)
+            from tool_system.llm.routing_policy import RoutingContext
+
+            agent_cfg_for_llm = _load_agent_config_file()
+            prompt_mode_for_route = str(problem.get("prompt_mode") or "analysis")
+            agent_loop_for_route = str(problem.get("agent_loop") or (
+                "context_loop" if prompt_mode_for_route == "analysis" else "single"
+            ))
+            route_ctx = RoutingContext(
+                prompt_mode=prompt_mode_for_route,
+                apply_ai_fixes=bool(problem.get("apply_ai_fixes")),
+                agent_loop=agent_loop_for_route,
+                round_index=0,
+            )
+            llm_config, llm_router_state = _build_llm_config_from_agent_config(
+                args.engine,
+                agent_cfg=agent_cfg_for_llm,
+                cli_mode=getattr(args, "llm_mode", None),
+                force_profile=getattr(args, "llm_profile", None),
+                routing_ctx=route_ctx,
+                engage=True,
+                return_router_state=True,
+            )
             if llm_config is not None:
                 config.llm = llm_config
             else:
+                skip = None
+                if llm_router_state is not None:
+                    skip = llm_router_state.skip_reason or llm_router_state.reason
                 error_result = {
                     "status": "error",
-                    "error": "未检测到可用 LLM 配置",
+                    "error": "未检测到可用 LLM 配置" + (f"（{skip}）" if skip else ""),
                     "workflow": workflow_name,
-                    "metadata": {"execution_events": []},
+                    "metadata": {
+                        "execution_events": [],
+                        "llm_routing": (
+                            llm_router_state.to_summary_dict()
+                            if llm_router_state is not None
+                            else {"engaged": False, "skip_reason": "no_llm_config"}
+                        ),
+                    },
                 }
                 _write_cli_report(
                     report_dir,
@@ -5651,9 +6081,33 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
             except Exception as exc:
                 print(f"警告: LLM 适配器初始化失败，将继续执行工具链。错误: {exc}", file=sys.stderr)
 
+    if llm_router_state is not None:
+        problem["_llm_router_state"] = llm_router_state
+
     executor = ConfigDrivenExecutor(registry, config, llm_adapter)
     result = executor.execute_workflow(workflow_name, problem)
     execution_events = list(executor.last_execution_events)
+
+    # Persist routing summary into result metadata for 00_run_summary
+    if isinstance(result, dict):
+        meta = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        if not isinstance(meta, dict):
+            meta = {}
+        router_obj = problem.get("_llm_router_state") or llm_router_state
+        if router_obj is not None and hasattr(router_obj, "to_summary_dict"):
+            meta["llm_routing"] = router_obj.to_summary_dict()
+        elif scope != "full":
+            from tool_system.llm.llm_router import skipped_summary, resolve_mode_from_config
+
+            agent_cfg_skip = _load_agent_config_file()
+            llm_cfg_skip = agent_cfg_skip.get("llm_config", {}) if isinstance(agent_cfg_skip, dict) else {}
+            mode_skip = resolve_mode_from_config(
+                llm_cfg_skip if isinstance(llm_cfg_skip, dict) else {},
+                cli_mode=getattr(args, "llm_mode", None),
+            )
+            meta["llm_routing"] = skipped_summary(scope=scope, mode=mode_skip)
+        result["metadata"] = meta
+
     applied_fix_result: Optional[Dict[str, Any]] = None
     apply_fix_duration_ms: Optional[int] = None
 
@@ -5938,7 +6392,13 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
 
     if report_dir is not None:
         if not use_tty_brief:
-            print(f"cli_report 已保存到: {report_dir}", file=sys.stderr)
+            print(f"report 已保存到: {report_dir}", file=sys.stderr)
+        _maybe_commit_vector_db_after_fix(
+            args,
+            report_dir,
+            applied_fix_result,
+            scope=scope,
+        )
 
     return 0 if result.get("status") == "success" else 1
 
@@ -6015,6 +6475,9 @@ def _is_tty_interactive() -> bool:
 def main(argv: Optional[List[str]] = None) -> int:
     raw_argv = list(argv if argv is not None else sys.argv[1:])
     try:
+        if raw_argv and raw_argv[0] == "native-leak":
+            from cli.native_leak import handle_native_leak_command
+            return handle_native_leak_command(raw_argv[1:])
         if raw_argv and raw_argv[0] == "skill":
             return handle_skill_command(raw_argv[1:])
         if raw_argv and raw_argv[0] == "config":

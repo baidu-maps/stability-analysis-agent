@@ -1,7 +1,7 @@
 # Stability Analysis Agent — CLI 命令参考
 
 本文档与仓库根目录下的 **`cli/main.py`**（Tool System 统一入口）保持一致。  
-CLI 为**扁平参数**（含少量管理子命令）：崩溃分析主流程与向量库运维类参数通过**是否携带向量库相关开关**区分；携带向量库运维参数时会**执行完即退出**，不跑崩溃分析。另提供 `config/profile/cancel/skill` 子命令用于配置管理、会话模板、skill 管理与 daemon 任务取消。
+CLI 为**扁平参数**（含少量管理子命令）：崩溃分析主流程与向量库运维类参数通过**是否携带向量库相关开关**区分；携带向量库运维参数时会**执行完即退出**，不跑崩溃分析。另提供 `native-leak/config/profile/cancel/skill` 子命令用于 Native 泄漏分析、配置管理、会话模板、skill 管理与 daemon 任务取消。
 
 **入口与典型工作目录**（在仓库根目录执行）：
 
@@ -29,8 +29,12 @@ python3 cli/main.py [参数...]
 | `--max-agent-rounds N` | 否 | `context_loop` 最多 LLM 轮数。默认：`analysis` 模式 `3` 轮，其它模式 `1` 轮；显式指定时以参数为准（硬上限 `8`）。 |
 | `--max-context-requests-per-round N` | 否 | `context_loop` 每轮最多处理的源码补充请求数，默认 `5`，硬上限 `16`。 |
 | `--engine {direct,langchain,langgraph}` | 否 | 传给 `LLMConfig` 的引擎标记，默认 `direct`。 |
+| `--llm-mode {fixed,auto}` | 否 | LLM 路由模式；默认读 `llm_config.mode`（配置缺省为 `fixed`）。`fixed`=仅 `active_provider`；`auto`=发现可用厂商并按内置策略选档。 |
+| `--llm-profile {default,strong,fast}` | 否 | 强制路由档位（覆盖 auto 内置策略）。 |
 | `--output-format {markdown,json,text}` | 否 | 终端打印/写入 `--output-file` 的格式，默认 `markdown`。 |
 | `--output-file PATH` | 否 | 将上述格式结果写入文件；不指定则打印到 **stdout**。 |
+| `--native-leak-dir DIR` | 否 | 将 HarmonyOS Native 泄漏采集包并入 OOM/Crash 的 04d 旁路。 |
+| `--native-leak-trace-db PATH` | 否 | 可选的 trace_streamer SQLite；只读分析未释放 native_hook 调用栈。 |
 
 #### `--scope` 取值
 
@@ -115,24 +119,26 @@ LLM 配置模板见 **`configs/agent_config.local.example.json`**。实际密钥
 | 参数 | 默认 | 作用 |
 |------|------|------|
 | `--apply-ai-fixes` / `--no-apply-ai-fixes` | **开启** | 是否在首轮 AI 分析后，再经一次结构化调用，将候选函数**回写到 `--code-root` 内源码**。关闭后只分析、不改文件。 |
-| `--backup-original-sources` / `--no-backup-original-sources` | **开启** | 回写前是否在当次 **`cli_reports/<run>/original_sources/`** 下保存**改前**源码副本。若工程已由 Git 管理、习惯用 `git checkout` 撤销，可加 **`--no-backup-original-sources`** 省略磁盘备份。 |
+| `--backup-original-sources` / `--no-backup-original-sources` | **开启** | 回写前是否在当次 **`reports/<run>/original_sources/`** 下保存**改前**源码副本。若工程已由 Git 管理、习惯用 `git checkout` 撤销，可加 **`--no-backup-original-sources`** 省略磁盘备份。 |
 
 **说明**：
 
 - 改码范围受限于本次 `code_content_provider` 图节点中的**函数签名 + 片段**，避免模型改到未出现在上下文中的路径。
 - `--prompt-mode` 不会干涉是否尝试自动改码：即使 `--prompt-mode analysis`，只要 `--apply-ai-fixes` 开启且模型输出中存在可提取的完整修复代码，后续仍会尝试应用；如果提取不到修复代码，则自然跳过。
-- 每次成功跑完主流程后，会在仓库 **`cli_reports/<时间戳>_analysis_<scope>_<engine>_<crash名>/`** 下写入解析 JSON、（若有）AI 文本、改码结果等（其中 `<scope>` 取自 `--scope`，例如 `analysis_full`、`analysis_gen_prompt_only`）；终端仍会打印摘要，并在 stderr 提示报告目录路径。
+- 每次成功跑完主流程后，会在仓库 **`reports/<时间戳>_analysis_<scope>_<engine>_<crash名>/`** 下写入解析 JSON、（若有）AI 文本、改码结果等（其中 `<scope>` 取自 `--scope`，例如 `analysis_full`、`analysis_gen_prompt_only`）；终端仍会打印摘要，并在 stderr 提示报告目录路径。
 
 ---
 
-## 3. 输出与 `cli_reports` 落盘
+## 3. 输出与 `reports` 落盘
+
+> 历史目录名 `cli_reports/` 在首次解析报告根时会自动迁移到 `reports/`。也可用环境变量 `STABILITY_AGENT_REPORT_DIR` 覆盖报告根路径。
 
 | 行为 | 说明 |
 |------|------|
 | 终端 / `--output-file` | 与 `--output-format` 一致，为面向阅读的摘要（markdown/json/text）。 |
-| `cli_reports/.../` | 运行开始时先写入 `00_run_request.json` 与状态为 `running` 的 `00_run_summary.json`；结束后更新阶段状态、耗时、错误与产物清单。主要产物编号如下（与 `--scope` 相关）： |
+| `reports/.../` | 运行开始时先写入 `00_run_request.json` 与状态为 `running` 的 `00_run_summary.json`（`schema_version` ≥ 3 含顶层 `llm` 路由摘要：mode / selected / pool / calls / failover）；结束后更新阶段状态、耗时、错误与产物清单。主要产物编号如下（与 `--scope` 相关）： |
 
-**`cli_reports` 产物编号（当前实现）**
+**`reports` 产物编号（当前实现）**
 
 | 文件 | scope | 说明 |
 |------|-------|------|
@@ -186,7 +192,30 @@ LLM 配置模板见 **`configs/agent_config.local.example.json`**。实际密钥
 
 ---
 
-## 6. Skill 管理子命令
+## 6. Native 泄漏分析子命令
+
+`native-leak` 无需 Crash 日志即可分析 HarmonyOS/OpenHarmony 的 sample、smaps、NMD、kernel DMA 与 native_hook SQLite：
+
+```bash
+python3 cli/main.py native-leak \
+  --input /path/to/nativeleak_bundle \
+  --trace-db /path/to/trace.db \
+  --code-root /path/to/source
+```
+
+默认生成：
+
+- `00_native_leak_request.json`
+- `04d_native_leak_diagnosis.json`
+- `native_leak_report.md`
+
+工具不会执行采集包内附带的二进制。文本 profiler 需先由可信的 `trace_streamer` 转换为 SQLite，再通过 `--trace-db` 输入。
+
+Daemon 直连接口为 `POST /tool-system/native-leak`，请求字段支持 `path`、`trace_db`、`code_roots`、`scope` 和调用栈数量/占比限制。
+
+---
+
+## 7. Skill 管理子命令
 
 `sa-agent skill ...` 用于安装、发现、校验与运行 Claude 兼容 skill。
 
@@ -211,7 +240,7 @@ LLM 配置模板见 **`configs/agent_config.local.example.json`**。实际密钥
 
 ---
 
-## 7. 管理子命令
+## 8. 管理子命令
 
 | 子命令 | 作用 |
 |--------|------|
@@ -219,7 +248,7 @@ LLM 配置模板见 **`configs/agent_config.local.example.json`**。实际密钥
 | `profile` | 管理会话模板（list/show/use/save/delete）。 |
 | `cancel` | 取消 daemon 中正在运行的任务。 |
 
-### 7.1 取消 daemon 任务
+### 8.1 取消 daemon 任务
 
 ```bash
 # 取消默认 daemon（http://127.0.0.1:8765）中的任务
@@ -252,6 +281,6 @@ python3 cli/main.py cancel <run_id> --daemon http://127.0.0.1:8765
 
 - **实现来源**：仓库根目录 `cli/main.py` 中 `build_parser()` 与 `main()`。
 - **最后更新**：2026-06-08（新增 skill 子命令与 skill system 文档入口）。
-- 若增减参数或改变 `cli_reports` / 改码语义，请同步更新本文件。
+- 若增减参数或改变 `reports` / 改码语义，请同步更新本文件。
 
 **说明**：若你曾在旧版本文档中见到 `tools/cli/main.py`、`--daemon` 等条目，**当前本仓库以 `cli/main.py` 为准**；其他入口（如 `agent/ai_stability_agent.py`、daemon）的参数不在此文件覆盖范围内。

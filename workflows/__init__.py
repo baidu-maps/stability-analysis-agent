@@ -18,6 +18,7 @@ __all__ = [
     "AndroidCrashAnalyzeWorkflow",
     "GenericCrashAnalyzeWorkflow",
     "AnrFreezeAnalysisWorkflow",
+    "NativeLeakAnalysisWorkflow",
     "register_all_workflows",
 ]
 
@@ -34,6 +35,7 @@ def register_all_workflows(registry=None):
         iOSCrashAnalyzeWorkflow,
     )
     from .anr_freeze_workflow import AnrFreezeAnalysisWorkflow
+    from .native_leak_workflow import NativeLeakAnalysisWorkflow
 
     if registry is None:
         registry = get_registry()
@@ -70,6 +72,14 @@ def register_all_workflows(registry=None):
         is_tool=False,
         module="workflows",
     )
+    registry.register(
+        "native_leak_analysis",
+        NativeLeakAnalysisWorkflow(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=False,
+        module="workflows",
+    )
 
 
 def __getattr__(name: str) -> Any:
@@ -78,6 +88,9 @@ def __getattr__(name: str) -> Any:
     if name == "AnrFreezeAnalysisWorkflow":
         from .anr_freeze_workflow import AnrFreezeAnalysisWorkflow
         return AnrFreezeAnalysisWorkflow
+    if name == "NativeLeakAnalysisWorkflow":
+        from .native_leak_workflow import NativeLeakAnalysisWorkflow
+        return NativeLeakAnalysisWorkflow
     from . import crash_analysis_workflow as _mod
 
     return getattr(_mod, name)
@@ -85,6 +98,7 @@ def __getattr__(name: str) -> Any:
 
 if TYPE_CHECKING:
     from .anr_freeze_workflow import AnrFreezeAnalysisWorkflow
+    from .native_leak_workflow import NativeLeakAnalysisWorkflow
     from .crash_analysis_workflow import (
         AndroidCrashAnalyzeWorkflow,
         BaseCrashAnalysisWorkflow,

@@ -15,9 +15,15 @@ python3 daemon/server.py --host 0.0.0.0 --port 8765
 启动后输出：
 ```
 daemon listening on http://127.0.0.1:8765 (protocol=1)
+  Web UI:         http://127.0.0.1:8765/
   Run API:         POST /runs  GET /runs/<id>  GET /runs/<id>/events  POST /runs/<id>/cancel
+                   POST /runs/<id>/vector-db/commit
+  Skills API:      GET /skills  GET /skills/<name>
+                   POST /skills/install  POST /skills/lint  POST /skills/uninstall
   Tool System API: POST /tool-system/analyze  GET /tool-system/tools  GET /tool-system/workflows
 ```
+
+浏览器打开 `/` 即可使用本地面板（详见 [WEB_UI_GUIDE.md](./WEB_UI_GUIDE.md)）。
 
 ---
 
@@ -30,8 +36,20 @@ daemon listening on http://127.0.0.1:8765 (protocol=1)
 
 **响应：**
 ```json
-{ "ok": true, "protocol_version": "1", "pid": 12345 }
+{ "ok": true, "protocol_version": "1", "pid": 12345, "web_ui": true }
 ```
+
+---
+
+### Web UI（静态页）
+
+| 路径 | 说明 |
+|------|------|
+| `GET /` / `GET /index.html` | 本地面板 |
+| `GET /app.js` | 前端逻辑 |
+| `GET /styles.css` | 样式 |
+
+文件来自仓库根目录 `web/`。
 
 ---
 
@@ -47,6 +65,7 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
 {
   "crash_log": "/path/to/crash.crash",
   "crash_log_content": "...",
+  "crash_log_dir": "/path/to/logs",
   "library_dir": "/path/to/lib",
   "code_roots": ["/path/to/src"],
   "output_format": "markdown",
@@ -56,15 +75,31 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
   "agent_loop": null,
   "max_agent_rounds": 1,
   "max_context_requests_per_round": 5,
-  "streaming": false
+  "streaming": false,
+  "apply_ai_fixes": true,
+  "backup_original_sources": true,
+  "force_disassembly": false,
+  "force_anr_analysis": false,
+  "force_memory_analysis": false,
+  "force_timeline_analysis": false,
+  "native_leak_dir": null,
+  "native_leak_trace_db": null,
+  "llm_mode": null,
+  "llm_profile": null,
+  "include_memory_in_05": false
 }
 ```
-- `crash_log` 与 `crash_log_content` 二选一；`crash_log_content` 通过 stdin 传入
-- `engine`：`direct`（默认）/ `langchain` / `langgraph`
+- `crash_log` / `crash_log_content` / `crash_log_dir`：三选一；`crash_log_dir` 优先；`crash_log_content` 通过 stdin 传入
+- `engine`：`direct`（默认）/ `langchain` / `langgraph`（旧值 `sequential` 会映射为 `direct`）
 - `output_format`：`markdown`（默认）/ `json` / `text`
 - `scope`：`full`（默认）/ `gen_prompt_only` / `parse_stack_only` / `parse_log_only`，控制 Agent 执行流程范围（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--scope-取值)）
 - `prompt_mode`：`analysis`（默认）/ `fix`，控制 `06_ai_prompt.md` / LLM 输入偏证据分析还是偏补丁输出；不控制是否自动应用修复（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--prompt-mode-取值)）
 - `agent_loop`：`null`（省略或传 `null` 时随 `prompt_mode`：`analysis`→`context_loop`，其它→`single`）/ `single` / `context_loop`，控制是否允许模型请求补充函数源码后继续多轮分析；独立于 `engine`（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--agent-loop-取值)）
+- `apply_ai_fixes` / `backup_original_sources`：默认 `true`；为 `false` 时分别传 `--no-apply-ai-fixes` / `--no-backup-original-sources`
+- daemon 对 `scope=full` 且 `apply_ai_fixes=true` 的请求自动创建 detached Git worktree，CLI 只修改该 run 的隔离目录，不会直接回写请求中的源码目录。`code_roots` 必须位于 Git 仓库内，且对应范围不能有未提交修改；非 Git 或 dirty code root 会使 run 以 `workspace_error` 结束。
+- worktree 默认保留在系统临时目录的 `stability-analysis-agent/worktrees/<run_id>/` 下，便于检查和继续处理；可通过 `STABILITY_AGENT_WORKTREE_DIR` 指定管理根目录。
+- `force_*` / `native_leak_*` / `llm_mode` / `llm_profile` / `include_memory_in_05`：透传对应 CLI 旗标
+- 未知字段会被忽略（`run_request_from_dict`）
 
 **响应：**
 ```json
@@ -86,10 +121,19 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
   "finished_at": null,
   "exit_code": null,
   "error": null,
-  "output_format": "markdown"
+  "output_format": "markdown",
+  "report_dir": "/path/to/reports/20260812_...",
+  "workspace_dir": "/tmp/stability-analysis-agent/worktrees/<run_id>",
+  "original_code_roots": ["/path/to/src"],
+  "isolated_code_roots": ["/tmp/.../src"],
+  "workspace_manifest": "/path/to/report/09_ai_fix_workspace.json",
+  "patch_path": "/path/to/report/09_ai_fix.patch"
 }
 ```
-`status` 取值：`queued` / `running` / `done` / `error` / `canceled`
+`status` 取值：`queued` / `running` / `done` / `error` / `canceled`  
+`report_dir`：从 CLI stderr 行 `report 已保存到:` 解析，供 Web 写向量库使用。
+`workspace_dir`：自动改码实际使用的隔离 worktree；任务完成后保留。
+`patch_path`：存在代码变化时生成的 Git patch；没有变化时为 `null`。
 
 ---
 
@@ -106,12 +150,15 @@ data: {"run_id": "...", "type": "stdout", "data": {"chunk": "..."}, "ts": 171800
 | type | 说明 |
 |------|------|
 | `run_started` | 任务开始执行 |
+| `workspace_prepared` | Git worktree 已创建，包含原始与隔离后的 code roots |
+| `workspace_error` | worktree 创建失败，任务不会回写原始源码 |
 | `process_spawn` | 子进程已启动，含命令行 |
 | `stdout` | 子进程标准输出块（`data.chunk`） |
 | `stderr` | 子进程标准错误行（`data.line`） |
 | `run_finished` | 任务结束（`data.status` / `data.exit_code`） |
 | `run_canceled` | 任务已取消 |
 | `artifact_written` | 产物已落盘（`data.path`） |
+| `workspace_artifacts_written` | worktree 清单与 patch 已写入报告目录 |
 | `keepalive` | 保活心跳（每 1 秒一次） |
 
 ---
@@ -140,6 +187,88 @@ data: {"run_id": "...", "type": "stdout", "data": {"chunk": "..."}, "ts": 171800
 ```json
 { "run_id": "...", "status": "canceled" }
 ```
+
+---
+
+#### `POST /runs/<run_id>/vector-db/commit`
+在 **改码成功** 后，将本次报告目录中的案例写入本地向量知识库（用户确认路径；Web 面板「写入」按钮调用此端点）。
+
+**前提：**
+- 任务已结束（`status` 为 `done` 或 `error`）
+- `report_dir` 已解析且目录存在
+- `08_apply_ai_fixes.json` 存在且 `success=true`
+
+**请求体：** 空 JSON `{}` 即可。
+
+**成功响应（200）：**
+```json
+{
+  "ok": true,
+  "pattern_id": "pattern_abc123...",
+  "vector_db_path": "/Users/you/.config/stability-analysis-agent/vector_db",
+  "summary": { "signal": "SIGSEGV", "fix_files": ["foo.cpp"] }
+}
+```
+
+**常见错误：**
+| HTTP | 说明 |
+|------|------|
+| `404` | `run_not_found` |
+| `409` | `run_not_finished` |
+| `400` | `report_dir_missing` 或报告不符合写库条件（`skipped`） |
+| `501` | `vector_db.mode=remote` 尚未实现 |
+| `500` | RAG 运行时不可用或其它内部错误 |
+
+写库配置来自 `web_preferences.json` 的 `vector_db` 段（`mode`、`local_path`）。成功后会在报告目录落盘 `09_vector_db_commit.json`。
+
+Daemon 拉起 CLI 时固定附加 `--no-interactive --no-save-to-vector-db`，避免子进程内二次确认。
+
+---
+
+### Skills API
+
+进程内调用 `skill_system.SkillManager`（与 `sa-agent skill` 对齐）。详见 [WEB_UI_GUIDE.md](./WEB_UI_GUIDE.md) 与 [Skill System](../skills/README.md)。
+
+#### `GET /skills`
+列出**已安装**技能（`~/.config/stability-analysis-agent/skills`；不含仅 discovery 路径下的 skill）。
+
+**响应：** `{ "skills": [ /* SkillSummary + enabled */ ] }`
+
+#### `GET /skills/<name>`
+技能详情（summary / frontmatter / package / body）。
+
+#### `POST /skills/install`
+```json
+{ "source": "/path/to/skill-or.zip", "overwrite": false }
+```
+成功返回 `SkillInstallResult`；目标已存在且未 overwrite → `409`。
+
+#### `POST /skills/lint`
+```json
+{ "source": "/path/to/skill" }
+```
+**响应：** `{ "issues": [ { "level", "message", "path" } ] }`
+
+#### `POST /skills/uninstall`
+```json
+{ "name": "my-skill" }
+```
+
+---
+
+### Web 偏好 API（本地面板）
+
+工作区路径与 Skill 开关；数据文件 `~/.config/stability-analysis-agent/web_preferences.json`。
+
+#### `GET /web/preferences`
+返回 `{ "workspace": { "library_dir", "code_roots" }, "disabled_skills": [...], "vector_db": { "mode", "local_path", ... } }`。
+
+#### `POST /web/preferences`
+- 更新工作区：`{ "workspace": { "library_dir", "code_roots" } }`
+- 切换 Skill：`{ "skill": "<command_name>", "enabled": true|false }`
+- 更新向量库：`{ "vector_db": { "mode": "local", "local_path": "/path/to/vector_db" } }`（`remote` 仅配置预留）
+
+禁用列表通过环境变量 `STABILITY_AGENT_DISABLED_SKILLS` 传入 CLI 子进程，分析时跳过对应 skill 注册。
 
 ---
 
@@ -193,6 +322,7 @@ data: {"run_id": "...", "type": "stdout", "data": {"chunk": "..."}, "ts": 171800
 
 ## 相关文档
 
+- [Local Web UI](./WEB_UI_GUIDE.md)
 - [CLI 使用指南](./CLI_GUIDE.md)
 - [Tool System 概览](../tools/tool_system/TOOL_SYSTEM_OVERVIEW.md)
 - [协议模型](../tools/tool_system/TOOL_SYSTEM_OVERVIEW.md)

@@ -6,14 +6,19 @@ on:
   pull_request:
     branches: [main, master]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    name: Python ${{ matrix.python-version }}
+  deterministic:
+    name: Deterministic (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        # PR: fast feedback on two versions; push to main/master: full matrix
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.10", "3.12"]') || fromJSON('["3.9", "3.10", "3.11", "3.12"]') }}
 
     steps:
       - uses: actions/checkout@v4
@@ -22,6 +27,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
 
       - name: Install package (core + test extras)
         run: |
@@ -32,8 +38,32 @@ jobs:
         run: |
           sa-agent --help
           sa-agent config path
+          python -c "from daemon.server import Handler; from rag.case_writer import commit_from_report_dir; print('imports_ok')"
 
-      - name: Run unit tests
+      - name: Pre-commit deterministic suite
+        run: |
+          python -B -m unittest \
+            test.ai_regression.test_runner \
+            test.cli.test_report_paths \
+            test.cli.test_vector_db_commit_prompt \
+            test.rag.test_case_writer \
+            test.daemon.test_build_cli_cmd \
+            test.daemon.test_skills_api \
+            test.daemon.test_run_lifecycle \
+            test.daemon.test_vector_db_commit_api \
+            test.daemon.test_web_preferences \
+            test.skill_system.test_installed_skills_runtime \
+            test.web.test_web_contract \
+            test.tools.test_diagnosis_infrastructure \
+            test.tools.test_cpp_crash \
+            test.tools.test_appfreeze \
+            test.tools.test_js_crash \
+            test.tools.test_js_heap \
+            test.tools.test_jank_analysis \
+            test.tools.test_api_fault \
+            -v
+
+      - name: Toolchain core spot checks
         run: |
           python -m unittest discover -s test/tool_system -p 'test_http_ssl.py' -v
           python -m unittest discover -s test/agent_py_tool -p 'test_parse_crash_errors.py' -v

@@ -3464,7 +3464,7 @@ quit
             return self._function_location_cache[function_name]
         try:
             workspace_root = str(Path(__file__).resolve().parents[1])
-            skip_dirs = {".git", "node_modules", "dist", "build", "cli_reports"}
+            skip_dirs = {".git", "node_modules", "dist", "build", "cli_reports", "reports"}
             skip_prefixes = (".venv", "__pycache__")
             source_exts = {".c", ".cc", ".cpp", ".cxx", ".m", ".mm", ".h", ".hh", ".hpp", ".hxx"}
 

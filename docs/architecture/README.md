@@ -5,12 +5,12 @@
 ## 系统目标
 
 - 核心能力只实现一次（解析、符号化、代码上下文、AI 分析、RAG）
-- 多入口复用同一核心（CLI / daemon）
+- 多入口复用同一核心（CLI / daemon / 本地面板 `web/`）
 - 配置与执行解耦（Tool System + ConfigDrivenExecutor）
 
 ## 分层架构
 
-- 应用层：CLI、daemon
+- 应用层：CLI、daemon（托管 `web/` 静态页 + HTTP API）
 - 编排层：Tool System / Workflow / Executor
 - 工具层：`crash_log_parser`、`add2line_resolver`、`code_content_provider`
 - AI 层：Direct / LangChain / LangGraph 适配器
@@ -32,13 +32,14 @@
 
 - `agent/`：AI Agent 实现
 - `cli/`：命令行入口
-- `daemon/`：本地 HTTP 服务
+- `daemon/`：本地 HTTP 服务（Run API、Skills API、`web_preferences`）
+- `web/`：本地面板静态资源
 - `workflows/`：Workflow 定义
 - `tool_system/`：注册表、配置、执行器、LLM 适配器
 - `tools/`：具体工具实现
 - `rag/`：RAG 相关实现
 - `examples/`：demo crash cases
-- `test/`：测试集
+- `test/`：测试集（文档见 [docs/testing/README.md](../testing/README.md)）
 
 ## 关键设计取舍
 

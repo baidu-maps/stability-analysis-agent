@@ -1,5 +1,5 @@
 ---
 triple:          'arm64-apple-darwin'
-binary-path:     '/Users/liuhong_cd/baidu/personal-code/ai-crash-analyzer/main/crash_cases/demo_basic/lib/mac/libmylib.dylib'
+binary-path:     '/Users/liuhong_cd/baidu/personal-code/github-repos/stability-analysis-agent/examples/crash_cases/demo_basic/lib/mac/libmylib.dylib'
 relocations:     []
 ...

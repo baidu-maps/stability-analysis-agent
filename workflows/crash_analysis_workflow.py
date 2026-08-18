@@ -613,6 +613,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     analysis_prompt += "\n\n" + report_instruction
             except Exception as ri_exc:
                 logger.debug("Report instruction injection skipped: %s", ri_exc)
+            if isinstance(problem, dict):
+                problem["_crash_diagnosis"] = crash_diagnosis
             analysis_text, final_prompt, agent_rounds, llm_response = self._run_llm_context_loop(
                 context=context,
                 initial_prompt=analysis_prompt,
@@ -646,9 +648,9 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 "vector_used": vector_used,
                 "memory_context": memory_context,
                 "memory_retrieval": memory_retrieval,
-                "metadata": {
-                    "problem_type": self.definition.problem_type
-                }
+                "metadata": self._metadata_with_llm_routing(
+                    problem, problem_type=self.definition.problem_type
+                ),
             }
 
         except Exception as e:
@@ -656,8 +658,29 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             return {
                 "status": "error",
                 "error": str(e),
-                "workflow": self.definition.name
+                "workflow": self.definition.name,
+                "metadata": self._metadata_with_llm_routing(
+                    problem if isinstance(problem, dict) else None,
+                    problem_type=self.definition.problem_type,
+                ),
             }
+
+    @staticmethod
+    def _metadata_with_llm_routing(
+        problem: Optional[Dict[str, Any]],
+        *,
+        problem_type: str = "crash_analysis",
+    ) -> Dict[str, Any]:
+        meta: Dict[str, Any] = {"problem_type": problem_type}
+        if not isinstance(problem, dict):
+            return meta
+        state = problem.get("_llm_router_state")
+        if state is not None and hasattr(state, "to_summary_dict"):
+            try:
+                meta["llm_routing"] = state.to_summary_dict()
+            except Exception:
+                pass
+        return meta
 
     def _build_analysis_prompt(self, parse_result: Dict, resolved: Dict, code_context: Dict, memory_context: str = "") -> str:
         """构建分析提示词"""
@@ -2755,10 +2778,70 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         )
 
     @staticmethod
+    def _apply_router_endpoint_to_context(context: WorkflowContext, endpoint: Any) -> None:
+        """Swap context.llm to the given router endpoint."""
+        if endpoint is None:
+            return
+        try:
+            from tool_system.llm.llm_adapter import LLMAdapterFactory
+            from tool_system.llm.llm_router import build_llm_config_for_endpoint
+
+            cfg = build_llm_config_for_endpoint(endpoint, engine="direct")
+            context.llm = LLMAdapterFactory.create(cfg.to_dict())
+        except Exception as exc:
+            logger.warning("Failed to switch LLM adapter for failover: %s", exc)
+
+    @staticmethod
+    def _prepare_router_for_round(
+        context: WorkflowContext,
+        problem: Optional[Dict[str, Any]],
+        *,
+        round_index: int,
+    ) -> None:
+        """Re-select tier/endpoint for this round when mode=auto."""
+        if not isinstance(problem, dict):
+            return
+        state = problem.get("_llm_router_state")
+        if state is None or getattr(state, "mode", "fixed") == "fixed":
+            return
+        try:
+            from tool_system.llm.llm_router import re_resolve_tier
+            from tool_system.llm.routing_policy import RoutingContext
+
+            diag = problem.get("_crash_diagnosis")
+            if not isinstance(diag, dict):
+                diag = None
+            ctx = RoutingContext(
+                mode=str(getattr(state, "mode", "auto")),
+                force_profile=getattr(state, "force_profile", None),
+                prompt_mode=str(problem.get("prompt_mode") or "analysis"),
+                apply_ai_fixes=bool(problem.get("apply_ai_fixes")),
+                agent_loop=str(problem.get("agent_loop") or "single"),
+                round_index=int(round_index),
+                crash_diagnosis=diag,
+            )
+            selected = re_resolve_tier(state, ctx)
+            if selected is not None:
+                BaseCrashAnalysisWorkflow._apply_router_endpoint_to_context(context, selected)
+                logger.info(
+                    "LLM router round=%s tier=%s provider=%s model=%s reason=%s",
+                    round_index,
+                    getattr(state, "requested_tier", None),
+                    selected.provider_key,
+                    selected.model,
+                    getattr(state, "reason", None),
+                )
+        except Exception as exc:
+            logger.debug("LLM re_resolve skipped: %s", exc)
+
+    @staticmethod
     def _llm_call_with_retries(
         context: WorkflowContext,
         prompt: str,
         problem: Optional[Dict[str, Any]],
+        *,
+        round_index: int = 0,
+        stage: str = "analysis",
     ) -> Tuple[Any, str]:
         prompt_cap_raw = problem.get("max_prompt_chars") if isinstance(problem, dict) else None
         if prompt_cap_raw is None:
@@ -2782,6 +2865,10 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 prompt_cap,
             )
 
+        BaseCrashAnalysisWorkflow._prepare_router_for_round(
+            context, problem, round_index=round_index
+        )
+
         llm_adapter = getattr(context, "llm", None)
         configured_max_tokens = 0
         try:
@@ -2803,35 +2890,94 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 token_attempts.append(candidate)
         token_attempts.append(None)
 
+        router_state = problem.get("_llm_router_state") if isinstance(problem, dict) else None
+        max_endpoint_attempts = 1
+        if router_state is not None and getattr(router_state, "failover_enabled", False):
+            max_endpoint_attempts = max(1, len(getattr(router_state, "pool", []) or []) or 1)
+
         llm_response = None
         last_llm_exc: Optional[Exception] = None
-        for idx, tok in enumerate(token_attempts, start=1):
-            try:
-                if tok is None:
-                    logger.info("LLM attempt %s: default max_tokens", idx)
-                    llm_response = context.call_llm(prompt_used, temperature=0)
-                else:
-                    logger.info("LLM attempt %s: max_tokens=%s", idx, tok)
-                    llm_response = context.call_llm(prompt_used, max_tokens=tok, temperature=0)
-                if tok is not None and llm_response is not None:
-                    usage = getattr(llm_response, "usage", None) or {}
-                    completion_tokens = usage.get("completion_tokens", 0) or 0
-                    if completion_tokens >= tok * 0.95:
-                        logger.warning(
-                            "LLM output likely truncated (completion_tokens=%s, max_tokens=%s), retrying",
-                            completion_tokens,
-                            tok,
+        call_started = None
+        for endpoint_attempt in range(max_endpoint_attempts):
+            llm_response = None
+            last_llm_exc = None
+            import time as _time
+
+            call_started = _time.perf_counter()
+            for idx, tok in enumerate(token_attempts, start=1):
+                try:
+                    if tok is None:
+                        logger.info("LLM attempt %s: default max_tokens", idx)
+                        llm_response = context.call_llm(prompt_used, temperature=0)
+                    else:
+                        logger.info("LLM attempt %s: max_tokens=%s", idx, tok)
+                        llm_response = context.call_llm(prompt_used, max_tokens=tok, temperature=0)
+                    if tok is not None and llm_response is not None:
+                        usage = getattr(llm_response, "usage", None) or {}
+                        completion_tokens = usage.get("completion_tokens", 0) or 0
+                        if completion_tokens >= tok * 0.95:
+                            logger.warning(
+                                "LLM output likely truncated (completion_tokens=%s, max_tokens=%s), retrying",
+                                completion_tokens,
+                                tok,
+                            )
+                            continue
+                    break
+                except Exception as llm_exc:
+                    last_llm_exc = llm_exc
+                    logger.warning(
+                        "LLM attempt %s failed (max_tokens=%s): %s",
+                        idx,
+                        tok if tok is not None else "default",
+                        llm_exc,
+                    )
+            duration_ms = int(round((_time.perf_counter() - call_started) * 1000))
+            if llm_response is not None:
+                if router_state is not None:
+                    try:
+                        from tool_system.llm.llm_router import record_call
+
+                        record_call(
+                            router_state,
+                            stage=stage,
+                            round_index=round_index,
+                            status="success",
+                            duration_ms=duration_ms,
                         )
-                        continue
+                    except Exception:
+                        pass
                 break
-            except Exception as llm_exc:
-                last_llm_exc = llm_exc
-                logger.warning(
-                    "LLM attempt %s failed (max_tokens=%s): %s",
-                    idx,
-                    tok if tok is not None else "default",
-                    llm_exc,
-                )
+
+            # Endpoint-level failure → optional failover
+            if router_state is not None:
+                try:
+                    from tool_system.llm.llm_router import failover_next, record_call
+
+                    record_call(
+                        router_state,
+                        stage=stage,
+                        round_index=round_index,
+                        status="error",
+                        duration_ms=duration_ms,
+                        error=str(last_llm_exc or "unknown"),
+                    )
+                    next_ep = failover_next(
+                        router_state, cause=str(last_llm_exc or "llm_call_failed")
+                    )
+                    if next_ep is None:
+                        break
+                    BaseCrashAnalysisWorkflow._apply_router_endpoint_to_context(context, next_ep)
+                    logger.warning(
+                        "LLM failover to provider=%s model=%s",
+                        next_ep.provider_key,
+                        next_ep.model,
+                    )
+                    continue
+                except Exception as fo_exc:
+                    logger.debug("LLM failover skipped: %s", fo_exc)
+                    break
+            break
+
         if llm_response is None:
             raise RuntimeError(f"LLM call failed after retries: {last_llm_exc}")
         return llm_response, prompt_used
@@ -2856,7 +3002,13 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
     ) -> Tuple[Any, str]:
         label = f"{cls._round_label_cn(round_index)}：AI推理分析"
         with PhaseSpinner(label, step=step, total_steps=total_steps) as sp:
-            response, prompt_used = cls._llm_call_with_retries(context, prompt, problem)
+            response, prompt_used = cls._llm_call_with_retries(
+                context,
+                prompt,
+                problem,
+                round_index=round_index,
+                stage="analysis" if round_index == 0 else "context_followup",
+            )
             usage = getattr(response, "usage", None) or {}
             if isinstance(usage, dict):
                 sp.set_tokens(
@@ -3478,9 +3630,13 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         """内存压力/OOM 旁路（阶段 A）：oom 族 log_kind 或 force 时产出 04d。"""
         if problem.get("skip_memory_sidepath"):
             return {}
+        native_leak_dir = str(problem.get("native_leak_dir") or "").strip()
+        native_leak_trace_db = str(problem.get("native_leak_trace_db") or "").strip()
         force = bool(
             problem.get("force_memory_analysis")
             or problem.get("enable_memory_analysis")
+            or native_leak_dir
+            or native_leak_trace_db
         )
         try:
             from tools.memory_diagnosis.core import run_memory_pressure_diagnosis
@@ -3489,6 +3645,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 resolved_stack,
                 crash_log_content or str(problem.get("crash_log") or ""),
                 force=force,
+                native_leak_path=native_leak_dir,
+                native_leak_trace_db=native_leak_trace_db,
             )
             return out if isinstance(out, dict) else {}
         except Exception as exc:

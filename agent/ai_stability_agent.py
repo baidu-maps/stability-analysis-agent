@@ -1157,18 +1157,7 @@ class FullStabilityAnalyzer:
                 "resolved_data": resolved_data,
             }
             
-            # 自动保存分析结果到向量数据库（仅当有有效的AI分析结果时）
-            if self.vector_db_analyzer and not self.disable_vector_db_save:
-                try:
-                    print("INFO: 正在保存分析结果到向量数据库...", file=sys.stderr)
-                    save_success = self._save_state_to_vector_db(final_state)
-                    if save_success:
-                        print("INFO: 分析结果已保存到向量数据库", file=sys.stderr)
-                    else:
-                        print("INFO: 跳过保存（AI分析结果无效或为空）", file=sys.stderr)
-                except Exception as e:
-                    print(f"WARNING: 保存到向量数据库时出错: {e}", file=sys.stderr)
-            
+            # 向量库写入改由修复成功后的用户确认流程（CLI / Web API）触发，见 rag/case_writer.py
             return final_state
             
         except Exception as e:
@@ -1251,18 +1240,7 @@ class FullStabilityAnalyzer:
                 total_time = (datetime.now() - start_time).total_seconds()
                 final_state["total_time"] = total_time
                 
-                # 自动保存分析结果到向量数据库（仅当有有效的AI分析结果时）
-                if self.vector_db_analyzer and not self.disable_vector_db_save:
-                    try:
-                        print("INFO: 正在保存分析结果到向量数据库...", file=sys.stderr)
-                        save_success = self._save_state_to_vector_db(final_state)
-                        if save_success:
-                            print("INFO: 分析结果已保存到向量数据库", file=sys.stderr)
-                        else:
-                            print("INFO: 跳过保存（AI分析结果无效或为空）", file=sys.stderr)
-                    except Exception as e:
-                        print(f"WARNING: 保存到向量数据库时出错: {e}", file=sys.stderr)
-                
+                # 向量库写入改由修复成功后的用户确认流程（CLI / Web API）触发
                 print(f"INFO: 完整分析流程完成（LangGraph模式），总耗时: {total_time:.2f}秒", file=sys.stderr)
                 
                 return final_state
@@ -1511,98 +1489,83 @@ class FullStabilityAnalyzer:
         return {"enabled": True}
     
     def build_vector_db_record(self, final_state: CrashAnalysisState) -> Optional[Dict[str, Any]]:
-        """构建向量数据库记录（仅当有有效的AI分析结果时）"""
+        """构建向量数据库记录（兼容旧调用；优先从 report 目录写入）。"""
         try:
-            # 检查是否有有效的AI分析结果
+            parsed_data = final_state.get("parsed_data", {})
+            resolved_data = final_state.get("resolved_data", {})
+            prompt_data = final_state.get("prompt_data", {}) or {}
+            if not parsed_data or not resolved_data:
+                return None
+            from rag.case_writer import build_case_record_from_report
+
+            report_dir = final_state.get("report_dir")
+            if report_dir:
+                return build_case_record_from_report(Path(str(report_dir)))
+            # Fallback: synthesize minimal apply success from state when no report dir
             ai_analysis = final_state.get("ai_analysis") or ""
             if isinstance(ai_analysis, str):
                 ai_analysis = ai_analysis.strip()
             else:
                 ai_analysis = ""
-            
-            # 无效的AI分析内容（占位文本或错误信息），这类结果不应该写入 Crash Memory
             invalid_patterns = [
                 "AI分析跳过",
                 "跳过AI分析",
                 "AI分析失败",
                 "分析失败",
                 "未配置密钥",
-                "只运行了前三个工具"
+                "只运行了前三个工具",
             ]
-            
-            # 如果AI分析为空或包含无效模式，则不保存
             if not ai_analysis or any(pattern in ai_analysis for pattern in invalid_patterns):
                 return None
-            
-            # 提取崩溃信息
-            parsed_data = final_state.get("parsed_data", {})
-            resolved_data = final_state.get("resolved_data", {})
-            prompt_data = final_state.get("prompt_data", {}) or {}
+            from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
 
+            if not flatten_resolved_frames_from_stack(resolved_data):
+                return None
+            # Delegate to inline builder via temporary structure
             crash_info = parsed_data.get("crash_info", {}) if isinstance(parsed_data, dict) else {}
             meta_info = parsed_data.get("meta_info", {}) if isinstance(parsed_data, dict) else {}
-            crash_reason = crash_info.get("crash_reason", "unknown") if isinstance(crash_info, dict) else "unknown"
             signal = crash_info.get("signal", "") if isinstance(crash_info, dict) else ""
+            crash_reason = crash_info.get("crash_reason", "unknown") if isinstance(crash_info, dict) else "unknown"
             os_type = meta_info.get("os_type", "unknown") if isinstance(meta_info, dict) else "unknown"
             platform = meta_info.get("platform") if isinstance(meta_info, dict) else None
-
             query_text, signature = build_pattern_query(parsed_data, resolved_data, prompt_data)
             pattern_summary = prompt_data.get("crash_summary") or ai_analysis.splitlines()[0]
             pattern_summary = str(pattern_summary).strip()
-
             crash_category = "unknown"
             if "SIGSEGV" in str(signal) or "segmentation" in str(crash_reason).lower():
                 crash_category = "memory"
             elif "deadlock" in str(crash_reason).lower() or "lock" in str(crash_reason).lower():
                 crash_category = "concurrency"
-
-            evidence_requirements = []
-            from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
-
-            if flatten_resolved_frames_from_stack(resolved_data):
-                evidence_requirements.append("stack_trace")
-            if prompt_data.get("code_contexts"):
-                evidence_requirements.append("code_snippet")
-            if parsed_data.get("raw_content"):
-                evidence_requirements.append("log_fragment")
-
             pattern_id = f"pattern_{hashlib.md5((pattern_summary + signature + datetime.now().isoformat()).encode()).hexdigest()}"
             pattern = {
                 "pattern_id": pattern_id,
                 "pattern_summary": pattern_summary or query_text[:200],
                 "crash_signature": signature,
-                "platform_scope": {
-                    "os": os_type,
-                    "platform": platform,
-                },
+                "platform_scope": {"os": os_type, "platform": platform},
                 "crash_category": crash_category,
-                "evidence_requirements": evidence_requirements,
+                "evidence_requirements": ["stack_trace"],
                 "confidence_score": 0.6,
                 "validation_state": "draft",
                 "source_type": "internal_case",
                 "created_at": datetime.now().isoformat(),
             }
-
             evidence_list = []
             for frame in flatten_resolved_frames_from_stack(resolved_data)[:5]:
-                evidence_list.append({
-                    "evidence_id": f"evidence_{hashlib.md5((pattern_id + str(frame)).encode()).hexdigest()}",
-                    "pattern_id": pattern_id,
-                    "evidence_type": "stack_trace",
-                    "raw_content": json.dumps(frame, ensure_ascii=False),
-                    "normalized_features": {
-                        "function": frame.get("function"),
-                        "module": frame.get("module"),
-                    },
-                    "reliability_score": 0.7,
-                    "created_at": datetime.now().isoformat(),
-                })
-
-            return {
-                "pattern": pattern,
-                "evidence": evidence_list,
-            }
-            
+                evidence_list.append(
+                    {
+                        "evidence_id": f"evidence_{hashlib.md5((pattern_id + str(frame)).encode()).hexdigest()}",
+                        "pattern_id": pattern_id,
+                        "evidence_type": "stack_trace",
+                        "raw_content": json.dumps(frame, ensure_ascii=False),
+                        "normalized_features": {
+                            "function": frame.get("function"),
+                            "module": frame.get("module"),
+                        },
+                        "reliability_score": 0.7,
+                        "created_at": datetime.now().isoformat(),
+                    }
+                )
+            return {"pattern": pattern, "evidence": evidence_list}
         except Exception as e:
             print(f"WARNING: 构建向量数据库记录失败: {e}", file=sys.stderr)
             return None

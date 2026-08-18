@@ -1,0 +1,46 @@
+# Knowledge Base YAML Schema
+# This file documents the format for fault mode YAML files.
+# Each domain has its own subdirectory containing fault_modes.yaml files.
+
+# Required top-level fields:
+# - domain: string - the diagnosis domain (must match directory name)
+# - version: string - schema version for forward compatibility
+# - fault_modes: list - array of fault mode entries
+
+# Each fault mode entry has these fields:
+# Required:
+#   id: string - unique identifier (e.g., "CPP-FM-01", "FREEZE-FM-03")
+#   name: string - human-readable fault mode name
+#   level_1: string - top-level classification category
+#   level_2: string - sub-category
+#   level_3: string - specific root cause
+#   owner: string - responsible module/layer (Application/System/Runtime/Native)
+#   confidence: float - default confidence score (0.0~1.0)
+#   evidence_patterns: list[string] - patterns to match in log/stack text
+#   guidance: list[string] - fix suggestions
+#
+# Optional:
+#   tags: list[string] - searchable tags
+#   api_version: string - applicable API version range
+#   last_verified: string - date of last verification (YYYY-MM-DD)
+#   description: string - extended description
+#   related_modes: list[string] - IDs of related fault modes
+
+# Example:
+domain: _schema_example
+version: "1.0"
+fault_modes:
+  - id: EXAMPLE-FM-01
+    name: "示例故障模式"
+    level_1: EXAMPLE
+    level_2: SubCategory
+    level_3: SpecificCause
+    owner: Application
+    confidence: 0.8
+    evidence_patterns:
+      - "pattern_to_match_in_log"
+      - "another_pattern"
+    guidance:
+      - "修复建议 1"
+      - "修复建议 2"
+    tags: [example, demo]

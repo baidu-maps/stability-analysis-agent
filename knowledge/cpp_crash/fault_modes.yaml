@@ -1,0 +1,227 @@
+domain: cpp_crash
+version: "1.0"
+fault_modes:
+  - id: CPP-FM-01
+    name: "SIGSEGV - 非法内存访问 (SEGV_MAPERR)"
+    level_1: NativeCrash
+    level_2: SIGSEGV
+    level_3: SEGV_MAPERR
+    owner: Application
+    confidence: 0.85
+    evidence_patterns:
+      - "signal.*11"
+      - "SIGSEGV"
+      - "SEGV_MAPERR"
+    guidance:
+      - "检查空指针解引用：确认对象是否在使用前已被释放或未初始化"
+      - "检查 UAF / 野指针：核对指针生命周期和所有权转移"
+      - "使用 ASan/HWASan 复现以定位首次非法访问位置"
+    tags: [memory, null_pointer, segfault]
+
+  - id: CPP-FM-02
+    name: "Use-after-free / 野指针"
+    level_1: NativeCrash
+    level_2: SIGSEGV
+    level_3: UseAfterFree
+    owner: Application
+    confidence: 0.7
+    evidence_patterns:
+      - "poison_value"
+      - "debug_poison"
+      - "use_after_free"
+      - "0xdeadbeef"
+      - "0xfdfdfdfd"
+      - "0xbaadf00d"
+    guidance:
+      - "核对释放点、所有权和异步回调"
+      - "使用 ASan/HWASan 复现确认"
+      - "检查跨线程对象访问是否有竞态"
+    tags: [memory, uaf, wild_pointer]
+
+  - id: CPP-FM-03
+    name: "SEGV_ACCERR - 映射权限错误"
+    level_1: NativeCrash
+    level_2: SIGSEGV
+    level_3: SEGV_ACCERR
+    owner: Application
+    confidence: 0.72
+    evidence_patterns:
+      - "SEGV_ACCERR"
+      - "permission"
+      - "readonly"
+    guidance:
+      - "检查是否写入只读段（const/rodata）"
+      - "检查缓冲区溢出改写保护页"
+      - "检查 mprotect/mmap 权限设置"
+    tags: [memory, permission, buffer_overflow]
+
+  - id: CPP-FM-05
+    name: "SIGBUS - 总线错误或未对齐访问"
+    level_1: NativeCrash
+    level_2: SIGBUS
+    level_3: BUS_ADRALN
+    owner: Application
+    confidence: 0.75
+    evidence_patterns:
+      - "SIGBUS"
+      - "BUS_ADRALN"
+      - "BUS_ADRERR"
+      - "alignment"
+    guidance:
+      - "检查 mmap/共享内存、文件映射和数据对齐"
+      - "非 x86 架构注意原子操作的对齐要求"
+      - "BUS_ADRERR: 检查映射文件是否被截断"
+    tags: [memory, alignment, mmap]
+
+  - id: CPP-FM-06
+    name: "SIGFPE - 算术异常"
+    level_1: NativeCrash
+    level_2: SIGFPE
+    level_3: FPE_INTDIV
+    owner: Application
+    confidence: 0.80
+    evidence_patterns:
+      - "SIGFPE"
+      - "FPE_INTDIV"
+      - "FPE_FLTDIV"
+      - "division"
+    guidance:
+      - "检查除零：整数除法前校验除数非零"
+      - "浮点异常检查 NaN/Inf 传播路径"
+    tags: [arithmetic, division]
+
+  - id: CPP-FM-07
+    name: "SIGILL - 非法指令"
+    level_1: NativeCrash
+    level_2: SIGILL
+    level_3: ILL_ILLOPC
+    owner: Application
+    confidence: 0.70
+    evidence_patterns:
+      - "SIGILL"
+      - "ILL_ILLOPC"
+      - "ILL_ILLPACCFI"
+      - "illegal instruction"
+    guidance:
+      - "核对 ABI/CPU 架构是否匹配（32/64位混用）"
+      - "检查二进制完整性和函数指针有效性"
+      - "PAC/CFI 校验失败表明控制流被劫持"
+    tags: [instruction, abi, cfi]
+
+  - id: CPP-FM-08
+    name: "SIGABRT - 主动终止或断言失败"
+    level_1: NativeCrash
+    level_2: SIGABRT
+    level_3: AssertionFailure
+    owner: Application
+    confidence: 0.86
+    evidence_patterns:
+      - "SIGABRT"
+      - "assert"
+      - "abort"
+      - "uncaught exception"
+      - "__assert_fail"
+    guidance:
+      - "检查 abort/assert 触发条件和未捕获 C++ 异常"
+      - "在业务代码中定位 throw 点并补捕获或入参校验"
+    tags: [abort, assert, exception]
+
+  - id: CPP-FM-09
+    name: "SIGTRAP - 陷阱或栈保护中断"
+    level_1: NativeCrash
+    level_2: SIGTRAP
+    level_3: TRAP_BRKPT
+    owner: Application
+    confidence: 0.75
+    evidence_patterns:
+      - "SIGTRAP"
+      - "TRAP_BRKPT"
+      - "stack canary"
+      - "__stack_chk_fail"
+    guidance:
+      - "检查 stack canary 失败（栈缓冲区溢出）"
+      - "排除调试断点和硬件断点"
+    tags: [trap, canary, stack_overflow]
+
+  - id: CPP-FM-10
+    name: "SIGSYS - 非法系统调用或沙箱拦截"
+    level_1: NativeCrash
+    level_2: SIGSYS
+    level_3: SeccompViolation
+    owner: System
+    confidence: 0.78
+    evidence_patterns:
+      - "SIGSYS"
+      - "seccomp"
+      - "syscall"
+    guidance:
+      - "核对 Seccomp/沙箱策略与系统调用号"
+      - "检查是否使用了被禁止的系统调用"
+    tags: [syscall, seccomp, sandbox]
+
+  - id: CPP-FM-11
+    name: "N-API 或运行时边界生命周期问题"
+    level_1: NativeCrash
+    level_2: NAPIBoundary
+    level_3: LifecycleMismatch
+    owner: Native/Runtime
+    confidence: 0.55
+    evidence_patterns:
+      - "napi_"
+      - "napi::"
+      - "arkruntime"
+      - "ArkNativeReference"
+    guidance:
+      - "核对 napi_env、引用和线程归属"
+      - "确认异步回调未跨线程使用错误环境"
+    tags: [napi, runtime, lifecycle]
+
+  - id: CPP-FM-12
+    name: "GWP-ASan 检出的堆损坏"
+    level_1: NativeCrash
+    level_2: GWPASan
+    level_3: HeapCorruption
+    owner: Application
+    confidence: 0.95
+    evidence_patterns:
+      - "gwp[-_]?asan"
+      - "GWP-ASan"
+      - "use-after-free"
+      - "heap-buffer-overflow"
+    guidance:
+      - "同时查看 violation / free / alloc 三栈，定位首次释放与非法访问"
+      - "GWP-ASan 报告是确定性证据（Tier 1），直接信任"
+    tags: [gwp_asan, heap, detector]
+
+  - id: CPP-FM-13
+    name: "sqlite/mmap 文件页访问错误"
+    level_1: NativeCrash
+    level_2: SIGBUS
+    level_3: BUS_OBJERR
+    owner: Application
+    confidence: 0.82
+    evidence_patterns:
+      - "BUS_OBJERR"
+      - "sqlite"
+      - "mmap"
+    guidance:
+      - "避免用普通文件接口改写正在 mmap 的数据库文件"
+      - "检查文件截断、磁盘空间和并发写入"
+    tags: [sqlite, mmap, file]
+
+  - id: CPP-FM-14
+    name: "JS 堆 OOM 触发 Native 崩溃"
+    level_1: NativeCrash
+    level_2: JSOOM
+    level_3: HeapExhaustion
+    owner: Runtime
+    confidence: 0.70
+    evidence_patterns:
+      - "js.*oom"
+      - "heap.*exhausted"
+      - "OutOfMemory"
+      - "FullGC"
+    guidance:
+      - "结合 JS Heap 快照确认泄漏或超大分配"
+      - "不要只看 Native 栈顶，关注 JS 层内存增长"
+    tags: [oom, js_heap, memory]

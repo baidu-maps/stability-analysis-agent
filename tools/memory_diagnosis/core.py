@@ -78,13 +78,15 @@ def run_memory_pressure_diagnosis(
     crash_log_content: str = "",
     *,
     force: bool = False,
+    native_leak_path: str = "",
+    native_leak_trace_db: str = "",
 ) -> Optional[Dict[str, Any]]:
     """执行内存压力/OOM 诊断。
 
     Returns:
         可写入 ``04d_memory_pressure_diagnosis.json`` 的字典；不应跑则 None。
     """
-    if not should_run_memory_analysis(parse_result, force=force):
+    if not should_run_memory_analysis(parse_result, force=force or bool(native_leak_path) or bool(native_leak_trace_db)):
         return None
 
     if not isinstance(parse_result, dict):
@@ -118,7 +120,7 @@ def run_memory_pressure_diagnosis(
     except Exception:
         oom_flag = bool((meta or {}).get("oom_suspected"))
 
-    return {
+    result = {
         "analyzed": True,
         "forced": bool(force),
         "log_kind": log_kind or None,
@@ -133,6 +135,34 @@ def run_memory_pressure_diagnosis(
             "非完整 heap snapshot 泄漏分析。OOM≠必然泄漏。"
         ),
     }
+    if native_leak_path or native_leak_trace_db:
+        try:
+            from tools.native_leak_diagnosis import analyze_native_leak_bundle
+            native_diagnosis = analyze_native_leak_bundle(
+                native_leak_path or native_leak_trace_db,
+                trace_db=native_leak_trace_db,
+            )
+            result["native_leak_diagnosis"] = native_diagnosis
+            native_prompt = str(native_diagnosis.get("prompt_section_zh") or "").strip()
+            if native_prompt:
+                result["prompt_section_zh"] = (
+                    str(result.get("prompt_section_zh") or "").rstrip()
+                    + "\n\n"
+                    + native_prompt
+                    + "\n"
+                )
+            result["note_zh"] = (
+                "阶段 B：已合并 sample/smaps/NMD/native_hook/DMA 确定性证据；"
+                "三级根因仍受证据门控。"
+            )
+        except Exception as exc:
+            result["native_leak_diagnosis"] = {
+                "analyzed": False,
+                "error": str(exc),
+                "prompt_section_zh": "",
+            }
+            logger.warning("native leak evidence analysis failed: %s", exc)
+    return result
 
 
 def _extract_memory_indicators(log_content: str) -> Dict[str, Any]:

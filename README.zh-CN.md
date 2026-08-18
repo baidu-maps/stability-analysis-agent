@@ -7,7 +7,7 @@
 
 [English](./README.md) | **简体中文**
 
-**维护状态：** 持续维护中 · **最新版 [v1.2.9](https://pypi.org/project/stability-analysis-agent/1.2.9/)**（证据诊断 `04a`–`04e`、ANR 专用 workflow、报告编号对齐）· 有实质性改动时发布 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases)（活跃期大约每月一档，非日历 SLA）· 详见 [CHANGELOG.md](./CHANGELOG.md)
+**维护状态：** 持续维护中 · **最新版 [v1.3.0](https://pypi.org/project/stability-analysis-agent/1.3.0/)**（证据诊断 `04a`–`04e`、ANR 专用 workflow、报告编号对齐）· 有实质性改动时发布 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases)（活跃期大约每月一档，非日历 SLA）· 详见 [CHANGELOG.md](./CHANGELOG.md)
 
 ---
 
@@ -134,6 +134,7 @@ sa-agent skill run cicd-pipeline-skill --input '{"artifact":{...}}'    --json
 
 - 🙋 **“我只想先自动修一份崩溃日志”** → [快速开始](#快速开始)，60 秒上手；诊断本身**无需 LLM Key**。
 - 🔬 **“我只要寄存器 / ANR / 业务路径，不调大模型”** → [证据驱动诊断](#证据驱动诊断开发者真正留下来的理由)。
+- 🖥 **“我想用浏览器一键跑全流程修复（本地开发）”** → [本地面板](#本地面板)。
 - 🛠 **“我想把** `sa-agent` **接进自己的工具 / IDE / CI”** → [Python API](#python-api) + [Daemon 模式](#daemon-模式)。
 - 🧩 **“我想扩展 Agent，加自己的 Tool / Workflow / Skill”** → [给开发者](#给开发者--四种贡献路径)。
 
@@ -206,11 +207,27 @@ library_dir -> examples/crash_cases/demo_basic/lib/mac
 code_root   -> examples/crash_cases/demo_basic/code_dir
 ```
 
-CLI 会先输出执行计划，再自动执行。AI 模式下它会解析、符号化、读源码上下文、生成 patch、本地落盘（含备份）。要自动修复自己的崩溃日志同样使用 `sa-agent` 交互输入路径即可。输出位于 `./cli_reports/<timestamp>/`。
+CLI 会先输出执行计划，再自动执行。AI 模式下它会解析、符号化、读源码上下文、生成 patch、本地落盘（含备份）。要自动修复自己的崩溃日志同样使用 `sa-agent` 交互输入路径即可。输出位于 `./reports/<timestamp>/`。
 
 > 🎥 想继续体验闭环？先跑完上面的 demo，再回到一级菜单，继续试试 `自动验证修复结果` 和 `自动生成修复后的新包`。
 
+### 本地面板
 
+面向**已有本机符号库与源码路径**的开发者的浏览器壳，用于一键全流程修复；开源版内部工具，不是面向地图 SDK 客户的最终「仅上传日志」交付形态。
+
+```bash
+python3 daemon/server.py --host 127.0.0.1 --port 8765
+open http://127.0.0.1:8765/
+```
+
+| 区域 | 作用 |
+|------|------|
+| **主区** | 粘贴崩溃日志路径或全文 →「运行全流程修复」（`scope=full`、自动改码，报告与 CLI 相同） |
+| **侧栏 · 工作区** | 保存 `library_dir`、`code_roots` 到 `~/.config/stability-analysis-agent/web_preferences.json` |
+| **侧栏 · 已安装 Skills** | 列出 `~/.config/.../skills` 下已安装项；开关启用/关闭；本地路径安装 |
+| **改码成功后** | 可选「写入向量知识库」（`POST /runs/<id>/vector-db/commit`）；CLI 同样会确认（默认不写） |
+
+`gen_prompt_only`、`parse_stack_only` 等参数扫描请用 CLI。详见 [本地面板指南](./docs/cli/WEB_UI_GUIDE.md)、[Daemon 服务指南](./docs/cli/DAEMON_SERVER_GUIDE.md)。
 
 ## 核心特性
 
@@ -235,10 +252,10 @@ CLI 会先输出执行计划，再自动执行。AI 模式下它会解析、符�
 | **Crash + ANR 同一 CLI** | 按 `log_kind` 自动路由：Crash → `crash_analysis`；AppFreeze / ANR → `anr_freeze_analysis`；混合场景按置信度决定主/辅轨 |
 | **地址符号化** | `addr2line` / `atos` 在 LLM 之前就把地址变成函数名 + 行号 |
 | **结构化日志解析** | iOS / Android / macOS / Linux / Windows / Harmony；Crash · ANR · OOM · Freeze 分类 |
-| **RAG 知识库** | 规则表（快速路径）+ 向量检索（ChromaDB）+ 三级故障模式库 + 证据模板 |
+| **RAG 知识库** | 规则表（快速路径）+ 向量检索（ChromaDB）；改码成功后**可选**写入本地向量库（CLI 确认 / Web 按钮，默认不自动写） |
 | **Tool + Workflow + Skill** | 可插拔工具/工作流 + Claude 风格 Skill + `extensions/` 落地插件 |
 | **对外 Agent 能力包** | 教 Claude Code / Cursor 正确调用 `sa-agent` |
-| **多种接入方式** | CLI、HTTP Daemon（SSE）、Python API |
+| **多种接入方式** | CLI、HTTP Daemon（SSE）、本地面板、Python API |
 
 
 
@@ -258,6 +275,7 @@ CLI 会先输出执行计划，再自动执行。AI 模式下它会解析、符�
 | `04c` **ANR / Freeze** | 栈热点、**EventHandler** 队列（含鸿蒙 AppFreeze dump）、**Binder/IPC 链路**（死锁检测）、阻塞指标 |
 | `04d` **内存压力** | RSS/PSS/heap/FD 线索 + 泄漏模式关键词（旁路 / `--force-memory-analysis`） |
 | `04e` **业务路径** | 崩溃前 logcat / HiLog / ASI 时序 → **业务操作路径推断**（*用户当时在干什么*） |
+| `04c`/`04f`/`04g`/`04h` **专项旁路** | Native 特征提示与栈分层 · AppFreeze Binder/系统噪声门禁 · API 错误码知识 · JS/ArkTS 故障模式 |
 | `05` RAG | **故障模式库匹配**（68 条规则）+ 证据等级 + 知识域路由 + 相似模式 |
 | `06` / `07` | 结构化 7 段式报告（启用 LLM 时）：故障信息 → 三级根因 → 证据链 → 置信度 → 责任归属 → 修复 → 补充材料 |
 
@@ -511,7 +529,7 @@ mkdir -p .cursor/skills
 cp -R stability-analysis-agent/stability-analysis-agent-skill .cursor/skills/stability-analysis-agent
 ```
 
-安装完成后，你就可以让外部 Agent“使用 Stability Analysis Agent 自动修复 crash”。它应该能够给出合适的 `sa-agent` 命令、选择正确的 `--scope`，并读取 `cli_reports/<timestamp>/` 下生成的报告。
+安装完成后，你就可以让外部 Agent“使用 Stability Analysis Agent 自动修复 crash”。它应该能够给出合适的 `sa-agent` 命令、选择正确的 `--scope`，并读取 `reports/<timestamp>/` 下生成的报告。
 
 
 | 资源                                                                                             | 说明                                                 |
@@ -546,10 +564,10 @@ cp -R stability-analysis-agent/stability-analysis-agent-skill .cursor/skills/sta
 | Crash 自动修复（解析 + 符号化 + patch + 落盘）                                              | ✅ GA     | v1.0（核心）→ v1.2.8（闭环预置） |
 | `bug-platform-fetcher` **/** `automation-testing` **/** `cicd-pipeline` **预置** | ✅ GA     | v1.2.8                 |
 | **同一框架，新稳定性类**                                                                 |          |                        |
-| ANR / AppFreeze / 卡死**分析**（热点、EventHandler、IPC）                                | ✅ GA     | v1.2.9                 |
-| 内存压力 / OOM **线索**（日志侧 `04d`）                                                   | ✅ GA（旁路） | v1.2.9                 |
-| 崩溃前业务路径 / 时序（`04e`）                                                            | ✅ GA（旁路） | v1.2.9                 |
-| Crash 证据罗盘 + 寄存器 + 可选反汇编（`04a`）                                                | ✅ GA     | v1.2.9                 |
+| ANR / AppFreeze / 卡死**分析**（热点、EventHandler、IPC）                                | ✅ GA     | v1.3.0                 |
+| 内存压力 / OOM **线索**（日志侧 `04d`）                                                   | ✅ GA（旁路） | v1.3.0                 |
+| 崩溃前业务路径 / 时序（`04e`）                                                            | ✅ GA（旁路） | v1.3.0                 |
+| Crash 证据罗盘 + 寄存器 + 可选反汇编（`04a`）                                                | ✅ GA     | v1.3.0                 |
 | ANR / Freeze **自动改码**（patch 落盘）                                                | 🚧 打磨中   | 后续小版本                  |
 | OOM / 内存 **自动改码**（heap snapshot diff）                                          | 📋 计划中   | 后续小版本                  |
 | **社区预置**                                                                       |          |                        |
@@ -685,18 +703,22 @@ sa-agent
 
 ## Daemon 模式
 
-Daemon 提供**流式输出（SSE）**、**进程复用**（免冷启动）和**任务取消**功能，适合 IDE 集成和高频分析场景：
+Daemon 提供**流式输出（SSE）**、**进程复用**（免冷启动）、**任务取消**，并托管**本地面板**，适合 IDE 集成、浏览器壳与高频率分析：
 
 ```bash
 # 启动 Daemon
 sa-agent --daemon-server --host 127.0.0.1 --port 8765
+# 或：python3 daemon/server.py
 
-# 通过 Daemon 分析
+# 打开本地面板
+open http://127.0.0.1:8765/
+
+# 通过 Daemon 分析（CLI）
 sa-agent --daemon http://127.0.0.1:8765 \
   --crash-log <崩溃日志> --library-dir <库目录> --code-root <源码目录>
 ```
 
-> 完整 HTTP API 参考请查看 [Daemon 服务指南](./docs/cli/DAEMON_SERVER_GUIDE.md)。
+> 完整 HTTP API 见 [Daemon 服务指南](./docs/cli/DAEMON_SERVER_GUIDE.md)；面板说明见 [本地面板指南](./docs/cli/WEB_UI_GUIDE.md)。
 
 
 
@@ -765,7 +787,8 @@ export STABILITY_AGENT_ADD2LINE_CONFIG_FILE="/绝对路径/add2line_resolver_con
 stability-analysis-agent/
 ├── agent/              # 自动修复核心引擎（LangGraph 状态机）
 ├── cli/                # CLI 入口
-├── daemon/             # HTTP Daemon（流式、SSE）
+├── daemon/             # HTTP Daemon（流式、SSE、托管 Web UI、web 偏好设置）
+├── web/                # 本地面板静态资源（一键全流程修复 + 工作区 + Skills）
 ├── tools/              # 工具实现（解析器、符号化、代码提取）
 │   └── configs/        # 配置模板
 ├── tool_system/        # Tool + Workflow 注册与调度框架
@@ -787,7 +810,9 @@ stability-analysis-agent/
 │   └── crash_cases/
 │       ├── demo_basic/         # NullPtr、DivZero、Abort、DoubleFree 等
 │       └── demo_multithread/   # 竞态条件、死锁、原子操作失败等
-├── test/               # 测试套件
+├── test/               # 测试套件（cli / daemon / web / rag / ai_regression / …）
+├── .github/workflows/  # CI、可选 AI 回归、PyPI 发布
+├── .devcontainer/      # Codespaces / VS Code Dev Container（轻量，默认不含完整 [rag]）
 ├── stability-analysis-agent-skill/  # 对外 Agent 能力包（Claude / Cursor 等）
 └── docs/               # 文档
 ```
@@ -802,12 +827,16 @@ stability-analysis-agent/
 | CLI 使用指南                   | [docs/cli/CLI_GUIDE.md](./docs/cli/CLI_GUIDE.md)                                                     |
 | CLI 参数参考                   | [docs/cli/CLI_COMMANDS_REFERENCE.md](./docs/cli/CLI_COMMANDS_REFERENCE.md)                           |
 | Daemon 服务指南                | [docs/cli/DAEMON_SERVER_GUIDE.md](./docs/cli/DAEMON_SERVER_GUIDE.md)                                 |
+| 本地面板                       | [docs/cli/WEB_UI_GUIDE.md](./docs/cli/WEB_UI_GUIDE.md)                                               |
+| 测试（单元 / AI 回归 / Web·Daemon / CI） | [docs/testing/README.md](./docs/testing/README.md)                                                   |
+| PyPI 发布（脚本 + GitHub Actions）       | [docs/scripts/PYPI_RELEASE_SCRIPTS.md](./docs/scripts/PYPI_RELEASE_SCRIPTS.md)                       |
+| Codespaces / Dev Container           | [.devcontainer/README.md](./.devcontainer/README.md)                                                 |
 | 对外 Agent 能力包               | [stability-analysis-agent-skill/](./stability-analysis-agent-skill/)                                 |
 | Skill 系统（sa-agent 运行时）     | [docs/skills/README.md](./docs/skills/README.md)                                                     |
 | 闭环 Skill 模板                | [docs/skills/CLOSE_LOOP_SKILL_TEMPLATES.md](./docs/skills/CLOSE_LOOP_SKILL_TEMPLATES.md)             |
 | 缺陷平台拉取模板                   | [docs/skills/BUG_PLATFORM_FETCHER_TEMPLATE.md](./docs/skills/BUG_PLATFORM_FETCHER_TEMPLATE.md)       |
 | Skill 模板参考                 | [docs/skills/SKILL_TEMPLATE.md](./docs/skills/SKILL_TEMPLATE.md)                                     |
-| PyPI 发布脚本指南                | [docs/scripts/PYPI_RELEASE_SCRIPTS.md](./docs/scripts/PYPI_RELEASE_SCRIPTS.md)                       |
+| AI 代码回归（重定向）              | [docs/testing/AI_REGRESSION.md](./docs/testing/AI_REGRESSION.md)                                     |
 | Roadmap 长版                 | [docs/ROADMAP.md](./docs/ROADMAP.md)                                                                 |
 | 系统架构                       | [docs/architecture/README.md](./docs/architecture/README.md)                                         |
 | 架构图                        | [docs/architecture/ARCHITECTURE_DIAGRAM.md](./docs/architecture/ARCHITECTURE_DIAGRAM.md)             |
@@ -824,25 +853,52 @@ stability-analysis-agent/
 
 ## 测试
 
+完整说明：**[docs/testing/README.md](./docs/testing/README.md)**（单元测试、AI 回归、Web/Daemon 契约、GitHub Actions）。
+
+**提交前（不调用 LLM）** — 与 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) 同一套：
+
 ```bash
-# 回归测试
-python3 test/tool_system/test_regression.py
-
-# LLM 连接测试
-python3 test/llm/test_llm_connection.py --provider openai
-
-# 代码内容提取测试
-python3 test/agent_py_tool/test_code_content_provider.py
-
-# 向量数据库测试
-python3 test/agent_py_tool/test_vector_db.py
-
-# Skill 系统（解析 / 安装 / 校验 / 运行时桥接 / 预置护栏）
-python3 test/skill_system/test_skill_system.py
-
-# CLI 报告路径助手 + extensions/ 自动发现
-python3 test/cli/test_report_paths.py
+python3 -B -m unittest \
+  test.ai_regression.test_runner \
+  test.cli.test_report_paths \
+  test.cli.test_vector_db_commit_prompt \
+  test.rag.test_case_writer \
+  test.daemon.test_build_cli_cmd \
+  test.daemon.test_skills_api \
+  test.daemon.test_run_lifecycle \
+  test.daemon.test_vector_db_commit_api \
+  test.daemon.test_web_preferences \
+  test.skill_system.test_installed_skills_runtime \
+  test.web.test_web_contract
 ```
+
+**GitHub Actions：**
+
+| Workflow | 触发时机 | 内容 |
+|----------|----------|------|
+| [CI](./.github/workflows/ci.yml) | PR / push 到 `main`/`master` | 确定性套件（Python matrix）+ 工具链抽查 |
+| [AI Regression](./.github/workflows/ai-regression.yml) | 手动运行，或 PR 打上 `ai-regression` label | 真实 LLM 改码回归（需 API Secret） |
+| [Publish PyPI](./.github/workflows/publish-pypi.yml) | tag `v*`，或手动 | 构建 + Trusted Publishing 上传（先过确定性门禁） |
+
+**Codespaces：** [`.devcontainer/`](./.devcontainer/) — 创建时执行 `pip install -e ".[test]"`；在 GitHub 上 **Code → Codespaces** 打开即可。
+
+**抽查：**
+
+```bash
+python3 test/tool_system/test_regression.py
+python3 test/skill_system/test_skill_system.py
+python3 test/llm/test_llm_connection.py --provider openai   # 需 API Key
+```
+
+**发布（真实 LLM、代码回归）：**
+
+```bash
+python3 scripts/run_ai_regression.py --case test/ai_regression/cases/demo_basic_nullptr.json
+# 若改动 daemon / Web 壳，追加：
+python3 scripts/run_ai_regression.py --case test/ai_regression/cases/demo_basic_nullptr.json --entrypoint daemon
+```
+
+另见 [docs/testing/AI_REGRESSION.md](./docs/testing/AI_REGRESSION.md)、[docs/testing/WEB_DAEMON_TESTS.md](./docs/testing/WEB_DAEMON_TESTS.md)。
 
 
 

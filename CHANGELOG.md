@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-18
+
+### Added
+
+- **Daemon/Web 并发改码隔离**：自动改码任务使用独立 Git worktree，生成 workspace 清单和 patch，避免并发任务互相覆盖源码。
+- **本地 Web UI 与专项诊断能力**：补充 ANR/AppFreeze、内存压力、业务路径及平台专项诊断旁路。
+
+### Changed
+
+- **报告目录改名**：默认产物根目录由 `cli_reports/` 改为 `reports/`（CLI / Daemon / Web 共用）。首次访问时自动将现有 `cli_reports/` 迁移到 `reports/`；可通过 `STABILITY_AGENT_REPORT_DIR` 覆盖。兼容旧函数名 `summarize_cli_reports` / `clear_cli_reports`。
+
 ## [1.2.9] - 2026-08-06
 
 ### Added

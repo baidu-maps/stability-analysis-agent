@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from typing import Any, Dict, List, Literal, Optional
 
 from .version import PROTOCOL_VERSION
@@ -9,10 +9,12 @@ from .version import PROTOCOL_VERSION
 
 RunStatus = Literal["queued", "running", "done", "error", "canceled"]
 OutputFormat = Literal["json", "markdown", "text"]
-EngineType = Literal["sequential", "langgraph"]
+EngineType = Literal["direct", "langchain", "langgraph"]
 ScopeType = Literal["full", "gen_prompt_only", "parse_stack_only", "parse_log_only"]
 PromptModeType = Literal["analysis", "fix"]
 AgentLoopType = Literal["single", "context_loop"]
+LlmModeType = Literal["fixed", "auto"]
+LlmProfileType = Literal["default", "strong", "fast"]
 
 
 def normalize_run_code_roots(req: "RunRequest") -> List[str]:
@@ -38,12 +40,37 @@ def normalize_run_code_roots(req: "RunRequest") -> List[str]:
     return out
 
 
+def run_request_from_dict(data: Dict[str, Any]) -> "RunRequest":
+    """
+    从 dict 构造 RunRequest：只保留 dataclass 已知字段，忽略未知 key。
+    兼容旧客户端 engine=sequential → direct。
+    """
+    payload = dict(data or {})
+    # 旧字段归并（与 daemon _start_run 一致，便于单测复用）
+    if "scope" not in payload:
+        if bool(payload.get("parse_stack_only", False)):
+            payload["scope"] = "parse_stack_only"
+        elif bool(payload.get("skip_ai", False)):
+            payload["scope"] = "gen_prompt_only"
+    payload.pop("skip_ai", None)
+    payload.pop("parse_stack_only", None)
+
+    engine = payload.get("engine")
+    if engine == "sequential":
+        payload["engine"] = "direct"
+
+    allowed = {f.name for f in fields(RunRequest)}
+    filtered = {k: v for k, v in payload.items() if k in allowed}
+    return RunRequest(**filtered)
+
+
 @dataclass(frozen=True)
 class RunRequest:
-    """daemon/CLI 的统一输入协议（最小集）。"""
+    """daemon/CLI/Web 的统一输入协议。"""
 
     crash_log: Optional[str] = None  # 文件路径；或 "-" 表示 stdin
     crash_log_content: Optional[str] = None  # 直接传内容（daemon 会走 stdin）
+    crash_log_dir: Optional[str] = None  # 批量分析目录
     library_dir: Optional[str] = None
     code_root: Optional[str] = None  # 单根（兼容旧协议）；与 code_roots 二选一或并存时以 code_roots 为准
     code_roots: Optional[List[str]] = None  # 多根，顺序 = 查找优先级
@@ -59,11 +86,25 @@ class RunRequest:
     optimized: bool = False
     streaming: bool = False
 
+    apply_ai_fixes: bool = True
+    backup_original_sources: bool = True
+
+    force_disassembly: bool = False
+    force_anr_analysis: bool = False
+    force_memory_analysis: bool = False
+    force_timeline_analysis: bool = False
+    native_leak_dir: Optional[str] = None
+    native_leak_trace_db: Optional[str] = None
+
+    llm_mode: Optional[LlmModeType] = None
+    llm_profile: Optional[LlmProfileType] = None
+    include_memory_in_05: bool = False
+
     consultation: bool = False
     prompt: Optional[str] = None
 
     model: Optional[str] = None
-    engine: EngineType = "sequential"
+    engine: EngineType = "direct"
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -97,5 +138,3 @@ class RunResult:
         d = asdict(self)
         d["protocol_version"] = PROTOCOL_VERSION
         return d
-
-
