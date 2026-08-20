@@ -6,6 +6,7 @@ import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from tools.crash_parser.address_pattern_analyzer import analyze_crash_address
+from tools.crash_parser.abort_message import extract_abort_message, is_heap_allocator_abort
 from tools.cpp_crash.hints import match_crash_hints
 
 
@@ -142,6 +143,8 @@ def extract_cpp_evidence(data: Mapping[str, Any]) -> Dict[str, Any]:
         if not last_fatal:
             match = re.search(r"(?im)^\s*LastFatalMessage\s*:\s*(.+?)\s*$", raw)
             last_fatal = match.group(1).strip() if match else ""
+        if not last_fatal:
+            last_fatal = extract_abort_message(raw)
     frames = _frames(data)
     modules = [str(_first(frame, "module", "library", "so") or "") for frame in frames[:20]]
     native_frames = [
@@ -191,15 +194,35 @@ def match_cpp_fault_modes(evidence: Mapping[str, Any]) -> List[Dict[str, Any]]:
     elif pattern in {"poison_value", "debug_poison", "use_after_free_fill", "low_address", "high_address"}:
         matches.append({"id": "CPP-FM-02", "name": "野指针或 Use-after-free", "level": "address", "owner": "Native", "confidence": float(address_analysis.get("confidence") or 0.7), "evidence": [pattern, str(address_analysis.get("hint") or "")], "guidance": ["核对释放点、所有权和异步回调；使用 ASan/HWASan 复现确认。"]})
     frames_text = " ".join(str(frame) for frame in evidence.get("native_frames") or []).lower()
+    last_fatal = str(evidence.get("last_fatal_message") or "")
+    raw = str(evidence.get("raw_content") or "")
+    if is_heap_allocator_abort(last_fatal, raw, frames_text):
+        matches.append({
+            "id": "CPP-FM-15",
+            "name": "堆分配器检出损坏",
+            "level": "detector",
+            "owner": "Native",
+            "confidence": 0.96,
+            "evidence": [last_fatal or "Scudo/jemalloc/invalid chunk abort"],
+            "guidance": [
+                "释放时 chunk 状态非法说明更早发生了越界写/double-free；"
+                "应检查业务栈第一帧及其被调函数中的 vector/new/delete，而不是 abort 帧本身。",
+            ],
+        })
     if "assert" in frames_text or "__assert" in frames_text:
         matches.append({"id": "CPP-FM-08", "name": "assert 失败", "level": "stack", "owner": "Native", "confidence": 0.88, "evidence": ["assert frame in native stack"], "guidance": ["检查断言前置条件和异常输入，避免仅删除断言。"]})
     if any(token in frames_text for token in ("napi_", "napi::", "arkruntime")):
         matches.append({"id": "CPP-FM-11", "name": "N-API 或运行时边界生命周期问题", "level": "stack", "owner": "Native/Runtime", "confidence": 0.55, "evidence": ["N-API/runtime frame in native stack"], "guidance": ["核对 napi_env、引用和线程归属，确认异步回调未跨线程使用错误环境。"]})
-    raw = str(evidence.get("raw_content") or "")
     if re.search(r"gwp[-_ ]?asan", raw + frames_text, re.I):
         matches.append({"id": "CPP-FM-12", "name": "GWP-ASan 检出的堆损坏", "level": "detector", "owner": "Native", "confidence": 0.95, "evidence": ["GWP-ASan marker"], "guidance": ["同时查看 violation / free / alloc 三栈，定位首次释放与非法访问。"]})
     hint_modes = {
         "uncaught_exception": ("CPP-FM-08", "C++ 未捕获异常", 0.86, ["在业务代码中定位 throw 点并补捕获或入参校验。"]),
+        "allocator_heap_abort": (
+            "CPP-FM-15",
+            "堆分配器检出损坏",
+            0.94,
+            ["检查越界写、double-free 和 vector 扩容，不要把 Scudo abort 当成业务 assert。"],
+        ),
         "js_oom": ("CPP-FM-14", "JS 堆 OOM 触发 Native 崩溃", 0.7, ["结合 JS Heap 快照确认泄漏或超大分配，而不是只看 Native 栈顶。"]),
         "sqlite_bus": ("CPP-FM-13", "sqlite/mmap 文件页异常", 0.82, ["避免用普通文件接口改写正在 mmap 的数据库文件。"]),
         "gc_delayed_corruption": ("CPP-FM-02", "GC 阶段暴露的延迟内存破坏", 0.74, ["不要归因于 GC；排查跨线程 env、UAF 和越界写。"]),
@@ -224,7 +247,7 @@ def _follow_up(evidence: Mapping[str, Any], modes: Sequence[Mapping[str, Any]]) 
         checks.append({"id": "extract_fault_address", "required": True, "reason": "缺少 fault address，无法完成地址语义分析"})
     if not evidence.get("native_frames"):
         checks.append({"id": "symbolicate_native_stack", "required": True, "reason": "缺少 Native 调用栈或符号化结果"})
-    if any(item["id"] in {"CPP-FM-02", "CPP-FM-11", "CPP-FM-12"} for item in modes):
+    if any(item["id"] in {"CPP-FM-02", "CPP-FM-11", "CPP-FM-12", "CPP-FM-15"} for item in modes):
         checks.append({"id": "asan_reproduction", "required": True, "reason": "疑似生命周期/Use-after-free 或 N-API 跨线程问题，静态现场不足以确认首次破坏位置"})
     if evidence.get("signal") in {"SIGILL", "SIGBUS"}:
         checks.append({"id": "verify_build_id_and_arch", "required": True, "reason": "需要核对 BuildID、ABI 和二进制架构"})
@@ -246,7 +269,7 @@ def _repair_guidance(modes: Sequence[Mapping[str, Any]]) -> Dict[str, List[str]]
         direct.extend(mode.get("guidance") or [])
         if ident in {"CPP-FM-01", "CPP-FM-02", "CPP-FM-03"}:
             defensive.append("增加对象状态、边界和所有权检查，避免仅在崩溃点添加兜底。")
-        if ident in {"CPP-FM-02", "CPP-FM-11", "CPP-FM-12"}:
+        if ident in {"CPP-FM-02", "CPP-FM-11", "CPP-FM-12", "CPP-FM-15"}:
             verification.append("使用 ASan/HWASan 和多线程/异步销毁场景回归验证。")
         if ident == "CPP-FM-08":
             verification.append("补充触发断言前置条件的单元测试和错误输入测试。")
@@ -260,7 +283,7 @@ def _repair_guidance(modes: Sequence[Mapping[str, Any]]) -> Dict[str, List[str]]
 
 
 def _evidence_grade(evidence: Mapping[str, Any], modes: Sequence[Mapping[str, Any]]) -> str:
-    if any(item.get("level") == "detector" or item.get("id") == "CPP-FM-12" for item in modes):
+    if any(item.get("level") == "detector" or item.get("id") in {"CPP-FM-12", "CPP-FM-15"} for item in modes):
         return "detector"
     if evidence.get("registers") and evidence.get("fault_address"):
         return "register"

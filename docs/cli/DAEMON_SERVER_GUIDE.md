@@ -71,7 +71,7 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
   "output_format": "markdown",
   "engine": "direct",
   "scope": "full",
-  "prompt_mode": "analysis",
+  "prompt_mode": "fix",
   "agent_loop": null,
   "max_agent_rounds": 1,
   "max_context_requests_per_round": 5,
@@ -93,7 +93,7 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
 - `engine`：`direct`（默认）/ `langchain` / `langgraph`（旧值 `sequential` 会映射为 `direct`）
 - `output_format`：`markdown`（默认）/ `json` / `text`
 - `scope`：`full`（默认）/ `gen_prompt_only` / `parse_stack_only` / `parse_log_only`，控制 Agent 执行流程范围（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--scope-取值)）
-- `prompt_mode`：`analysis`（默认）/ `fix`，控制 `06_ai_prompt.md` / LLM 输入偏证据分析还是偏补丁输出；不控制是否自动应用修复（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--prompt-mode-取值)）
+- `prompt_mode`：`fix`（默认）/ `analysis`，控制 `06_ai_prompt.md` / LLM 输入偏补丁输出还是偏证据分析；不控制是否自动应用修复（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--prompt-mode-取值)）
 - `agent_loop`：`null`（省略或传 `null` 时随 `prompt_mode`：`analysis`→`context_loop`，其它→`single`）/ `single` / `context_loop`，控制是否允许模型请求补充函数源码后继续多轮分析；独立于 `engine`（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--agent-loop-取值)）
 - `apply_ai_fixes` / `backup_original_sources`：默认 `true`；为 `false` 时分别传 `--no-apply-ai-fixes` / `--no-backup-original-sources`
 - daemon 对 `scope=full` 且 `apply_ai_fixes=true` 的请求自动创建 detached Git worktree，CLI 只修改该 run 的隔离目录，不会直接回写请求中的源码目录。`code_roots` 必须位于 Git 仓库内，且对应范围不能有未提交修改；非 Git 或 dirty code root 会使 run 以 `workspace_error` 结束。

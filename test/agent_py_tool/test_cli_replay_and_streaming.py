@@ -166,6 +166,8 @@ class TestCliReplayAndStreaming(unittest.TestCase):
         self.assertIn("--agent-loop", argv)
         self.assertIn("context_loop", argv)
         self.assertIn("--max-agent-rounds", argv)
+        self.assertIn("--prompt-mode", argv)
+        self.assertIn("analysis", argv)
         self.assertIn("--no-apply-ai-fixes", argv)
         self.assertIn("--streaming", argv)
         self.assertFalse(cleanup_paths)

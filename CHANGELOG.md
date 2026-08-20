@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-08-20
+
+### Changed
+
+- **向量库写库**：从分析报告构建案例时同时识别 `08_apply_ai_fixes.json` 与 `07_apply_ai_fixes.json`，兼容新旧报告编号。
+- **崩溃解析与修复门禁**：增强 abort/heap 相关解析与改码守卫，减少误修系统库/无效补丁。
+- **诊断与提示词**：收紧 prompt 上下文过滤、C++ crash 线索与 LLM 路由策略。
+
+### Documentation
+
+- README / PyPI 发布说明中的最新版本号更新为 1.3.1。
+
 ## [1.3.0] - 2026-08-18
 
 ### Added

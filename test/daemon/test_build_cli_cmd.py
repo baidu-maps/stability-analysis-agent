@@ -85,8 +85,7 @@ class BuildCliCmdTests(unittest.TestCase):
         self.assertIn("langgraph", cmd)
         self.assertIn("--scope", cmd)
         self.assertIn("parse_stack_only", cmd)
-        self.assertIn("--prompt-mode", cmd)
-        self.assertIn("fix", cmd)
+        self.assertNotIn("--prompt-mode", cmd)
         self.assertIn("--agent-loop", cmd)
         self.assertIn("single", cmd)
 

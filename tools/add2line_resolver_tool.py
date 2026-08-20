@@ -21,7 +21,11 @@ from tools._stack_symbol_utils import (
     should_keep_frame_for_cpp_stack_output,
 )
 
-from ._library_frame_whitelist import find_library_files_in_dir, match_libraries_for_module
+from ._library_frame_whitelist import (
+    find_library_files_in_dir,
+    is_system_native_module,
+    match_libraries_for_module,
+)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -1630,6 +1634,12 @@ class Add2lineResolver:
                 None,
             )
 
+        # 系统库禁止用业务 library_dir 中的误匹配 so 覆盖 tombstone 已有符号（如 abort+164）
+        if is_system_native_module(module_str):
+            rf = self._passthrough_resolved_frame(frame, meta, resolution_kind="log_symbol")
+            counted = self._frame_has_usable_output(rf) if is_crash_thread else False
+            return rf, counted, None
+
         target_library_files = match_libraries_for_module(
             module_str if module_str else None, library_files,
         )
@@ -1767,6 +1777,8 @@ class Add2lineResolver:
             offset = info.get("offset")
             offset_str = str(offset).strip() if offset is not None else ""
 
+            if is_system_native_module(module_str):
+                continue
             target_libs = match_libraries_for_module(
                 module_str if module_str else None, library_files
             )
@@ -2245,6 +2257,20 @@ class Add2lineResolver:
                 if not address:
                     self._emit_progress("⚠️ [add2line_resolver] 跳过无地址的堆栈帧")
                     return {"skip": True, "filtered": False, "resolved": None, "error": None}
+
+                if is_system_native_module(module_str):
+                    self._emit_progress(
+                        f"⊘ [add2line_resolver] 系统库保留日志符号: module={module_str or 'unknown'}"
+                    )
+                    passthrough = self._passthrough_resolved_frame(
+                        frame, {"is_crash_thread": True}, resolution_kind="log_symbol"
+                    )
+                    return {
+                        "skip": False,
+                        "filtered": False,
+                        "resolved": passthrough,
+                        "error": None,
+                    }
 
                 # 只解析 library_dir 下存在的库：若当前帧的模块在 library_files 中找不到对应库，则直接过滤
                 target_library_files = match_libraries_for_module(

@@ -9,6 +9,7 @@ from dataclasses import replace
 from typing import List, Optional
 
 from tools.crash_parser.android import _android_stack_sample_hint
+from tools.crash_parser.abort_message import thread_type_from_name
 from tools.crash_parser.format_detect import detect_os_type
 from tools.crash_parser.log_sections import detect_raw_log_sections, extract_build_ids
 from tools.crash_parser.meta import extract_crash_info, extract_meta_info
@@ -24,6 +25,7 @@ from tools.crash_parser.register_analyzer import (
 )
 from tools.crash_parser.types import (
     CrashAnalysisResult,
+    CrashInfo,
     CrashParseOptions,
     ThreadStack,
     _maybe_filter_threads_by_library_dir,
@@ -71,6 +73,7 @@ def parse_crash_core(
     total_frames = sum(len(t.frames) for t in threads)
 
     crash_info = extract_crash_info(content)
+    crash_info = _align_thread_type_with_crash_thread(crash_info, threads)
     meta_info = extract_meta_info(content)
 
     # 推断性分析已迁移到 02b/04a_crash_diagnosis 模块
@@ -145,3 +148,24 @@ def parse_crash_core(
         raw_log_sections=raw_log_sections,
         parse_status=parse_status,
     )
+
+
+def _align_thread_type_with_crash_thread(
+    crash_info: CrashInfo,
+    threads: List[ThreadStack],
+) -> CrashInfo:
+    """用崩溃线程名/主线程标记覆盖默认 thread_type=main。"""
+    crash = next((item for item in threads if item.is_crash_thread), None)
+    if crash is None and threads:
+        crash = threads[0]
+    if crash is None:
+        return crash_info
+    if crash.is_main_thread is True:
+        thread_type = "main"
+    elif crash.is_main_thread is False:
+        thread_type = "background"
+    else:
+        thread_type = thread_type_from_name(crash.name)
+    if thread_type == crash_info.thread_type:
+        return crash_info
+    return replace(crash_info, thread_type=thread_type)

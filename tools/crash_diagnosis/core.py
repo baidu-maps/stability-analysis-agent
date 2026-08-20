@@ -219,6 +219,7 @@ _DETERMINISTIC_PATTERN_MAP = {
     "null_pointer": ("null_pointer_dereference", "空指针解引用（确定性规则确认）"),
     "stack_overflow": ("stack_overflow", "栈溢出（确定性规则确认）"),
     "abort": ("explicit_abort", "进程主动 abort（确定性规则确认）"),
+    "heap_abort": ("heap_corruption", "堆分配器检出损坏（确定性规则确认）"),
     "detector_report": ("detector_confirmed", "检测器报告（确定性规则确认，请直接采信）"),
     "divide_by_zero": ("divide_by_zero", "算术异常/除零（确定性规则确认）"),
 }

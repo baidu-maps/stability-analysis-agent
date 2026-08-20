@@ -60,6 +60,16 @@ def match_crash_hints(
             "hint": f"C++ 未捕获异常导致 abort：类型 {exception.group(1).rstrip(':')}，应定位 throw 点而不是 abort 帧",
             "confidence": 0.88,
         })
+    if re.search(
+        r"scudo|jemalloc|invalid chunk state|double[-_ ]?free when deallocat",
+        fatal + "\n" + blob,
+        re.I,
+    ):
+        hits.append({
+            "id": "allocator_heap_abort",
+            "hint": "分配器在 deallocate 时 abort：堆更早已损坏，应看业务栈第一帧的堆操作而非 abort/assert",
+            "confidence": 0.94,
+        })
     if re.search(r"libark_jsruntime.*(?:HandleUncatchableError|AllocateAlignedRegion|ThrowOutOfMemoryError)|"
                  r"\[gc].*(?:Out of Memory|OOM fatal|SharedHeap OOM)", blob, re.I):
         hits.append({

@@ -16,6 +16,20 @@ _WEAK_ONLY_TAGS = frozenset(
     }
 )
 
+_MUST_TAGS = frozenset(
+    {
+        "崩溃函数",
+        "崩溃行被调",
+        "栈序保留",
+        "调用崩溃点",
+    }
+)
+
+_NOISE_FUNC_RE = re.compile(r"::(?:find|Invoke|CONFIG_INS)\s*\(", re.I)
+
+DEFAULT_FUNCTION_CHARS_IN_PROMPT = 96000
+DEFAULT_MAX_STACK_FRAMES_IN_PROMPT = 8
+
 # 路径片段：栈相关 walk/pano 模块（通用子串，非单一工程符号）
 _STACK_PATH_HINTS = (
     "/walk/",
@@ -30,9 +44,10 @@ _STACK_PATH_HINTS = (
 
 @dataclass(frozen=True)
 class PromptFilterOptions:
-    # 0 表示不限制函数数量（05 纳入全部有 snippet 的候选）
+    # 0 表示不限制函数数量；弱线索仍会按 bucket 丢弃
     max_functions_in_prompt: int = 0
-    max_stack_frames_in_prompt: int = 4
+    max_stack_frames_in_prompt: int = DEFAULT_MAX_STACK_FRAMES_IN_PROMPT
+    max_function_chars_in_prompt: int = DEFAULT_FUNCTION_CHARS_IN_PROMPT
 
 
 def norm_graph_nid(raw: Optional[str]) -> str:
@@ -71,8 +86,13 @@ def resolve_prompt_filter_options(
         return default
 
     return PromptFilterOptions(
-        max_functions_in_prompt=_pick_int("max_functions_in_prompt", 0, 0, 24),
-        max_stack_frames_in_prompt=_pick_int("max_stack_frames_in_prompt", 4, 2, 16),
+        max_functions_in_prompt=_pick_int("max_functions_in_prompt", 0, 0, 64),
+        max_stack_frames_in_prompt=_pick_int(
+            "max_stack_frames_in_prompt", DEFAULT_MAX_STACK_FRAMES_IN_PROMPT, 2, 16
+        ),
+        max_function_chars_in_prompt=_pick_int(
+            "max_function_chars_in_prompt", DEFAULT_FUNCTION_CHARS_IN_PROMPT, 0, 400000
+        ),
     )
 
 
@@ -277,11 +297,57 @@ def _record_is_weak_only(
 ) -> bool:
     if norm_id in root_cause_norm:
         return False
-    if "栈序保留" in tags or "崩溃函数" in tags:
+    if tags & _MUST_TAGS:
         return False
     if not tags:
         return True
     return tags <= _WEAK_ONLY_TAGS
+
+
+def _looks_like_noise_helper(rec: Dict[str, Any]) -> bool:
+    """find/Invoke 等行窗口：非 must 时默认不进 05。"""
+    tags = rec.get("tags")
+    tag_set = set(tags) if isinstance(tags, (set, list)) else set()
+    if tag_set & _MUST_TAGS:
+        return False
+    node = rec.get("node") if isinstance(rec.get("node"), dict) else {}
+    sig = str(node.get("signature") or "")
+    return bool(_NOISE_FUNC_RE.search(sig))
+
+
+def _snippet_char_len(rec: Dict[str, Any]) -> int:
+    """估算函数片段写入 05 时占用的字符数。"""
+    node = rec.get("node") if isinstance(rec.get("node"), dict) else {}
+    snippet = node.get("snippet") if isinstance(node, dict) else None
+    if not isinstance(snippet, list):
+        return 0
+    return sum(len(str(line)) + 1 for line in snippet)
+
+
+def _record_bucket(
+    rec: Dict[str, Any],
+    *,
+    stack_norm: Set[str],
+    root_cause_norm: Set[str],
+    anchor_paths: Set[str],
+) -> str:
+    """将函数记录分为 must / should / drop。"""
+    tags = rec.get("tags")
+    tag_set = set(tags) if isinstance(tags, (set, list)) else set()
+    nfid = str(rec.get("norm_id") or "")
+    if nfid in stack_norm or tag_set & _MUST_TAGS:
+        return "must"
+    if _looks_like_noise_helper(rec) or _record_is_weak_only(tag_set, nfid, root_cause_norm):
+        return "drop"
+    tier = _selection_tier(
+        rec,
+        stack_norm=stack_norm,
+        root_cause_norm=root_cause_norm,
+        anchor_paths=anchor_paths,
+    )
+    if tier >= 90:
+        return "drop"
+    return "should"
 
 
 def _selection_tier(
@@ -299,7 +365,7 @@ def _selection_tier(
 
     if nfid in stack_norm:
         return 0
-    if "崩溃函数" in tag_set:
+    if "崩溃函数" in tag_set or "崩溃行被调" in tag_set:
         return 1
     if _record_is_weak_only(tag_set, nfid, root_cause_norm):
         return 99
@@ -329,20 +395,27 @@ def filter_prompt_function_records(
     stack_frame_norm_ids: Optional[Set[str]] = None,
     anchor_paths: Optional[Set[str]] = None,
     max_functions: int = 0,
+    max_function_chars: int = DEFAULT_FUNCTION_CHARS_IN_PROMPT,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
-    筛选送入 05 的函数源码记录。
-    ``max_functions <= 0`` 时不设上限，且纳入全部有 snippet 的候选（含原 tier>=99）。
-    返回 (included_records, index_lines)。
+    按 must/should/drop 筛选送入 05 的函数源码。
+
+    ``max_functions <= 0`` 时不限制条数；弱线索与噪音函数仍会 drop。
+    ``max_function_chars <= 0`` 时不限制字符；must 始终保留。
+    若传入 ``stats`` 字典，写入分桶计数。
     """
     root_cause_norm = root_cause_norm_ids or set()
     stack_norm = stack_frame_norm_ids or set()
     anchors = anchor_paths or set()
     unlimited = int(max_functions) <= 0
-    cap = 0 if unlimited else max(4, min(int(max_functions), 24))
+    cap = 0 if unlimited else max(4, min(int(max_functions), 64))
+    char_cap = int(max_function_chars or 0)
 
-    candidates: List[Dict[str, Any]] = []
+    must_recs: List[Dict[str, Any]] = []
+    should_recs: List[Dict[str, Any]] = []
     excluded: List[Dict[str, Any]] = []
+    drop_count = 0
 
     for rec in ordered_records:
         node = rec.get("node") if isinstance(rec.get("node"), dict) else {}
@@ -355,34 +428,71 @@ def filter_prompt_function_records(
             root_cause_norm=root_cause_norm,
             anchor_paths=anchors,
         )
-        if tier >= 99 and not unlimited:
-            excluded.append(rec)
-            continue
+        bucket = _record_bucket(
+            rec,
+            stack_norm=stack_norm,
+            root_cause_norm=root_cause_norm,
+            anchor_paths=anchors,
+        )
         rec_copy = dict(rec)
         rec_copy["_select_tier"] = tier
-        candidates.append(rec_copy)
+        rec_copy["_bucket"] = bucket
+        if bucket == "must":
+            must_recs.append(rec_copy)
+        elif bucket == "should":
+            should_recs.append(rec_copy)
+        else:
+            drop_count += 1
+            excluded.append(rec_copy)
 
-    candidates.sort(
-        key=lambda r: (
-            int(r.get("_select_tier", 50)),
-            int(r.get("priority", 99)),
-            str((r.get("node") or {}).get("signature") or ""),
+    def _sort_key(item: Dict[str, Any]) -> Tuple[int, int, str]:
+        """must/should 装箱时的稳定排序键。"""
+        return (
+            int(item.get("_select_tier", 50)),
+            int(item.get("priority", 99)),
+            str((item.get("node") or {}).get("signature") or ""),
         )
-    )
+
+    must_recs.sort(key=_sort_key)
+    should_recs.sort(key=_sort_key)
 
     included: List[Dict[str, Any]] = []
     seen_norm: Set[str] = set()
-    for rec in candidates:
-        if not unlimited and len(included) >= cap:
-            excluded.append(rec)
-            continue
+    used_chars = 0
+    must_included = 0
+    should_included = 0
+
+    def _append(rec: Dict[str, Any]) -> bool:
+        """去重后纳入 included；重复 norm_id 返回 False。"""
         nf = str(rec.get("norm_id") or "")
         if nf and nf in seen_norm:
-            continue
+            return False
         if nf:
             seen_norm.add(nf)
         rec.pop("_select_tier", None)
+        rec.pop("_bucket", None)
         included.append(rec)
+        return True
+
+    for rec in must_recs:
+        extra = _snippet_char_len(rec)
+        if _append(rec):
+            used_chars += extra
+            must_included += 1
+
+    for rec in should_recs:
+        extra = _snippet_char_len(rec)
+        if not unlimited and len(included) >= cap:
+            rec["_exclude_reason"] = "超出函数条数预算已裁剪"
+            excluded.append(rec)
+            continue
+        if char_cap > 0 and used_chars + extra > char_cap:
+            rec["_exclude_reason"] = "超出函数体字符预算已裁剪"
+            excluded.append(rec)
+            continue
+        if _append(rec):
+            used_chars += extra
+            should_included += 1
 
     index_lines: List[str] = []
     for rec in excluded:
@@ -394,12 +504,19 @@ def filter_prompt_function_records(
             if isinstance(tags, (set, list)) and tags
             else "上下文候选"
         )
-        tier = rec.get("_select_tier")
-        reason = (
-            "置信度较低已裁剪"
-            if tier is None or tier >= 99
-            else "超出函数体预算已裁剪"
-        )
+        reason = str(rec.get("_exclude_reason") or "")
+        if not reason:
+            bucket = rec.get("_bucket")
+            reason = "弱线索/噪音已裁剪" if bucket == "drop" else "置信度较低已裁剪"
         index_lines.append(f"- {sig}（来源: {tag_txt}；未纳入：{reason}）")
+
+    if isinstance(stats, dict):
+        stats["must_count"] = must_included
+        stats["should_count"] = should_included
+        stats["drop_count"] = drop_count
+        stats["included_count"] = len(included)
+        stats["excluded_count"] = len(excluded)
+        stats["used_function_chars"] = used_chars
+        stats["max_function_chars"] = char_cap
 
     return included, index_lines

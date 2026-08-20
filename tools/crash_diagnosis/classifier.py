@@ -14,6 +14,7 @@ from tools.crash_diagnosis.types import (
     RegisterCorrelation,
     SpAnalysis,
 )
+from tools.crash_parser.abort_message import is_heap_allocator_abort
 
 
 def classify_crash(
@@ -80,9 +81,14 @@ def classify_crash(
     elif fault.pattern == "unmapped_access":
         candidates.append(("wild_pointer", 0.60, f"崩溃地址 {fault.crash_address} 无法关联到已知模式"))
 
-    # 6. SIGABRT 特殊处理
-    if "SIGABRT" in signal or "abort" in crash_reason:
-        candidates.append(("explicit_abort", 0.95, "进程主动 abort（SIGABRT）"))
+    # 6. SIGABRT：分配器堆损坏优先于普通 abort
+    abort_message = str(crash_info.get("abort_message") or "")
+    if is_heap_allocator_abort(abort_message, crash_reason):
+        candidates.append(
+            ("heap_corruption", 0.97, "分配器在释放时检出堆损坏（Scudo/jemalloc 等）")
+        )
+    elif "SIGABRT" in signal or "abort" in crash_reason:
+        candidates.append(("explicit_abort", 0.85, "进程主动 abort（SIGABRT）"))
 
     # --- 选择最高置信度的分类 ---
     if not candidates:

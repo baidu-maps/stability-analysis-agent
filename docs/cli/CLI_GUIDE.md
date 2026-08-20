@@ -84,7 +84,7 @@ python3 cli/main.py \
   --scope gen_prompt_only
 ```
 
-默认生成的 `round_0/06_ai_prompt.md` 使用 `--prompt-mode analysis`：提示词偏证据分析、置信度判断和“不足以定位时说明缺失证据”，不会强制模型必须输出修复代码。若需要回到补丁导向提示词，可显式指定：
+默认生成的 `round_0/06_ai_prompt.md` 使用 `--prompt-mode fix`：提示词要求列出需改函数并给出完整可替换修复代码。若只要证据分析、不强制补丁，可显式指定：
 
 ```bash
 python3 cli/main.py \
@@ -92,7 +92,7 @@ python3 cli/main.py \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
   --code-root examples/crash_cases/demo_basic/code_dir \
   --scope gen_prompt_only \
-  --prompt-mode fix
+  --prompt-mode analysis
 ```
 
 `--prompt-mode` 只控制提示词内容，不控制是否自动应用修复。`--scope full` 下是否尝试回写源码仍由 `--apply-ai-fixes` / `--no-apply-ai-fixes` 决定；如果模型没有输出可提取的完整修复代码，自动改码会自然跳过。

@@ -16,6 +16,7 @@ from tools.parse_crash_errors import (
 class TestParseCrashErrors(unittest.TestCase):
     def test_usable_frame_address(self):
         self.assertTrue(frame_has_usable_info({"address": "0x1000", "function": ""}))
+        self.assertTrue(frame_has_usable_info({"address": "000000000160b4dc", "function": ""}))
 
     def test_usable_frame_symbol(self):
         self.assertTrue(frame_has_usable_info({"function": "MyClass::foo()"}))

@@ -17,8 +17,8 @@ python3 cli/cpp_crash.py \
 - 复用 `address_pattern_analyzer` 的空指针、低地址和 poison 地址判断
 - Signal → si_code 三级分类（参照华为 cppcrash `fault_mode.md`）
 - 调用栈分层：崩溃帧 / 第一非运行时调用方 / 第一应用帧
-- 历史特征提示：JS OOM、跨线程 env、ASCII 踩踏、libuv、sqlite BUS、GWP-ASan、未捕获异常
-- `CPP-FM-*` 故障模式：空指针、野指针/Use-after-free、权限错误、abort/assert、N-API 边界、检测器报告等
+- 历史特征提示：JS OOM、跨线程 env、ASCII 踩踏、libuv、sqlite BUS、GWP-ASan、Scudo/jemalloc 堆 abort、未捕获异常
+- `CPP-FM-*` 故障模式：空指针、野指针/Use-after-free、权限错误、abort/assert、堆分配器损坏（CPP-FM-15）、N-API 边界、检测器报告等
 - 证据等级：detector > register > address > pattern
 - `confirmed / probable / preliminary` 诊断状态
 - 缺失证据和后续检查：ASan/HWASan、BuildID/ABI、反汇编、源码条件核对

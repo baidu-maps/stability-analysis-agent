@@ -99,6 +99,8 @@ from skill_system.cli import handle_skill_command
 from skill_system.manager import SkillManager
 from skill_system.templates import available_skill_presets
 
+DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS = 12
+
 # RAG（chromadb / sentence-transformers 等）仅在向量库子命令需要时加载，避免 `sa-agent` 首屏被拖慢。
 _rag_runtime_resolved = False
 RAG_RUNTIME_AVAILABLE = False
@@ -3491,11 +3493,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--prompt-mode",
         choices=["analysis", "fix"],
-        default="analysis",
+        default="fix",
         help=(
-            "06 / LLM 提示词输出模式（默认 analysis）："
-            "analysis=偏证据分析与置信度判断，不强制修复代码；"
-            "fix=偏补丁输出，要求完整可替换修复代码。"
+            "06 / LLM 提示词输出模式（默认 fix）："
+            "fix=偏补丁输出，要求完整可替换修复代码；"
+            "analysis=偏证据分析与置信度判断，不强制修复代码。"
             "该参数只控制提示词内容，不控制是否自动应用修复。"
         ),
     )
@@ -3571,10 +3573,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-sibling-member-functions",
         type=int,
-        default=0,
+        default=DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS,
         help=(
-            "code_content_provider：同类「兄弟成员函数」最多纳入条数（默认 0=关闭）。"
-            "大代码库建议保持 0，依赖共享变量关联扩展相关函数。"
+            "code_content_provider：同类「兄弟成员函数」最多纳入条数"
+            f"（默认 {DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS}；0=关闭）。"
+            "模块级 code-root 建议保持默认，整仓扫描可显式设为 0。"
         ),
     )
     p.add_argument(
@@ -3957,7 +3960,7 @@ def _llm_request_snapshot(args: argparse.Namespace, scope: str) -> Dict[str, Any
         # Snapshot uses fixed/active for display when mode=fixed; for auto use resolved endpoint
         from tool_system.llm.routing_policy import RoutingContext
 
-        prompt_mode = str(getattr(args, "prompt_mode", "analysis") or "analysis")
+        prompt_mode = str(getattr(args, "prompt_mode", "fix") or "fix")
         route_ctx = RoutingContext(
             prompt_mode=prompt_mode,
             apply_ai_fixes=bool(getattr(args, "apply_ai_fixes", True)),
@@ -4564,7 +4567,7 @@ def _build_run_request_record(
 ) -> Dict[str, Any]:
     crash_log_source_norm = str(crash_log_source or "").strip().lower() or "file"
     crash_log_value_norm = str(crash_log_value or "").strip()
-    prompt_mode = str(getattr(args, "prompt_mode", "analysis") or "analysis")
+    prompt_mode = str(getattr(args, "prompt_mode", "fix") or "fix")
     explicit_agent_loop = str(getattr(args, "agent_loop", None) or "").strip()
     agent_loop = explicit_agent_loop or ("context_loop" if prompt_mode == "analysis" else "single")
     configured_rounds = int(getattr(args, "max_agent_rounds", 0) or 0)
@@ -4632,7 +4635,9 @@ def _build_run_request_record(
         "vector_db_max_results": int(getattr(args, "vector_db_max_results", 3) or 3),
         "vector_db_record_usage": bool(getattr(args, "vector_db_record_usage", False)),
         "rule_confidence_threshold": float(getattr(args, "rule_confidence_threshold", 0.85) or 0.85),
-        "max_sibling_member_functions": int(getattr(args, "max_sibling_member_functions", 0) or 0),
+        "max_sibling_member_functions": int(
+            getattr(args, "max_sibling_member_functions", DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS) or 0
+        ),
         "max_shared_var_related_functions": int(
             getattr(args, "max_shared_var_related_functions", 20) or 20
         ),
@@ -4763,8 +4768,8 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
     if output_format != "markdown":
         argv += ["--output-format", output_format]
 
-    prompt_mode = str(record.get("prompt_mode") or "analysis").strip() or "analysis"
-    if prompt_mode != "analysis":
+    prompt_mode = str(record.get("prompt_mode") or "fix").strip() or "fix"
+    if prompt_mode != "fix":
         argv += ["--prompt-mode", prompt_mode]
 
     agent_loop = str(record.get("agent_loop") or "").strip()
@@ -5922,7 +5927,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         "native_leak_dir": str(getattr(args, "native_leak_dir", None) or ""),
         "native_leak_trace_db": str(getattr(args, "native_leak_trace_db", None) or ""),
         "force_timeline_analysis": bool(getattr(args, "force_timeline_analysis", False)),
-        "prompt_mode": str(getattr(args, "prompt_mode", "analysis") or "analysis"),
+        "prompt_mode": str(getattr(args, "prompt_mode", "fix") or "fix"),
         # 0 表示让 workflow 按 prompt_mode 决定默认轮数
         "max_agent_rounds": int(getattr(args, "max_agent_rounds", 0) or 0),
         "max_context_requests_per_round": max(
@@ -5933,7 +5938,9 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         "vector_db_max_results": args.vector_db_max_results,
         "vector_db_readonly": not bool(getattr(args, "vector_db_record_usage", False)),
         "rule_confidence_threshold": args.rule_confidence_threshold,
-        "max_sibling_member_functions": int(getattr(args, "max_sibling_member_functions", 0) or 0),
+        "max_sibling_member_functions": int(
+            getattr(args, "max_sibling_member_functions", DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS) or 0
+        ),
         "max_shared_var_related_functions": int(
             getattr(args, "max_shared_var_related_functions", 12) or 12
         ),
@@ -6017,7 +6024,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
             from tool_system.llm.routing_policy import RoutingContext
 
             agent_cfg_for_llm = _load_agent_config_file()
-            prompt_mode_for_route = str(problem.get("prompt_mode") or "analysis")
+            prompt_mode_for_route = str(problem.get("prompt_mode") or "fix")
             agent_loop_for_route = str(problem.get("agent_loop") or (
                 "context_loop" if prompt_mode_for_route == "analysis" else "single"
             ))

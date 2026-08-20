@@ -45,8 +45,11 @@ def _applied_files_summary(apply_fix: Dict[str, Any]) -> List[str]:
 def build_case_record_from_report(report_dir: Path) -> Optional[Dict[str, Any]]:
     """Build pattern + evidence payload from a finished report directory."""
     report_dir = Path(report_dir).expanduser().resolve()
-    apply_path = report_dir / "08_apply_ai_fixes.json"
-    apply_fix = _read_json(apply_path)
+    apply_path = _first_existing(
+        report_dir,
+        ["08_apply_ai_fixes.json", "07_apply_ai_fixes.json"],
+    )
+    apply_fix = _read_json(apply_path) if apply_path else None
     if not apply_fix or not apply_fix.get("success"):
         return None
 

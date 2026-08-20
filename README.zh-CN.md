@@ -7,7 +7,7 @@
 
 [English](./README.md) | **简体中文**
 
-**维护状态：** 持续维护中 · **最新版 [v1.3.0](https://pypi.org/project/stability-analysis-agent/1.3.0/)**（证据诊断 `04a`–`04e`、ANR 专用 workflow、报告编号对齐）· 有实质性改动时发布 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases)（活跃期大约每月一档，非日历 SLA）· 详见 [CHANGELOG.md](./CHANGELOG.md)
+**维护状态：** 持续维护中 · **最新版 [v1.3.1](https://pypi.org/project/stability-analysis-agent/1.3.1/)**（证据诊断 `04a`–`04e`、ANR 专用 workflow、报告编号对齐）· 有实质性改动时发布 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases)（活跃期大约每月一档，非日历 SLA）· 详见 [CHANGELOG.md](./CHANGELOG.md)
 
 ---
 

@@ -76,8 +76,8 @@ class DeterministicAnalyzer:
         # Rule 2: Stack overflow via recursive pattern
         self._check_stack_overflow(crash_info, resolved_stack, conclusions)
 
-        # Rule 3: Explicit abort
-        self._check_abort(crash_info, conclusions)
+        # Rule 3: Explicit abort / allocator heap abort
+        self._check_abort(crash_info, crash_log_content, conclusions)
 
         # Rule 4: Sanitizer/detector report
         self._check_detector_report(crash_log_content, conclusions)
@@ -216,19 +216,49 @@ class DeterministicAnalyzer:
                 implication="可能是递归过深或栈帧过大，需检查调用深度和局部变量大小",
             ))
 
-    def _check_abort(self, crash_info: Dict[str, Any], out: DeterministicConclusions) -> None:
-        """SIGABRT = intentional abort (not a random crash)."""
+    def _check_abort(
+        self,
+        crash_info: Dict[str, Any],
+        log_content: str,
+        out: DeterministicConclusions,
+    ) -> None:
+        """SIGABRT：区分分配器堆损坏与普通 abort/assert。"""
         signal = str(crash_info.get("signal") or crash_info.get("crash_signal") or "")
         if "SIGABRT" not in signal.upper():
             return
 
+        from tools.crash_parser.abort_message import extract_abort_message, is_heap_allocator_abort
+
         reason = str(crash_info.get("crash_reason") or "")
+        abort_message = str(
+            crash_info.get("abort_message") or extract_abort_message(log_content) or ""
+        )
+        if is_heap_allocator_abort(abort_message, reason, log_content):
+            out.facts.append(DeterministicFact(
+                fact_type="heap_abort",
+                description="堆分配器在释放/校验时 abort（非业务 assert）",
+                confidence=1.0,
+                evidence=(
+                    f"信号=SIGABRT"
+                    + (f", Abort message={abort_message}" if abort_message else "")
+                    + (f", reason={reason}" if reason else "")
+                ),
+                implication=(
+                    "Scudo/jemalloc 等在 deallocate 时发现 chunk 非法，说明更早发生了越界写或 double-free。"
+                    "应检查业务栈第一帧及其被调函数中的堆操作，不要当作普通 assert，也不要根据错误的 libc 符号编故事。"
+                ),
+            ))
+            return
+
         out.facts.append(DeterministicFact(
             fact_type="abort",
             description="进程主动 abort（非随机崩溃）",
-            confidence=1.0,
+            confidence=0.92,
             evidence=f"信号=SIGABRT" + (f", reason={reason}" if reason else ""),
-            implication="这是程序主动调用 abort/assert 触发，需找到触发 abort 的业务逻辑（assert 条件/异常处理）",
+            implication=(
+                "可能是 assert/显式 abort，也可能是未抽取到的分配器错误。"
+                "请先阅读 Abort message；仅在确认是业务断言后再查 assert 条件。"
+            ),
         ))
 
     def _check_detector_report(self, log_content: str, out: DeterministicConclusions) -> None:
@@ -238,6 +268,7 @@ class DeterministicAnalyzer:
             "ThreadSanitizer": "线程安全检测器 (TSan) 报告",
             "GWP-ASan": "GWP-ASan 采样检测器报告",
             "LeakSanitizer": "内存泄漏检测器 (LSan) 报告",
+            "Scudo ERROR": "Scudo 堆分配器完整性失败",
         }
         search_area = log_content[:10000]
         for keyword, desc in detectors.items():

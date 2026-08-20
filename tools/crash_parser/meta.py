@@ -8,6 +8,11 @@ import logging
 import re
 from typing import Optional
 
+from tools.crash_parser.abort_message import (
+    extract_abort_message,
+    is_heap_allocator_abort,
+    thread_type_from_name,
+)
 from tools.crash_parser.android import (
     _android_heuristic_anr_stack,
     _android_mixed_native_java_jni_sample,
@@ -40,6 +45,15 @@ def extract_crash_info(content: str) -> CrashInfo:
     category = None
     primary_language = None
     crash_address = None
+    abort_message = extract_abort_message(content)
+
+    dbg_name = re.search(
+        r"pid:\s*\d+,\s*tid:\s*\d+,\s*name:\s*([^\s>]+)\s*>>>",
+        content,
+        re.IGNORECASE,
+    )
+    if dbg_name:
+        thread_type = thread_type_from_name(dbg_name.group(1))
 
     reason_line_match = re.search(r'^Reason:\s*([^\n\r]+)$', content, re.IGNORECASE | re.MULTILINE)
     reason_text = reason_line_match.group(1).strip() if reason_line_match else ""
@@ -186,12 +200,20 @@ def extract_crash_info(content: str) -> CrashInfo:
 
     # 基于关键字的通用场景分类（category）补全
     low = content_lower
+    heap_abort = is_heap_allocator_abort(abort_message, content)
+    if heap_abort and (not crash_reason or crash_reason in {"unknown", "abort"}):
+        crash_reason = "heap allocator abort"
     if category is None:
         if "out of memory" in low or "outofmemoryerror" in low or "lowmemory" in low:
             category = "oom"
         elif "anr" in low or "appfreeze" in low or "application not responding" in low:
             category = "anr"
-        elif "gpu" in low or "vulkan" in low or "gles" in low:
+        elif heap_abort:
+            category = "native_crash"
+        elif re.search(
+            r"gpu\s+(crash|fault)|vk_error_device_lost|gles_crash|gpu hung",
+            low,
+        ):
             category = "gpu_crash"
         elif "ability" in low or "entryability" in low:
             category = "ability_crash"
@@ -259,6 +281,7 @@ def extract_crash_info(content: str) -> CrashInfo:
         crash_address=crash_address,
         category=category,
         primary_language=primary_language,
+        abort_message=abort_message or None,
     )
 
 def extract_meta_info(content: str) -> MetaInfo:

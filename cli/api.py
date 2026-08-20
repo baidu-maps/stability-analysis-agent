@@ -85,7 +85,7 @@ def interactive_state_to_argv(state: Dict[str, Any]) -> List[str]:
     if scope != "full":
         argv.extend(["--scope", scope])
     prompt_mode = str(state.get("prompt_mode") or "").strip()
-    if prompt_mode in {"analysis", "fix"} and prompt_mode != "analysis":
+    if prompt_mode in {"analysis", "fix"} and prompt_mode != "fix":
         argv.extend(["--prompt-mode", prompt_mode])
     if "agent_loop" in state:
         agent_loop = str(state.get("agent_loop") or "").strip()

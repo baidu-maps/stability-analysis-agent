@@ -225,8 +225,8 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
     scope = str(getattr(req, "scope", "full") or "full")
     if scope and scope != "full":
         cmd += ["--scope", scope]
-    prompt_mode = str(getattr(req, "prompt_mode", "analysis") or "analysis")
-    if prompt_mode and prompt_mode != "analysis":
+    prompt_mode = str(getattr(req, "prompt_mode", "fix") or "fix")
+    if prompt_mode and prompt_mode != "fix":
         cmd += ["--prompt-mode", prompt_mode]
     agent_loop = getattr(req, "agent_loop", None)
     if agent_loop in {"single", "context_loop"}:

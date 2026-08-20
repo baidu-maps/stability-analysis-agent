@@ -147,15 +147,19 @@ class TestMemoryRetriever(unittest.TestCase):
         args_off = parser.parse_args(["--crash-log", "-", "--no-include-memory-in-05"])
         self.assertFalse(args_off.include_memory_in_05)
 
-    def test_prompt_mode_default_analysis(self):
-        self.assertEqual(BaseCrashAnalysisWorkflow._resolve_prompt_mode({}), "analysis")
+    def test_prompt_mode_default_fix(self):
+        self.assertEqual(BaseCrashAnalysisWorkflow._resolve_prompt_mode({}), "fix")
         self.assertEqual(
             BaseCrashAnalysisWorkflow._resolve_prompt_mode({"prompt_mode": "fix"}),
             "fix",
         )
         self.assertEqual(
-            BaseCrashAnalysisWorkflow._resolve_prompt_mode({"prompt_mode": "unknown"}),
+            BaseCrashAnalysisWorkflow._resolve_prompt_mode({"prompt_mode": "analysis"}),
             "analysis",
+        )
+        self.assertEqual(
+            BaseCrashAnalysisWorkflow._resolve_prompt_mode({"prompt_mode": "unknown"}),
+            "fix",
         )
 
     def test_build_prompt_final_tip_analysis_mode_does_not_force_fix_code(self):
@@ -164,7 +168,7 @@ class TestMemoryRetriever(unittest.TestCase):
             {},
             {"resolved_frames": []},
             {"crash_summary": {"error_type": "SIGSEGV"}},
-            problem={},
+            problem={"prompt_mode": "analysis"},
         )
         self.assertIn("结论置信度", text)
         self.assertIn("仅在证据与上下文足够时", text)
@@ -188,7 +192,7 @@ class TestMemoryRetriever(unittest.TestCase):
 
     def test_agent_loop_defaults_and_context_loop_prompt(self):
         wf = iOSCrashAnalyzeWorkflow()
-        self.assertEqual(BaseCrashAnalysisWorkflow._resolve_agent_loop({}), "context_loop")
+        self.assertEqual(BaseCrashAnalysisWorkflow._resolve_agent_loop({}), "single")
         self.assertEqual(
             BaseCrashAnalysisWorkflow._resolve_agent_loop({"prompt_mode": "fix"}),
             "single",
@@ -220,7 +224,7 @@ class TestMemoryRetriever(unittest.TestCase):
             {},
             {"resolved_frames": []},
             {"crash_summary": {"error_type": "SIGSEGV"}},
-            problem={"agent_loop": "context_loop", "max_agent_rounds": 2},
+            problem={"agent_loop": "context_loop", "max_agent_rounds": 2, "prompt_mode": "analysis"},
         )
         self.assertIn("context_requests", text)
         self.assertIn("agent_can_fetch_more", text)
@@ -243,7 +247,7 @@ class TestMemoryRetriever(unittest.TestCase):
         self.assertIn("不得放入 `context_requests`", weak_text)
         self.assertIn("`type=function` 只能请求函数源码", weak_text)
         self.assertIn("首轮应尽量一次性列出所有高价值补充请求", weak_text)
-        self.assertIn("如果还需要 Agent 补充上下文", weak_text)
+        self.assertIn("如果还需要 Agent 自动补充上下文", weak_text)
         self.assertIn("只输出需要 Agent 补充什么内容，以及为什么需要这些内容", weak_text)
         self.assertIn("当输出 `agent_can_fetch_more=true` 时，禁止输出最终分析报告", weak_text)
         self.assertIn("证据充分且上下文完整时，可给出直接可用的 C/C++ 修复代码块", weak_text)
@@ -1116,7 +1120,9 @@ class TestMemoryRetriever(unittest.TestCase):
 
         parser = build_parser()
         args = parser.parse_args(["--crash-log", "-"])
-        self.assertEqual(args.prompt_mode, "analysis")
+        self.assertEqual(args.prompt_mode, "fix")
+        args_analysis = parser.parse_args(["--crash-log", "-", "--prompt-mode", "analysis"])
+        self.assertEqual(args_analysis.prompt_mode, "analysis")
         args_fix = parser.parse_args(["--crash-log", "-", "--prompt-mode", "fix"])
         self.assertEqual(args_fix.prompt_mode, "fix")
 

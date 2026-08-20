@@ -279,7 +279,12 @@ def _generate_suggestions(
         suggestions.append("排查: 虚表指针(vptr)是否被覆盖、函数指针是否有效")
 
     elif pattern == "explicit_abort":
-        suggestions.append("聚焦: abort 前的日志输出和 assert 条件")
+        suggestions.append("聚焦: abort 前的日志输出和 assert 条件；若有 Abort message 必须先引用原文")
+    elif pattern == "heap_corruption":
+        suggestions.append(
+            "聚焦: 业务栈第一帧及其被调函数中的 vector/new/delete 越界或 double-free，而不是 abort 帧"
+        )
+        suggestions.append("不要把 Scudo invalid chunk 当成 GL/业务 assert，也不要发明与源码矛盾的 glUseProgram(0)")
 
     excludes: List[str] = []
     if sp.stack_overflow_risk == "none":

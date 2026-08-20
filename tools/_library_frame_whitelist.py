@@ -8,7 +8,62 @@
 from pathlib import Path
 from typing import List, Optional
 
-__all__ = ["find_library_files_in_dir", "match_libraries_for_module"]
+__all__ = [
+    "find_library_files_in_dir",
+    "is_system_native_module",
+    "match_libraries_for_module",
+]
+
+_SYSTEM_SO_NAMES = frozenset(
+    {
+        "libc.so",
+        "libm.so",
+        "libdl.so",
+        "liblog.so",
+        "libc++.so",
+        "libstdc++.so",
+        "libart.so",
+        "libandroid.so",
+        "libbinder.so",
+        "libutils.so",
+        "libandroid_runtime.so",
+        "linker",
+        "linker64",
+        "app_process32",
+        "app_process64",
+        "libsystem_c.dylib",
+        "libsystem_malloc.dylib",
+        "libsystem_kernel.dylib",
+        "libsystem_pthread.dylib",
+        "libobjc.A.dylib",
+        "libdispatch.dylib",
+        "libdyld.dylib",
+    }
+)
+
+_SYSTEM_MODULE_PREFIXES = (
+    "libsystem_",
+    "libobjc",
+    "libdispatch",
+    "libc++",
+    "libc++abi",
+)
+
+
+def is_system_native_module(module_name: Optional[str]) -> bool:
+    """判断堆栈 module 是否为 Android/iOS 系统库（不应拿业务 library_dir 去做 addr2line）。"""
+    if not module_name:
+        return False
+    raw = str(module_name).strip().replace("\\", "/")
+    name = Path(raw).name
+    lowered = name.lower()
+    if lowered in _SYSTEM_SO_NAMES:
+        return True
+    if any(lowered.startswith(prefix) for prefix in _SYSTEM_MODULE_PREFIXES):
+        return True
+    if "/system/" in raw.lower() or "/apex/" in raw.lower() or "/usr/lib/" in raw.lower():
+        return True
+    return False
 
 
 def find_library_files_in_dir(library_dir: str, os_type: str) -> List[Path]:
@@ -42,16 +97,24 @@ def match_libraries_for_module(
     """
     if not module_name:
         return []
-    exact_matches = [f for f in library_files if f.name == module_name]
+    module_basename = Path(str(module_name).replace("\\", "/")).name
+    if is_system_native_module(module_name):
+        return [f for f in library_files if f.name == module_basename]
+    exact_matches = [f for f in library_files if f.name == module_basename]
     if exact_matches:
         return exact_matches
-    lib_prefixed = f"lib{module_name}"
+    lib_prefixed = f"lib{module_basename}"
     lib_matches = [f for f in library_files if f.name == lib_prefixed]
     if lib_matches:
         return lib_matches
-    suffix_matches = [f for f in library_files if f.name.endswith(module_name)]
+    suffix_matches = [f for f in library_files if f.name.endswith(module_basename)]
     if suffix_matches:
         return suffix_matches
-    module_short = module_name.replace(".so", "").replace(".dylib", "").replace(".dll", "")
-    substring_matches = [f for f in library_files if module_short and module_short in f.name]
+    module_short = (
+        module_basename.replace(".so", "").replace(".dylib", "").replace(".dll", "")
+    )
+    # 过短的短名（如 libc）会误伤 libcrypto 等，禁止子串匹配
+    if not module_short or len(module_short) < 8:
+        return []
+    substring_matches = [f for f in library_files if module_short in f.name]
     return substring_matches

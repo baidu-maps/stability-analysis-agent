@@ -12,6 +12,7 @@ OutputFormat = Literal["json", "markdown", "text"]
 EngineType = Literal["direct", "langchain", "langgraph"]
 ScopeType = Literal["full", "gen_prompt_only", "parse_stack_only", "parse_log_only"]
 PromptModeType = Literal["analysis", "fix"]
+DEFAULT_PROMPT_MODE: PromptModeType = "fix"
 AgentLoopType = Literal["single", "context_loop"]
 LlmModeType = Literal["fixed", "auto"]
 LlmProfileType = Literal["default", "strong", "fast"]
@@ -79,8 +80,8 @@ class RunRequest:
     output_format: OutputFormat = "markdown"
 
     scope: ScopeType = "full"
-    prompt_mode: PromptModeType = "analysis"
-    agent_loop: Optional[AgentLoopType] = None  # None=随 prompt_mode 决定（analysis→context_loop）
+    prompt_mode: PromptModeType = DEFAULT_PROMPT_MODE
+    agent_loop: Optional[AgentLoopType] = None  # None=随 prompt_mode 决定（analysis→context_loop，fix→single）
     max_agent_rounds: int = 1
     max_context_requests_per_round: int = 5
     optimized: bool = False

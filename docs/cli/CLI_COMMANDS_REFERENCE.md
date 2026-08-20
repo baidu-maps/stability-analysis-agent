@@ -24,7 +24,7 @@ python3 cli/main.py [参数...]
 | `--code-root DIR` | 建议填写 | 代码根目录；可**多次**指定，在多根目录下查找源码。 |
 | `--config PATH` | 否 | `SystemConfig` JSON 文件；不指定时使用内置默认工具链 + `crash_analysis` 工作流。 |
 | `--scope {full,gen_prompt_only,parse_stack_only,parse_log_only}` | 否 | Agent 执行流程范围，默认 `full`。详见下方“`--scope` 取值”。 |
-| `--prompt-mode {analysis,fix}` | 否 | `round_0/06_ai_prompt.md` / LLM 输入的提示词输出模式，默认 `analysis`。详见下方“`--prompt-mode` 取值”。 |
+| `--prompt-mode {analysis,fix}` | 否 | `round_0/06_ai_prompt.md` / LLM 输入的提示词输出模式，默认 `fix`。详见下方“`--prompt-mode` 取值”。 |
 | `--agent-loop {single,context_loop}` | 否 | Agent 编排模式。未指定时随 `--prompt-mode`：`analysis`→`context_loop`，其它→`single`。`context_loop` 允许模型请求补充函数源码并继续多轮分析，独立于 `--engine`。 |
 | `--max-agent-rounds N` | 否 | `context_loop` 最多 LLM 轮数。默认：`analysis` 模式 `3` 轮，其它模式 `1` 轮；显式指定时以参数为准（硬上限 `8`）。 |
 | `--max-context-requests-per-round N` | 否 | `context_loop` 每轮最多处理的源码补充请求数，默认 `5`，硬上限 `16`。 |
@@ -57,8 +57,8 @@ python3 cli/main.py [参数...]
 
 | 取值 | 行为 |
 |------|------|
-| `analysis`（默认） | 偏证据分析与置信度判断：要求模型说明证据是否足够、区分结论与推断，不强制输出修复代码。 |
-| `fix` | 偏补丁输出：要求模型列出需要修改的函数，并输出完整可替换、可编译的修复代码。 |
+| `analysis` | 偏证据分析与置信度判断：要求模型说明证据是否足够、区分结论与推断，不强制输出修复代码。 |
+| `fix`（默认） | 偏补丁输出：要求模型列出需要修改的函数，并输出完整可替换、可编译的修复代码。 |
 
 #### `--agent-loop` 取值
 
@@ -267,8 +267,8 @@ python3 cli/main.py cancel <run_id> --daemon http://127.0.0.1:8765
 | 完整分析 + 默认改码 + 默认备份 | `--crash-log-file ... --library-dir ... --code-root ...` |
 | 分析且改码，但不要磁盘备份（Git 撤销） | 在上行基础上加 `--no-backup-original-sources` |
 | 只分析、不改源码 | `--no-apply-ai-fixes` |
-| 提示词偏证据分析（默认） | `--prompt-mode analysis` |
-| 提示词要求完整修复代码 | `--prompt-mode fix` |
+| 提示词要求完整修复代码（默认） | `--prompt-mode fix` |
+| 提示词偏证据分析 | `--prompt-mode analysis` |
 | 只要工具链、不要 LLM | `--scope gen_prompt_only` |
 | 仅解析 + 符号化 + 诊断 | `--scope parse_stack_only` |
 | 仅解析崩溃日志 | `--scope parse_log_only` |

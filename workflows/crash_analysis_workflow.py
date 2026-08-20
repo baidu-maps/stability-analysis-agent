@@ -48,6 +48,10 @@ from tool_system.registry import ToolAndWorkflowRegistry
 
 logger = logging.getLogger(__name__)
 
+# 未设置 SA_MAX_PROMPT_CHARS / max_prompt_chars 时的默认上限（字符）。
+# 硬截断只作为最后手段；0 表示不限制。
+DEFAULT_ANALYSIS_PROMPT_CHARS = 120000
+
 # 尝试导入现有的 prompts
 try:
     from prompts.crash_analysis_prompt_templates import generate_crash_analysis_prompt
@@ -58,19 +62,66 @@ except ImportError as e:
     generate_crash_analysis_prompt = None
 
 def _truncate_analysis_prompt(prompt: str, prompt_cap: int) -> str:
-    """截断分析 prompt：保留头部上下文与尾部输出约束。"""
+    """截断分析 prompt：按章节优先级装箱，禁止头尾对切以免丢掉中间崩溃函数。"""
     if len(prompt) <= prompt_cap:
         return prompt
-    keep_head = max(1000, int(prompt_cap * 0.72))
-    keep_tail = max(500, prompt_cap - keep_head - 80)
-    merged = (
-        prompt[:keep_head]
-        + "\n\n...[PROMPT TRUNCATED — 中间省略]...\n\n"
-        + prompt[-keep_tail:]
+    packed = _pack_prompt_sections_by_priority(prompt, prompt_cap)
+    if packed:
+        return packed
+    logger.warning(
+        "prompt section packing failed; keep original prompt (%s chars, cap=%s)",
+        len(prompt),
+        prompt_cap,
     )
-    if len(merged) > prompt_cap:
-        merged = merged[:prompt_cap]
-    return merged
+    return prompt
+
+
+def _prompt_section_priority(title: str) -> int:
+    """截断时的章节保留优先级，数值越大越先保留。"""
+    if any(key in title for key in ("输出要求", "必须遵守", "崩溃分析任务")):
+        return 100
+    if any(key in title for key in ("崩溃证据", "已确认事实", "Abort message", "崩溃摘要")):
+        return 95
+    if any(key in title for key in ("崩溃函数", "函数源码")):
+        return 90
+    if "调用链" in title:
+        return 45
+    if any(key in title for key in ("变量", "兄弟", "共享")):
+        return 15
+    return 35
+
+
+def _pack_prompt_sections_by_priority(prompt: str, prompt_cap: int) -> str:
+    """按 markdown 二级标题切分并按优先级装箱。must 章节即使略超 cap 也整段保留。"""
+    parts = re.split(r"(?=^## )", prompt, flags=re.M)
+    parts = [p for p in parts if p]
+    if len(parts) < 3:
+        return ""
+    last_idx = len(parts) - 1
+    must_parts: List[Tuple[int, str]] = []
+    optional_parts: List[Tuple[int, int, str]] = []
+    for idx, part in enumerate(parts):
+        first_line = part.splitlines()[0] if part.splitlines() else ""
+        prio = _prompt_section_priority(first_line)
+        is_must = idx in (0, last_idx) or prio >= 90
+        if is_must:
+            must_parts.append((idx, part))
+        else:
+            optional_parts.append((idx, prio, part))
+    chosen: List[Tuple[int, str]] = list(must_parts)
+    used = sum(len(part) for _idx, part in chosen)
+    optional_parts.sort(key=lambda item: (-item[1], item[0]))
+    dropped = 0
+    for idx, _prio, part in optional_parts:
+        if used + len(part) <= prompt_cap:
+            chosen.append((idx, part))
+            used += len(part)
+        else:
+            dropped += 1
+    if dropped:
+        chosen.append((last_idx + 1, "\n\n...[PROMPT TRUNCATED]...\n\n"))
+    chosen.sort(key=lambda item: item[0])
+    return "".join(item[1] for item in chosen)
 
 
 # ==================== Base Crash Analysis Workflow ====================
@@ -819,7 +870,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             raw = str(problem.get("prompt_mode") or "").strip().lower()
             if raw in valid:
                 return raw
-        return "analysis"
+        return "fix"
 
     @staticmethod
     def _resolve_agent_loop(problem: Optional[Dict[str, Any]] = None) -> str:
@@ -2814,7 +2865,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             ctx = RoutingContext(
                 mode=str(getattr(state, "mode", "auto")),
                 force_profile=getattr(state, "force_profile", None),
-                prompt_mode=str(problem.get("prompt_mode") or "analysis"),
+                prompt_mode=str(problem.get("prompt_mode") or "fix"),
                 apply_ai_fixes=bool(problem.get("apply_ai_fixes")),
                 agent_loop=str(problem.get("agent_loop") or "single"),
                 round_index=int(round_index),
@@ -2847,13 +2898,17 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         if prompt_cap_raw is None:
             prompt_cap_raw = os.getenv("SA_MAX_PROMPT_CHARS")
         prompt_cap: Optional[int] = None
-        if prompt_cap_raw not in (None, ""):
+        if prompt_cap_raw in (None, ""):
+            prompt_cap = DEFAULT_ANALYSIS_PROMPT_CHARS
+        else:
             try:
                 parsed = int(prompt_cap_raw)
                 if parsed > 0:
                     prompt_cap = parsed
+                elif parsed == 0:
+                    prompt_cap = None
             except (TypeError, ValueError):
-                prompt_cap = None
+                prompt_cap = DEFAULT_ANALYSIS_PROMPT_CHARS
         prompt_used = prompt
         if prompt_cap and len(prompt_used) > prompt_cap:
             orig_len = len(prompt_used)
@@ -3234,14 +3289,14 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             raw = src.get("max_prompt_stack_frame_functions")
             if raw is not None:
                 try:
-                    return max(1, min(int(raw), 32))
+                    return max(1, min(int(raw), 48))
                 except (TypeError, ValueError):
                     pass
         if isinstance(graph, dict):
             kept = graph.get("stack_kept_original_indices")
             if isinstance(kept, list) and kept:
-                return max(3, min(len(kept) + 2, 16))
-        return 8
+                return max(3, min(len(kept) + 2, 24))
+        return 12
 
     @classmethod
     def _collect_add2line_stack_node_ids(
@@ -4495,6 +4550,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             tags: Set[str] = rec["tags"]
             if nfid in crash_fn_norm_ids:
                 tags.add("崩溃函数")
+            if str(node.get("role") or "") == "crash_line_callee":
+                tags.add("崩溃行被调")
             if nfid in primary_path_norm_ids:
                 tags.add("调用链")
             if nfid in caller_to_crash_norm:
@@ -4522,7 +4579,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
 
             if "栈序保留" in tags:
                 rec["priority"] = 0
-            elif "崩溃函数" in tags:
+            elif "崩溃函数" in tags or "崩溃行被调" in tags:
                 rec["priority"] = 1
             elif "共享变量写" in tags:
                 rec["priority"] = 2
@@ -4584,12 +4641,15 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             ),
         )
 
+        filter_stats: Dict[str, Any] = {}
         included_records, excluded_index_lines = filter_prompt_function_records(
             ordered_records,
             root_cause_norm_ids=root_cause_norm_ids,
             stack_frame_norm_ids=stack_frame_norm_ids,
             anchor_paths=stack_anchors,
             max_functions=prompt_filter_opts.max_functions_in_prompt,
+            max_function_chars=prompt_filter_opts.max_function_chars_in_prompt,
+            stats=filter_stats,
         )
         # 将 prompt 裁剪/未纳入信息写入 code_context（03_code_content_provider.json），
         # 避免把元信息噪音塞进 05_ai_final_tip 文本。
@@ -4603,9 +4663,18 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 meta = {}
             meta["max_functions_in_prompt"] = int(prompt_filter_opts.max_functions_in_prompt)
             meta["max_stack_frames_in_prompt"] = int(prompt_filter_opts.max_stack_frames_in_prompt)
+            meta["max_function_chars_in_prompt"] = int(
+                prompt_filter_opts.max_function_chars_in_prompt
+            )
+            meta.update(filter_stats)
             meta["excluded_function_index"] = list(excluded_index_lines or [])
+            src_callees = diagnostics.get("crash_line_callees")
+            if isinstance(src_callees, list) and src_callees:
+                meta["crash_line_callees"] = [str(x) for x in src_callees if str(x).strip()]
             diagnostics["prompt_context_meta"] = meta
 
+        complete_prompt_sigs: List[str] = []
+        incomplete_prompt_sigs: List[str] = []
         if not included_records:
             lines.append("- N/A")
             lines.append("")
@@ -4623,6 +4692,10 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 snippet, is_complete_snippet, incomplete_reason = self._prepare_prompt_function_snippet(node, snippet)
                 if not snippet:
                     continue
+                if is_complete_snippet:
+                    complete_prompt_sigs.append(sig)
+                else:
+                    incomplete_prompt_sigs.append(sig)
                 lines.append(f"#### 函数源码: {sig}")
                 lines.append(f"- 文件: {node.get('file', 'N/A')}")
                 if not is_complete_snippet:
@@ -4630,6 +4703,14 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 lines.append("- 代码片段:")
                 lines.extend([str(s) for s in snippet])
                 lines.append("")
+
+        if isinstance(code_context, dict):
+            diagnostics = code_context.get("diagnostics")
+            if isinstance(diagnostics, dict):
+                meta = diagnostics.get("prompt_context_meta")
+                if isinstance(meta, dict):
+                    meta["included_complete_signatures"] = list(complete_prompt_sigs)
+                    meta["included_incomplete_signatures"] = list(incomplete_prompt_sigs)
 
         # 输出类骨架（强归因且已写入 graph 时才有）：完整类结构供结构性修复参考
         emit_class_skeleton = not (
@@ -4736,6 +4817,21 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             "- 非静态成员函数内不得用 `if (this == nullptr)` 等形式作为 use-after-free/悬空对象 的修复；"
             "应在释放路径、任务/线程同步或所有权转移处消除非法访问。"
         )
+        lines.append(
+            "- 若存在 Abort message / Scudo / jemalloc / invalid chunk："
+            "这是堆分配器在释放时检出损坏，不要当成普通业务 assert；"
+            "优先检查崩溃函数及其同文件被调函数中的 vector/new/delete 越界或 double-free。"
+        )
+        lines.append(
+            "- 不要根据被错误符号化的 libc 符号编造崩溃点；"
+            "tombstone 已写明 abort/Scudo 时以 Abort message 和业务栈第一帧为准。"
+        )
+        lines.append(
+            "- 若 apply()/compile() 等在失败路径已经 return，禁止发明与源码矛盾的根因（例如 compile 失败后仍 glUseProgram(0)）。"
+        )
+        lines.append(
+            "- 修复代码必须带完整类名签名（`Class::method`），禁止把其它类的同名函数体写入当前文件。"
+        )
         lines.append("")
         lines.append("**通用分析步骤**：")
         lines.append("1. 明确崩溃点的直接原因（例如空指针、越界访问、使用已释放内存等）。")
@@ -4816,9 +4912,23 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             )
             lines.append("- **修复代码格式**：每个修复函数必须使用独立的 ```cpp 围栏包裹；函数体必须完整，禁止用 `...`、`// ...`、`/* ... */`、`[其他代码]`、`其他逻辑保持不变`、`省略` 等任何占位内容代替代码行。")
             lines.append("- “需要修改的函数”列表中的每一项，都必须在“修复代码”中给出对应的完整函数定义（包含函数签名、完整函数体和全部原有必要逻辑），不能只给函数体片段、局部代码片段、diff 片段或伪代码。")
-            lines.append("- 修复代码必须保持原函数签名不变：不得修改返回类型、函数名、类作用域、参数列表、const/static/virtual 等限定；构造函数和析构函数绝对不能添加返回类型（例如禁止写成 `VBool Class::~Class()`）。")
+            lines.append(
+                "- 修复代码必须保持原函数签名不变：不得修改返回类型、函数名、类作用域、参数列表、const/static/virtual 等限定；"
+                "构造函数和析构函数绝对不能添加返回类型（例如禁止写成 `VBool Class::~Class()`）。"
+            )
+            lines.append(
+                "- 每个修复函数的类名必须与目标文件中的定义一致；"
+                "禁止将 `OtherClass::apply()` 的函数体写入 `ThisClass::apply()` 所在文件。"
+            )
             lines.append("- 如果确实需要调整函数签名或类接口，不能输出自动替换代码；应放到“无法生成完整修复代码/需人工处理”并说明需要人工同步修改声明、定义和所有调用点。")
-            lines.append("- 如果当前上下文不足以输出某个函数的完整可替换代码，必须不要把该函数列入“需要修改的函数”；应放到“无法生成完整修复代码/需人工处理”并说明缺少哪些上下文。")
+            lines.append(
+                "- 如果当前上下文不足以输出某个函数的完整可替换代码，必须不要把该函数列入“需要修改的函数”；"
+                "应放到“无法生成完整修复代码/需人工处理”并说明缺少哪些上下文。"
+            )
+            lines.append(
+                "- 仅当上文「函数源码」中已给出该函数的完整函数体时，才允许将其列入「需要修改的函数」并输出可替换代码；"
+                "禁止修改仅出现在分析文字、类骨架或不完整片段中的函数。"
+            )
             lines.append("- 禁止在修复函数中用注释表示保留原逻辑；所有未改动但仍需要保留的原代码也必须原样写出。")
         else:
             lines.append("**必须提供**：")

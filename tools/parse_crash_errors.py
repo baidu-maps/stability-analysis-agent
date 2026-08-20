@@ -46,6 +46,10 @@ def frame_has_usable_info(frame: Any) -> bool:
     addr = str(frame.get("address") or "").strip()
     if addr.lower().startswith("0x") and len(addr) > 2:
         return True
+    # Android tombstone 常见无 0x 前缀的 PC（如 000000000160b4dc）
+    addr_hex = addr.lower()[2:] if addr.lower().startswith("0x") else addr
+    if len(addr_hex) >= 6 and all(c in "0123456789abcdef" for c in addr_hex):
+        return True
     for key in ("function", "resolved_function"):
         if _meaningful_symbol(str(frame.get(key) or "")):
             return True

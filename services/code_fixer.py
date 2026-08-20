@@ -206,7 +206,10 @@ def _extracted_block_matches_signature(block: str, signature: str) -> bool:
         return False
     first = non_empty[0].strip()
     target_head = f"{owner}::{func_name}" if owner else func_name
-    if target_head not in first and not re.search(
+    if owner:
+        if target_head not in first:
+            return False
+    elif not re.search(
         rf"(?:^|\s){re.escape(func_name)}\s*(?:<[^>]*>)?\s*\(",
         first,
     ):
@@ -223,10 +226,56 @@ def _extracted_block_matches_signature(block: str, signature: str) -> bool:
     return True
 
 
+def _extract_owner_and_name(signature: str) -> Tuple[str, str]:
+    """从签名提取 (类名, 函数名)；无类作用域时类名为空。"""
+    text = str(signature or "")
+    m_owner = re.search(
+        r"([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)::\s*([~]?[A-Za-z_]\w*)\s*[\(<]",
+        text,
+    )
+    if m_owner:
+        return m_owner.group(1), m_owner.group(2)
+    return "", _extract_simple_function_name(text)
+
+
+def edit_allowed_by_prompt_complete_body(
+    signature: str,
+    code_context: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """提示词未给出完整函数体时拒绝自动改码。缺元数据则不拦截（兼容旧报告）。"""
+    if not isinstance(code_context, dict):
+        return None
+    diagnostics = code_context.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        return None
+    meta = diagnostics.get("prompt_context_meta")
+    if not isinstance(meta, dict) or "included_complete_signatures" not in meta:
+        return None
+    allowed = meta.get("included_complete_signatures")
+    if not isinstance(allowed, list):
+        return None
+    allowed_sigs = [str(item).strip() for item in allowed if str(item).strip()]
+    if not allowed_sigs:
+        return "提示词中没有完整函数体，已拒绝自动改码"
+    for item in allowed_sigs:
+        if signatures_match(item, signature):
+            return None
+    return "目标函数未在提示词中给出完整函数体，已拒绝写入"
+
+
 def signatures_match(candidate_sig: str, target_sig: str) -> bool:
     """改码时匹配候选函数：兼容模板/命名空间/签名空白差异。"""
     if not candidate_sig or not target_sig:
         return False
+    oa, na = _extract_owner_and_name(candidate_sig)
+    ob, nb = _extract_owner_and_name(target_sig)
+    if na and nb and na != nb:
+        return False
+    if oa and ob:
+        oa_tail = oa.split("::")[-1]
+        ob_tail = ob.split("::")[-1]
+        if oa != ob and oa_tail != ob_tail:
+            return False
     a = _normalize_signature_key(candidate_sig)
     b = _normalize_signature_key(target_sig)
     if a == b or (len(a) > 8 and a in b) or (len(b) > 8 and b in a):
@@ -239,6 +288,8 @@ def signatures_match(candidate_sig: str, target_sig: str) -> bool:
             or ma.group(1).endswith(mb.group(1).split("::")[-1])
             or mb.group(1).endswith(ma.group(1).split("::")[-1])
         )
+    if oa and ob:
+        return bool(na and nb and na == nb)
     sa = _extract_simple_function_name(candidate_sig)
     sb = _extract_simple_function_name(target_sig)
     return bool(sa and sb and sa == sb)
@@ -1278,6 +1329,13 @@ def _replacement_signature_compatible(target_signature: str, replacement_code: s
     block_name = _extract_signature_function_name(block_sig)
     if target_name and block_name and target_name != block_name:
         return False
+    target_owner, _ = _extract_owner_and_name(target_signature)
+    block_owner, _ = _extract_owner_and_name(block_sig)
+    if target_owner and block_owner:
+        t_tail = target_owner.split("::")[-1]
+        b_tail = block_owner.split("::")[-1]
+        if target_owner != block_owner and t_tail != b_tail:
+            return False
     if _target_is_destructor(target_signature):
         # 析构函数没有返回类型；`VBool Class::~Class()` 或 `VBool ~Class()` 都不可直接替换。
         if re.match(r"^\s*(?:[\w:<>,*&]+\s+)+[A-Za-z_]\w*::~[A-Za-z_]\w*\s*\(", block_sig):
@@ -1683,8 +1741,10 @@ class CodeFixer:
                         (
                             node
                             for node in candidate_nodes
-                            if _extract_simple_function_name(str(node.get("signature") or ""))
-                            == func_name.split("::")[-1]
+                            if signatures_match(
+                                str(node.get("signature") or ""),
+                                func_name if "(" in func_name else f"{func_name}()",
+                            )
                         ),
                         None,
                     )
@@ -2048,6 +2108,15 @@ class CodeFixer:
                 continue
             if not _is_valid_replacement_code(replacement_code):
                 record["error"] = "replacement_code 无效（含孤立括号或占位符）"
+                applied.append(record)
+                continue
+            if not _replacement_signature_compatible(signature, replacement_code):
+                record["error"] = "replacement_code 的类名/函数名与目标签名不一致，已拒绝写入"
+                applied.append(record)
+                continue
+            prompt_block = edit_allowed_by_prompt_complete_body(signature, code_context)
+            if prompt_block:
+                record["error"] = prompt_block
                 applied.append(record)
                 continue
             node = _find_candidate_node_for_edit(candidate_nodes, file_path, signature)

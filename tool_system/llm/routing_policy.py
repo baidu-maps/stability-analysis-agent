@@ -18,7 +18,7 @@ class RoutingContext:
 
     mode: str = "fixed"  # fixed|auto
     force_profile: Optional[str] = None  # CLI --llm-profile
-    prompt_mode: str = "analysis"  # analysis|fix
+    prompt_mode: str = "fix"  # analysis|fix
     apply_ai_fixes: bool = False
     agent_loop: str = "single"  # single|context_loop
     round_index: int = 0
@@ -32,13 +32,12 @@ def resolve_tier(ctx: RoutingContext) -> tuple:
         return force, f"cli_force_profile={force}"
 
     mode = str(ctx.mode or "fixed").strip().lower()
+    if str(ctx.agent_loop or "").strip().lower() == "context_loop" and int(ctx.round_index or 0) > 0:
+        return "fast", f"context_loop_round={ctx.round_index}"
     if str(ctx.prompt_mode or "").strip().lower() == "fix":
         return "strong", "prompt_mode=fix"
     if ctx.apply_ai_fixes:
         return "strong", "apply_ai_fixes=true"
-
-    if str(ctx.agent_loop or "").strip().lower() == "context_loop" and int(ctx.round_index or 0) > 0:
-        return "fast", f"context_loop_round={ctx.round_index}"
 
     diag = ctx.crash_diagnosis if isinstance(ctx.crash_diagnosis, dict) else {}
     compass = diag.get("evidence_compass") if isinstance(diag.get("evidence_compass"), dict) else {}

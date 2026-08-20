@@ -39,6 +39,7 @@ class CrashInfo:
     crash_address: Optional[str] = None
     category: Optional[str] = None  # 崩溃类别：native_crash / js_exception / java_exception / oom / anr / gpu_crash / ability_crash 等
     primary_language: Optional[str] = None  # 本次崩溃主语言/运行时，如 "cpp" / "java" / "arkts" / "objc"
+    abort_message: Optional[str] = None  # tombstone Abort message / LastFatalMessage
 
 @dataclass
 class MetaInfo:
@@ -191,6 +192,9 @@ def _maybe_filter_threads_by_library_dir(
         for fr in ts.frames:
             mod = fr.module if isinstance(fr.module, str) else None
             if match_libraries_for_module(mod, library_files):
+                kept.append(fr)
+            elif ts.is_crash_thread:
+                # 崩溃线程保留系统库帧（abort/Scudo），供后续 log_symbol 透传
                 kept.append(fr)
         if not kept:
             continue

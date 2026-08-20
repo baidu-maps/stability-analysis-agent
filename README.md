@@ -19,7 +19,7 @@
 <p align="center">
   <sub>
     <b>Maintenance:</b> actively maintained ·
-    <b>latest:</b> <a href="https://pypi.org/project/stability-analysis-agent/1.3.0/">v1.3.0</a>
+    <b>latest:</b> <a href="https://pypi.org/project/stability-analysis-agent/1.3.1/">v1.3.1</a>
     (evidence diagnosis <code>04a</code>–<code>04e</code>, ANR workflow, report renumbering) ·
     meaningful changes → <a href="https://github.com/baidu-maps/stability-analysis-agent/releases">GitHub Releases</a>
     (aim for about monthly when there is substance; not a calendar SLA) ·
