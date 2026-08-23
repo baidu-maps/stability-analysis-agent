@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
 import json
 import os
 import queue
@@ -117,6 +118,7 @@ class RunState:
     isolated_code_roots: List[str] = field(default_factory=list)
     workspace_manifest: Optional[str] = None
     patch_path: Optional[str] = None
+    last_progress: Optional[str] = None
 
     process: Optional[subprocess.Popen] = None
     events: "queue.Queue[RunEvent]" = field(default_factory=queue.Queue)
@@ -148,15 +150,192 @@ class RunManager:
         with self._lock:
             return dict(self._runs)
 
+    def discard(self, run_id: str) -> None:
+        """Drop a run that never entered the worker queue."""
+        with self._lock:
+            self._runs.pop(run_id, None)
+
 
 RUNS = RunManager()
 
 
-def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: Dict[str, Any]) -> None:
+def _env_int(name: str, default: int) -> int:
+    """Read a non-negative int from the environment."""
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+class SchedulerBusy(Exception):
+    """Raised when the in-memory run queue is full."""
+
+    def __init__(self, queued: int, max_queue: int) -> None:
+        self.queued = int(queued)
+        self.max_queue = int(max_queue)
+        super().__init__(f"run queue is full ({self.queued}/{self.max_queue})")
+
+
+@dataclass
+class _QueuedJob:
+    run: RunState
+    req: RunRequest
+    context: contextvars.Context
+
+
+class RunScheduler:
+    """Bounded worker pool: POST /runs enqueues, workers execute CLI subprocesses."""
+
+    def __init__(
+        self,
+        *,
+        max_workers: int = 2,
+        max_queue: int = 32,
+        run_timeout_sec: int = 0,
+    ) -> None:
+        self.max_workers = max(1, int(max_workers))
+        self.max_queue = max(1, int(max_queue))
+        self.run_timeout_sec = max(0, int(run_timeout_sec))
+        self._jobs: "queue.Queue[Optional[_QueuedJob]]" = queue.Queue()
+        self._pending = 0
+        self._active = 0
+        self._lock = threading.Lock()
+        self._started = False
+
+    def start(self) -> None:
+        """Start worker threads once."""
+        if self._started:
+            return
+        self._started = True
+        for index in range(self.max_workers):
+            threading.Thread(
+                target=self._loop,
+                name=f"sa-daemon-worker-{index}",
+                daemon=True,
+            ).start()
+
+    def snapshot(self) -> Dict[str, int]:
+        """Return queue counters for /health and GET /runs."""
+        with self._lock:
+            return {
+                "queued": int(self._pending),
+                "running": int(self._active),
+                "max_workers": int(self.max_workers),
+                "max_queue": int(self.max_queue),
+                "run_timeout_sec": int(self.run_timeout_sec),
+            }
+
+    def submit(self, run: RunState, req: RunRequest) -> None:
+        """Enqueue a run; copy ContextVar bindings from the HTTP thread."""
+        ctx = contextvars.copy_context()
+        with self._lock:
+            if self._pending >= self.max_queue:
+                raise SchedulerBusy(self._pending, self.max_queue)
+            self._pending += 1
+        self._jobs.put(_QueuedJob(run=run, req=req, context=ctx))
+
+    def _loop(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            with self._lock:
+                self._pending = max(0, self._pending - 1)
+            run = job.run
+            if run.status == "canceled":
+                self._jobs.task_done()
+                continue
+            with self._lock:
+                self._active += 1
+            try:
+                job.context.run(_run_worker, run, job.req)
+            finally:
+                with self._lock:
+                    self._active = max(0, self._active - 1)
+                self._jobs.task_done()
+
+
+SCHEDULER: Optional[RunScheduler] = None
+_SCHEDULER_LOCK = threading.Lock()
+
+
+def ensure_run_scheduler(
+    *,
+    max_workers: Optional[int] = None,
+    max_queue: Optional[int] = None,
+    run_timeout_sec: Optional[int] = None,
+) -> RunScheduler:
+    """Create the process-wide worker pool on first use."""
+    global SCHEDULER
+    with _SCHEDULER_LOCK:
+        if SCHEDULER is None:
+            SCHEDULER = RunScheduler(
+                max_workers=(
+                    int(max_workers)
+                    if max_workers is not None
+                    else _env_int("STABILITY_AGENT_DAEMON_MAX_WORKERS", 2)
+                ),
+                max_queue=(
+                    int(max_queue)
+                    if max_queue is not None
+                    else _env_int("STABILITY_AGENT_DAEMON_MAX_QUEUE", 32)
+                ),
+                run_timeout_sec=(
+                    int(run_timeout_sec)
+                    if run_timeout_sec is not None
+                    else _env_int("STABILITY_AGENT_DAEMON_RUN_TIMEOUT", 0)
+                ),
+            )
+            SCHEDULER.start()
+        return SCHEDULER
+
+
+def reset_run_scheduler_for_tests(
+    *,
+    max_workers: int = 2,
+    max_queue: int = 32,
+    run_timeout_sec: int = 0,
+) -> RunScheduler:
+    """Replace the process-wide pool. Test-only; in-flight jobs on the old pool are abandoned."""
+    global SCHEDULER
+    with _SCHEDULER_LOCK:
+        old = SCHEDULER
+        SCHEDULER = RunScheduler(
+            max_workers=max_workers,
+            max_queue=max_queue,
+            run_timeout_sec=run_timeout_sec,
+        )
+        SCHEDULER.start()
+        if old is not None:
+            for _ in range(old.max_workers):
+                old._jobs.put(None)
+        return SCHEDULER
+
+
+def _send_cors_headers(handler: BaseHTTPRequestHandler) -> None:
+    """Allow intranet digital-employee / browser clients to call the daemon."""
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+    handler.send_header("Access-Control-Max-Age", "600")
+
+
+def _json_response(
+    handler: BaseHTTPRequestHandler,
+    code: int,
+    payload: Dict[str, Any],
+    headers: Optional[Dict[str, str]] = None,
+) -> None:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(code)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(data)))
+    _send_cors_headers(handler)
+    for key, value in (headers or {}).items():
+        handler.send_header(key, value)
     handler.end_headers()
     handler.wfile.write(data)
 
@@ -167,10 +346,40 @@ def _read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
     return json.loads(raw.decode("utf-8") or "{}")
 
 
+_CLI_ANALYSIS_DEFAULTS = None
+
+
+def _cli_analysis_defaults():
+    """CLI `build_parser().parse_args([])` 的默认值，保证 daemon 省略旗标时与直接跑 CLI 一致。"""
+    global _CLI_ANALYSIS_DEFAULTS
+    if _CLI_ANALYSIS_DEFAULTS is None:
+        from cli.main import build_parser
+
+        _CLI_ANALYSIS_DEFAULTS = build_parser().parse_args([])
+    return _CLI_ANALYSIS_DEFAULTS
+
+
+def _append_nondefault_value(cmd: list, flag: str, value: Any, default: Any) -> None:
+    if value is None:
+        return
+    if default is not None and value == default:
+        return
+    cmd += [flag, str(value)]
+
+
+def _append_store_true(cmd: list, flag: str, value: bool, default: bool) -> None:
+    if bool(value) and not bool(default):
+        cmd += [flag]
+
+
 def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
     """
     将 RunRequest 转成 CLI 命令行参数。
     返回 (cmd, stdin_text)
+
+    与 CLI argparse 默认值对齐：请求未给或值等于 CLI 默认时不拼该旗标，
+    让子进程走 `cli/main.py` 的默认逻辑。daemon 仅额外固定
+    `--no-interactive --no-save-to-vector-db`（HTTP 非交互 + 写库走独立 API）。
     """
     cmd = [
         "python3",
@@ -179,32 +388,20 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
     ]
 
     stdin_text: Optional[str] = None
-
-    # consultation 模式
-    if req.consultation:
-        cmd += ["--consultation"]
-        if req.prompt:
-            cmd += ["--prompt", req.prompt]
-        if req.streaming:
-            cmd += ["--streaming"]
-        if req.config:
-            cmd += ["--config", req.config]
-        if req.output_format:
-            cmd += ["--output-format", req.output_format]
-        return cmd, None
+    defaults = _cli_analysis_defaults()
 
     # analysis 模式：crash_log_dir 优先；否则 file / content
     crash_log_dir = (getattr(req, "crash_log_dir", None) or "").strip()
     if crash_log_dir:
         cmd += ["--crash-log-dir", crash_log_dir]
     elif req.crash_log_content is not None:
-        cmd += ["--crash-log", "-"]
+        cmd += ["--crash-log-file", "-"]
         stdin_text = req.crash_log_content
     elif req.crash_log:
-        cmd += ["--crash-log", req.crash_log]
+        cmd += ["--crash-log-file", req.crash_log]
     else:
         # 交给 CLI 自己报错
-        cmd += ["--crash-log", ""]
+        cmd += ["--crash-log-file", ""]
 
     if req.library_dir:
         cmd += ["--library-dir", req.library_dir]
@@ -213,48 +410,77 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
     if req.config:
         cmd += ["--config", req.config]
 
-    if req.output_format:
-        cmd += ["--output-format", req.output_format]
+    output_format = req.output_format or getattr(defaults, "output_format", "markdown")
+    if output_format != getattr(defaults, "output_format", "markdown"):
+        cmd += ["--output-format", output_format]
 
     engine = str(getattr(req, "engine", None) or "direct")
     if engine == "sequential":
         engine = "direct"
-    if engine and engine != "direct":
+    default_engine = str(getattr(defaults, "engine", "direct") or "direct")
+    if engine and engine != default_engine:
         cmd += ["--engine", engine]
 
     scope = str(getattr(req, "scope", "full") or "full")
-    if scope and scope != "full":
+    default_scope = str(getattr(defaults, "scope", "full") or "full")
+    if scope and scope != default_scope:
         cmd += ["--scope", scope]
     prompt_mode = str(getattr(req, "prompt_mode", "fix") or "fix")
-    if prompt_mode and prompt_mode != "fix":
+    default_prompt_mode = str(getattr(defaults, "prompt_mode", "fix") or "fix")
+    if prompt_mode and prompt_mode != default_prompt_mode:
         cmd += ["--prompt-mode", prompt_mode]
     agent_loop = getattr(req, "agent_loop", None)
     if agent_loop in {"single", "context_loop"}:
         cmd += ["--agent-loop", str(agent_loop)]
-    max_rounds = int(getattr(req, "max_agent_rounds", 1) or 1)
-    if max_rounds != 1:
-        cmd += ["--max-agent-rounds", str(max_rounds)]
-    max_context_requests = int(getattr(req, "max_context_requests_per_round", 5) or 5)
-    if max_context_requests != 5:
-        cmd += ["--max-context-requests-per-round", str(max_context_requests)]
-    if req.optimized:
-        cmd += ["--optimized"]
-    if req.streaming:
+
+    default_max_rounds = int(getattr(defaults, "max_agent_rounds", 0) or 0)
+    if req.max_agent_rounds is not None and int(req.max_agent_rounds) != default_max_rounds:
+        cmd += ["--max-agent-rounds", str(int(req.max_agent_rounds))]
+    default_max_ctx = int(getattr(defaults, "max_context_requests_per_round", 5) or 5)
+    if (
+        req.max_context_requests_per_round is not None
+        and int(req.max_context_requests_per_round) != default_max_ctx
+    ):
+        cmd += ["--max-context-requests-per-round", str(int(req.max_context_requests_per_round))]
+
+    _append_store_true(cmd, "--optimized", bool(req.optimized), bool(getattr(defaults, "optimized", False)))
+    if req.streaming is True:
         cmd += ["--streaming"]
+    elif req.streaming is False:
+        cmd += ["--no-streaming"]
 
-    if not bool(getattr(req, "apply_ai_fixes", True)):
-        cmd += ["--no-apply-ai-fixes"]
-    if not bool(getattr(req, "backup_original_sources", True)):
-        cmd += ["--no-backup-original-sources"]
+    if bool(getattr(req, "apply_ai_fixes", True)) != bool(getattr(defaults, "apply_ai_fixes", True)):
+        cmd += ["--apply-ai-fixes" if req.apply_ai_fixes else "--no-apply-ai-fixes"]
+    if bool(getattr(req, "backup_original_sources", True)) != bool(
+        getattr(defaults, "backup_original_sources", True)
+    ):
+        cmd += [
+            "--backup-original-sources"
+            if req.backup_original_sources
+            else "--no-backup-original-sources"
+        ]
 
-    if bool(getattr(req, "force_disassembly", False)):
-        cmd += ["--force-disassembly"]
-    if bool(getattr(req, "force_anr_analysis", False)):
-        cmd += ["--force-anr-analysis"]
-    if bool(getattr(req, "force_memory_analysis", False)):
-        cmd += ["--force-memory-analysis"]
-    if bool(getattr(req, "force_timeline_analysis", False)):
-        cmd += ["--force-timeline-analysis"]
+    _append_store_true(
+        cmd, "--force-disassembly", bool(req.force_disassembly), bool(getattr(defaults, "force_disassembly", False))
+    )
+    _append_store_true(
+        cmd,
+        "--force-anr-analysis",
+        bool(req.force_anr_analysis),
+        bool(getattr(defaults, "force_anr_analysis", False)),
+    )
+    _append_store_true(
+        cmd,
+        "--force-memory-analysis",
+        bool(req.force_memory_analysis),
+        bool(getattr(defaults, "force_memory_analysis", False)),
+    )
+    _append_store_true(
+        cmd,
+        "--force-timeline-analysis",
+        bool(req.force_timeline_analysis),
+        bool(getattr(defaults, "force_timeline_analysis", False)),
+    )
 
     native_leak_dir = getattr(req, "native_leak_dir", None)
     if native_leak_dir:
@@ -269,8 +495,79 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
     llm_profile = getattr(req, "llm_profile", None)
     if llm_profile in {"default", "strong", "fast"}:
         cmd += ["--llm-profile", str(llm_profile)]
-    if bool(getattr(req, "include_memory_in_05", False)):
-        cmd += ["--include-memory-in-05"]
+    if bool(getattr(req, "include_memory_in_05", False)) != bool(
+        getattr(defaults, "include_memory_in_05", False)
+    ):
+        cmd += ["--include-memory-in-05" if req.include_memory_in_05 else "--no-include-memory-in-05"]
+
+    _append_nondefault_value(cmd, "--vector-db-path", req.vector_db_path, getattr(defaults, "vector_db_path", None))
+    _append_nondefault_value(
+        cmd,
+        "--vector-db-max-results",
+        req.vector_db_max_results,
+        getattr(defaults, "vector_db_max_results", None),
+    )
+    _append_store_true(
+        cmd,
+        "--vector-db-record-usage",
+        bool(req.vector_db_record_usage),
+        bool(getattr(defaults, "vector_db_record_usage", False)),
+    )
+    _append_nondefault_value(
+        cmd,
+        "--rule-confidence-threshold",
+        req.rule_confidence_threshold,
+        getattr(defaults, "rule_confidence_threshold", None),
+    )
+    _append_store_true(
+        cmd, "--use-ctags-index", bool(req.use_ctags_index), bool(getattr(defaults, "use_ctags_index", False))
+    )
+    _append_nondefault_value(
+        cmd,
+        "--max-sibling-member-functions",
+        req.max_sibling_member_functions,
+        getattr(defaults, "max_sibling_member_functions", None),
+    )
+    _append_nondefault_value(
+        cmd,
+        "--max-stack-frames-symbol-enrich",
+        req.max_stack_frames_symbol_enrich,
+        getattr(defaults, "max_stack_frames_symbol_enrich", None),
+    )
+    _append_nondefault_value(
+        cmd,
+        "--max-stack-frames-in-prompt",
+        req.max_stack_frames_in_prompt,
+        getattr(defaults, "max_stack_frames_in_prompt", None),
+    )
+    _append_nondefault_value(
+        cmd,
+        "--max-shared-var-related-functions",
+        req.max_shared_var_related_functions,
+        getattr(defaults, "max_shared_var_related_functions", None),
+    )
+    _append_nondefault_value(
+        cmd,
+        "--min-key-read-related-functions",
+        req.min_key_read_related_functions,
+        getattr(defaults, "min_key_read_related_functions", None),
+    )
+    _append_nondefault_value(
+        cmd,
+        "--code-context-timeout-sec",
+        req.code_context_timeout_sec,
+        getattr(defaults, "code_context_timeout_sec", None),
+    )
+    _append_nondefault_value(
+        cmd,
+        "--find-source-timeout-sec",
+        req.find_source_timeout_sec,
+        getattr(defaults, "find_source_timeout_sec", None),
+    )
+    for module in req.plugin_modules or []:
+        module_text = str(module or "").strip()
+        if module_text:
+            cmd += ["--plugin-module", module_text]
 
     cmd += ["--no-interactive", "--no-save-to-vector-db"]
 
@@ -316,6 +613,7 @@ def _emit_stdout_line(run: RunState, stdout_acc: list[str], line: str) -> None:
     text = line.rstrip("\n")
     stdout_acc.append(text + "\n")
     _capture_report_dir_from_line(run, text)
+    _capture_progress(run, text)
     if text.startswith("AI_STREAM_DATA:"):
         payload_text = text[len("AI_STREAM_DATA:"):].strip()
         try:
@@ -413,6 +711,8 @@ def _write_run_workspace_artifacts(run: RunState, workspace) -> None:
 
 
 def _run_worker(run: RunState, req: RunRequest) -> None:
+    if run.status == "canceled":
+        return
     run.status = "running"
     run.started_at = time.time()
     run.events.put(RunEvent(run.run_id, "run_started", {"request": req.to_dict()}))
@@ -472,6 +772,7 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
                     if not line:
                         break
                     _capture_report_dir_from_line(run, line)
+                    _capture_progress(run, line.rstrip("\n"))
                     run.events.put(RunEvent(run.run_id, "stderr", {"line": line.rstrip("\n")}))
             except Exception as e:
                 run.events.put(RunEvent(run.run_id, "stream_error", {"which": "stderr", "error": str(e)}))
@@ -481,7 +782,7 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
         t_out.start()
         t_err.start()
 
-        exit_code = p.wait()
+        exit_code = _wait_cli_process(p, run)
         run.exit_code = exit_code
         run.finished_at = time.time()
 
@@ -503,12 +804,18 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
         run.status = status
 
         output_text = "".join(stdout_acc)
+        if run.status == "canceled":
+            result_error = run.error or "canceled"
+        elif exit_code == 0:
+            result_error = None
+        else:
+            result_error = f"process exit {exit_code}"
         run.result = RunResult(
             run_id=run.run_id,
             status=run.status,
             output_format=req.output_format,
             output=output_text,
-            error=None if exit_code == 0 else f"process exit {exit_code}",
+            error=result_error,
         )
         if workspace is not None:
             try:
@@ -527,15 +834,228 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
         run.events.put(RunEvent(run.run_id, "run_finished", {"status": run.status, "exit_code": run.exit_code}))
 
 
+def _wait_cli_process(process: subprocess.Popen, run: RunState) -> int:
+    """Wait for the CLI subprocess, optionally enforcing a run timeout."""
+    timeout = int(SCHEDULER.run_timeout_sec) if SCHEDULER is not None else 0
+    if timeout <= 0:
+        return int(process.wait())
+    try:
+        return int(process.wait(timeout=timeout))
+    except subprocess.TimeoutExpired:
+        run.status = "canceled"
+        run.error = f"run timed out after {timeout}s"
+        try:
+            process.terminate()
+        except Exception:
+            pass
+        time.sleep(0.2)
+        if process.poll() is None:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        try:
+            return int(process.wait(timeout=10))
+        except subprocess.TimeoutExpired:
+            return -15
+
+
+_REPORT_MARKS = ("# 崩溃分析结果", "# Crash Analysis Result", "# Crash analysis")
+
+
+def _capture_progress(run: RunState, text: str) -> None:
+    """Keep the latest human-readable stage line for GET /status."""
+    stripped = str(text or "").strip()
+    if not stripped:
+        return
+    if (
+        stripped.startswith("[阶段")
+        or stripped.startswith("[sdk-release]")
+        or stripped.startswith("ERROR:")
+    ):
+        run.last_progress = stripped[:500]
+
+
+def _extract_report(output: str) -> str:
+    """Strip SDK-status preface; keep the Markdown report body."""
+    text = str(output or "")
+    for mark in _REPORT_MARKS:
+        index = text.find(mark)
+        if index >= 0:
+            return text[index:]
+    return text
+
+
+def _queue_position(run: RunState) -> Optional[int]:
+    """1-based position among currently queued runs, or None if not queued."""
+    if run.status != "queued":
+        return None
+    ahead = 0
+    for other in RUNS.list().values():
+        if other.status == "queued" and other.created_at <= run.created_at:
+            ahead += 1
+    return ahead
+
+
+def _status_message(run: RunState) -> str:
+    """Short Chinese summary for digital-employee polling."""
+    if run.status == "queued":
+        position = _queue_position(run)
+        if position:
+            return f"排队中（第 {position} 位）"
+        return "排队等待执行"
+    if run.status == "running":
+        return run.last_progress or "分析进行中"
+    if run.status == "done":
+        return "分析完成"
+    if run.status == "canceled":
+        return run.error or "已取消"
+    return run.error or "分析失败"
+
+
+def _run_links(run_id: str) -> Dict[str, str]:
+    """Public URLs for status / result / cancel (short aliases + canonical)."""
+    return {
+        "status": f"/status/{run_id}",
+        "result": f"/result/{run_id}",
+        "cancel": f"/cancel/{run_id}",
+        "events": f"/runs/{run_id}/events",
+    }
+
+
+def _single_id_path(path: str, prefix: str) -> Optional[str]:
+    """Return the id if path is exactly ``{prefix}{id}`` with one segment."""
+    if not path.startswith(prefix):
+        return None
+    rest = path[len(prefix):].strip("/")
+    if not rest or "/" in rest:
+        return None
+    return rest
+
+
+def _run_public_dict(run: RunState) -> Dict[str, Any]:
+    """JSON view of a run for GET /runs, GET /runs/<id> and GET /status/<id>."""
+    return {
+        "run_id": run.run_id,
+        "status": run.status,
+        "message": _status_message(run),
+        "progress": run.last_progress,
+        "queue_position": _queue_position(run),
+        "created_at": run.created_at,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "exit_code": run.exit_code,
+        "error": run.error,
+        "output_format": run.output_format,
+        "report_dir": run.report_dir,
+        "workspace_dir": run.workspace_dir,
+        "original_code_roots": run.original_code_roots,
+        "isolated_code_roots": run.isolated_code_roots,
+        "workspace_manifest": run.workspace_manifest,
+        "patch_path": run.patch_path,
+        "links": _run_links(run.run_id),
+    }
+
+
+def _result_public_dict(run: RunState) -> Dict[str, Any]:
+    """JSON view of a finished run, including a cleaned ``report`` field."""
+    payload = run.result.to_dict() if run.result is not None else {}
+    output = str(payload.get("output") or "")
+    payload["report"] = _extract_report(output)
+    payload["links"] = _run_links(run.run_id)
+    return payload
+
+
+def _respond_status(handler: BaseHTTPRequestHandler, run_id: str) -> None:
+    """GET /status/{id} and GET /runs/{id}."""
+    run = RUNS.get(run_id)
+    if not run:
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
+        return
+    _json_response(handler, HTTPStatus.OK, _run_public_dict(run))
+
+
+def _respond_result(handler: BaseHTTPRequestHandler, run_id: str) -> None:
+    """GET /result/{id} and GET /runs/{id}/result."""
+    run = RUNS.get(run_id)
+    if not run:
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
+        return
+    if not run.result:
+        _json_response(
+            handler,
+            HTTPStatus.ACCEPTED,
+            {
+                "status": run.status,
+                "message": _status_message(run),
+                "progress": run.last_progress,
+            },
+        )
+        return
+    _json_response(handler, HTTPStatus.OK, _result_public_dict(run))
+
+
+def _respond_cancel(handler: BaseHTTPRequestHandler, run_id: str) -> None:
+    """POST /cancel/{id} and POST /runs/{id}/cancel."""
+    run = RUNS.get(run_id)
+    if not run:
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
+        return
+    try:
+        _cancel_run(run)
+    except Exception as exc:
+        _json_response(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+        return
+    _json_response(
+        handler,
+        HTTPStatus.OK,
+        {"run_id": run_id, "status": run.status, "message": _status_message(run)},
+    )
+
+
+def _scheduler_snapshot() -> Dict[str, int]:
+    """Queue counters; start the pool lazily so /health works before the first POST."""
+    return ensure_run_scheduler().snapshot()
+
+
+def _cancel_run(run: RunState) -> None:
+    """Cancel a queued job in-place, or terminate a running CLI subprocess."""
+    if run.status == "queued":
+        run.status = "canceled"
+        run.finished_at = time.time()
+        run.error = "canceled before start"
+        run.result = RunResult(
+            run_id=run.run_id,
+            status="canceled",
+            output_format=run.output_format,
+            output="",
+            error=run.error,
+        )
+        run.events.put(RunEvent(run.run_id, "run_canceled", {"phase": "queued"}))
+        run.events.put(
+            RunEvent(run.run_id, "run_finished", {"status": "canceled", "exit_code": None})
+        )
+        return
+    if run.process and run.status == "running":
+        run.process.terminate()
+        time.sleep(0.2)
+        if run.process.poll() is None:
+            run.process.kill()
+        run.status = "canceled"
+        run.finished_at = time.time()
+        run.events.put(RunEvent(run.run_id, "run_canceled", {"phase": "running"}))
+
+
 def _start_run(req_dict: Dict[str, Any]) -> RunState:
+    """Enqueue a run on the worker pool. Copies HTTP-thread ContextVars into the worker."""
+    scheduler = ensure_run_scheduler()
     req = run_request_from_dict(req_dict)
     run = RUNS.create_run(req)
-
-    def worker():
-        _run_worker(run, req)
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
+    try:
+        scheduler.submit(run, req)
+    except SchedulerBusy:
+        RUNS.discard(run.run_id)
+        raise
     return run
 
 
@@ -787,16 +1307,15 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
 
         if path == "/health":
-            _json_response(
-                self,
-                HTTPStatus.OK,
-                {
-                    "ok": True,
-                    "protocol_version": PROTOCOL_VERSION,
-                    "pid": os.getpid(),
-                    "web_ui": True,
-                },
-            )
+            payload = {
+                "ok": True,
+                "service": "stability-analysis-agent",
+                "protocol_version": PROTOCOL_VERSION,
+                "pid": os.getpid(),
+                "web_ui": True,
+            }
+            payload.update(_scheduler_snapshot())
+            _json_response(self, HTTPStatus.OK, payload)
             return
 
         if _handle_skills_get(self, path):
@@ -814,6 +1333,14 @@ class Handler(BaseHTTPRequestHandler):
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
             return
 
+        if path == "/runs":
+            items = [_run_public_dict(run) for run in RUNS.list().values()]
+            items.sort(key=lambda item: float(item.get("created_at") or 0), reverse=True)
+            payload = {"runs": items}
+            payload.update(_scheduler_snapshot())
+            _json_response(self, HTTPStatus.OK, payload)
+            return
+
         if path.startswith("/runs/") and path.endswith("/events"):
             run_id = path.split("/")[2]
             run = RUNS.get(run_id)
@@ -825,6 +1352,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
+            _send_cors_headers(self)
             self.end_headers()
 
             hello = RunEvent(run_id, "events_opened", {}).to_dict()
@@ -848,50 +1376,45 @@ class Handler(BaseHTTPRequestHandler):
                     break
             return
 
+        result_id = _single_id_path(path, "/result/")
+        if result_id:
+            _respond_result(self, result_id)
+            return
+
+        status_id = _single_id_path(path, "/status/")
+        if status_id:
+            _respond_status(self, status_id)
+            return
+
+        cancel_id = _single_id_path(path, "/cancel/")
+        if cancel_id:
+            _json_response(
+                self,
+                HTTPStatus.METHOD_NOT_ALLOWED,
+                {"error": "method_not_allowed", "hint": f"POST /cancel/{cancel_id}"},
+            )
+            return
+
         if path.startswith("/runs/") and path.endswith("/result"):
             run_id = path.split("/")[2]
-            run = RUNS.get(run_id)
-            if not run:
-                _json_response(self, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
-                return
-            if not run.result:
-                _json_response(self, HTTPStatus.ACCEPTED, {"status": run.status})
-                return
-            _json_response(self, HTTPStatus.OK, run.result.to_dict())
+            _respond_result(self, run_id)
             return
 
         if path.startswith("/runs/"):
             run_id = path.split("/")[2]
-            run = RUNS.get(run_id)
-            if not run:
-                _json_response(self, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
-                return
-            _json_response(
-                self,
-                HTTPStatus.OK,
-                {
-                    "run_id": run.run_id,
-                    "status": run.status,
-                    "created_at": run.created_at,
-                    "started_at": run.started_at,
-                    "finished_at": run.finished_at,
-                    "exit_code": run.exit_code,
-                    "error": run.error,
-                    "output_format": run.output_format,
-                    "report_dir": run.report_dir,
-                    "workspace_dir": run.workspace_dir,
-                    "original_code_roots": run.original_code_roots,
-                    "isolated_code_roots": run.isolated_code_roots,
-                    "workspace_manifest": run.workspace_manifest,
-                    "patch_path": run.patch_path,
-                },
-            )
+            _respond_status(self, run_id)
             return
 
         if _serve_web_static(self, path):
             return
 
         _json_response(self, HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        _send_cors_headers(self)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
@@ -900,30 +1423,40 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = _read_json_body(self)
                 run = _start_run(body)
-                _json_response(self, HTTPStatus.OK, {"run_id": run.run_id})
+                links = _run_links(run.run_id)
+                _json_response(
+                    self,
+                    HTTPStatus.OK,
+                    {
+                        "run_id": run.run_id,
+                        "status": run.status,
+                        "message": _status_message(run),
+                        "links": links,
+                    },
+                )
+            except SchedulerBusy as exc:
+                _json_response(
+                    self,
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    {
+                        "error": "queue_full",
+                        "queued": exc.queued,
+                        "max_queue": exc.max_queue,
+                    },
+                    headers={"Retry-After": "5"},
+                )
             except Exception as e:
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(e)})
             return
 
+        cancel_id = _single_id_path(path, "/cancel/")
+        if cancel_id:
+            _respond_cancel(self, cancel_id)
+            return
+
         if path.startswith("/runs/") and path.endswith("/cancel"):
             run_id = path.split("/")[2]
-            run = RUNS.get(run_id)
-            if not run:
-                _json_response(self, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
-                return
-            if run.process and run.status == "running":
-                try:
-                    run.process.terminate()
-                    time.sleep(0.2)
-                    if run.process.poll() is None:
-                        run.process.kill()
-                    run.status = "canceled"
-                    run.finished_at = time.time()
-                    run.events.put(RunEvent(run_id, "run_canceled", {}))
-                except Exception as e:
-                    _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
-                    return
-            _json_response(self, HTTPStatus.OK, {"run_id": run_id, "status": run.status})
+            _respond_cancel(self, run_id)
             return
 
         if _handle_run_vector_db_commit(self, path):
@@ -988,7 +1521,30 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Stability Analysis Agent Local Daemon (HTTP)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=_env_int("STABILITY_AGENT_DAEMON_MAX_WORKERS", 2),
+        help="Max concurrent CLI subprocesses (env STABILITY_AGENT_DAEMON_MAX_WORKERS)",
+    )
+    parser.add_argument(
+        "--max-queue",
+        type=int,
+        default=_env_int("STABILITY_AGENT_DAEMON_MAX_QUEUE", 32),
+        help="Max queued runs waiting for a worker (env STABILITY_AGENT_DAEMON_MAX_QUEUE)",
+    )
+    parser.add_argument(
+        "--run-timeout",
+        type=int,
+        default=_env_int("STABILITY_AGENT_DAEMON_RUN_TIMEOUT", 0),
+        help="Seconds before a running CLI is killed; 0 disables (env STABILITY_AGENT_DAEMON_RUN_TIMEOUT)",
+    )
     args = parser.parse_args()
+    ensure_run_scheduler(
+        max_workers=args.max_workers,
+        max_queue=args.max_queue,
+        run_timeout_sec=args.run_timeout,
+    )
 
     try:
         from cli.report_paths import ensure_reports_migrated
@@ -1005,9 +1561,16 @@ def main() -> int:
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
+    snap = ensure_run_scheduler().snapshot()
     print(f"daemon listening on http://{args.host}:{args.port} (protocol={PROTOCOL_VERSION})")
-    print(f"  Web UI:         http://{args.host}:{args.port}/")
-    print(f"  Run API:         POST /runs  GET /runs/<id>  GET /runs/<id>/events  POST /runs/<id>/cancel")
+    print(
+        f"  Workers:         max_workers={snap['max_workers']} max_queue={snap['max_queue']} "
+        f"run_timeout_sec={snap['run_timeout_sec']}"
+    )
+    print("  Web UI:         http://{}/".format(f"{args.host}:{args.port}"))
+    print("  Run API:         POST /runs")
+    print("                   GET /health  GET /status/<id>  GET /result/<id>  POST /cancel/<id>")
+    print("                   GET /runs  GET /runs/<id>  GET /runs/<id>/events  POST /runs/<id>/cancel")
     print("                   POST /runs/<id>/vector-db/commit")
     print("  Web preferences: GET/POST /web/preferences")
     print("  Skills API:      GET /skills  GET /skills/<name>")

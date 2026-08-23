@@ -530,6 +530,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     "code_context_timeout_sec",
                     "max_nearby_module_scan_files",
                     "max_prompt_stack_frame_functions",
+                    "max_stack_frames_symbol_enrich",
+                    "max_stack_frames_in_prompt",
                     "max_crash_caller_search_files",
                     "_code_index_service",
                     "use_ctags_index",

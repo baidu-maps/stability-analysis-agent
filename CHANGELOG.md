@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-08-23
+
+### Changed
+
+- **Daemon HTTP 与 CLI 对齐**：`POST /runs` 的 `RunRequest` 透传分析主流程参数；省略字段时沿用 CLI argparse 默认值（不再覆盖 `max_agent_rounds` / `streaming` 等）。新增 `max_stack_frames_symbol_enrich`（默认 8）与 `max_stack_frames_in_prompt`（默认 4）。同类兄弟函数 `--max-sibling-member-functions` 默认改为 0。
+- **提示词栈帧裁剪**：栈顶符号补全默认 8 帧，提示词纳入工程栈帧默认 4 帧；可通过 CLI / HTTP 覆盖（范围 2～16）。
+
+### Documentation
+
+- README / PyPI 发布说明中的最新版本号更新为 1.3.2。
+- Daemon / CLI 参考文档同步 HTTP 字段与默认值语义。
+
 ## [1.3.1] - 2026-08-20
 
 ### Changed

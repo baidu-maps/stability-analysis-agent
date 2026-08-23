@@ -98,10 +98,24 @@ class TestPromptContextFilter(unittest.TestCase):
         sigs = [(r["node"] or {}).get("signature") for r in included]
         self.assertEqual(sigs, ["Crash::hit()"])
 
-    def test_resolve_options_defaults(self):
+    def test_resolve_options_defaults(self) -> None:
+        from tools._prompt_context_filter import (
+            DEFAULT_MAX_STACK_FRAMES_IN_PROMPT,
+            DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH,
+        )
+
         opts = resolve_prompt_filter_options(None, None)
         self.assertEqual(opts.max_functions_in_prompt, 0)
-        self.assertEqual(opts.max_stack_frames_in_prompt, 8)
+        self.assertEqual(opts.max_stack_frames_in_prompt, 4)
+        self.assertEqual(DEFAULT_MAX_STACK_FRAMES_IN_PROMPT, 4)
+        self.assertEqual(DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH, 8)
+
+    def test_resolve_options_from_problem(self) -> None:
+        opts = resolve_prompt_filter_options(
+            None,
+            {"max_stack_frames_in_prompt": 6},
+        )
+        self.assertEqual(opts.max_stack_frames_in_prompt, 6)
 
     def test_resolve_options_from_code_context(self):
         opts = resolve_prompt_filter_options(

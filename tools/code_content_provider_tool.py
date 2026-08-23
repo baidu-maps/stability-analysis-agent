@@ -16,6 +16,10 @@ from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from tools._prompt_context_filter import (
+    DEFAULT_MAX_STACK_FRAMES_IN_PROMPT,
+    DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH,
+)
 from tools._stack_symbol_utils import sanitize_stack_symbol
 from tools.code_context_errors import (
     CodeContextUserError,
@@ -345,6 +349,8 @@ class CodeContentProvider:
                  max_shared_var_related_functions: Optional[int] = None,
                  min_key_read_related_functions: Optional[int] = None,
                  max_sibling_member_functions: Optional[int] = None,
+                 max_stack_frames_symbol_enrich: Optional[int] = None,
+                 max_stack_frames_in_prompt: Optional[int] = None,
                  max_symbol_only_rescues: Optional[int] = None,
                  find_source_timeout_sec: Optional[float] = None,
                  code_context_timeout_sec: Optional[float] = None,
@@ -364,6 +370,8 @@ class CodeContentProvider:
             max_shared_var_related_functions: 共享变量相关函数记录最多保留条数，默认 20，至少 1，上限 512
             min_key_read_related_functions: 共享变量相关函数截断时，关键读路径最少保留条数（默认 2，允许 0）
             max_sibling_member_functions: 同类「兄弟成员函数」最多纳入条数；默认 0（关闭，大库避免图膨胀），>0 时启用并截断
+            max_stack_frames_symbol_enrich: 栈顶最多几帧补齐 file:line；默认 8，范围 2～16
+            max_stack_frames_in_prompt: 提示词最多纳入的工程栈帧数；默认 4，范围 2～16
             max_symbol_only_rescues: add2line 缺失 file:line 时，按符号名兜底定位的最多尝试帧数，默认 5，允许 0（关闭）
             find_source_timeout_sec: 单次 _find_source_file 总超时（秒）；None 表示 600
             code_context_timeout_sec: 第三步整阶段 wall-clock 上限（秒）；None 表示 360；0 表示不限制
@@ -392,6 +400,18 @@ class CodeContentProvider:
         self.min_key_read_related_functions = max(0, min(_mkr, 64))
         _sib = 0 if max_sibling_member_functions is None else int(max_sibling_member_functions)
         self.max_sibling_member_functions = max(0, min(_sib, 512))
+        _mse = (
+            DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH
+            if max_stack_frames_symbol_enrich is None
+            else int(max_stack_frames_symbol_enrich)
+        )
+        self.max_stack_frames_symbol_enrich = max(2, min(_mse, 16))
+        _msp = (
+            DEFAULT_MAX_STACK_FRAMES_IN_PROMPT
+            if max_stack_frames_in_prompt is None
+            else int(max_stack_frames_in_prompt)
+        )
+        self.max_stack_frames_in_prompt = max(2, min(_msp, 16))
         _msr = 5 if max_symbol_only_rescues is None else int(max_symbol_only_rescues)
         self.max_symbol_only_rescues = max(0, min(_msr, 512))
         
@@ -8815,7 +8835,7 @@ class CodeContentProvider:
         resolved_frames: List[Dict[str, Any]],
         code_roots: List[str],
         *,
-        max_frames: int = 8,
+        max_frames: int = DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH,
     ) -> None:
         """
         为栈顶若干帧补齐 file:line（已符号化但无 addr2line 行号时），
@@ -9193,8 +9213,8 @@ class CodeContentProvider:
                 else 8
             ),
             "max_functions_in_prompt": 0,
-            "max_stack_frames_symbol_enrich": 12,
-            "max_stack_frames_in_prompt": 8,
+            "max_stack_frames_symbol_enrich": int(getattr(self, "max_stack_frames_symbol_enrich", DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH)),
+            "max_stack_frames_in_prompt": int(getattr(self, "max_stack_frames_in_prompt", DEFAULT_MAX_STACK_FRAMES_IN_PROMPT)),
             "max_crash_caller_search_files": int(
                 getattr(self, "max_crash_caller_search_files", 600) or 600
             ),
@@ -10387,7 +10407,9 @@ class CodeContentProvider:
                     _rf_list = flatten_resolved_frames_from_stack(add2line_data)
                     if _rf_list:
                         self._enrich_resolved_frames_symbol_locations(
-                            _rf_list, code_roots_abs_strs, max_frames=8
+                            _rf_list,
+                            code_roots_abs_strs,
+                            max_frames=int(getattr(self, "max_stack_frames_symbol_enrich", DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH)),
                         )
                     thread_context = self._analyze_thread_context(add2line_data)
                 except _CodeContextPhaseTimeout:
@@ -10711,10 +10733,19 @@ class CodeContentProviderTool(BaseTool):
                     "max_sibling_member_functions": {
                         "type": "integer",
                         "description": (
-                            "同类兄弟成员函数最大条数；0=关闭。"
-                            "CLI 默认 12，工具直调未传时仍为 0。"
+                            "同类兄弟成员函数最大条数；0=关闭（CLI 与工具直调默认均为 0）。"
                         ),
                         "default": 0,
+                    },
+                    "max_stack_frames_symbol_enrich": {
+                        "type": "integer",
+                        "description": "栈顶最多几帧补齐 file:line；默认 8，范围 2～16。",
+                        "default": 8,
+                    },
+                    "max_stack_frames_in_prompt": {
+                        "type": "integer",
+                        "description": "提示词最多纳入的工程栈帧数；默认 4，范围 2～16。",
+                        "default": 4,
                     },
                     "max_direct_callers": {"type": "integer", "description": "静态直接调用者候选上限（可选）"},
                     "max_shared_var_related_functions": {"type": "integer", "description": "共享变量关联函数上限（可选）"},
@@ -10772,6 +10803,8 @@ class CodeContentProviderTool(BaseTool):
             "min_key_read_related_functions",
             "max_static_call_chain_depth",
             "max_symbol_only_rescues",
+            "max_stack_frames_symbol_enrich",
+            "max_stack_frames_in_prompt",
         ):
             _v = _maybe_int(input_data, _k)
             if _v is not None:

@@ -54,7 +54,7 @@ python3 -m unittest discover -s test/daemon -v
 
 | 文件 | 覆盖点 |
 |------|--------|
-| `test_build_cli_cmd.py` | `RunRequest` → `cli/main.py` 参数透传（含 Web 非交互写库旗标） |
+| `test_build_cli_cmd.py` | `RunRequest` → `cli/main.py` 参数透传（默认值对齐 CLI argparse；显式超时/插件/向量库；Web 非交互写库旗标） |
 | `test_vector_db_commit_api.py` | `POST /runs/<id>/vector-db/commit`、`report_dir` |
 | `test_skills_api.py` | `GET/POST /skills*`、仅已安装列表 |
 | `test_web_preferences.py` | `web_preferences.json` 工作区、skill 开关、`vector_db` |

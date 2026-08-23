@@ -161,6 +161,8 @@ class FullStabilityAnalyzer:
         max_direct_callers: Optional[int] = None,
         max_shared_var_related_functions: Optional[int] = None,
         max_sibling_member_functions: Optional[int] = None,
+        max_stack_frames_symbol_enrich: Optional[int] = None,
+        max_stack_frames_in_prompt: Optional[int] = None,
         max_symbol_only_rescues: Optional[int] = None,
         find_source_timeout_sec: Optional[float] = None,
         code_context_timeout_sec: Optional[float] = None,
@@ -172,6 +174,8 @@ class FullStabilityAnalyzer:
         self.max_direct_callers = max_direct_callers
         self.max_shared_var_related_functions = max_shared_var_related_functions
         self.max_sibling_member_functions = max_sibling_member_functions
+        self.max_stack_frames_symbol_enrich = max_stack_frames_symbol_enrich
+        self.max_stack_frames_in_prompt = max_stack_frames_in_prompt
         self.max_symbol_only_rescues = max_symbol_only_rescues
         self.find_source_timeout_sec = find_source_timeout_sec
         self.code_context_timeout_sec = code_context_timeout_sec
@@ -233,6 +237,8 @@ class FullStabilityAnalyzer:
             max_direct_callers=self.max_direct_callers,
             max_shared_var_related_functions=self.max_shared_var_related_functions,
             max_sibling_member_functions=self.max_sibling_member_functions,
+            max_stack_frames_symbol_enrich=self.max_stack_frames_symbol_enrich,
+            max_stack_frames_in_prompt=self.max_stack_frames_in_prompt,
             max_symbol_only_rescues=self.max_symbol_only_rescues,
             find_source_timeout_sec=self.find_source_timeout_sec,
             code_context_timeout_sec=self.code_context_timeout_sec,
@@ -1383,6 +1389,8 @@ class FullStabilityAnalyzer:
                 max_direct_callers=self.max_direct_callers,
                 max_shared_var_related_functions=self.max_shared_var_related_functions,
                 max_sibling_member_functions=self.max_sibling_member_functions,
+                max_stack_frames_symbol_enrich=self.max_stack_frames_symbol_enrich,
+                max_stack_frames_in_prompt=self.max_stack_frames_in_prompt,
                 max_symbol_only_rescues=self.max_symbol_only_rescues,
                 find_source_timeout_sec=self.find_source_timeout_sec,
                 code_context_timeout_sec=self.code_context_timeout_sec,

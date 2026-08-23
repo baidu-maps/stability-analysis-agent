@@ -82,6 +82,10 @@ from tools.code_context_errors import (
     code_context_failure_message,
     code_context_skip_pipeline_message,
 )
+from tools._prompt_context_filter import (
+    DEFAULT_MAX_STACK_FRAMES_IN_PROMPT,
+    DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH,
+)
 from tools.parse_crash_errors import parse_result_skip_pipeline_message
 from tools.resolve_stack_errors import resolved_stack_skip_pipeline_message
 
@@ -99,7 +103,7 @@ from skill_system.cli import handle_skill_command
 from skill_system.manager import SkillManager
 from skill_system.templates import available_skill_presets
 
-DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS = 12
+DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS = 0
 
 # RAG（chromadb / sentence-transformers 等）仅在向量库子命令需要时加载，避免 `sa-agent` 首屏被拖慢。
 _rag_runtime_resolved = False
@@ -3576,8 +3580,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS,
         help=(
             "code_content_provider：同类「兄弟成员函数」最多纳入条数"
-            f"（默认 {DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS}；0=关闭）。"
-            "模块级 code-root 建议保持默认，整仓扫描可显式设为 0。"
+            f"（默认 {DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS}=关闭；>0 时启用并截断）。"
+            "需要把同类其它成员函数纳入 04b 时再显式设为正整数。"
+        ),
+    )
+    p.add_argument(
+        "--max-stack-frames-symbol-enrich",
+        dest="max_stack_frames_symbol_enrich",
+        type=int,
+        default=DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH,
+        help=(
+            "code_content_provider：栈顶最多几帧补齐 file:line（已符号化但缺 addr2line 行号时）；"
+            f"默认 {DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH}，范围 2～16。"
+        ),
+    )
+    p.add_argument(
+        "--max-stack-frames-in-prompt",
+        dest="max_stack_frames_in_prompt",
+        type=int,
+        default=DEFAULT_MAX_STACK_FRAMES_IN_PROMPT,
+        help=(
+            "06 / LLM 提示词中最多纳入的工程栈帧源码数；"
+            f"默认 {DEFAULT_MAX_STACK_FRAMES_IN_PROMPT}，范围 2～16。"
         ),
     )
     p.add_argument(
@@ -4638,6 +4662,34 @@ def _build_run_request_record(
         "max_sibling_member_functions": int(
             getattr(args, "max_sibling_member_functions", DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS) or 0
         ),
+        "max_stack_frames_symbol_enrich": max(
+            2,
+            min(
+                int(
+                    getattr(
+                        args,
+                        "max_stack_frames_symbol_enrich",
+                        DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH,
+                    )
+                    or DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH
+                ),
+                16,
+            ),
+        ),
+        "max_stack_frames_in_prompt": max(
+            2,
+            min(
+                int(
+                    getattr(
+                        args,
+                        "max_stack_frames_in_prompt",
+                        DEFAULT_MAX_STACK_FRAMES_IN_PROMPT,
+                    )
+                    or DEFAULT_MAX_STACK_FRAMES_IN_PROMPT
+                ),
+                16,
+            ),
+        ),
         "max_shared_var_related_functions": int(
             getattr(args, "max_shared_var_related_functions", 20) or 20
         ),
@@ -4817,6 +4869,12 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
     max_sibling = record.get("max_sibling_member_functions")
     if max_sibling is not None:
         argv += ["--max-sibling-member-functions", str(max_sibling)]
+    max_symbol_enrich = record.get("max_stack_frames_symbol_enrich")
+    if max_symbol_enrich is not None:
+        argv += ["--max-stack-frames-symbol-enrich", str(max_symbol_enrich)]
+    max_prompt_frames = record.get("max_stack_frames_in_prompt")
+    if max_prompt_frames is not None:
+        argv += ["--max-stack-frames-in-prompt", str(max_prompt_frames)]
     max_shared = record.get("max_shared_var_related_functions")
     if max_shared is not None:
         argv += ["--max-shared-var-related-functions", str(max_shared)]
@@ -5940,6 +5998,34 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         "rule_confidence_threshold": args.rule_confidence_threshold,
         "max_sibling_member_functions": int(
             getattr(args, "max_sibling_member_functions", DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS) or 0
+        ),
+        "max_stack_frames_symbol_enrich": max(
+            2,
+            min(
+                int(
+                    getattr(
+                        args,
+                        "max_stack_frames_symbol_enrich",
+                        DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH,
+                    )
+                    or DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH
+                ),
+                16,
+            ),
+        ),
+        "max_stack_frames_in_prompt": max(
+            2,
+            min(
+                int(
+                    getattr(
+                        args,
+                        "max_stack_frames_in_prompt",
+                        DEFAULT_MAX_STACK_FRAMES_IN_PROMPT,
+                    )
+                    or DEFAULT_MAX_STACK_FRAMES_IN_PROMPT
+                ),
+                16,
+            ),
         ),
         "max_shared_var_related_functions": int(
             getattr(args, "max_shared_var_related_functions", 12) or 12

@@ -135,18 +135,30 @@ python3 cli/main.py ... --engine langchain
 python3 cli/main.py ... --engine langgraph
 ```
 
-### 5) 通过 Daemon 执行（推荐高频调用）
+### 5) 通过 Daemon 执行（推荐高频 / HTTP 接入）
+
+分析主流程请直接 `POST /runs`（JSON 为 `RunRequest`）。CLI 的 `--daemon` **仅**用于 `cancel` 子命令，不会把分析请求转发到 daemon。
 
 ```bash
 # 终端 A：启动 daemon
 python3 daemon/server.py --host 127.0.0.1 --port 8765
 
-# 终端 B：CLI 通过 daemon 执行
-python3 cli/main.py --daemon http://127.0.0.1:8765 \
-  --crash-log-file examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
-  --library-dir examples/crash_cases/demo_basic/lib/mac \
-  --code-root examples/crash_cases/demo_basic/code_dir
+# 终端 B：提交分析（字段省略时与 CLI argparse 默认值相同）
+curl -sS -X POST http://127.0.0.1:8765/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "crash_log": "examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash",
+    "library_dir": "examples/crash_cases/demo_basic/lib/mac",
+    "code_roots": ["examples/crash_cases/demo_basic/code_dir"],
+    "scope": "gen_prompt_only",
+    "apply_ai_fixes": false
+  }'
+
+# 取消任务
+python3 cli/main.py cancel <run_id> --daemon http://127.0.0.1:8765
 ```
+
+完整字段见 [DAEMON_SERVER_GUIDE.md](./DAEMON_SERVER_GUIDE.md)。
 
 ## 配置加载规则（LLM）
 

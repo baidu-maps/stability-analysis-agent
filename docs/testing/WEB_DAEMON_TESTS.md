@@ -37,11 +37,11 @@ python3 -m unittest discover -s test/daemon -v
 
 | 模块 | 验证内容 |
 |------|----------|
-| `test_build_cli_cmd.py` | Web 固定流水线字段（`scope=full`、`apply_ai_fixes` 等）映射到 CLI；含 `--no-interactive` / `--no-save-to-vector-db` |
+| `test_build_cli_cmd.py` | `RunRequest` → CLI argv：默认值与 `build_parser()` 对齐；显式 `max_agent_rounds`/`streaming`/超时/插件/向量库透传；`--no-interactive` / `--no-save-to-vector-db`；忽略 `consultation` |
 | `test_vector_db_commit_api.py` | `POST /runs/<id>/vector-db/commit`、`report_dir` 解析 |
 | `test_skills_api.py` | 安装/列表/详情；`GET /skills` 仅返回**已安装** skill |
 | `test_web_preferences.py` | `~/.config/.../web_preferences.json` 工作区、`disabled_skills`、`vector_db` |
-| `test_run_lifecycle.py` | 任务队列、SSE 事件、取消 |
+| `test_run_lifecycle.py` | 任务队列、429、短路径 `/status` `/result` `/cancel`、`report` 字段、ContextVar |
 
 本地临时目录测试可通过 `STABILITY_AGENT_SKILL_HOME`、`STABILITY_AGENT_WEB_PREFS_FILE` 覆盖路径。
 

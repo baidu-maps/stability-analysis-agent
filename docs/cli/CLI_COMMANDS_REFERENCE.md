@@ -28,6 +28,8 @@ python3 cli/main.py [参数...]
 | `--agent-loop {single,context_loop}` | 否 | Agent 编排模式。未指定时随 `--prompt-mode`：`analysis`→`context_loop`，其它→`single`。`context_loop` 允许模型请求补充函数源码并继续多轮分析，独立于 `--engine`。 |
 | `--max-agent-rounds N` | 否 | `context_loop` 最多 LLM 轮数。默认：`analysis` 模式 `3` 轮，其它模式 `1` 轮；显式指定时以参数为准（硬上限 `8`）。 |
 | `--max-context-requests-per-round N` | 否 | `context_loop` 每轮最多处理的源码补充请求数，默认 `5`，硬上限 `16`。 |
+| `--max-stack-frames-symbol-enrich N` | 否 | 栈顶最多几帧补齐 `file:line`（已符号化但缺 addr2line 行号）。默认 `8`，范围 `2～16`。Daemon 字段 `max_stack_frames_symbol_enrich`。 |
+| `--max-stack-frames-in-prompt N` | 否 | `06` / LLM 提示词最多纳入的工程栈帧源码数。默认 `4`，范围 `2～16`。Daemon 字段 `max_stack_frames_in_prompt`。 |
 | `--engine {direct,langchain,langgraph}` | 否 | 传给 `LLMConfig` 的引擎标记，默认 `direct`。 |
 | `--llm-mode {fixed,auto}` | 否 | LLM 路由模式；默认读 `llm_config.mode`（配置缺省为 `fixed`）。`fixed`=仅 `active_provider`；`auto`=发现可用厂商并按内置策略选档。 |
 | `--llm-profile {default,strong,fast}` | 否 | 强制路由档位（覆盖 auto 内置策略）。 |

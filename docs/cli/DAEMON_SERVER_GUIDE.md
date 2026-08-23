@@ -9,14 +9,14 @@
 python3 daemon/server.py
 
 # 自定义地址和端口
-python3 daemon/server.py --host 0.0.0.0 --port 8765
+python3 daemon/server.py --host 0.0.0.0 --port 8765 --max-workers 2 --max-queue 32
 ```
 
 启动后输出：
 ```
 daemon listening on http://127.0.0.1:8765 (protocol=1)
   Web UI:         http://127.0.0.1:8765/
-  Run API:         POST /runs  GET /runs/<id>  GET /runs/<id>/events  POST /runs/<id>/cancel
+  Run API:         POST /runs  GET /runs  GET /runs/<id>  GET /runs/<id>/events  POST /runs/<id>/cancel
                    POST /runs/<id>/vector-db/commit
   Skills API:      GET /skills  GET /skills/<name>
                    POST /skills/install  POST /skills/lint  POST /skills/uninstall
@@ -32,12 +32,25 @@ daemon listening on http://127.0.0.1:8765 (protocol=1)
 ### 公共
 
 #### `GET /health`
-健康检查。
+健康检查。数字员工探活用此接口。
 
 **响应：**
 ```json
-{ "ok": true, "protocol_version": "1", "pid": 12345, "web_ui": true }
+{
+  "ok": true,
+  "service": "stability-analysis-agent",
+  "protocol_version": "1",
+  "pid": 12345,
+  "web_ui": true,
+  "queued": 0,
+  "running": 1,
+  "max_workers": 2,
+  "max_queue": 32,
+  "run_timeout_sec": 0
+}
 ```
+
+并发：`--max-workers`（或环境变量 `STABILITY_AGENT_DAEMON_MAX_WORKERS`，默认 2）限制同时运行的 CLI 子进程；`--max-queue`（`STABILITY_AGENT_DAEMON_MAX_QUEUE`，默认 32）限制等待中的任务。队列满时 `POST /runs` 返回 **429** `queue_full`。`--run-timeout` 为 0 表示不限时。
 
 ---
 
@@ -57,8 +70,24 @@ daemon listening on http://127.0.0.1:8765 (protocol=1)
 
 daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推送事件。
 
+数字员工常用短路径（与 `/runs/...` 等价）：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/health` | 探活 |
+| POST | `/runs` | 提交任务 |
+| GET | `/status/{id}` | 查询状态 |
+| GET | `/result/{id}` | 取分析结果（含 `report` 正文） |
+| POST | `/cancel/{id}` | 取消任务 |
+
 #### `POST /runs`
-提交一个分析任务。
+提交一个分析任务。任务先进入 `queued`，有空闲 worker 后变为 `running`。队列已满时返回 **429**：
+
+```json
+{ "error": "queue_full", "queued": 32, "max_queue": 32 }
+```
+
+成功时：
 
 **请求体（RunRequest）：**
 ```json
@@ -68,14 +97,15 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
   "crash_log_dir": "/path/to/logs",
   "library_dir": "/path/to/lib",
   "code_roots": ["/path/to/src"],
+  "config": null,
   "output_format": "markdown",
   "engine": "direct",
   "scope": "full",
   "prompt_mode": "fix",
   "agent_loop": null,
-  "max_agent_rounds": 1,
-  "max_context_requests_per_round": 5,
-  "streaming": false,
+  "max_agent_rounds": null,
+  "max_context_requests_per_round": null,
+  "streaming": null,
   "apply_ai_fixes": true,
   "backup_original_sources": true,
   "force_disassembly": false,
@@ -86,10 +116,25 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
   "native_leak_trace_db": null,
   "llm_mode": null,
   "llm_profile": null,
-  "include_memory_in_05": false
+  "include_memory_in_05": false,
+  "vector_db_path": null,
+  "vector_db_max_results": null,
+  "vector_db_record_usage": false,
+  "rule_confidence_threshold": null,
+  "use_ctags_index": false,
+  "plugin_modules": null,
+  "max_sibling_member_functions": null,
+  "max_stack_frames_symbol_enrich": null,
+  "max_stack_frames_in_prompt": null,
+  "max_shared_var_related_functions": null,
+  "min_key_read_related_functions": null,
+  "code_context_timeout_sec": null,
+  "find_source_timeout_sec": null
 }
 ```
-- `crash_log` / `crash_log_content` / `crash_log_dir`：三选一；`crash_log_dir` 优先；`crash_log_content` 通过 stdin 传入
+- `crash_log` / `crash_log_content` / `crash_log_dir`：三选一；`crash_log_dir` 优先；`crash_log_content` 通过 stdin 传入（`--crash-log-file -`）
+- **省略字段 = 与直接跑 CLI 的 argparse 默认值相同**（daemon 对照 `build_parser().parse_args([])`，默认值不拼进子进程命令行）。例如不传 `max_agent_rounds` 时 CLI 仍为 `0`（随 `prompt_mode`：analysis=3，其它=1）；不传 `streaming` 时沿用 provider 配置。
+- 显式传值才会覆盖：`max_agent_rounds: 1` 会加上 `--max-agent-rounds 1`；`streaming: false` 会加上 `--no-streaming`。
 - `engine`：`direct`（默认）/ `langchain` / `langgraph`（旧值 `sequential` 会映射为 `direct`）
 - `output_format`：`markdown`（默认）/ `json` / `text`
 - `scope`：`full`（默认）/ `gen_prompt_only` / `parse_stack_only` / `parse_log_only`，控制 Agent 执行流程范围（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--scope-取值)）
@@ -98,18 +143,36 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
 - `apply_ai_fixes` / `backup_original_sources`：默认 `true`；为 `false` 时分别传 `--no-apply-ai-fixes` / `--no-backup-original-sources`
 - daemon 对 `scope=full` 且 `apply_ai_fixes=true` 的请求自动创建 detached Git worktree，CLI 只修改该 run 的隔离目录，不会直接回写请求中的源码目录。`code_roots` 必须位于 Git 仓库内，且对应范围不能有未提交修改；非 Git 或 dirty code root 会使 run 以 `workspace_error` 结束。
 - worktree 默认保留在系统临时目录的 `stability-analysis-agent/worktrees/<run_id>/` 下，便于检查和继续处理；可通过 `STABILITY_AGENT_WORKTREE_DIR` 指定管理根目录。
-- `force_*` / `native_leak_*` / `llm_mode` / `llm_profile` / `include_memory_in_05`：透传对应 CLI 旗标
+- `force_*` / `native_leak_*` / `llm_mode` / `llm_profile` / `include_memory_in_05` / 向量库与 04b 超时裁剪字段 / `max_stack_frames_symbol_enrich` / `max_stack_frames_in_prompt`：透传对应 CLI 旗标（仅当与 CLI 默认不同）
+- `consultation` / `prompt` / `model`：兼容旧客户端，**不会**转成 CLI 参数（当前 CLI 无 `--consultation` / `--model`）
 - 未知字段会被忽略（`run_request_from_dict`）
 
 **响应：**
 ```json
-{ "run_id": "20260413-153012-a1b2c3d4" }
+{ "run_id": "20260413-153012-a1b2c3d4", "status": "queued" }
 ```
 
 ---
 
-#### `GET /runs/<run_id>`
-查询任务状态。
+#### `GET /runs`
+列出内存中的任务，并附带调度器计数（字段与 `/health` 相同：`queued` / `running` / `max_workers` / `max_queue` / `run_timeout_sec`）。
+
+**响应：**
+```json
+{
+  "runs": [{ "run_id": "...", "status": "queued" }],
+  "queued": 1,
+  "running": 1,
+  "max_workers": 2,
+  "max_queue": 32,
+  "run_timeout_sec": 0
+}
+```
+
+---
+
+#### `GET /runs/<run_id>` / `GET /status/<run_id>`
+查询任务状态。`/status/{id}` 是给外部调用方的短路径。
 
 **响应：**
 ```json
@@ -163,8 +226,8 @@ data: {"run_id": "...", "type": "stdout", "data": {"chunk": "..."}, "ts": 171800
 
 ---
 
-#### `GET /runs/<run_id>/result`
-获取任务最终结果（任务完成后可用）。
+#### `GET /runs/<run_id>/result` / `GET /result/<run_id>`
+获取任务最终结果（任务完成后可用）。响应含 `output`（全文）和 `report`（去掉前言的 Markdown）。
 
 **响应（RunResult）：**
 ```json
@@ -180,8 +243,8 @@ data: {"run_id": "...", "type": "stdout", "data": {"chunk": "..."}, "ts": 171800
 
 ---
 
-#### `POST /runs/<run_id>/cancel`
-取消正在运行的任务。
+#### `POST /runs/<run_id>/cancel` / `POST /cancel/<run_id>`
+取消排队中的任务（不启动 CLI），或终止正在运行的 CLI 子进程。
 
 **响应：**
 ```json

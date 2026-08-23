@@ -104,6 +104,8 @@ class TestCliReplayAndStreaming(unittest.TestCase):
                 vector_db_record_usage=False,
                 rule_confidence_threshold=0.85,
                 max_sibling_member_functions=0,
+                max_stack_frames_symbol_enrich=8,
+                max_stack_frames_in_prompt=4,
                 max_shared_var_related_functions=20,
                 min_key_read_related_functions=2,
                 use_ctags_index=False,

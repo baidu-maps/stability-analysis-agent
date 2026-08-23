@@ -82,10 +82,12 @@ class RunRequest:
     scope: ScopeType = "full"
     prompt_mode: PromptModeType = DEFAULT_PROMPT_MODE
     agent_loop: Optional[AgentLoopType] = None  # None=随 prompt_mode 决定（analysis→context_loop，fix→single）
-    max_agent_rounds: int = 1
-    max_context_requests_per_round: int = 5
+    # None/省略 = 不传 CLI 旗标，沿用 argparse 默认（0=随 prompt_mode：analysis=3，其它=1）
+    max_agent_rounds: Optional[int] = None
+    max_context_requests_per_round: Optional[int] = None
     optimized: bool = False
-    streaming: bool = False
+    # None/省略 = 沿用 provider 配置；True/False 分别透传 --streaming / --no-streaming
+    streaming: Optional[bool] = None
 
     apply_ai_fixes: bool = True
     backup_original_sources: bool = True
@@ -101,6 +103,21 @@ class RunRequest:
     llm_profile: Optional[LlmProfileType] = None
     include_memory_in_05: bool = False
 
+    vector_db_path: Optional[str] = None
+    vector_db_max_results: Optional[int] = None
+    vector_db_record_usage: bool = False
+    rule_confidence_threshold: Optional[float] = None
+    use_ctags_index: bool = False
+    plugin_modules: Optional[List[str]] = None
+    max_sibling_member_functions: Optional[int] = None
+    max_stack_frames_symbol_enrich: Optional[int] = None
+    max_stack_frames_in_prompt: Optional[int] = None
+    max_shared_var_related_functions: Optional[int] = None
+    min_key_read_related_functions: Optional[int] = None
+    code_context_timeout_sec: Optional[float] = None
+    find_source_timeout_sec: Optional[float] = None
+
+    # 兼容旧客户端字段：当前 CLI 已无 --consultation，daemon 忽略这些键
     consultation: bool = False
     prompt: Optional[str] = None
 
