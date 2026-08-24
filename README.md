@@ -19,8 +19,8 @@
 <p align="center">
   <sub>
     <b>Maintenance:</b> actively maintained ·
-    <b>latest:</b> <a href="https://pypi.org/project/stability-analysis-agent/1.3.3/">v1.3.3</a>
-    (daemon graceful shutdown, bounded SSE queues, finished-run TTL) ·
+    <b>latest:</b> <a href="https://pypi.org/project/stability-analysis-agent/1.3.4/">v1.3.4</a>
+    (daemon JSON body cap, HTTP 413 payload_too_large) ·
     meaningful changes → <a href="https://github.com/baidu-maps/stability-analysis-agent/releases">GitHub Releases</a>
     (aim for about monthly when there is substance; not a calendar SLA) ·
     see <a href="./CHANGELOG.md">CHANGELOG</a>

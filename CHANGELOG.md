@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-08-24
+
+### Changed
+
+- **Daemon 请求体上限**：JSON body 在 `read` 前按 `Content-Length` 校验，默认 16 MiB；超限 **413** `payload_too_large`（`--max-body-bytes` / `STABILITY_AGENT_DAEMON_MAX_BODY_BYTES`）。非法 JSON 统一为 **400** `invalid_json`。`GET /health` 增加 `max_body_bytes`。
+
+### Documentation
+
+- README / PyPI 发布说明中的最新版本号更新为 1.3.4。
+- Daemon 指南补充请求体上限与 413。
+
 ## [1.3.3] - 2026-08-24
 
 ### Changed

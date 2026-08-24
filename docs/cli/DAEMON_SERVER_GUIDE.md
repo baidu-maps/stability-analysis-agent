@@ -49,7 +49,8 @@ daemon listening on http://127.0.0.1:8765 (protocol=1)
   "max_queue": 32,
   "run_timeout_sec": 0,
   "shutting_down": false,
-  "runs_retained": 3
+  "runs_retained": 3,
+  "max_body_bytes": 16777216
 }
 ```
 
@@ -58,6 +59,8 @@ daemon listening on http://127.0.0.1:8765 (protocol=1)
 优雅停机：`SIGTERM`/`SIGINT` 后 `POST /runs` 返回 **503** `shutting_down`，并取消 queued/running 任务，最多等待 `--shutdown-wait` 秒（默认 90，`STABILITY_AGENT_DAEMON_SHUTDOWN_WAIT_SEC`）。systemd 的 `TimeoutStopSec` 必须大于该值。
 
 内存：每任务 SSE 队列默认最多 256 条（满则丢最旧，`--event-queue-max` / `STABILITY_AGENT_DAEMON_EVENT_QUEUE_MAX`）；结束态任务默认保留 6 小时后从内存淘汰（`--run-ttl` / `STABILITY_AGENT_DAEMON_RUN_TTL_SEC`，`0` 表示不淘汰）。淘汰后旧 `run_id` 会 404，应重新提交。
+
+JSON 请求体默认上限 **16 MiB**（`--max-body-bytes` / `STABILITY_AGENT_DAEMON_MAX_BODY_BYTES`）。超过时在读入内存前返回 **413** `payload_too_large`。`GET /health` 的 `max_body_bytes` 为当前上限。1.2MB 崩溃日志可正常提交。
 
 ---
 
@@ -98,6 +101,12 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
 
 ```json
 { "error": "shutting_down", "message": "服务正在停机，请稍后重新提交分析任务" }
+```
+
+请求体过大时返回 **413**（尚未读入 body）：
+
+```json
+{ "error": "payload_too_large", "max_body_bytes": 16777216, "content_length": 20000000 }
 ```
 
 成功时：

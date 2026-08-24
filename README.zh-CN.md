@@ -7,7 +7,7 @@
 
 [English](./README.md) | **简体中文**
 
-**维护状态：** 持续维护中 · **最新版 [v1.3.3](https://pypi.org/project/stability-analysis-agent/1.3.3/)**（Daemon 优雅停机、有界 SSE 队列、结束态任务 TTL）· 有实质性改动时发布 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases)（活跃期大约每月一档，非日历 SLA）· 详见 [CHANGELOG.md](./CHANGELOG.md)
+**维护状态：** 持续维护中 · **最新版 [v1.3.4](https://pypi.org/project/stability-analysis-agent/1.3.4/)**（Daemon JSON 请求体上限、超限 413）· 有实质性改动时发布 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases)（活跃期大约每月一档，非日历 SLA）· 详见 [CHANGELOG.md](./CHANGELOG.md)
 
 ---
 

@@ -466,10 +466,54 @@ def _json_response(
     handler.wfile.write(data)
 
 
+DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024
+
+
+def _max_json_body_bytes() -> int:
+    """JSON request body limit in bytes (default 16 MiB)."""
+    return max(1, _env_int("STABILITY_AGENT_DAEMON_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES))
+
+
 def _read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
-    length = int(handler.headers.get("Content-Length", "0"))
+    """Read a JSON object from the request. Oversize ``Content-Length`` is 413 before ``read``."""
+    raw_len = str(handler.headers.get("Content-Length", "0") or "0").strip()
+    try:
+        length = int(raw_len)
+    except ValueError:
+        raise DaemonHttpError(
+            HTTPStatus.BAD_REQUEST,
+            {"error": "invalid_content_length", "message": "Content-Length 必须是整数"},
+        )
+    if length < 0:
+        raise DaemonHttpError(
+            HTTPStatus.BAD_REQUEST,
+            {"error": "invalid_content_length", "message": "Content-Length 不能为负数"},
+        )
+    limit = _max_json_body_bytes()
+    if length > limit:
+        raise DaemonHttpError(
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            {
+                "error": "payload_too_large",
+                "max_body_bytes": limit,
+                "content_length": length,
+                "message": f"请求体超过上限 {limit} 字节",
+            },
+        )
     raw = handler.rfile.read(length) if length > 0 else b"{}"
-    return json.loads(raw.decode("utf-8") or "{}")
+    try:
+        parsed = json.loads(raw.decode("utf-8") or "{}")
+    except json.JSONDecodeError as exc:
+        raise DaemonHttpError(
+            HTTPStatus.BAD_REQUEST,
+            {"error": "invalid_json", "message": str(exc)},
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise DaemonHttpError(
+            HTTPStatus.BAD_REQUEST,
+            {"error": "invalid_json", "message": "请求体必须是 JSON object"},
+        )
+    return parsed
 
 
 def _installed_dist_version(dist_name: str) -> Optional[str]:
@@ -1512,6 +1556,8 @@ def _handle_skills_post(handler: BaseHTTPRequestHandler, path: str) -> bool:
                 overwrite=bool(body.get("overwrite", False)),
             )
             _json_response(handler, HTTPStatus.OK, result.to_dict())
+        except DaemonHttpError as exc:
+            _json_response(handler, int(exc.status), exc.payload)
         except FileNotFoundError as e:
             _json_response(handler, HTTPStatus.NOT_FOUND, {"error": str(e)})
         except FileExistsError as e:
@@ -1530,6 +1576,8 @@ def _handle_skills_post(handler: BaseHTTPRequestHandler, path: str) -> bool:
             manager = _skill_manager()
             issues = [issue.to_dict() for issue in manager.lint(source)]
             _json_response(handler, HTTPStatus.OK, {"issues": issues})
+        except DaemonHttpError as exc:
+            _json_response(handler, int(exc.status), exc.payload)
         except FileNotFoundError as e:
             _json_response(handler, HTTPStatus.NOT_FOUND, {"error": str(e)})
         except Exception as e:
@@ -1549,6 +1597,8 @@ def _handle_skills_post(handler: BaseHTTPRequestHandler, path: str) -> bool:
                 _json_response(handler, HTTPStatus.NOT_FOUND, {"error": f"skill not found: {name}"})
                 return True
             _json_response(handler, HTTPStatus.OK, {"ok": True, "name": name})
+        except DaemonHttpError as exc:
+            _json_response(handler, int(exc.status), exc.payload)
         except Exception as e:
             _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": str(e)})
         return True
@@ -1579,6 +1629,8 @@ def _handle_web_post(handler: BaseHTTPRequestHandler, path: str) -> bool:
             else:
                 prefs = save_web_preferences(body)
             _json_response(handler, HTTPStatus.OK, prefs)
+        except DaemonHttpError as exc:
+            _json_response(handler, int(exc.status), exc.payload)
         except Exception as e:
             _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": str(e)})
         return True
@@ -1676,6 +1728,7 @@ class Handler(BaseHTTPRequestHandler):
             payload.update(_health_package_info())
             payload["shutting_down"] = bool(_SHUTTING_DOWN)
             payload["runs_retained"] = len(RUNS.list())
+            payload["max_body_bytes"] = _max_json_body_bytes()
             _json_response(self, HTTPStatus.OK, payload)
             return
 
@@ -1873,6 +1926,8 @@ class Handler(BaseHTTPRequestHandler):
                     "scope": body.get("scope", "full"),
                 })
                 _json_response(self, HTTPStatus.OK, result)
+            except DaemonHttpError as exc:
+                _json_response(self, int(exc.status), exc.payload)
             except Exception as e:
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
             return
@@ -1890,6 +1945,8 @@ class Handler(BaseHTTPRequestHandler):
                     "min_callchain_percentage": body.get("min_callchain_percentage", 0.0),
                 })
                 _json_response(self, HTTPStatus.OK, result)
+            except DaemonHttpError as exc:
+                _json_response(self, int(exc.status), exc.payload)
             except Exception as e:
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
             return
@@ -1937,10 +1994,17 @@ def main() -> int:
         default=_env_int("STABILITY_AGENT_DAEMON_EVENT_QUEUE_MAX", 256),
         help="Per-run SSE queue size; oldest events drop (env STABILITY_AGENT_DAEMON_EVENT_QUEUE_MAX)",
     )
+    parser.add_argument(
+        "--max-body-bytes",
+        type=int,
+        default=_env_int("STABILITY_AGENT_DAEMON_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
+        help="Max JSON request body bytes; oversize is HTTP 413 (env STABILITY_AGENT_DAEMON_MAX_BODY_BYTES)",
+    )
     args = parser.parse_args()
     os.environ["STABILITY_AGENT_DAEMON_SHUTDOWN_WAIT_SEC"] = str(max(0, int(args.shutdown_wait)))
     os.environ["STABILITY_AGENT_DAEMON_RUN_TTL_SEC"] = str(max(0, int(args.run_ttl)))
     os.environ["STABILITY_AGENT_DAEMON_EVENT_QUEUE_MAX"] = str(max(1, int(args.event_queue_max)))
+    os.environ["STABILITY_AGENT_DAEMON_MAX_BODY_BYTES"] = str(max(1, int(args.max_body_bytes)))
     ensure_run_scheduler(
         max_workers=args.max_workers,
         max_queue=args.max_queue,

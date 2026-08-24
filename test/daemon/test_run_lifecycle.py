@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -170,6 +171,7 @@ class DaemonRunLifecycleTests(unittest.TestCase):
         self.assertIn("running", health)
         self.assertFalse(health.get("shutting_down"))
         self.assertIn("runs_retained", health)
+        self.assertEqual(health.get("max_body_bytes"), server.DEFAULT_MAX_BODY_BYTES)
         status, listed = self._request("GET", "/runs")
         self.assertEqual(status, 200)
         self.assertEqual(listed.get("runs"), [])
@@ -395,6 +397,37 @@ class DaemonRunLifecycleTests(unittest.TestCase):
             self.assertTrue(health.get("shutting_down"))
         finally:
             server._SHUTTING_DOWN = False
+
+    def test_oversized_content_length_is_413_without_reading(self) -> None:
+        """Reject oversize Content-Length before rfile.read."""
+        class _Handler:
+            headers = {"Content-Length": str(server.DEFAULT_MAX_BODY_BYTES + 1)}
+            rfile = mock.Mock()
+
+        with self.assertRaises(server.DaemonHttpError) as ctx:
+            server._read_json_body(_Handler())
+        self.assertEqual(ctx.exception.status, 413)
+        self.assertEqual(ctx.exception.payload.get("error"), "payload_too_large")
+        _Handler.rfile.read.assert_not_called()
+
+    def test_post_runs_returns_413_when_body_exceeds_limit(self) -> None:
+        """POST /runs with a body larger than the configured cap is 413."""
+        old = os.environ.get("STABILITY_AGENT_DAEMON_MAX_BODY_BYTES")
+        os.environ["STABILITY_AGENT_DAEMON_MAX_BODY_BYTES"] = "64"
+        try:
+            status, payload = self._request(
+                "POST",
+                "/runs",
+                {"crash_log": "/tmp/demo.crash", "crash_log_content": "x" * 200},
+            )
+            self.assertEqual(status, 413)
+            self.assertEqual(payload.get("error"), "payload_too_large")
+            self.assertEqual(payload.get("max_body_bytes"), 64)
+        finally:
+            if old is None:
+                os.environ.pop("STABILITY_AGENT_DAEMON_MAX_BODY_BYTES", None)
+            else:
+                os.environ["STABILITY_AGENT_DAEMON_MAX_BODY_BYTES"] = old
 
 
 if __name__ == "__main__":
