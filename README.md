@@ -19,8 +19,8 @@
 <p align="center">
   <sub>
     <b>Maintenance:</b> actively maintained ·
-    <b>latest:</b> <a href="https://pypi.org/project/stability-analysis-agent/1.3.2/">v1.3.2</a>
-    (daemon HTTP aligned with CLI flags, stack-frame prompt caps) ·
+    <b>latest:</b> <a href="https://pypi.org/project/stability-analysis-agent/1.3.3/">v1.3.3</a>
+    (daemon graceful shutdown, bounded SSE queues, finished-run TTL) ·
     meaningful changes → <a href="https://github.com/baidu-maps/stability-analysis-agent/releases">GitHub Releases</a>
     (aim for about monthly when there is substance; not a calendar SLA) ·
     see <a href="./CHANGELOG.md">CHANGELOG</a>

@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-08-24
+
+### Changed
+
+- **Daemon 优雅停机**：`SIGTERM`/`SIGINT` 后拒绝新的 `POST /runs`（**503** `shutting_down`），取消 queued/running 任务，并等待 CLI 子进程退出（`--shutdown-wait`，默认 90 秒，环境变量 `STABILITY_AGENT_DAEMON_SHUTDOWN_WAIT_SEC`）。systemd 的 `TimeoutStopSec` 须大于该等待时间。
+- **Daemon 内存边界**：每任务 SSE 队列默认 256 条、满则丢最旧（`--event-queue-max` / `STABILITY_AGENT_DAEMON_EVENT_QUEUE_MAX`）；结束态任务默认 6 小时后从内存淘汰（`--run-ttl` / `STABILITY_AGENT_DAEMON_RUN_TTL_SEC`，`0` 表示不淘汰），并清理对应幂等 key。
+- **`GET /health`**：增加 `shutting_down`、`runs_retained`。
+
+### Documentation
+
+- README / PyPI 发布说明中的最新版本号更新为 1.3.3。
+- Daemon 指南补充停机、队列上界与任务 TTL。
+
 ## [1.3.2] - 2026-08-23
 
 ### Changed

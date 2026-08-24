@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import argparse
 import contextvars
+import hashlib
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -25,7 +27,8 @@ from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CLI_ENTRY = PROJECT_ROOT / "cli" / "main.py"
@@ -45,6 +48,33 @@ from protocol.models import (
 )
 from protocol.version import PROTOCOL_VERSION
 
+IDEMPOTENCY_TTL_SEC = 7200
+_IDEMPOTENCY_LOCK = threading.Lock()
+_IDEMPOTENCY: Dict[str, Tuple[float, str, str]] = {}
+_HEALTH_EXTRAS: List[Callable[[], Dict[str, Any]]] = []
+
+
+class DaemonHttpError(Exception):
+    """Mapped to an HTTP JSON error by Handler.do_POST / do_GET."""
+
+    def __init__(self, status: int, payload: Dict[str, Any]) -> None:
+        """Store status code and JSON body."""
+        super().__init__(str((payload or {}).get("error") or status))
+        self.status = int(status)
+        self.payload = dict(payload or {})
+
+
+def register_health_extra(factory: Callable[[], Dict[str, Any]]) -> None:
+    """Let the enterprise shell add fields to GET /health (replaces prior extra)."""
+    _HEALTH_EXTRAS.clear()
+    _HEALTH_EXTRAS.append(factory)
+
+
+def reset_idempotency_for_tests() -> None:
+    """Drop in-memory idempotency keys. Test-only."""
+    with _IDEMPOTENCY_LOCK:
+        _IDEMPOTENCY.clear()
+
 
 # ---------------------------------------------------------------------------
 # Tool System executor（用于 /tool-system/* 端点）
@@ -52,6 +82,30 @@ from protocol.version import PROTOCOL_VERSION
 _ts_executor = None
 _ts_lock = threading.Lock()
 _worktree_setup_lock = threading.Lock()
+_SHUTTING_DOWN = False
+_EVICTION_STARTED = False
+_TERMINAL_RUN_STATUSES = frozenset({"done", "error", "canceled"})
+
+
+class DropOldestQueue(queue.Queue):
+    """Bounded queue; a full put drops the oldest item instead of blocking."""
+
+    def put(self, item, block: bool = True, timeout: Optional[float] = None) -> None:
+        """Enqueue ``item``, discarding the oldest entry when ``maxsize`` is reached."""
+        with self.not_full:
+            if 0 < self.maxsize <= self._qsize():
+                self._get()
+                if self.unfinished_tasks > 0:
+                    self.unfinished_tasks -= 1
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+
+def _new_event_queue() -> queue.Queue:
+    """Create the per-run SSE queue with a drop-oldest bound."""
+    maxsize = _env_int("STABILITY_AGENT_DAEMON_EVENT_QUEUE_MAX", 256)
+    return DropOldestQueue(maxsize=max(1, maxsize))
 
 
 def _get_ts_executor():
@@ -119,9 +173,12 @@ class RunState:
     workspace_manifest: Optional[str] = None
     patch_path: Optional[str] = None
     last_progress: Optional[str] = None
+    last_progress_percent: Optional[int] = None
+    completion_reason: Optional[str] = None
+    cancel_requested: bool = False
 
     process: Optional[subprocess.Popen] = None
-    events: "queue.Queue[RunEvent]" = field(default_factory=queue.Queue)
+    events: "queue.Queue[RunEvent]" = field(default_factory=_new_event_queue)
     result: Optional[RunResult] = None
 
 
@@ -170,6 +227,72 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _drop_run_events(run: RunState) -> None:
+    """Discard queued SSE events after a run is evicted or finished."""
+    while True:
+        try:
+            run.events.get_nowait()
+        except queue.Empty:
+            break
+
+
+def evict_finished_runs(*, now: Optional[float] = None, ttl_sec: Optional[int] = None) -> int:
+    """Drop finished runs from memory after ``ttl_sec`` (default 6 hours). ``ttl_sec==0`` disables."""
+    ttl = _env_int("STABILITY_AGENT_DAEMON_RUN_TTL_SEC", 6 * 60 * 60) if ttl_sec is None else int(ttl_sec)
+    if ttl <= 0:
+        return 0
+    stamp = now if now is not None else time.time()
+    removed = 0
+    for run_id, run in list(RUNS.list().items()):
+        if run.status not in _TERMINAL_RUN_STATUSES:
+            continue
+        finished = run.finished_at or run.created_at
+        if stamp - finished < ttl:
+            continue
+        RUNS.discard(run_id)
+        _drop_run_events(run)
+        removed += 1
+        with _IDEMPOTENCY_LOCK:
+            stale = [key for key, item in _IDEMPOTENCY.items() if item[2] == run_id]
+            for key in stale:
+                _IDEMPOTENCY.pop(key, None)
+    return removed
+
+
+def _eviction_loop() -> None:
+    """Background loop that evicts finished in-memory runs."""
+    while True:
+        time.sleep(60)
+        try:
+            evict_finished_runs()
+        except Exception:
+            continue
+
+
+def _ensure_eviction_thread() -> None:
+    """Start the finished-run eviction thread once per process."""
+    global _EVICTION_STARTED
+    if _EVICTION_STARTED:
+        return
+    _EVICTION_STARTED = True
+    threading.Thread(target=_eviction_loop, name="run-eviction", daemon=True).start()
+
+
+def _drain_active_runs(wait_sec: int) -> None:
+    """Cancel queued/running work and wait up to ``wait_sec`` for workers to leave those states."""
+    for run in RUNS.list().values():
+        if run.status in ("queued", "running"):
+            try:
+                _cancel_run(run)
+            except Exception:
+                continue
+    deadline = time.time() + max(0, int(wait_sec))
+    while time.time() < deadline:
+        if not any(r.status in ("queued", "running") for r in RUNS.list().values()):
+            return
+        time.sleep(0.2)
+
+
 class SchedulerBusy(Exception):
     """Raised when the in-memory run queue is full."""
 
@@ -210,6 +333,7 @@ class RunScheduler:
         if self._started:
             return
         self._started = True
+        _ensure_eviction_thread()
         for index in range(self.max_workers):
             threading.Thread(
                 target=self._loop,
@@ -300,7 +424,8 @@ def reset_run_scheduler_for_tests(
     run_timeout_sec: int = 0,
 ) -> RunScheduler:
     """Replace the process-wide pool. Test-only; in-flight jobs on the old pool are abandoned."""
-    global SCHEDULER
+    global SCHEDULER, _SHUTTING_DOWN
+    _SHUTTING_DOWN = False
     with _SCHEDULER_LOCK:
         old = SCHEDULER
         SCHEDULER = RunScheduler(
@@ -312,6 +437,7 @@ def reset_run_scheduler_for_tests(
         if old is not None:
             for _ in range(old.max_workers):
                 old._jobs.put(None)
+        reset_idempotency_for_tests()
         return SCHEDULER
 
 
@@ -319,7 +445,7 @@ def _send_cors_headers(handler: BaseHTTPRequestHandler) -> None:
     """Allow intranet digital-employee / browser clients to call the daemon."""
     handler.send_header("Access-Control-Allow-Origin", "*")
     handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type, Idempotency-Key")
     handler.send_header("Access-Control-Max-Age", "600")
 
 
@@ -344,6 +470,117 @@ def _read_json_body(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
     length = int(handler.headers.get("Content-Length", "0"))
     raw = handler.rfile.read(length) if length > 0 else b"{}"
     return json.loads(raw.decode("utf-8") or "{}")
+
+
+def _installed_dist_version(dist_name: str) -> Optional[str]:
+    """Return installed distribution version, or None if missing."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+    except ImportError:
+        from importlib_metadata import PackageNotFoundError, version  # type: ignore
+    try:
+        return str(version(dist_name))
+    except PackageNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _health_package_info() -> Dict[str, Any]:
+    """Core package identity for GET /health."""
+    payload: Dict[str, Any] = {
+        "package": "stability-analysis-agent",
+        "package_version": _installed_dist_version("stability-analysis-agent"),
+    }
+    for factory in list(_HEALTH_EXTRAS):
+        try:
+            extra = factory() or {}
+        except Exception:
+            extra = {}
+        if isinstance(extra, dict):
+            payload.update(extra)
+    return payload
+
+
+def _run_fingerprint(body: Dict[str, Any]) -> str:
+    """Hash the fields that distinguish one analysis request."""
+    relevant = {
+        "crash_log_content": body.get("crash_log_content"),
+        "crash_log": body.get("crash_log"),
+        "crash_log_dir": body.get("crash_log_dir"),
+        "platform": body.get("platform"),
+        "sdk_version": body.get("sdk_version"),
+        "apply_ai_fixes": body.get("apply_ai_fixes"),
+        "output_format": body.get("output_format"),
+    }
+    blob = json.dumps(relevant, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _extract_idempotency_key(handler: BaseHTTPRequestHandler, body: Dict[str, Any]) -> str:
+    """Read Idempotency-Key header or body.idempotency_key."""
+    header = str(
+        handler.headers.get("Idempotency-Key")
+        or handler.headers.get("idempotency-key")
+        or ""
+    ).strip()
+    if header:
+        return header
+    return str((body or {}).get("idempotency_key") or "").strip()
+
+
+def _idempotency_lookup(key: str, fingerprint: str) -> Optional[str]:
+    """Return existing run_id, or raise DaemonHttpError on fingerprint mismatch."""
+    now = time.time()
+    with _IDEMPOTENCY_LOCK:
+        item = _IDEMPOTENCY.get(key)
+        if not item:
+            return None
+        expires, stored_fp, run_id = item
+        if expires < now:
+            _IDEMPOTENCY.pop(key, None)
+            return None
+        if stored_fp != fingerprint:
+            raise DaemonHttpError(
+                HTTPStatus.CONFLICT,
+                {
+                    "error": "idempotency_key_conflict",
+                    "message": "同一 idempotency_key 不能搭配不同的分析请求",
+                    "run_id": run_id,
+                },
+            )
+        return run_id
+
+
+def _idempotency_store(key: str, fingerprint: str, run_id: str) -> None:
+    """Remember a successful POST /runs under an idempotency key."""
+    with _IDEMPOTENCY_LOCK:
+        _IDEMPOTENCY[key] = (time.time() + IDEMPOTENCY_TTL_SEC, fingerprint, run_id)
+
+
+def _created_run_payload(run: "RunState") -> Dict[str, Any]:
+    """JSON body returned by POST /runs."""
+    return {
+        "run_id": run.run_id,
+        "status": run.status,
+        "message": _status_message(run),
+        "links": _run_links(run.run_id),
+    }
+
+
+def _load_run_summary(run: "RunState") -> Optional[Dict[str, Any]]:
+    """Load 00_run_summary.json when present."""
+    report_dir = _resolve_report_dir(run.report_dir)
+    if report_dir is None:
+        return None
+    path = report_dir / "00_run_summary.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 _CLI_ANALYSIS_DEFAULTS = None
@@ -750,6 +987,12 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
             env=_subprocess_env_for_run(run.run_id),
         )
         run.process = p
+        if run.cancel_requested:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+            run.status = "canceled"
 
         if stdin_text is not None and p.stdin is not None:
             p.stdin.write(stdin_text)
@@ -800,16 +1043,21 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
         except Exception:
             pass
 
-        status = "canceled" if run.status == "canceled" else ("done" if exit_code == 0 else "error")
-        run.status = status
-
         output_text = "".join(stdout_acc)
-        if run.status == "canceled":
-            result_error = run.error or "canceled"
+        reason = _extract_completion_reason(output_text)
+        if reason:
+            run.completion_reason = reason
+        if run.cancel_requested or run.status == "canceled":
+            status = "canceled"
+        elif reason and reason.startswith("skipped_"):
+            status = "error"
         elif exit_code == 0:
-            result_error = None
+            status = "done"
         else:
-            result_error = f"process exit {exit_code}"
+            status = "error"
+        run.status = status
+        result_error = _summarize_cli_outcome(run, output_text, exit_code)
+        run.error = result_error
         run.result = RunResult(
             run_id=run.run_id,
             status=run.status,
@@ -861,6 +1109,60 @@ def _wait_cli_process(process: subprocess.Popen, run: RunState) -> int:
 
 
 _REPORT_MARKS = ("# 崩溃分析结果", "# Crash Analysis Result", "# Crash analysis")
+_STAGE_RE = re.compile(r"\[阶段\s*(\d+)\s*/\s*(\d+)\]")
+_COMPLETION_REASON_RE = re.compile(
+    r'completion_reason["\s:=]+([A-Za-z0-9_]+)',
+    re.IGNORECASE,
+)
+_SKIP_REASON_TOKENS = (
+    "skipped_no_usable_resolve",
+    "skipped_no_usable_parse",
+    "skipped_no_usable_code",
+)
+
+
+def _progress_percent_from_text(text: str) -> Optional[int]:
+    """Map ``[阶段 n/m]`` to 0-100. Unknown text returns None."""
+    match = _STAGE_RE.search(str(text or ""))
+    if not match:
+        return None
+    current = int(match.group(1))
+    total = int(match.group(2))
+    if total <= 0:
+        return None
+    percent = int(round(100.0 * current / total))
+    return max(0, min(100, percent))
+
+
+def _extract_completion_reason(text: str) -> Optional[str]:
+    """Parse CLI completion_reason from stdout/stderr blobs."""
+    blob = str(text or "")
+    match = _COMPLETION_REASON_RE.search(blob)
+    if match:
+        return str(match.group(1) or "").strip() or None
+    for token in _SKIP_REASON_TOKENS:
+        if token in blob:
+            return token
+    return None
+
+
+def _summarize_cli_outcome(
+    run: RunState,
+    output_text: str,
+    exit_code: Optional[int],
+) -> Optional[str]:
+    """Build a user-facing Chinese error; None when the run succeeded."""
+    reason = run.completion_reason or _extract_completion_reason(output_text)
+    stage = (run.last_progress or "").strip() or "未知阶段"
+    if run.status == "canceled":
+        code = exit_code if exit_code is not None else -15
+        return f"任务已取消，未产出分析结果（exit_code={code}）"
+    if reason and str(reason).startswith("skipped_"):
+        return f"分析未正常完成；中止于 {stage}；completion_reason={reason}"
+    if run.status == "error" or (exit_code not in (None, 0)):
+        extra = f"；completion_reason={reason}" if reason else ""
+        return f"分析未正常完成；中止于 {stage}{extra}"
+    return None
 
 
 def _capture_progress(run: RunState, text: str) -> None:
@@ -874,6 +1176,12 @@ def _capture_progress(run: RunState, text: str) -> None:
         or stripped.startswith("ERROR:")
     ):
         run.last_progress = stripped[:500]
+        percent = _progress_percent_from_text(stripped)
+        if percent is not None:
+            run.last_progress_percent = percent
+        reason = _extract_completion_reason(stripped)
+        if reason:
+            run.completion_reason = reason
 
 
 def _extract_report(output: str) -> str:
@@ -940,12 +1248,14 @@ def _run_public_dict(run: RunState) -> Dict[str, Any]:
         "status": run.status,
         "message": _status_message(run),
         "progress": run.last_progress,
+        "progress_percent": run.last_progress_percent,
         "queue_position": _queue_position(run),
         "created_at": run.created_at,
         "started_at": run.started_at,
         "finished_at": run.finished_at,
         "exit_code": run.exit_code,
         "error": run.error,
+        "completion_reason": run.completion_reason,
         "output_format": run.output_format,
         "report_dir": run.report_dir,
         "workspace_dir": run.workspace_dir,
@@ -962,6 +1272,8 @@ def _result_public_dict(run: RunState) -> Dict[str, Any]:
     payload = run.result.to_dict() if run.result is not None else {}
     output = str(payload.get("output") or "")
     payload["report"] = _extract_report(output)
+    payload["error"] = run.error if payload.get("error") is None else payload.get("error")
+    payload["completion_reason"] = run.completion_reason
     payload["links"] = _run_links(run.run_id)
     return payload
 
@@ -975,7 +1287,12 @@ def _respond_status(handler: BaseHTTPRequestHandler, run_id: str) -> None:
     _json_response(handler, HTTPStatus.OK, _run_public_dict(run))
 
 
-def _respond_result(handler: BaseHTTPRequestHandler, run_id: str) -> None:
+def _respond_result(
+    handler: BaseHTTPRequestHandler,
+    run_id: str,
+    *,
+    result_format: str = "",
+) -> None:
     """GET /result/{id} and GET /runs/{id}/result."""
     run = RUNS.get(run_id)
     if not run:
@@ -989,10 +1306,25 @@ def _respond_result(handler: BaseHTTPRequestHandler, run_id: str) -> None:
                 "status": run.status,
                 "message": _status_message(run),
                 "progress": run.last_progress,
+                "progress_percent": run.last_progress_percent,
             },
         )
         return
-    _json_response(handler, HTTPStatus.OK, _result_public_dict(run))
+    fmt = str(result_format or "").strip().lower()
+    if fmt and fmt not in {"markdown", "json", "summary"}:
+        _json_response(
+            handler,
+            HTTPStatus.BAD_REQUEST,
+            {
+                "error": "format_not_supported",
+                "message": "format 仅支持 markdown（默认）或 summary",
+            },
+        )
+        return
+    payload = _result_public_dict(run)
+    if fmt == "summary":
+        payload["summary"] = _load_run_summary(run)
+    _json_response(handler, HTTPStatus.OK, payload)
 
 
 def _respond_cancel(handler: BaseHTTPRequestHandler, run_id: str) -> None:
@@ -1009,7 +1341,12 @@ def _respond_cancel(handler: BaseHTTPRequestHandler, run_id: str) -> None:
     _json_response(
         handler,
         HTTPStatus.OK,
-        {"run_id": run_id, "status": run.status, "message": _status_message(run)},
+        {
+            "run_id": run_id,
+            "status": run.status,
+            "message": _status_message(run),
+            "cancel_requested": bool(run.cancel_requested),
+        },
     )
 
 
@@ -1020,10 +1357,11 @@ def _scheduler_snapshot() -> Dict[str, int]:
 
 def _cancel_run(run: RunState) -> None:
     """Cancel a queued job in-place, or terminate a running CLI subprocess."""
+    run.cancel_requested = True
     if run.status == "queued":
         run.status = "canceled"
         run.finished_at = time.time()
-        run.error = "canceled before start"
+        run.error = "任务已取消，未产出分析结果（尚未启动）"
         run.result = RunResult(
             run_id=run.run_id,
             status="canceled",
@@ -1036,18 +1374,36 @@ def _cancel_run(run: RunState) -> None:
             RunEvent(run.run_id, "run_finished", {"status": "canceled", "exit_code": None})
         )
         return
-    if run.process and run.status == "running":
-        run.process.terminate()
+    if run.status != "running":
+        return
+    if run.process:
+        try:
+            run.process.terminate()
+        except Exception:
+            pass
         time.sleep(0.2)
         if run.process.poll() is None:
-            run.process.kill()
+            try:
+                run.process.kill()
+            except Exception:
+                pass
         run.status = "canceled"
         run.finished_at = time.time()
+        run.error = "任务已取消，未产出分析结果（exit_code=-15）"
         run.events.put(RunEvent(run.run_id, "run_canceled", {"phase": "running"}))
+        return
 
 
 def _start_run(req_dict: Dict[str, Any]) -> RunState:
     """Enqueue a run on the worker pool. Copies HTTP-thread ContextVars into the worker."""
+    if _SHUTTING_DOWN:
+        raise DaemonHttpError(
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            {
+                "error": "shutting_down",
+                "message": "服务正在停机，请稍后重新提交分析任务",
+            },
+        )
     scheduler = ensure_run_scheduler()
     req = run_request_from_dict(req_dict)
     run = RUNS.create_run(req)
@@ -1304,7 +1660,9 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:
-        path = self.path.split("?", 1)[0]
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = {key: (vals[-1] if vals else "") for key, vals in parse_qs(parsed.query).items()}
 
         if path == "/health":
             payload = {
@@ -1315,6 +1673,9 @@ class Handler(BaseHTTPRequestHandler):
                 "web_ui": True,
             }
             payload.update(_scheduler_snapshot())
+            payload.update(_health_package_info())
+            payload["shutting_down"] = bool(_SHUTTING_DOWN)
+            payload["runs_retained"] = len(RUNS.list())
             _json_response(self, HTTPStatus.OK, payload)
             return
 
@@ -1378,7 +1739,7 @@ class Handler(BaseHTTPRequestHandler):
 
         result_id = _single_id_path(path, "/result/")
         if result_id:
-            _respond_result(self, result_id)
+            _respond_result(self, result_id, result_format=str(query.get("format") or ""))
             return
 
         status_id = _single_id_path(path, "/status/")
@@ -1397,7 +1758,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path.startswith("/runs/") and path.endswith("/result"):
             run_id = path.split("/")[2]
-            _respond_result(self, run_id)
+            _respond_result(self, run_id, result_format=str(query.get("format") or ""))
             return
 
         if path.startswith("/runs/"):
@@ -1420,20 +1781,37 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
 
         if path == "/runs":
-            try:
-                body = _read_json_body(self)
-                run = _start_run(body)
-                links = _run_links(run.run_id)
+            if _SHUTTING_DOWN:
                 _json_response(
                     self,
-                    HTTPStatus.OK,
+                    HTTPStatus.SERVICE_UNAVAILABLE,
                     {
-                        "run_id": run.run_id,
-                        "status": run.status,
-                        "message": _status_message(run),
-                        "links": links,
+                        "error": "shutting_down",
+                        "message": "服务正在停机，请稍后重新提交分析任务",
                     },
+                    headers={"Retry-After": "30"},
                 )
+                return
+            try:
+                body = _read_json_body(self)
+                if not isinstance(body, dict):
+                    raise DaemonHttpError(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": "invalid_json", "message": "请求体必须是 JSON object"},
+                    )
+                key = _extract_idempotency_key(self, body)
+                fingerprint = _run_fingerprint(body)
+                if key:
+                    existing_id = _idempotency_lookup(key, fingerprint)
+                    if existing_id:
+                        existing = RUNS.get(existing_id)
+                        if existing is not None:
+                            _json_response(self, HTTPStatus.OK, _created_run_payload(existing))
+                            return
+                run = _start_run(body)
+                if key:
+                    _idempotency_store(key, fingerprint, run.run_id)
+                _json_response(self, HTTPStatus.OK, _created_run_payload(run))
             except SchedulerBusy as exc:
                 _json_response(
                     self,
@@ -1445,6 +1823,8 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     headers={"Retry-After": "5"},
                 )
+            except DaemonHttpError as exc:
+                _json_response(self, int(exc.status), exc.payload)
             except Exception as e:
                 _json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(e)})
             return
@@ -1539,7 +1919,28 @@ def main() -> int:
         default=_env_int("STABILITY_AGENT_DAEMON_RUN_TIMEOUT", 0),
         help="Seconds before a running CLI is killed; 0 disables (env STABILITY_AGENT_DAEMON_RUN_TIMEOUT)",
     )
+    parser.add_argument(
+        "--shutdown-wait",
+        type=int,
+        default=_env_int("STABILITY_AGENT_DAEMON_SHUTDOWN_WAIT_SEC", 90),
+        help="Seconds to wait for CLI subprocesses after SIGTERM (env STABILITY_AGENT_DAEMON_SHUTDOWN_WAIT_SEC)",
+    )
+    parser.add_argument(
+        "--run-ttl",
+        type=int,
+        default=_env_int("STABILITY_AGENT_DAEMON_RUN_TTL_SEC", 6 * 60 * 60),
+        help="Seconds to keep finished runs in memory; 0 disables (env STABILITY_AGENT_DAEMON_RUN_TTL_SEC)",
+    )
+    parser.add_argument(
+        "--event-queue-max",
+        type=int,
+        default=_env_int("STABILITY_AGENT_DAEMON_EVENT_QUEUE_MAX", 256),
+        help="Per-run SSE queue size; oldest events drop (env STABILITY_AGENT_DAEMON_EVENT_QUEUE_MAX)",
+    )
     args = parser.parse_args()
+    os.environ["STABILITY_AGENT_DAEMON_SHUTDOWN_WAIT_SEC"] = str(max(0, int(args.shutdown_wait)))
+    os.environ["STABILITY_AGENT_DAEMON_RUN_TTL_SEC"] = str(max(0, int(args.run_ttl)))
+    os.environ["STABILITY_AGENT_DAEMON_EVENT_QUEUE_MAX"] = str(max(1, int(args.event_queue_max)))
     ensure_run_scheduler(
         max_workers=args.max_workers,
         max_queue=args.max_queue,
@@ -1556,7 +1957,9 @@ def main() -> int:
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
 
     def _shutdown(*_):
-        httpd.shutdown()
+        global _SHUTTING_DOWN
+        _SHUTTING_DOWN = True
+        threading.Thread(target=httpd.shutdown, name="httpd-shutdown", daemon=True).start()
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -1578,6 +1981,12 @@ def main() -> int:
     print("  Tool System API: POST /tool-system/analyze  POST /tool-system/native-leak")
     print("                   GET /tool-system/tools  GET /tool-system/workflows")
     httpd.serve_forever()
+    wait_sec = _env_int("STABILITY_AGENT_DAEMON_SHUTDOWN_WAIT_SEC", 90)
+    print(
+        f"daemon shutting down; cancelling active runs (wait up to {wait_sec}s)",
+        file=sys.stderr,
+    )
+    _drain_active_runs(wait_sec)
     return 0
 
 

@@ -9,7 +9,8 @@
 python3 daemon/server.py
 
 # 自定义地址和端口
-python3 daemon/server.py --host 0.0.0.0 --port 8765 --max-workers 2 --max-queue 32
+python3 daemon/server.py --host 0.0.0.0 --port 8765 --max-workers 2 --max-queue 32 \
+  --shutdown-wait 90 --run-ttl 21600 --event-queue-max 256
 ```
 
 启动后输出：
@@ -46,11 +47,17 @@ daemon listening on http://127.0.0.1:8765 (protocol=1)
   "running": 1,
   "max_workers": 2,
   "max_queue": 32,
-  "run_timeout_sec": 0
+  "run_timeout_sec": 0,
+  "shutting_down": false,
+  "runs_retained": 3
 }
 ```
 
-并发：`--max-workers`（或环境变量 `STABILITY_AGENT_DAEMON_MAX_WORKERS`，默认 2）限制同时运行的 CLI 子进程；`--max-queue`（`STABILITY_AGENT_DAEMON_MAX_QUEUE`，默认 32）限制等待中的任务。队列满时 `POST /runs` 返回 **429** `queue_full`。`--run-timeout` 为 0 表示不限时。
+并发：`--max-workers`（或环境变量 `STABILITY_AGENT_DAEMON_MAX_WORKERS`，默认 2）限制同时运行的 CLI 子进程；`--max-queue`（`STABILITY_AGENT_DAEMON_MAX_QUEUE`，默认 32）限制等待中的任务。队列满时 `POST /runs` 返回 **429** `queue_full`。`--run-timeout` 为 **0** 表示不限时；**非 0** 表示该秒数后终止 CLI 子进程。
+
+优雅停机：`SIGTERM`/`SIGINT` 后 `POST /runs` 返回 **503** `shutting_down`，并取消 queued/running 任务，最多等待 `--shutdown-wait` 秒（默认 90，`STABILITY_AGENT_DAEMON_SHUTDOWN_WAIT_SEC`）。systemd 的 `TimeoutStopSec` 必须大于该值。
+
+内存：每任务 SSE 队列默认最多 256 条（满则丢最旧，`--event-queue-max` / `STABILITY_AGENT_DAEMON_EVENT_QUEUE_MAX`）；结束态任务默认保留 6 小时后从内存淘汰（`--run-ttl` / `STABILITY_AGENT_DAEMON_RUN_TTL_SEC`，`0` 表示不淘汰）。淘汰后旧 `run_id` 会 404，应重新提交。
 
 ---
 
@@ -74,10 +81,10 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/health` | 探活 |
-| POST | `/runs` | 提交任务 |
+| GET | `/health` | 探活（含 `package` / `package_version`） |
+| POST | `/runs` | 提交任务；可选头 `Idempotency-Key` 或 body `idempotency_key`（TTL 2 小时） |
 | GET | `/status/{id}` | 查询状态 |
-| GET | `/result/{id}` | 取分析结果（含 `report` 正文） |
+| GET | `/result/{id}` | 取分析结果；`?format=summary` 附加 `00_run_summary.json` |
 | POST | `/cancel/{id}` | 取消任务 |
 
 #### `POST /runs`
@@ -85,6 +92,12 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
 
 ```json
 { "error": "queue_full", "queued": 32, "max_queue": 32 }
+```
+
+进程正在停机时返回 **503**：
+
+```json
+{ "error": "shutting_down", "message": "服务正在停机，请稍后重新提交分析任务" }
 ```
 
 成功时：
@@ -194,14 +207,18 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
 }
 ```
 `status` 取值：`queued` / `running` / `done` / `error` / `canceled`  
-`report_dir`：从 CLI stderr 行 `report 已保存到:` 解析，供 Web 写向量库使用。
-`workspace_dir`：自动改码实际使用的隔离 worktree；任务完成后保留。
-`patch_path`：存在代码变化时生成的 Git patch；没有变化时为 `null`。
+`progress`：阶段文案；对外另有 `progress_percent`（0–100，可 null）。  
+`error`：失败/取消时的中文摘要，可直接转述。  
+`workspace_dir`：自动改码隔离 worktree；任务未改码时经常为 `null`，不是必有字段。  
+`report_dir`：从 CLI stderr 行 `report 已保存到:` 解析，供 Web 写向量库使用。  
+`patch_path`：存在代码变化时生成的 Git patch；没有变化时为 `null`。  
+任务表在内存中，daemon 重启后旧 run_id 全部 404，应重新提交。  
+对 running 任务 POST `/cancel` 后可能仍返回 `status: running`，需再查 `/status`。
 
 ---
 
 #### `GET /runs/<run_id>/events`
-SSE 流式订阅任务事件（`text/event-stream`）。
+SSE 流式订阅任务事件（`text/event-stream`）。队列为**单消费者**，不要多端同时订阅；轮询 `/status` 已足够。
 
 **事件格式：**
 ```

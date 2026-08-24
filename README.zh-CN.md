@@ -7,7 +7,7 @@
 
 [English](./README.md) | **简体中文**
 
-**维护状态：** 持续维护中 · **最新版 [v1.3.2](https://pypi.org/project/stability-analysis-agent/1.3.2/)**（Daemon HTTP 与 CLI 参数对齐、栈帧默认裁剪）· 有实质性改动时发布 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases)（活跃期大约每月一档，非日历 SLA）· 详见 [CHANGELOG.md](./CHANGELOG.md)
+**维护状态：** 持续维护中 · **最新版 [v1.3.3](https://pypi.org/project/stability-analysis-agent/1.3.3/)**（Daemon 优雅停机、有界 SSE 队列、结束态任务 TTL）· 有实质性改动时发布 [GitHub Releases](https://github.com/baidu-maps/stability-analysis-agent/releases)（活跃期大约每月一档，非日历 SLA）· 详见 [CHANGELOG.md](./CHANGELOG.md)
 
 ---
 
