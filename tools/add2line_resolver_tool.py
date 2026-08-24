@@ -308,6 +308,7 @@ class Add2lineResolver:
             quick_mode: 快速模式（跳过慢速兜底策略，优先吞吐）
         """
         self.tool_search_paths = tool_search_paths or {}
+        self._protected_search_paths: set = set()
         self.config_file = config_file
         self.library_dir = library_dir
         self.quick_mode = quick_mode
@@ -606,12 +607,16 @@ class Add2lineResolver:
                 for tool_path in platform_config["tool_paths"]:
                     if Path(tool_path).exists() and tool_path not in search_paths:
                         search_paths.append(tool_path)
+                    if Path(tool_path).exists():
+                        self._protected_search_paths.add(os.path.abspath(os.path.expanduser(str(tool_path))))
             
             # 添加全局工具路径
             if "global" in self.config and "tool_paths" in self.config["global"]:
                 for tool_path in self.config["global"]["tool_paths"]:
                     if Path(tool_path).exists() and tool_path not in search_paths:
                         search_paths.append(tool_path)
+                    if Path(tool_path).exists():
+                        self._protected_search_paths.add(os.path.abspath(os.path.expanduser(str(tool_path))))
         
         for tool in tool_priorities:
             try:
@@ -1069,7 +1074,17 @@ class Add2lineResolver:
 
         # 在扩展路径中查找
         for search_path in search_paths:
-            if self.os_type == "harmonyos" and self._is_android_affinity_path(search_path):
+            abs_search = os.path.abspath(os.path.expanduser(str(search_path or "")))
+            protected = abs_search in getattr(self, "_protected_search_paths", set())
+            if (
+                self.os_type == "harmonyos"
+                and self._is_android_affinity_path(search_path)
+                and not protected
+            ):
+                logger.warning(
+                    "HarmonyOS 跳过疑似 Android 路径 %s；若这是你配置的 llvm-addr2line 目录，请把它写进 platforms.harmonyos.tool_paths",
+                    search_path,
+                )
                 continue
             tool_path = Path(search_path) / tool_name
             if tool_path.exists() and tool_path.is_file():

@@ -114,6 +114,8 @@ class RunRequest:
     max_stack_frames_in_prompt: Optional[int] = None
     max_shared_var_related_functions: Optional[int] = None
     min_key_read_related_functions: Optional[int] = None
+    max_symbol_only_rescues: Optional[int] = None
+    max_crash_caller_search_files: Optional[int] = None
     code_context_timeout_sec: Optional[float] = None
     find_source_timeout_sec: Optional[float] = None
 

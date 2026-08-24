@@ -62,6 +62,8 @@ daemon listening on http://127.0.0.1:8765 (protocol=1)
 
 JSON 请求体默认上限 **16 MiB**（`--max-body-bytes` / `STABILITY_AGENT_DAEMON_MAX_BODY_BYTES`）。超过时在读入内存前返回 **413** `payload_too_large`。`GET /health` 的 `max_body_bytes` 为当前上限。1.2MB 崩溃日志可正常提交。
 
+远程/无鉴权端口建议加 `--deny-local-path-fields`（或 `STABILITY_AGENT_DAEMON_DENY_LOCAL_PATH_FIELDS=1`），命中 `crash_log` / `code_root` / `library_dir` 等本地路径字段时返回 **400** `forbidden_field`。省略 `apply_ai_fixes` 时 HTTP 默认为 `false`。空 `crash_log_content` 为 **400** `crash_log_content_required`。`--access-log`（或 `STABILITY_AGENT_DAEMON_ACCESS_LOG=1`）将 method/path/状态打到 stderr。`--allow-local-path-fields` 用于本机 Web UI。
+
 ---
 
 ### Web UI（静态页）

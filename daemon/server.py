@@ -53,6 +53,78 @@ _IDEMPOTENCY_LOCK = threading.Lock()
 _IDEMPOTENCY: Dict[str, Tuple[float, str, str]] = {}
 _HEALTH_EXTRAS: List[Callable[[], Dict[str, Any]]] = []
 
+_DENY_LOCAL_PATH_FIELDS = False
+_ACCESS_LOG = False
+_LOCAL_PATH_FIELDS = frozenset(
+    {
+        "crash_log",
+        "crash_log_dir",
+        "code_root",
+        "code_roots",
+        "library_dir",
+        "config",
+        "native_leak_dir",
+        "native_leak_trace_db",
+        "workspace_root",
+        "repo_cache_root",
+        "vector_db_path",
+    }
+)
+_OUTPUT_FORMATS = frozenset({"markdown", "json", "text"})
+
+
+def set_deny_local_path_fields(enabled: bool) -> None:
+    """Enterprise/remote daemons should turn this on for unauthenticated ports."""
+    global _DENY_LOCAL_PATH_FIELDS
+    _DENY_LOCAL_PATH_FIELDS = bool(enabled)
+
+
+def _prepare_http_run_body(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize and guard a POST /runs JSON object."""
+    payload = dict(body or {})
+    if "apply_ai_fixes" not in payload:
+        payload["apply_ai_fixes"] = False
+    fmt = str(payload.get("output_format") or "markdown").strip().lower() or "markdown"
+    if fmt not in _OUTPUT_FORMATS:
+        raise DaemonHttpError(
+            HTTPStatus.BAD_REQUEST,
+            {
+                "error": "invalid_output_format",
+                "message": "output_format 只能是 markdown / json / text",
+                "output_format": payload.get("output_format"),
+            },
+        )
+    payload["output_format"] = fmt
+    if _DENY_LOCAL_PATH_FIELDS:
+        for field_name in sorted(_LOCAL_PATH_FIELDS):
+            if field_name not in payload:
+                continue
+            value = payload.get(field_name)
+            if value in (None, "", [], {}):
+                continue
+            raise DaemonHttpError(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": "forbidden_field",
+                    "field": field_name,
+                    "message": f"远程模式不允许传 {field_name}，日志请放 crash_log_content",
+                },
+            )
+    content = payload.get("crash_log_content")
+    has_content = isinstance(content, str) and bool(content.strip())
+    has_path = bool(str(payload.get("crash_log") or "").strip())
+    has_dir = bool(str(payload.get("crash_log_dir") or "").strip())
+    if _DENY_LOCAL_PATH_FIELDS or not (has_path or has_dir):
+        if not has_content:
+            raise DaemonHttpError(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": "crash_log_content_required",
+                    "message": "crash_log_content 不能为空",
+                },
+            )
+    return payload
+
 
 class DaemonHttpError(Exception):
     """Mapped to an HTTP JSON error by Handler.do_POST / do_GET."""
@@ -844,6 +916,18 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
         "--find-source-timeout-sec",
         req.find_source_timeout_sec,
         getattr(defaults, "find_source_timeout_sec", None),
+    )
+    _append_nondefault_value(
+        cmd,
+        "--max-symbol-only-rescues",
+        req.max_symbol_only_rescues,
+        getattr(defaults, "max_symbol_only_rescues", None),
+    )
+    _append_nondefault_value(
+        cmd,
+        "--max-crash-caller-search-files",
+        req.max_crash_caller_search_files,
+        getattr(defaults, "max_crash_caller_search_files", None),
     )
     for module in req.plugin_modules or []:
         module_text = str(module or "").strip()
@@ -1709,7 +1793,9 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "AIStabilityDaemon/0.1"
 
     def log_message(self, format: str, *args: Any) -> None:
-        return
+        if not _ACCESS_LOG:
+            return
+        sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), format % args))
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -1852,6 +1938,7 @@ class Handler(BaseHTTPRequestHandler):
                         HTTPStatus.BAD_REQUEST,
                         {"error": "invalid_json", "message": "请求体必须是 JSON object"},
                     )
+                body = _prepare_http_run_body(body)
                 key = _extract_idempotency_key(self, body)
                 fingerprint = _run_fingerprint(body)
                 if key:
@@ -1879,7 +1966,11 @@ class Handler(BaseHTTPRequestHandler):
             except DaemonHttpError as exc:
                 _json_response(self, int(exc.status), exc.payload)
             except Exception as e:
-                _json_response(self, HTTPStatus.BAD_REQUEST, {"error": str(e)})
+                _json_response(
+                    self,
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": "internal_error", "message": str(e)},
+                )
             return
 
         cancel_id = _single_id_path(path, "/cancel/")
@@ -2000,11 +2091,33 @@ def main() -> int:
         default=_env_int("STABILITY_AGENT_DAEMON_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
         help="Max JSON request body bytes; oversize is HTTP 413 (env STABILITY_AGENT_DAEMON_MAX_BODY_BYTES)",
     )
+    parser.add_argument(
+        "--deny-local-path-fields",
+        action="store_true",
+        help="Reject POST /runs fields that point at server-local paths",
+    )
+    parser.add_argument(
+        "--allow-local-path-fields",
+        action="store_true",
+        help="Allow crash_log/code_root/library_dir in POST /runs (local Web UI)",
+    )
+    parser.add_argument(
+        "--access-log",
+        action="store_true",
+        default=_env_int("STABILITY_AGENT_DAEMON_ACCESS_LOG", 0) == 1,
+        help="Log method/path/status to stderr (env STABILITY_AGENT_DAEMON_ACCESS_LOG=1)",
+    )
     args = parser.parse_args()
     os.environ["STABILITY_AGENT_DAEMON_SHUTDOWN_WAIT_SEC"] = str(max(0, int(args.shutdown_wait)))
     os.environ["STABILITY_AGENT_DAEMON_RUN_TTL_SEC"] = str(max(0, int(args.run_ttl)))
     os.environ["STABILITY_AGENT_DAEMON_EVENT_QUEUE_MAX"] = str(max(1, int(args.event_queue_max)))
     os.environ["STABILITY_AGENT_DAEMON_MAX_BODY_BYTES"] = str(max(1, int(args.max_body_bytes)))
+    global _ACCESS_LOG
+    _ACCESS_LOG = bool(args.access_log) or _env_int("STABILITY_AGENT_DAEMON_ACCESS_LOG", 0) == 1
+    if args.allow_local_path_fields:
+        set_deny_local_path_fields(False)
+    elif args.deny_local_path_fields or _env_int("STABILITY_AGENT_DAEMON_DENY_LOCAL_PATH_FIELDS", 0) == 1:
+        set_deny_local_path_fields(True)
     ensure_run_scheduler(
         max_workers=args.max_workers,
         max_queue=args.max_queue,
@@ -2039,6 +2152,7 @@ def main() -> int:
     print("                   GET /health  GET /status/<id>  GET /result/<id>  POST /cancel/<id>")
     print("                   GET /runs  GET /runs/<id>  GET /runs/<id>/events  POST /runs/<id>/cancel")
     print("                   POST /runs/<id>/vector-db/commit")
+    print(f"  deny_local_path_fields={_DENY_LOCAL_PATH_FIELDS} access_log={_ACCESS_LOG}")
     print("  Web preferences: GET/POST /web/preferences")
     print("  Skills API:      GET /skills  GET /skills/<name>")
     print("                   POST /skills/install  POST /skills/lint  POST /skills/uninstall")

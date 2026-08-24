@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 
+from rag.sqlite_compat import upsert_row
+
 
 class MetadataStore:
     def __init__(self, db_path: str = "./vector_db/metadata.sqlite3"):
@@ -118,34 +120,28 @@ class MetadataStore:
             "updated_at": now,
         }
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO crash_pattern_index (
-                    pattern_id, pattern_summary, crash_signature, platform_scope,
-                    crash_category, evidence_requirements, confidence_score,
-                    validation_state, source_type, hit_count, adopted_count,
-                    rejected_count, created_at, updated_at
-                ) VALUES (
-                    :pattern_id, :pattern_summary, :crash_signature, :platform_scope,
-                    :crash_category, :evidence_requirements, :confidence_score,
-                    :validation_state, :source_type, :hit_count, :adopted_count,
-                    :rejected_count, :created_at, :updated_at
-                )
-                ON CONFLICT(pattern_id) DO UPDATE SET
-                    pattern_summary=excluded.pattern_summary,
-                    crash_signature=excluded.crash_signature,
-                    platform_scope=excluded.platform_scope,
-                    crash_category=excluded.crash_category,
-                    evidence_requirements=excluded.evidence_requirements,
-                    confidence_score=excluded.confidence_score,
-                    validation_state=excluded.validation_state,
-                    source_type=excluded.source_type,
-                    hit_count=excluded.hit_count,
-                    adopted_count=excluded.adopted_count,
-                    rejected_count=excluded.rejected_count,
-                    updated_at=excluded.updated_at
-                """,
+            upsert_row(
+                conn,
+                "crash_pattern_index",
+                "pattern_id",
                 payload,
+                (
+                    "pattern_id",
+                    "pattern_summary",
+                    "crash_signature",
+                    "platform_scope",
+                    "crash_category",
+                    "evidence_requirements",
+                    "confidence_score",
+                    "validation_state",
+                    "source_type",
+                    "hit_count",
+                    "adopted_count",
+                    "rejected_count",
+                    "created_at",
+                    "updated_at",
+                ),
+                preserve_on_update=("created_at",),
             )
 
     def get_pattern(self, pattern_id: str) -> Optional[Dict[str, Any]]:
@@ -223,24 +219,20 @@ class MetadataStore:
             "created_at": evidence.get("created_at") or datetime.now().isoformat(),
         }
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO crash_evidence (
-                    evidence_id, pattern_id, evidence_type, raw_content,
-                    normalized_features, reliability_score, created_at
-                ) VALUES (
-                    :evidence_id, :pattern_id, :evidence_type, :raw_content,
-                    :normalized_features, :reliability_score, :created_at
-                )
-                ON CONFLICT(evidence_id) DO UPDATE SET
-                    pattern_id=excluded.pattern_id,
-                    evidence_type=excluded.evidence_type,
-                    raw_content=excluded.raw_content,
-                    normalized_features=excluded.normalized_features,
-                    reliability_score=excluded.reliability_score,
-                    created_at=excluded.created_at
-                """,
+            upsert_row(
+                conn,
+                "crash_evidence",
+                "evidence_id",
                 payload,
+                (
+                    "evidence_id",
+                    "pattern_id",
+                    "evidence_type",
+                    "raw_content",
+                    "normalized_features",
+                    "reliability_score",
+                    "created_at",
+                ),
             )
 
     def list_evidence(self, pattern_id: str) -> List[Dict[str, Any]]:
@@ -273,26 +265,24 @@ class MetadataStore:
             "updated_at": now,
         }
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO fix_strategy (
-                    strategy_id, applicable_pattern_ids, fix_intent, constraints,
-                    risk_level, confidence_score, example_diff, notes, created_at, updated_at
-                ) VALUES (
-                    :strategy_id, :applicable_pattern_ids, :fix_intent, :constraints,
-                    :risk_level, :confidence_score, :example_diff, :notes, :created_at, :updated_at
-                )
-                ON CONFLICT(strategy_id) DO UPDATE SET
-                    applicable_pattern_ids=excluded.applicable_pattern_ids,
-                    fix_intent=excluded.fix_intent,
-                    constraints=excluded.constraints,
-                    risk_level=excluded.risk_level,
-                    confidence_score=excluded.confidence_score,
-                    example_diff=excluded.example_diff,
-                    notes=excluded.notes,
-                    updated_at=excluded.updated_at
-                """,
+            upsert_row(
+                conn,
+                "fix_strategy",
+                "strategy_id",
                 payload,
+                (
+                    "strategy_id",
+                    "applicable_pattern_ids",
+                    "fix_intent",
+                    "constraints",
+                    "risk_level",
+                    "confidence_score",
+                    "example_diff",
+                    "notes",
+                    "created_at",
+                    "updated_at",
+                ),
+                preserve_on_update=("created_at",),
             )
 
     def list_fix_strategies(self, pattern_ids: List[str]) -> List[Dict[str, Any]]:
@@ -345,20 +335,18 @@ class MetadataStore:
             "created_at": feedback.get("created_at") or datetime.now().isoformat(),
         }
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO pattern_feedback (
-                    feedback_id, pattern_id, feedback_type, comment, created_at
-                ) VALUES (
-                    :feedback_id, :pattern_id, :feedback_type, :comment, :created_at
-                )
-                ON CONFLICT(feedback_id) DO UPDATE SET
-                    pattern_id=excluded.pattern_id,
-                    feedback_type=excluded.feedback_type,
-                    comment=excluded.comment,
-                    created_at=excluded.created_at
-                """,
+            upsert_row(
+                conn,
+                "pattern_feedback",
+                "feedback_id",
                 payload,
+                (
+                    "feedback_id",
+                    "pattern_id",
+                    "feedback_type",
+                    "comment",
+                    "created_at",
+                ),
             )
 
     def list_all_feedback(self) -> List[Dict[str, Any]]:
@@ -401,22 +389,22 @@ class MetadataStore:
             "updated_at": now,
         }
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO analysis_guidance_blocks (
-                    block_id, pattern_id, rule_id, block_type, content, priority, created_at, updated_at
-                ) VALUES (
-                    :block_id, :pattern_id, :rule_id, :block_type, :content, :priority, :created_at, :updated_at
-                )
-                ON CONFLICT(block_id) DO UPDATE SET
-                    pattern_id=excluded.pattern_id,
-                    rule_id=excluded.rule_id,
-                    block_type=excluded.block_type,
-                    content=excluded.content,
-                    priority=excluded.priority,
-                    updated_at=excluded.updated_at
-                """,
+            upsert_row(
+                conn,
+                "analysis_guidance_blocks",
+                "block_id",
                 payload,
+                (
+                    "block_id",
+                    "pattern_id",
+                    "rule_id",
+                    "block_type",
+                    "content",
+                    "priority",
+                    "created_at",
+                    "updated_at",
+                ),
+                preserve_on_update=("created_at",),
             )
 
     def list_guidance_blocks(

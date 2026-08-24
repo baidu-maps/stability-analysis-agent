@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.3.5] - 2026-08-24
+
+### Changed
+
+- **RAG / SQLite**：元数据写入不再依赖 SQLite UPSERT（`ON CONFLICT`），CentOS 7 系统库 3.7.17 可写知识库；`[rag]` extra 增加 `pysqlite3-binary`，包导入时尽量顶替旧 `sqlite3`。
+- **Daemon 远程入参**：`POST /runs` 省略 `apply_ai_fixes` 时默认为 `false`；空日志 **400** `crash_log_content_required`；非法 `output_format` **400** `invalid_output_format`。`--deny-local-path-fields` 拒绝指向服务端本地路径的字段（**400** `forbidden_field`）。未预期异常 **500** `internal_error`。`--access-log` 输出 method/path/状态。
+- **符号化探测**：HarmonyOS 显式配置的 `tool_paths` 不再被 Android affinity 规则丢掉；`config doctor` 按平台打印实际 `primary_tool`。
+- **维护命令**：非 TTY 下 `--check-llm` 不再等待回车。
+- **阶段 4 参数**：CLI / HTTP 可传 `--max-symbol-only-rescues`、`--max-crash-caller-search-files`。
+
+### Documentation
+
+- README / PyPI 发布说明中的最新版本号更新为 1.3.5。
+
 ## [1.3.4] - 2026-08-24
 
 ### Changed

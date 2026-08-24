@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 
+from rag.sqlite_compat import upsert_row
+
 
 class RuleStore:
     def __init__(self, db_path: str = "./vector_db/metadata.sqlite3"):
@@ -56,28 +58,24 @@ class RuleStore:
             "updated_at": now,
         }
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO crash_rules (
-                    rule_id, rule_name, trigger_condition, required_features,
-                    conclusion_type, conclusion_payload, confidence_score,
-                    enabled, created_at, updated_at
-                ) VALUES (
-                    :rule_id, :rule_name, :trigger_condition, :required_features,
-                    :conclusion_type, :conclusion_payload, :confidence_score,
-                    :enabled, :created_at, :updated_at
-                )
-                ON CONFLICT(rule_id) DO UPDATE SET
-                    rule_name=excluded.rule_name,
-                    trigger_condition=excluded.trigger_condition,
-                    required_features=excluded.required_features,
-                    conclusion_type=excluded.conclusion_type,
-                    conclusion_payload=excluded.conclusion_payload,
-                    confidence_score=excluded.confidence_score,
-                    enabled=excluded.enabled,
-                    updated_at=excluded.updated_at
-                """,
+            upsert_row(
+                conn,
+                "crash_rules",
+                "rule_id",
                 payload,
+                (
+                    "rule_id",
+                    "rule_name",
+                    "trigger_condition",
+                    "required_features",
+                    "conclusion_type",
+                    "conclusion_payload",
+                    "confidence_score",
+                    "enabled",
+                    "created_at",
+                    "updated_at",
+                ),
+                preserve_on_update=("created_at",),
             )
 
     def list_enabled_rules(self) -> List[Dict[str, Any]]:

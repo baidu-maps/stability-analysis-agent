@@ -17,3 +17,16 @@ stability_analyzer_agent.rag — 向量数据库集成（仅代码实现层）
   如需导入自定义知识库，可通过 init_vector_db_data.py 初始化种子数据，
   或自行准备 JSON 快照并调用 AICrashAnalyzerWithVectorDB.import_snapshot() 导入。
 """
+
+def _maybe_upgrade_sqlite() -> None:
+    """Prefer pysqlite3 when present so ChromaDB can run on old system SQLite."""
+    import sys
+
+    try:
+        import pysqlite3 as _pysqlite3  # type: ignore
+    except Exception:
+        return
+    sys.modules["sqlite3"] = _pysqlite3
+
+
+_maybe_upgrade_sqlite()

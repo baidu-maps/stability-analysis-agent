@@ -10,7 +10,10 @@ when the stack is missing or broken (e.g. NameError inside transformers).
 from __future__ import annotations
 
 import logging
+import sqlite3
 from typing import Any, Optional, Type
+
+from rag.sqlite_compat import sqlite_meets
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +48,25 @@ def get_ai_stability_analyzer_class() -> Optional[Type[Any]]:
     return _RAG_ANALYZER_CLASS
 
 
+def sqlite_usable_for_metadata() -> bool:
+    """Metadata store needs a working sqlite3; UPSERT-era SQL is no longer required."""
+    try:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE t (id TEXT PRIMARY KEY)")
+        conn.close()
+    except Exception:
+        return False
+    return True
+
+
+def sqlite_usable_for_chroma() -> bool:
+    """ChromaDB historically requires SQLite >= 3.35."""
+    return sqlite_meets(3, 35)
+
+
 def rag_stack_available() -> bool:
+    if not sqlite_usable_for_metadata():
+        return False
     return get_ai_stability_analyzer_class() is not None
 
 

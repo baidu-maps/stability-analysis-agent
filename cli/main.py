@@ -2659,7 +2659,7 @@ def _check_llm_connectivity(provider_key: Optional[str] = None, *, probe_all: bo
                 default_index=0,
             )
         else:
-            _safe_input("联通性检测已完成，按回车返回... ")
+            return
 
     from tool_system.llm.http_ssl import is_ssl_certificate_error, precheck_https_ssl_environment, uses_urllib_transport
 
@@ -3036,6 +3036,16 @@ def _print_add2line_detection_explainer(status: Dict[str, Any]) -> None:
         else:
             print(f"- {platform_labels[p]}: {_red('无可用工具')}")
     print("")
+    platform_primary = status.get("platform_primary_tools") or {}
+    if isinstance(platform_primary, dict) and platform_primary:
+        print("各平台实际选中的解析工具（崩溃 os_type 探测结果）：")
+        for plat in ("android", "harmonyos", "ios"):
+            meta = platform_primary.get(plat) or {}
+            tool = meta.get("primary_tool") or "无"
+            path = meta.get("path") or ""
+            extra = f"  ({path})" if path else ""
+            print(f"- {plat}: {tool}{extra}")
+        print("")
 
     addr2line_meta = (status.get("tool_status") or {}).get("llvm-addr2line") or {}
     if addr2line_meta.get("aliased_from") == "llvm-symbolizer":
@@ -3631,6 +3641,20 @@ def build_parser() -> argparse.ArgumentParser:
             "code_content_provider：源文件定位总预算（秒）；"
             f"默认 {_FIND_SOURCE_TIMEOUT_DEFAULT_SECONDS:.0f}（可由 workflow_config.find_source_timeout_sec 覆盖）。"
         ),
+    )
+    p.add_argument(
+        "--max-symbol-only-rescues",
+        dest="max_symbol_only_rescues",
+        type=int,
+        default=None,
+        help="code_content_provider：按符号名兜底定位的最多帧数（默认 5，0 关闭）",
+    )
+    p.add_argument(
+        "--max-crash-caller-search-files",
+        dest="max_crash_caller_search_files",
+        type=int,
+        default=None,
+        help="code_content_provider：反向搜索调用方时最多扫描文件数（默认 600）",
     )
     p.add_argument(
         "--min-key-read-related-functions",
@@ -4702,6 +4726,8 @@ def _build_run_request_record(
         "native_leak_trace_db": str(getattr(args, "native_leak_trace_db", None) or ""),
         "code_context_timeout_sec": code_context_timeout,
         "find_source_timeout_sec": find_source_timeout,
+        "max_symbol_only_rescues": getattr(args, "max_symbol_only_rescues", None),
+        "max_crash_caller_search_files": getattr(args, "max_crash_caller_search_files", None),
         "uaf_nullptr_guard_policy": _effective_uaf_nullptr_guard_policy(),
         "plugin_modules": plugin_modules,
         "output_file": getattr(args, "output_file", None),
@@ -4887,6 +4913,12 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
     find_source_timeout = record.get("find_source_timeout_sec")
     if find_source_timeout is not None:
         argv += ["--find-source-timeout-sec", str(find_source_timeout)]
+    max_rescues = record.get("max_symbol_only_rescues")
+    if max_rescues is not None:
+        argv += ["--max-symbol-only-rescues", str(max_rescues)]
+    max_caller_files = record.get("max_crash_caller_search_files")
+    if max_caller_files is not None:
+        argv += ["--max-crash-caller-search-files", str(max_caller_files)]
 
     for module in record.get("plugin_modules") or []:
         module_text = str(module or "").strip()
@@ -5268,6 +5300,29 @@ def _print_tty_markdown_brief_summary(
             print(_yellow(f"【错误】{err}"))
 
 
+def _probe_platform_primary_tools() -> Dict[str, Any]:
+    """按崩溃平台跑一遍 add2line 探测，展示实际选中的 primary_tool。"""
+    out: Dict[str, Any] = {}
+    try:
+        from tools.add2line_resolver_tool import Add2lineResolver
+
+        probe = Add2lineResolver(quick_mode=True)
+        for plat in ("android", "harmonyos", "ios"):
+            probe._restore_env_snapshot()
+            probe.os_type = plat
+            probe._protected_search_paths = set()
+            tools = probe._find_resolver_tools() or {}
+            probe.resolver_tools = tools
+            primary = probe._select_primary_tool()
+            out[plat] = {
+                "primary_tool": primary,
+                "path": tools.get(str(primary or "")) if primary else None,
+            }
+    except Exception as exc:
+        out["error"] = str(exc)
+    return out
+
+
 def _doctor_status() -> Dict[str, Any]:
     agent_cfg = _load_json_or_empty(_agent_config_file())
     llm_cfg = agent_cfg.get("llm_config", {}) if isinstance(agent_cfg, dict) else {}
@@ -5299,6 +5354,7 @@ def _doctor_status() -> Dict[str, Any]:
         "tool_status": tool_status,
         "tools": tools,
         "tool_ok": any(tools.values()),
+        "platform_primary_tools": _probe_platform_primary_tools(),
     }
 
 
@@ -6033,6 +6089,8 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         "min_key_read_related_functions": int(
             getattr(args, "min_key_read_related_functions", 2) or 0
         ),
+        "max_symbol_only_rescues": getattr(args, "max_symbol_only_rescues", None),
+        "max_crash_caller_search_files": getattr(args, "max_crash_caller_search_files", None),
         "use_ctags_index": bool(getattr(args, "use_ctags_index", False)),
         "include_memory_context_in_final_tip": bool(
             getattr(args, "include_memory_in_05", False)
