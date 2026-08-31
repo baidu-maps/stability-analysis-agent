@@ -163,3 +163,5 @@ ANR、OOM、Jank、JavaScript/ArkTS 等问题已经具备专项分析组件；�
 - 已有 Crash 日志：参考内置 Demo 的参数，替换为自己的日志、符号库和源码路径。
 - 想接入团队流程：阅读 [Skill System](./docs/skills/README.md) 和 [CLI 指南](./docs/cli/CLI_GUIDE.md)。
 - 想理解实现方式：阅读 [系统架构总览](./docs/architecture/README.md)。
+
+如果这个项目帮助你定位或修复过一次稳定性问题，欢迎在 [GitHub](https://github.com/baidu-maps/stability-analysis-agent) 点个 Star。你的 Star 会帮助更多开发者发现这个项目，也会为后续的平台适配和能力建设提供反馈。

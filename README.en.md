@@ -159,3 +159,5 @@ Version history and important changes are tracked in [GitHub Releases](https://g
 - Have your own Crash log: replace the Demo log, symbol, and source paths with your own.
 - Integrate with a team workflow: read the [Skill System](./docs/skills/README.md) and [CLI Guide](./docs/cli/CLI_GUIDE.md).
 - Understand the implementation: read the [System Architecture Overview](./docs/architecture/README.md).
+
+If this project helps you diagnose or fix a stability issue, consider giving it a [Star on GitHub](https://github.com/baidu-maps/stability-analysis-agent). It helps more developers discover the project and gives us useful feedback for future platform and capability improvements.
