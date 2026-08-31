@@ -1516,7 +1516,9 @@ class SymbolLocator:
                     return lines[i].strip()
         return "unknown function"
 
-    def extract_function_name_at_line(self, lines: List[str], line_number: int) -> Optional[str]:
+    def extract_function_name_at_line(
+        self, lines: List[str], line_number: int, *, keep_class_qualifier: bool = False
+    ) -> Optional[str]:
         """Find the enclosing function name at given line number."""
         from tools.function_snippet_utils import (
             is_control_flow_source_line,
@@ -1544,11 +1546,10 @@ class SymbolLocator:
             m = pattern.search(strip_leading_close_braces(line))
             if m and self.is_function_definition_line(line):
                 name = m.group(1)
-                # Remove class prefix for simple name
-                if "::" in name:
+                if not keep_class_qualifier and "::" in name:
                     parts = name.split("::")
                     name = parts[-1] if parts[-1] else name
-                if is_plausible_function_name(name):
+                if is_plausible_function_name(name.split("::")[-1] if name else name):
                     return name
         return None
 
@@ -1893,7 +1894,9 @@ class CallerLocator:
             "CallerLocator: searching %d files for calls to '%s' (budget=%d)",
             len(search_files), simple_name, budget,
         )
-        results = self._regex_scan_callers(simple_name, search_files, code_roots)
+        results = self._regex_scan_callers(
+            simple_name, search_files, code_roots, crash_function_name=crash_function_name
+        )
         matches = [
             {"file": c.file, "caller": c.name, "origin": c.chain_origin}
             for c in results[:20]
@@ -2097,9 +2100,15 @@ class CallerLocator:
         return results
 
     def _regex_scan_callers(
-        self, simple_function_name: str, candidate_files: List[str], code_roots: List[str]
+        self,
+        simple_function_name: str,
+        candidate_files: List[str],
+        code_roots: List[str],
+        crash_function_name: str = "",
     ) -> List[CallChainFunction]:
         """Regex-based caller scan across candidate files."""
+        from tools._stack_symbol_utils import caller_is_same_cpp_method
+
         pattern = re.compile(rf"\b{re.escape(simple_function_name)}\s*\(")
         results: List[CallChainFunction] = []
         seen_keys: Set[str] = set()
@@ -2130,9 +2139,15 @@ class CallerLocator:
                 # Skip comments
                 if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
                     continue
-                # Extract enclosing function
-                caller_name = self._symbol.extract_function_name_at_line(lines, idx + 1)
-                if not caller_name or caller_name == simple_function_name:
+                # Extract enclosing function（保留 Class::method，避免同名转发被当成自身）
+                caller_name = self._symbol.extract_function_name_at_line(
+                    lines, idx + 1, keep_class_qualifier=True
+                )
+                if not caller_name:
+                    continue
+                if caller_is_same_cpp_method(
+                    caller_name, simple_function_name, crash_function_name or simple_function_name
+                ):
                     continue
                 key = f"{caller_name}:{fp}"
                 if key in seen_keys:

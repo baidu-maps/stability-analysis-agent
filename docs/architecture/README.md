@@ -23,7 +23,7 @@
 1. 解析崩溃日志
 2. 地址符号化
 3. 提取代码上下文
-4. （可选）RAG 检索增强
+4. RAG 检索增强（默认安装）
 5. 生成 AI 分析结论
 
 统一 CLI 入口为 `cli/main.py`，通过 `execute_workflow("crash_analysis", problem)` 执行。

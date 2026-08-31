@@ -4510,9 +4510,17 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         write_shared_func_norm: Set[str] = set()
         key_read_shared_func_norm: Set[str] = set()
         any_shared_func_norm: Set[str] = set()
+        thread_affinity_norm: Set[str] = set()
         shared_rels_by_func_var: Dict[Tuple[str, str], Set[str]] = {}
         for e in edges_list:
-            if not isinstance(e, dict) or e.get("type") != "use_shared_var":
+            if not isinstance(e, dict):
+                continue
+            if (
+                str(e.get("type") or "") == "same_class_brother"
+                and "thread_affinity" in str(e.get("relation") or "")
+            ):
+                thread_affinity_norm.add(_norm_graph_nid(str(e.get("from_id") or "")))
+            if e.get("type") != "use_shared_var":
                 continue
             fid = _norm_graph_nid(str(e.get("from_id") or ""))
             tid = str(e.get("to_id") or "")
@@ -4568,6 +4576,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 tags.add("共享变量关键读")
             elif nfid in any_shared_func_norm:
                 tags.add("共享变量读/访问")
+            if nfid in thread_affinity_norm:
+                tags.add("线程投递对照")
             # 聚合共享变量命中明细
             shared_vars: Dict[str, Set[str]] = rec["shared_vars"]
             for (fid_n, tid), rels in shared_rels_by_func_var.items():
@@ -4583,20 +4593,22 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 rec["priority"] = 0
             elif "崩溃函数" in tags or "崩溃行被调" in tags:
                 rec["priority"] = 1
-            elif "共享变量写" in tags:
+            elif "线程投递对照" in tags:
                 rec["priority"] = 2
-            elif "调用崩溃点" in tags:
+            elif "共享变量写" in tags:
                 rec["priority"] = 3
-            elif "共享变量关键读" in tags:
+            elif "调用崩溃点" in tags:
                 rec["priority"] = 4
-            elif "调用链" in tags:
+            elif "共享变量关键读" in tags:
                 rec["priority"] = 5
-            elif "堆栈帧" in tags or "堆栈列表" in tags:
+            elif "调用链" in tags:
                 rec["priority"] = 6
-            elif "共享变量读/访问" in tags:
+            elif "堆栈帧" in tags or "堆栈列表" in tags:
                 rec["priority"] = 7
-            else:
+            elif "共享变量读/访问" in tags:
                 rec["priority"] = 8
+            else:
+                rec["priority"] = 9
 
         crash_site_norm_ids: Set[str] = set(crash_fn_norm_ids)
         caller_to_crash_norm: Set[str] = set()

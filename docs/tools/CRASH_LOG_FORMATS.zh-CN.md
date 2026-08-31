@@ -55,7 +55,22 @@ CLI **不按后缀白名单过滤**，只要能读成文本即可；能否解析
 
 文本 native 栈常见：**`#NN pc 0x地址 /path/lib.so (符号+偏移)`**（Harmony JSON 的 `call_stack` 字段也走同一套解析）。
 
-### 3.3 Harmony 崩溃平台 JSON（含单行导出）
+### 3.3 Windows native 文本报告
+
+Windows CLI 可以解析常见的异常摘要和已符号化调用栈，例如：
+
+```text
+Exception Code:    0xc0000005
+Faulting Module:  demo.exe
+Call Stack:
+  0 0x00007ff612341234 demo.exe!CrashDemo::run+0x2a
+```
+
+支持识别访问违规（`0xc0000005`）、模块名、函数名、地址和偏移。要继续定位到源码文件与行号，需要提供与崩溃版本匹配的 PE 文件（`.exe` / `.dll`）及其 `.pdb`，并在 Windows 上安装 LLVM 的 `llvm-symbolizer.exe`。解析器会以 PE 文件作为目标输入，LLVM 会按调试信息查找同目录或配置路径中的 PDB。
+
+当前不把 `dumpbin` 当作源码行号工具；它只能作为缺少 LLVM 时的有限符号兜底。不同 Windows 崩溃采集器的转储格式、ASLR 地址和 PDB 搜索路径可能不同，首次接入应使用真实产物验证。
+
+### 3.4 Harmony 崩溃平台 JSON（含单行导出）
 
 | `log_format` | 常见来源 | 内容特征 |
 |--------------|----------|----------|
@@ -88,7 +103,7 @@ JSON 要点：
 
 **当前不支持：** 无前缀的裸 JSON `{...}`（需带 `crashDiagnosis:` 前缀，或改用下方通用 JSON 适配）。
 
-### 3.4 第三方崩溃平台 JSON 导出
+### 3.5 第三方崩溃平台 JSON 导出
 
 模块：`tools/crash_parser/platform_json_exports.py`  
 解析器：`PlatformJsonExportParser`  

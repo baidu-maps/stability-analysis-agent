@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import List, Optional, Sequence, Tuple
 
 # iOS / 导出日志中常见的 C++ 限定名（可无括号）
 _CPP_QUALIFIED_SYMBOL_RE = re.compile(
@@ -48,6 +48,127 @@ def rtf_to_plain_text(content: str) -> str:
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _owner_class_token(owner: str) -> str:
+    """owner 末段类名，去掉返回类型（如 'VVoid NaviMapRender' -> 'NaviMapRender'）。"""
+    last = (owner or "").split("::")[-1].strip()
+    toks = last.split()
+    return toks[-1] if toks else last
+
+
+def cpp_owner_and_method(resolved_function: Optional[str]) -> Optional[Tuple[str, str]]:
+    """
+    从 C++ 符号提取 (owner, method)。
+    例：walk_navi::NaviMapRender::UpdateFoo(...) -> (walk_navi::NaviMapRender, UpdateFoo)
+    """
+    s = sanitize_stack_symbol(resolved_function) or ""
+    s = s.strip()
+    if "::" not in s:
+        return None
+    head = s.split("(", 1)[0].strip()
+    if "::" not in head:
+        return None
+    # 签名行可能带返回类型：VVoid NaviMapRender::Foo
+    pre, rest = head.split("::", 1)
+    pre = pre.strip()
+    if " " in pre:
+        pre = pre.split()[-1]
+        head = f"{pre}::{rest}"
+    parts = [p.strip() for p in head.split("::") if p.strip()]
+    if len(parts) < 2:
+        return None
+    owner = "::".join(parts[:-1]).strip()
+    method = parts[-1].strip()
+    if not owner or not method:
+        return None
+    return owner, method
+
+
+def stack_symbol_aliases_crash_function(
+    resolved_function: str,
+    crash_simple_name: str,
+    *crash_symbols: str,
+) -> bool:
+    """
+    栈帧符号是否应复用崩溃函数图节点。
+
+    同名成员函数挂在不同类上时必须拆开，否则会把
+    WalkMapControl::UpdateFoo 折叠成 NaviMapRender::UpdateFoo。
+    崩溃点源码签名若只有 simple name（无 Class::），不得仅凭同名折叠其它类。
+    """
+    simple = (crash_simple_name or "").strip()
+    if not simple:
+        return False
+    parsed = cpp_owner_and_method(resolved_function)
+    method = parsed[1] if parsed else ""
+    if not method:
+        head = (resolved_function or "").split("(", 1)[0].strip()
+        method = head.split("::")[-1].strip() if head else ""
+        method = method.split()[-1] if method.split() else method
+    if method != simple:
+        return False
+    crash_parsed = None
+    for sym in crash_symbols:
+        if not sym:
+            continue
+        crash_parsed = cpp_owner_and_method(sym)
+        if crash_parsed:
+            break
+    if parsed and crash_parsed:
+        return _owner_class_token(parsed[0]) == _owner_class_token(crash_parsed[0])
+    if parsed and not crash_parsed:
+        return False
+    return True
+
+
+def caller_is_same_cpp_method(
+    caller_name: str,
+    target_simple_name: str,
+    crash_function_name: str,
+) -> bool:
+    """
+    反向搜调用方时，是否应跳过「崩溃函数自身」。
+
+    同 simple name 但类不同（薄封装/同名转发）应保留为调用方。
+    """
+    simple = (target_simple_name or "").strip()
+    if not simple or not (caller_name or "").strip():
+        return False
+    caller_parsed = cpp_owner_and_method(caller_name)
+    crash_parsed = cpp_owner_and_method(crash_function_name)
+    caller_method = caller_parsed[1] if caller_parsed else caller_name.split("::")[-1].strip()
+    if caller_method != simple:
+        return False
+    if caller_parsed and crash_parsed:
+        return _owner_class_token(caller_parsed[0]) == _owner_class_token(crash_parsed[0])
+    # 无类限定时退回旧行为：simple name 相同视为自身
+    return not caller_parsed
+
+
+def stack_has_same_named_trampoline(symbols: Sequence[str]) -> bool:
+    """
+    栈符号列表（崩溃帧在前）是否存在「不同类、同方法名」的转发调用方。
+    例如 NaviMapRender::UpdateFoo ← WalkMapControl::UpdateFoo。
+    """
+    cleaned = [str(s).strip() for s in (symbols or []) if str(s or "").strip()]
+    if len(cleaned) < 2:
+        return False
+    crash = cpp_owner_and_method(cleaned[0])
+    if not crash:
+        return False
+    crash_owner, crash_method = crash
+    crash_tail = _owner_class_token(crash_owner)
+    if not crash_method or not crash_tail:
+        return False
+    for other in cleaned[1:]:
+        parsed = cpp_owner_and_method(other)
+        if not parsed:
+            continue
+        o_owner, o_method = parsed
+        if o_method == crash_method and _owner_class_token(o_owner) != crash_tail:
+            return True
+    return False
 
 
 def sanitize_stack_symbol(symbol: Optional[str]) -> Optional[str]:

@@ -11,7 +11,7 @@ import logging
 import re
 import subprocess
 import time
-from typing import Dict, List, Any, Optional, Tuple, Union, Set
+from typing import Dict, List, Any, Optional, Tuple, Union, Set, Sequence
 from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,7 +20,21 @@ from tools._prompt_context_filter import (
     DEFAULT_MAX_STACK_FRAMES_IN_PROMPT,
     DEFAULT_MAX_STACK_FRAMES_SYMBOL_ENRICH,
 )
-from tools._stack_symbol_utils import sanitize_stack_symbol
+from tools._lifecycle_contrast import (
+    arrow_callees_of_member,
+    body_calls_unqualified,
+    deref_members_from_text,
+    forwarding_members,
+    has_self_repost_prologue,
+    member_is_assigned,
+    pick_lifecycle_contrast,
+)
+from tools._stack_symbol_utils import (
+    _owner_class_token,
+    cpp_owner_and_method,
+    sanitize_stack_symbol,
+    stack_symbol_aliases_crash_function,
+)
 from tools.code_context_errors import (
     CodeContextUserError,
     NO_EXTRACTABLE_CONTEXT,
@@ -7963,7 +7977,7 @@ class CodeContentProvider:
                     from_id=rid,
                     to_id=cf_id,
                     type="same_class_brother",
-                    relation=rf.description or rf.relation_type,
+                    relation=rf.relation_type or rf.description,
                 )
             )
 
@@ -7981,8 +7995,15 @@ class CodeContentProvider:
                 simple_name = self._extract_function_name_from_resolved(fn)
                 if not simple_name:
                     continue
-                # 崩溃函数本身已作为节点，保持 file 一致
-                if simple_name == crash_func.name:
+                # 崩溃函数本身已作为节点，保持 file 一致。
+                # 仅按 simple name 对齐会把 WalkMapControl::Foo 折叠成 NaviMapRender::Foo。
+                if stack_symbol_aliases_crash_function(
+                    fn,
+                    crash_func.name,
+                    crash_func.signature or "",
+                    getattr(crash_summary, "analysis_entry_function", None) or "",
+                    getattr(crash_summary, "function", None) or "",
+                ):
                     nid = func_node_id(simple_name, crash_file, crash_func.signature)
                     ensure_func_node(simple_name, crash_file, crash_func.signature, crash_func.snippet)
                     thread_nodes.append(nid)
@@ -9004,6 +9025,292 @@ class CodeContentProvider:
             logger.error(f"查找相关函数失败: {e}")
         
         return related_functions
+
+    def _companion_class_source_files(self, source_file: str) -> List[str]:
+        """cpp 旁同名头文件，供类外定义扫描。"""
+        out: List[str] = []
+        path = Path(source_file)
+        if path.is_file():
+            out.append(str(path))
+        if path.suffix.lower() in {".c", ".cc", ".cpp", ".cxx", ".mm"}:
+            for ext in (".h", ".hpp", ".hxx", ".hh"):
+                header = path.with_suffix(ext)
+                if header.is_file():
+                    out.append(str(header))
+        return out
+
+    def _iter_out_of_line_class_methods(
+        self,
+        source_files: Sequence[str],
+        class_name: str,
+        skip_methods: Optional[Set[str]] = None,
+    ) -> List[Tuple[str, str, str, List[str]]]:
+        """
+        扫描 Class::method( 类外定义。
+        返回 (file, func_name, func_code, snippet)。
+        """
+        skip = {str(x).strip() for x in (skip_methods or set()) if str(x or "").strip()}
+        skip.add(class_name)
+        skip.add(f"~{class_name}")
+        found: Set[str] = set()
+        hits: List[Tuple[str, str, str, List[str]]] = []
+        if not class_name:
+            return hits
+        def_re = re.compile(
+            rf"(?:[\w:<>,\s*&~]+)?\s*{re.escape(class_name)}::([~]?\w+)\s*\("
+        )
+        for source_file in source_files:
+            if not source_file or not os.path.isfile(source_file):
+                continue
+            try:
+                with open(source_file, "r", encoding="utf-8", errors="ignore") as handle:
+                    lines = handle.readlines()
+            except OSError:
+                continue
+            for i, line in enumerate(lines):
+                match = def_re.search(line)
+                if not match:
+                    continue
+                if not self._locator.symbol_locator.is_function_definition_line(line.strip()):
+                    continue
+                func_name = match.group(1)
+                if not func_name or func_name in skip or func_name in found:
+                    continue
+                func_code = self._extract_full_function_code(
+                    lines, i, target_function_name=func_name
+                )
+                if not func_code:
+                    continue
+                snippet = [ln.rstrip() for ln in func_code.split("\n") if ln.strip()]
+                if self.max_code_length > 0:
+                    snippet = self._truncate_snippet(snippet)
+                if not snippet:
+                    continue
+                found.add(func_name)
+                hits.append((source_file, func_name, func_code, snippet))
+        return hits
+
+    def _related_from_method(
+        self,
+        source_file: str,
+        class_name: str,
+        func_name: str,
+        snippet: List[str],
+        description: str,
+    ) -> RelatedFunction:
+        return RelatedFunction(
+            name=f"{class_name}::{func_name}",
+            file=source_file,
+            snippet=snippet,
+            relation_type="thread_affinity",
+            description=description,
+        )
+
+    def _find_stack_caller_thread_affinity_siblings(
+        self,
+        resolved_frames: List[Dict[str, Any]],
+        crash_func: CrashFunction,
+        crash_resolved_function: str,
+        crash_file: str,
+        code_roots: List[str],
+        max_total: int = 3,
+    ) -> List[RelatedFunction]:
+        """
+        栈上调用方：转发成员的赋值切片 + 自投递序言差；崩溃类：被解引用成员的写点。
+        不打开全量 max_sibling_member_functions。
+        """
+        crash_parsed = cpp_owner_and_method(crash_resolved_function) or cpp_owner_and_method(
+            getattr(crash_func, "signature", None) or ""
+        )
+        crash_owner_tail = _owner_class_token(crash_parsed[0]) if crash_parsed else ""
+        crash_method = str(getattr(crash_func, "name", "") or "").strip()
+        cap = max(1, min(int(max_total or 3), 4))
+        by_name: Dict[str, RelatedFunction] = {}
+        names_with_repost: Set[str] = set()
+        assign_names: List[str] = []
+        callers_of_assign: List[str] = []
+        hop_exemplars: List[str] = []
+        crash_writers: List[str] = []
+        caller_has_repost = False
+
+        crash_text = "\n".join(
+            [
+                str(getattr(crash_func, "crash_line", "") or ""),
+                "\n".join(getattr(crash_func, "snippet", None) or []),
+            ]
+        )
+        crash_deref_members = deref_members_from_text(crash_text)
+
+        actual_crash = ""
+        if crash_file:
+            actual_crash = self._find_source_file(crash_file, code_roots) or (
+                crash_file if os.path.isfile(crash_file) else ""
+            )
+        if crash_owner_tail and actual_crash and crash_deref_members:
+            for src, fname, code, snippet in self._iter_out_of_line_class_methods(
+                self._companion_class_source_files(actual_crash),
+                crash_owner_tail,
+                {crash_method},
+            ):
+                if not any(member_is_assigned(code, member) for member in crash_deref_members):
+                    continue
+                qname = f"{crash_owner_tail}::{fname}"
+                by_name[qname] = self._related_from_method(
+                    src,
+                    crash_owner_tail,
+                    fname,
+                    snippet,
+                    "崩溃类中对被解引用成员的写点（生命周期赋值）",
+                )
+                crash_writers.append(qname)
+
+        frames = [f for f in (resolved_frames or []) if isinstance(f, dict)]
+        for frame in frames[1:]:
+            rf = str(frame.get("resolved_function") or frame.get("function") or "").strip()
+            rfile = str(frame.get("resolved_file") or "").strip()
+            parsed = cpp_owner_and_method(rf)
+            if not parsed or not rfile:
+                continue
+            owner_tail = _owner_class_token(parsed[0])
+            method = parsed[1]
+            if not owner_tail or (crash_owner_tail and owner_tail == crash_owner_tail):
+                continue
+            actual = self._find_source_file(rfile, code_roots) or (
+                rfile if os.path.isfile(rfile) else ""
+            )
+            if not actual:
+                continue
+            methods = self._iter_out_of_line_class_methods(
+                self._companion_class_source_files(actual),
+                owner_tail,
+                {method, crash_method},
+            )
+            if not methods:
+                continue
+            caller_code = ""
+            try:
+                with open(actual, "r", encoding="utf-8", errors="ignore") as handle:
+                    caller_lines = handle.readlines()
+            except OSError:
+                caller_lines = []
+            if caller_lines:
+                try:
+                    rline = int(frame.get("resolved_line") or 0)
+                except (TypeError, ValueError):
+                    rline = 0
+                if rline > 0:
+                    caller_code = self._extract_full_function_code(
+                        caller_lines, rline - 1, target_function_name=method
+                    ) or ""
+                if not caller_code:
+                    patterns = [
+                        rf"{re.escape(owner_tail)}::{re.escape(method)}\s*\(",
+                        rf"\b{re.escape(method)}\s*\(",
+                    ]
+                    for pat in patterns:
+                        def_re = re.compile(pat)
+                        for i, line in enumerate(caller_lines):
+                            if not def_re.search(line):
+                                continue
+                            if not self._locator.symbol_locator.is_function_definition_line(
+                                line.strip()
+                            ):
+                                continue
+                            caller_code = self._extract_full_function_code(
+                                caller_lines, i, target_function_name=method
+                            ) or ""
+                            if caller_code:
+                                break
+                        if caller_code:
+                            break
+            members = forwarding_members(caller_code, crash_method) if caller_code else []
+            if caller_code:
+                caller_has_repost = caller_has_repost or has_self_repost_prologue(
+                    caller_code, owner_tail
+                )
+            if not members:
+                continue
+
+            method_map = {fname: (src, code, snippet) for src, fname, code, snippet in methods}
+            assign_local: List[str] = []
+            for fname, (src, code, snippet) in method_map.items():
+                qname = f"{owner_tail}::{fname}"
+                if has_self_repost_prologue(code, owner_tail):
+                    names_with_repost.add(qname)
+                if any(member_is_assigned(code, mem) for mem in members):
+                    assign_local.append(fname)
+                    by_name[qname] = self._related_from_method(
+                        src,
+                        owner_tail,
+                        fname,
+                        snippet,
+                        "调用方类中对转发成员的赋值（生命周期写点）",
+                    )
+            assign_local.sort()
+            for fname in assign_local:
+                qname = f"{owner_tail}::{fname}"
+                if qname not in assign_names:
+                    assign_names.append(qname)
+
+            one_hop: List[str] = []
+            for fname, (src, code, snippet) in method_map.items():
+                if fname in assign_local:
+                    continue
+                if any(body_calls_unqualified(code, assign_fn) for assign_fn in assign_local):
+                    one_hop.append(fname)
+                    qname = f"{owner_tail}::{fname}"
+                    by_name[qname] = self._related_from_method(
+                        src,
+                        owner_tail,
+                        fname,
+                        snippet,
+                        "调用方类中调用了转发成员赋值函数的公开入口",
+                    )
+            one_hop.sort()
+            for fname in one_hop:
+                qname = f"{owner_tail}::{fname}"
+                if qname not in callers_of_assign:
+                    callers_of_assign.append(qname)
+
+            hops: List[str] = []
+            for fname, (src, code, snippet) in method_map.items():
+                if fname in assign_local or fname in one_hop:
+                    continue
+                if not any(arrow_callees_of_member(code, mem) for mem in members):
+                    continue
+                if not has_self_repost_prologue(code, owner_tail):
+                    continue
+                hops.append(fname)
+                qname = f"{owner_tail}::{fname}"
+                by_name[qname] = self._related_from_method(
+                    src,
+                    owner_tail,
+                    fname,
+                    snippet,
+                    "同类经同一转发成员调用、且带自投递早返回的序言对照",
+                )
+            hops.sort()
+            for fname in hops:
+                qname = f"{owner_tail}::{fname}"
+                if qname not in hop_exemplars:
+                    hop_exemplars.append(qname)
+
+        ordered = pick_lifecycle_contrast(
+            caller_has_repost=caller_has_repost,
+            assign_names=assign_names,
+            callers_of_assign=callers_of_assign,
+            hop_exemplars=hop_exemplars,
+            crash_writers=crash_writers,
+            names_with_repost=names_with_repost,
+            cap=cap,
+        )
+        picked = [by_name[n] for n in ordered if n in by_name]
+        if picked:
+            logger.info(
+                "生命周期对照兄弟: %s",
+                ", ".join(rf.name for rf in picked),
+            )
+        return picked
     
     def _find_class_end(self, content: str, class_start: int) -> int:
         """查找类定义的结束位置"""
@@ -10418,6 +10725,25 @@ class CodeContentProvider:
                     logger.warning(f"线程上下文分析失败，已跳过: {e}")
                     extraction_warnings.append(f"线程上下文分析失败: {e}")
                 logger.info(f"找到 {len(thread_context)} 个线程上下文")
+
+                try:
+                    affinity_frames = flatten_resolved_frames_from_stack(add2line_data)
+                    affinity_siblings = self._find_stack_caller_thread_affinity_siblings(
+                        affinity_frames,
+                        crash_func,
+                        resolved_function,
+                        resolved_file,
+                        code_roots_abs_strs,
+                        max_total=3,
+                    )
+                    if affinity_siblings:
+                        sibling_member_func_in_same_class = list(
+                            sibling_member_func_in_same_class
+                        ) + list(affinity_siblings)
+                except _CodeContextPhaseTimeout:
+                    raise
+                except Exception as e:
+                    logger.warning("栈调用方线程亲和兄弟抽取失败，已跳过: %s", e)
 
                 # 8. 构建图结构视图
                 graph: CrashGraph

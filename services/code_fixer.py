@@ -563,14 +563,37 @@ def _extract_entry_null_guard_var(replacement: str) -> Optional[str]:
     return guard_match.group(1) if guard_match else None
 
 
+def _stack_symbols_from_code_context(code_context: Optional[Dict[str, Any]]) -> List[str]:
+    graph = (code_context or {}).get("graph") if isinstance(code_context, dict) else None
+    if not isinstance(graph, dict):
+        return []
+    symbols: List[str] = []
+    for item in graph.get("call_chain_from_add2line") or []:
+        if not isinstance(item, dict):
+            continue
+        for s in item.get("call_order_from_add2line") or []:
+            if isinstance(s, str) and s.strip():
+                symbols.append(s.strip())
+        if symbols:
+            return symbols
+    for item in graph.get("stack_function_symbols") or []:
+        if not isinstance(item, dict):
+            continue
+        fn = str(item.get("function") or "").strip()
+        if fn:
+            symbols.append(fn)
+    return symbols
+
+
 def _check_null_guard_only_patch(
     old_block: str,
     replacement: str,
     *,
     code_context: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """检测 replacement 是否仅在函数入口添加了简单判空早返回（症状级）。"""
-    del code_context
+    """同名转发栈上，拒绝仅在崩溃点整函数入口添加判空早返回的补丁。"""
+    from tools._stack_symbol_utils import stack_has_same_named_trampoline
+
     guarded_var = _extract_entry_null_guard_var(replacement)
     if not guarded_var:
         return None
@@ -583,9 +606,16 @@ def _check_null_guard_only_patch(
     )
     if _normalize_code_for_equivalence(stripped) != _normalize_code_for_equivalence(old_block):
         return None
-    if re.search(rf'\b{re.escape(guarded_var)}\s*->', old_block):
-        return None
-    return "replacement_code 仅添加了简单判空早返回（症状级止血），未解决根因，已跳过"
+    has_trampoline = stack_has_same_named_trampoline(
+        _stack_symbols_from_code_context(code_context)
+    )
+    if has_trampoline:
+        return (
+            "replacement_code 在崩溃点整函数入口判空早返回；"
+            "调用栈存在同名转发调用方，应优先在调用方对齐线程投递，已跳过"
+        )
+    # 无同名转发时不拦截入口判空（含 this==nullptr / 原函数已有 var-> 等）。
+    return None
 
 
 def _find_containing_code_root(path: Path, code_roots: List[str]) -> Optional[Path]:
@@ -2186,8 +2216,14 @@ class CodeFixer:
                 record["error"] = "replacement_code 与原函数等价（仅空白或格式差异），已跳过写入"
                 applied.append(record)
                 continue
-            # 应用阶段不做业务/语义门禁；此处只保证定位成功且不是 no-op。
-            # 修复质量由提示词、上下文和人工 review 控制，避免事后规则误拦模型输出。
+            guard_err = _check_null_guard_only_patch(
+                old_block, replacement_code, code_context=code_context
+            )
+            if guard_err:
+                record["error"] = guard_err
+                applied.append(record)
+                continue
+            # 仅拦截「同名转发 + 整函数入口判空」；其余质量由提示词与人工 review 控制。
             eol = _source_newline_style(original)
             replacement_code = _convert_newlines(replacement_code, eol)
             new_text_content = _convert_newlines(

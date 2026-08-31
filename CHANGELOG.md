@@ -94,7 +94,7 @@ All notable changes to this project are documented in this file.
 
 ### Documentation
 
-- `README.md` / `README.zh-CN.md`：证据链能力、维护状态与发版节奏（有意义则发版，活跃期约每月一档，非日历 SLA）。
+- `README.md` / `README.en.md`：证据链能力、维护状态与发版节奏（有意义则发版，活跃期约每月一档，非日历 SLA）。
 - `docs/cli/CLI_COMMANDS_REFERENCE.md`、`docs/architecture/fault_mode_library.md`、Skill 包参考文档同步新报告编号与 scope 语义。
 
 ## [1.2.8] - 2026-07-15
@@ -122,7 +122,7 @@ All notable changes to this project are documented in this file.
 
 - `docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md`：补充「仓库级示例 `extensions/`」、「用户级扩展发现」、「Python 入口点发布扩展包」三个段落，及设置菜单新动作的说明。
 - `docs/README.md`：在文档目录结构下新增「仓库自带扩展（`extensions/`）」段。
-- `README.md` / `README.zh-CN.md`：同步 Skill System / 闭环 Skill 模板章节的扩展机制。
+- `README.md` / `README.en.md`：同步 Skill System / 闭环 Skill 模板章节的扩展机制。
 - 新增 `test/cli/test_report_paths.py`：覆盖 `format_bytes` 单位换算、`summarize / clear_cli_reports` 在正常、缺失目录、`preview_limit=1` 下的行为，以及 example 模板与用户级扩展自动发现。
 
 ## [1.2.6] - 2026-06-03
@@ -139,7 +139,7 @@ All notable changes to this project are documented in this file.
 
 - **Interactive CLI（堆栈符号化配置）**：移除「从 shell 读取环境变量 KEY 并写入配置」的向导菜单；手动配置改为 **「手动设置符号化工具绝对路径」**（可输入可执行文件或其所在目录）。在需要符号化的 **快速开始** 流程中，会先静默尝试与 **自动获取** 相同的配置写入，减少重复操作。文档与 `add2line_resolver_config.local.example.json` 已同步说明 `tool_paths` / `environment_vars` 含义。
 - **Interactive CLI（大模型文案）**：菜单与检测摘要中面向用户的 **provider** 统一改为 **厂商** 等中文表述（配置 JSON 字段名 `active_provider` / `providers` 仍保持不变）。
-- **Documentation**：`README.md` / `README.zh-CN.md`、`docs/cli/CLI_GUIDE.md`、`docs/cli/INTERACTIVE_CLI_DESIGN.md` 与 `tools/configs/agent_config.local.example.json` 中面向用户的 LLM 说明已与「厂商」用语对齐（英文 README 使用 *vendor*；脚本参数 `--provider` 等接口名不变）。
+- **Documentation**：`README.md` / `README.en.md`、`docs/cli/CLI_GUIDE.md`、`docs/cli/INTERACTIVE_CLI_DESIGN.md` 与 `tools/configs/agent_config.local.example.json` 中面向用户的 LLM 说明已与「厂商」用语对齐（英文 README 使用 *vendor*；脚本参数 `--provider` 等接口名不变）。
 - **Interactive CLI（大模型向导）**：交互提示将裸写 `base_url` 改为「接口请求地址」，并在说明中保留 JSON 字段名 `base_url` 以便对照配置文件。
 - **LLM 示例配置**：`tools/configs/agent_config.local.example.json` 移除仅占位的 `your_*` 自定义厂商条目，避免用户复制到 `agent_config.local.json` 后在厂商菜单中出现无关项；说明与 JSON 模板见 `docs/cli/CLI_GUIDE.md`。
 

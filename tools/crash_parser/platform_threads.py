@@ -9,6 +9,7 @@ import re
 from dataclasses import replace
 from typing import List, Optional, Tuple
 
+from tools.crash_parser.abort_message import thread_type_from_name
 from tools.crash_parser.android import _parse_android_thread_banner
 from tools.crash_parser.ios_scoping import (
     _ios_apple_thread_block_count,
@@ -270,16 +271,20 @@ def apply_android_thread_metadata(content: str, threads: List[ThreadStack]) -> L
         threads[0] = replace(threads[0], tid=tid_s, name=nm)
         return threads
 
-    if threads[0].tid is None:
-        m_dbg = re.search(
-            r"pid:\s*\d+,\s*tid:\s*(\d+),\s*name:\s*([^\s>]+)\s*>>>",
-            content,
-            re.IGNORECASE,
-        )
-        if m_dbg:
-            threads[0] = replace(
-                threads[0],
-                tid=m_dbg.group(1).strip(),
-                name=m_dbg.group(2).strip(),
-            )
+    m_dbg = re.search(
+        r"pid:\s*(\d+),\s*tid:\s*(\d+),\s*name:\s*([^\s>]+)\s*>>>",
+        content,
+        re.IGNORECASE,
+    )
+    if m_dbg:
+        pid_s = m_dbg.group(1).strip()
+        tid_s = m_dbg.group(2).strip()
+        tname = m_dbg.group(3).strip()
+        is_main = pid_s == tid_s or thread_type_from_name(tname) == "main"
+        kwargs = {
+            "tid": threads[0].tid or tid_s,
+            "name": threads[0].name or tname,
+            "is_main_thread": True if is_main else False,
+        }
+        threads[0] = replace(threads[0], **kwargs)
     return threads

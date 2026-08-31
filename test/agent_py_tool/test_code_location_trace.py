@@ -161,6 +161,116 @@ class TestCodeLocationTrace(unittest.TestCase):
             self.assertIn("graph", out)
             self.assertIn("location_trace", out)
 
+    def test_same_method_name_on_caller_class_stays_separate_node(self):
+        """栈上 WalkMapControl::UpdateFoo 不得折叠成崩溃点 NaviMapRender::UpdateFoo。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = Path(tmp) / "proj" / "src"
+            src_dir.mkdir(parents=True)
+            (src_dir / "navi_map_render.cpp").write_text(
+                "class NaviMapRender {\n"
+                "public:\n"
+                "  void UpdateMapRenderCustomDrawOption() {\n"
+                "    m_config->x = 1;\n"
+                "  }\n"
+                "};\n"
+                "void NaviMapRender::OnCreate() {\n"
+                "    m_config = 0;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (src_dir / "walk_map_control.cpp").write_text(
+                "class WalkMapControl {\n"
+                "public:\n"
+                "  void UpdateMapRenderCustomDrawOption() {\n"
+                "    if (!m_render) return;\n"
+                "    m_render->UpdateMapRenderCustomDrawOption();\n"
+                "  }\n"
+                "};\n"
+                "void WalkMapControl::OnInit() {\n"
+                "    m_render = 0;\n"
+                "}\n"
+                "void WalkMapControl::Init() {\n"
+                "    if (Hop(WalkMapControl::Init)) return;\n"
+                "    OnInit();\n"
+                "}\n"
+                "void WalkMapControl::SetOverlookMode() {\n"
+                "    if (Hop(WalkMapControl::SetOverlookMode)) return;\n"
+                "    m_render->SetOverlookMode();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            resolved = {
+                "os_type": "android",
+                "crash_thread_id": "1242",
+                "crash_thread_name": "ninebot.ninebot",
+                "crash_thread_is_main_thread": True,
+                "crash_thread_has_business_frames": True,
+                "resolved_threads": [
+                    {
+                        "thread_id": "1242",
+                        "thread_name": "ninebot.ninebot",
+                        "tid": "1242",
+                        "name": "ninebot.ninebot",
+                        "is_crash_thread": True,
+                        "is_main_thread": True,
+                        "frames": [
+                            {
+                                "address": "0x1000",
+                                "resolved_function": (
+                                    "walk_navi::NaviMapRender::UpdateMapRenderCustomDrawOption("
+                                    "walk_navi::NE_MapRenderCustomDrawOption&)"
+                                ),
+                                "resolved_file": "proj/src/navi_map_render.cpp",
+                                "resolved_line": 4,
+                            },
+                            {
+                                "address": "0x2000",
+                                "resolved_function": (
+                                    "walk_navi::WalkMapControl::UpdateMapRenderCustomDrawOption("
+                                    "walk_navi::NE_MapRenderCustomDrawOption&)"
+                                ),
+                                "resolved_file": "proj/src/walk_map_control.cpp",
+                                "resolved_line": 5,
+                            },
+                        ],
+                    }
+                ],
+            }
+            out = CodeContentProviderTool().execute(
+                {
+                    "resolved_stack": json.dumps(resolved, ensure_ascii=False),
+                    "code_roots": [tmp],
+                }
+            )
+            self.assertNotIn("error", out)
+            graph = out.get("graph") or {}
+            nodes = graph.get("nodes") or []
+            files = " ".join(str(n.get("file") or n.get("id") or "") for n in nodes)
+            self.assertIn("walk_map_control.cpp", files)
+            chains = graph.get("call_chain_from_add2line") or []
+            self.assertTrue(chains)
+            node_ids = chains[0].get("nodes") or []
+            self.assertGreaterEqual(len(set(node_ids)), 2)
+            node_blob = " ".join(
+                str(n.get("name") or "") + " " + str(n.get("signature") or "")
+                for n in nodes
+            )
+            self.assertIn("Init", node_blob)
+            self.assertIn("OnInit", node_blob)
+            self.assertIn("OnCreate", node_blob)
+            self.assertNotIn("SetOverlookMode", node_blob)
+            edges = graph.get("edges") or []
+            self.assertTrue(
+                any(
+                    isinstance(e, dict)
+                    and e.get("type") == "same_class_brother"
+                    and "thread_affinity" in str(e.get("relation") or "")
+                    for e in edges
+                ),
+                edges,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -1,6 +1,6 @@
 {
   "_comment": "复制本文件为 add2line_resolver_config.local.json（建议放在 ~/.config/stability-analysis-agent/）。命中该 local 文件后解析器不再与其它 base 模板 merge。本文件已在 .gitignore 中忽略。",
-  "_comment_tool_paths": "platforms.<os>.tool_paths：字符串数组；每项为「包含 llvm-addr2line / addr2line / atos 等可执行文件」的目录的绝对路径（不是可执行文件本身的路径）。交互向导「手动设置符号化工具绝对路径」支持填可执行文件路径（会存其父目录）或直接填目录。",
+  "_comment_tool_paths": "platforms.<os>.tool_paths：字符串数组；每项为「包含 llvm-addr2line / llvm-symbolizer / addr2line / atos 等可执行文件」的目录的绝对路径（不是可执行文件本身的路径）。交互向导「手动设置符号化工具绝对路径」支持填可执行文件路径（会存其父目录）或直接填目录。",
   "_comment_environment_vars": "platforms.<os>.environment_vars：可选。值为工具链安装根目录（如 ANDROID_NDK_HOME 指向 NDK 根）；解析器会按变量名推导子目录下的 bin。可由「自动获取」写入；高级用户也可手编。交互向导已不再提供「从 shell 读取任意 KEY」的独立菜单。",
   "description": "堆栈地址解析工具配置文件（本地示例，含占位路径，不入 git）",
   "platforms": {
@@ -31,6 +31,13 @@
     "linux": {
       "tool_paths": [],
       "preferred_tools": ["addr2line", "llvm-addr2line"],
+      "environment_vars": {}
+    },
+    "windows": {
+      "tool_paths": [
+        "C:/Program Files/LLVM/bin"
+      ],
+      "preferred_tools": ["llvm-symbolizer", "llvm-addr2line", "dumpbin"],
       "environment_vars": {}
     }
   }

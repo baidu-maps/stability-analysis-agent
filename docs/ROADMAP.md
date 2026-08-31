@@ -1,8 +1,8 @@
 # Roadmap
 
 This is the long-form version of what we'd like to ship next in
-**Stability Analysis Agent**. The README ships a one-page [milestone table](../README.md#roadmap);
-this document covers deferred ideas, RFCs, and design notes that haven't
+**Stability Analysis Agent**. The README provides the project overview and
+links here for the detailed roadmap, deferred ideas, RFCs, and design notes that haven't
 earned a place on the main page yet.
 
 ## TL;DR

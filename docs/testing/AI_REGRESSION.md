@@ -73,7 +73,7 @@ python3 -m unittest test.ai_regression.test_runner -v
 
 | 时机 | 测试 |
 |------|------|
-| 每次提交 | [提交前确定性套件](./README.md#提交前推荐) |
+| 每次提交 | [提交前确定性套件](./README.md) |
 | Python 包发布 | 确定性 + 默认 `cli` AI 回归 |
 | Web / daemon 发布 | 确定性 + `cli` AI 回归 + `--entrypoint daemon` |
 

@@ -24,14 +24,14 @@
 ### 1) 安装依赖
 
 ```bash
-pip install "stability-analysis-agent[rag]"
-# 或源码：pip install -e ".[rag]"
+pip install stability-analysis-agent
+# 源码开发：pip install -e .
 ```
 
 说明：
 - 核心包默认不强制安装 ChromaDB / sentence-transformers，避免 ML 栈导入失败阻断基础分析。
 - 默认使用简单哈希嵌入，**无需**下载 HuggingFace 模型；预训练嵌入需设置 `AI_STABILITY_ANALYZER_ENABLE_SENTENCE_MODEL=1`。
-- ML 栈版本：`numpy<2`、`torch>=2.4`、`transformers<4.52`、`sentence-transformers<3`、`accelerate>=0.26`（见 `pyproject.toml` 的 `[rag]` 或 `requirements-rag.txt`）。
+- ML 栈版本：`numpy<2`、`torch>=2.4`、`transformers<4.52`、`sentence-transformers<3`、`accelerate>=0.26`（默认由 `pyproject.toml` 安装，也可参考 `requirements-rag.txt`）。
 - 版本冲突排错见 [../cli/INSTALL_TROUBLESHOOTING.md](../cli/INSTALL_TROUBLESHOOTING.md)。
 
 ### 2) 初始化本地向量库
@@ -139,4 +139,3 @@ Web / Daemon：`POST /runs/<run_id>/vector-db/commit`（见 [DAEMON_SERVER_GUIDE
 - 单独运行 `rag/init_vector_db_data.py` 方式。
 
 后续如果要统一到 CLI，可在 `cli/main.py` 增加显式子命令（如 `rag init/stats/export/import`）。
-

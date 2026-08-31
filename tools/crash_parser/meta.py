@@ -48,12 +48,17 @@ def extract_crash_info(content: str) -> CrashInfo:
     abort_message = extract_abort_message(content)
 
     dbg_name = re.search(
-        r"pid:\s*\d+,\s*tid:\s*\d+,\s*name:\s*([^\s>]+)\s*>>>",
+        r"pid:\s*(\d+),\s*tid:\s*(\d+),\s*name:\s*([^\s>]+)\s*>>>",
         content,
         re.IGNORECASE,
     )
     if dbg_name:
-        thread_type = thread_type_from_name(dbg_name.group(1))
+        pid_s, tid_s, tname = dbg_name.group(1), dbg_name.group(2), dbg_name.group(3)
+        # Android 主线程 tombstone：pid==tid，线程名常为进程名（如 ninebot.ninebot），不是 "main"
+        if pid_s == tid_s or thread_type_from_name(tname) == "main":
+            thread_type = "main"
+        else:
+            thread_type = thread_type_from_name(tname)
 
     reason_line_match = re.search(r'^Reason:\s*([^\n\r]+)$', content, re.IGNORECASE | re.MULTILINE)
     reason_text = reason_line_match.group(1).strip() if reason_line_match else ""
@@ -197,6 +202,13 @@ def extract_crash_info(content: str) -> CrashInfo:
             signal = "14 (SIGALRM)"
         elif 'access violation' in content_lower:
             signal = "0xC0000005"
+
+    windows_exception = re.search(
+        r"^Exception Code:\s*([^\s]+)", header_scope, re.IGNORECASE | re.MULTILINE
+    )
+    if windows_exception:
+        exception_type = exception_type or windows_exception.group(1).upper()
+        category = category or "native_crash"
 
     # 基于关键字的通用场景分类（category）补全
     low = content_lower

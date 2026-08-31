@@ -76,7 +76,9 @@ def find_library_files_in_dir(library_dir: str, os_type: str) -> List[Path]:
         "ios": [".dylib", ".a"],
         "linux": [".so", ".a"],
         "macos": [".dylib", ".a"],
-        "windows": [".dll", ".lib", ".a"],
+        # LLVM symbolizer / MSVC PDB 通常以 exe 或 dll 作为 --obj 输入；
+        # .pdb 本身也保留在候选集中，便于仅分发符号文件的场景匹配。
+        "windows": [".exe", ".dll", ".pdb", ".lib", ".a"],
         "unknown": [".so", ".dylib", ".dll", ".a", ".lib"],
     }
     target_extensions = extensions.get(os_type, extensions["unknown"])

@@ -116,7 +116,7 @@ class DeterministicAnalyzer:
                     description="空指针解引用（确定）",
                     confidence=1.0,
                     evidence=f"信号={signal}, 故障地址={crash_address} (< 0x1000)",
-                    implication="崩溃原因为空指针访问，分析应聚焦于指针为何为空（生命周期/未初始化/竞态）",
+                    implication="崩溃原因为空指针访问。确定性事实只说明指针为空，不自动等于多线程竞态；应先对照调用栈与初始化路径区分：未初始化/生命周期时序 vs 跨线程数据竞争",
                 ))
         except (ValueError, TypeError):
             pass

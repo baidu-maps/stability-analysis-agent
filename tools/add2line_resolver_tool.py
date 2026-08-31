@@ -11,6 +11,7 @@ import subprocess
 import logging
 import os
 import platform
+import shutil
 import concurrent.futures
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, asdict, field
@@ -470,7 +471,7 @@ class Add2lineResolver:
         
         # 检查PATH中是否有Android工具
         if 'PATH' in os.environ:
-            path_dirs = os.environ['PATH'].split(':')
+            path_dirs = os.environ['PATH'].split(os.pathsep)
             for path_dir in path_dirs:
                 if any(android_tool in path_dir.lower() for android_tool in ['android', 'ndk', 'sdk']):
                     return True
@@ -503,7 +504,7 @@ class Add2lineResolver:
         
         # 检查PATH中是否有iOS工具
         if 'PATH' in os.environ:
-            path_dirs = os.environ['PATH'].split(':')
+            path_dirs = os.environ['PATH'].split(os.pathsep)
             for path_dir in path_dirs:
                 if any(ios_tool in path_dir.lower() for ios_tool in ['xcode', 'ios', 'developer']):
                     return True
@@ -555,11 +556,10 @@ class Add2lineResolver:
                 "otool",               # 对象文件工具
             ],
             "windows": [
+                "llvm-symbolizer",       # LLVM 对 PE/COFF + PDB 的推荐入口
                 "llvm-addr2line",      # LLVM版本
                 "addr2line",           # 标准工具
                 "dumpbin",             # Microsoft工具
-                "windbg",              # Windows调试器
-                "cdb",                 # 控制台调试器
             ],
             "android": [
                 "llvm-addr2line",      # LLVM版本
@@ -721,7 +721,7 @@ class Add2lineResolver:
                         if Path(tool_path).exists():
                             current_path = os.environ.get('PATH', '')
                             if tool_path not in current_path:
-                                os.environ['PATH'] = f"{tool_path}:{current_path}"
+                                os.environ['PATH'] = f"{tool_path}{os.pathsep}{current_path}"
                                 logger.info(f"从配置文件添加工具路径到PATH: {tool_path}")
                 
                 # 读取当前运行平台特定的环境变量
@@ -748,7 +748,7 @@ class Add2lineResolver:
                             if Path(tool_path).exists():
                                 current_path = os.environ.get('PATH', '')
                                 if tool_path not in current_path:
-                                    os.environ['PATH'] = f"{tool_path}:{current_path}"
+                                    os.environ['PATH'] = f"{tool_path}{os.pathsep}{current_path}"
                                     logger.info(f"从全局配置添加工具路径到PATH: {tool_path}")
                     
                     if "environment_vars" in global_config:
@@ -793,7 +793,7 @@ class Add2lineResolver:
                             if path_str and '\n' not in path_str:  # 确保没有换行符
                                 if path_str not in os.environ.get('PATH', ''):
                                     current_path = os.environ.get('PATH', '')
-                                    os.environ['PATH'] = f"{path_str}:{current_path}"
+                                    os.environ['PATH'] = f"{path_str}{os.pathsep}{current_path}"
                                     logger.debug(f"从 {config_file} 加载PATH: {path_str}")
                         
                         # 查找特定工具的环境变量
@@ -825,7 +825,7 @@ class Add2lineResolver:
                                             if Path(tool_path).exists():
                                                 current_path = os.environ.get('PATH', '')
                                                 if tool_path not in current_path:
-                                                    os.environ['PATH'] = f"{tool_path}:{current_path}"
+                                                    os.environ['PATH'] = f"{tool_path}{os.pathsep}{current_path}"
                                                     logger.debug(f"添加工具路径到PATH: {tool_path}")
                                     
                     except Exception as e:
@@ -860,7 +860,7 @@ class Add2lineResolver:
                             if Path(tool_path).exists():
                                 current_path = os.environ.get('PATH', '')
                                 if tool_path not in current_path:
-                                    os.environ['PATH'] = f"{tool_path}:{current_path}"
+                                    os.environ['PATH'] = f"{tool_path}{os.pathsep}{current_path}"
                                     logger.debug(f"添加工具路径到PATH: {tool_path}")
             elif isinstance(paths, str):
                 # 单个路径
@@ -874,7 +874,7 @@ class Add2lineResolver:
                         if Path(tool_path).exists():
                             current_path = os.environ.get('PATH', '')
                             if tool_path not in current_path:
-                                os.environ['PATH'] = f"{tool_path}:{current_path}"
+                                os.environ['PATH'] = f"{tool_path}{os.pathsep}{current_path}"
                                 logger.debug(f"添加工具路径到PATH: {tool_path}")
     
     def _get_tool_paths_from_env_var(self, var_name: str, base_path: str) -> List[str]:
@@ -984,7 +984,7 @@ class Add2lineResolver:
         # 添加标准PATH
         if 'PATH' in os.environ:
             # 清理PATH中的换行符和无效字符
-            path_entries = os.environ['PATH'].split(':')
+            path_entries = os.environ['PATH'].split(os.pathsep)
             for path_entry in path_entries:
                 if path_entry and '\n' not in path_entry and len(path_entry) < 500:  # 跳过包含换行符或过长的路径
                     if self.os_type == "harmonyos" and self._is_android_affinity_path(path_entry):
@@ -1064,13 +1064,16 @@ class Add2lineResolver:
         # 本机 PATH 里常会同时存在 Android NDK 的 llvm-addr2line，容易把 OpenHarmony 解析任务带偏。
         if self.os_type != "harmonyos":
             try:
-                result = subprocess.run(["which", tool_name], capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    tool_path = result.stdout.strip()
-                    if self._test_tool_availability(tool_name, tool_path):
-                        return tool_path
+                tool_path = shutil.which(tool_name)
+                if tool_path and self._test_tool_availability(tool_name, tool_path):
+                    return tool_path
             except Exception:
                 pass
+
+        # Windows 工具通常以 .exe 结尾；PATH 查找会自动处理后缀，显式目录扫描也需要保持一致。
+        tool_names = [tool_name]
+        if self.os_type == "windows" and not tool_name.lower().endswith(".exe"):
+            tool_names.append(f"{tool_name}.exe")
 
         # 在扩展路径中查找
         for search_path in search_paths:
@@ -1086,19 +1089,24 @@ class Add2lineResolver:
                     search_path,
                 )
                 continue
-            tool_path = Path(search_path) / tool_name
-            if tool_path.exists() and tool_path.is_file():
-                if self._test_tool_availability(tool_name, str(tool_path)):
-                    return str(tool_path)
+            for candidate_name in tool_names:
+                tool_path = Path(search_path) / candidate_name
+                if tool_path.exists() and tool_path.is_file():
+                    if self._test_tool_availability(tool_name, str(tool_path)):
+                        return str(tool_path)
         
         # 尝试查找平台特定的工具名称
         platform_specific_names = self._get_platform_specific_tool_names(tool_name)
         for specific_name in platform_specific_names:
             for search_path in search_paths:
-                tool_path = Path(search_path) / specific_name
-                if tool_path.exists() and tool_path.is_file():
-                    if self._test_tool_availability(tool_name, str(tool_path)):
-                        return str(tool_path)
+                specific_names = [specific_name]
+                if self.os_type == "windows" and not specific_name.lower().endswith(".exe"):
+                    specific_names.append(f"{specific_name}.exe")
+                for candidate_name in specific_names:
+                    tool_path = Path(search_path) / candidate_name
+                    if tool_path.exists() and tool_path.is_file():
+                        if self._test_tool_availability(tool_name, str(tool_path)):
+                            return str(tool_path)
         
         return None
     
@@ -1124,6 +1132,8 @@ class Add2lineResolver:
                     "eu-addr2line",
                     "gcc-addr2line"
                 ]
+            elif self.os_type == "windows":
+                return ["llvm-symbolizer", "llvm-addr2line"]
         elif base_tool_name == "atos":
             if self.os_type == "macos":
                 return [
@@ -1171,6 +1181,13 @@ class Add2lineResolver:
                 if tool_path:
                     platform_tools[tool] = tool_path
                     logger.info(f"找到iOS特定工具: {tool} -> {tool_path}")
+
+        elif self.os_type == "windows":
+            for tool in ("llvm-symbolizer", "llvm-addr2line", "dumpbin", "cdb"):
+                tool_path = self._find_tool_in_paths(tool, self._get_extended_search_paths())
+                if tool_path:
+                    platform_tools[tool] = tool_path
+                    logger.info(f"找到Windows特定工具: {tool} -> {tool_path}")
         
         return platform_tools
     
@@ -1181,7 +1198,7 @@ class Add2lineResolver:
         
         # 显示PATH信息
         if 'PATH' in os.environ:
-            path_dirs = os.environ['PATH'].split(':')
+            path_dirs = os.environ['PATH'].split(os.pathsep)
             logger.info(f"PATH包含 {len(path_dirs)} 个目录")
             
             # 显示包含关键字的路径
@@ -1259,12 +1276,52 @@ class Add2lineResolver:
                 return self._resolve_with_otool(address, library_path, tool_path)
             elif tool_name == "dumpbin":
                 return self._resolve_with_dumpbin(address, library_path, tool_path)
+            elif tool_name == "llvm-symbolizer":
+                return self._resolve_with_llvm_symbolizer(address, library_path, tool_path)
             else:
                 # 默认使用addr2line格式
                 return self._resolve_with_addr2line(address, library_path, tool_path)
                 
         except Exception as e:
             logger.warning(f"使用工具 {tool_name} 解析地址 {address} 时出错: {e}")
+        return None
+
+    def _resolve_with_llvm_symbolizer(
+        self, address: str, library_path: str, tool_path: str
+    ) -> Optional[ResolvedFrame]:
+        """使用 LLVM symbolizer 解析 PE/COFF 地址，并读取同目录 PDB。"""
+        try:
+            result = subprocess.run(
+                [tool_path, f"--obj={library_path}", "--demangle", address],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+            if result.returncode != 0:
+                return None
+            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            if not lines:
+                return None
+            function = lines[0] if lines[0] not in {"??", "???"} else None
+            file_path = None
+            line_number = None
+            if len(lines) > 1 and lines[1] not in {"??:0", "??"}:
+                # 非贪婪匹配可保留 Windows 盘符和源码路径中的冒号，并兼容 :line:column。
+                match = re.match(r"(.+?):(\d+)(?::\d+)?$", lines[1])
+                if match:
+                    file_path = match.group(1)
+                    line_number = int(match.group(2))
+            if not function and not file_path:
+                return None
+            return ResolvedFrame(
+                address=address,
+                resolved_function=function,
+                resolved_file=file_path,
+                resolved_line=line_number,
+            )
+        except (subprocess.TimeoutExpired, OSError, ValueError):
             return None
     
     def _parse_add2line_output(self, output: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
@@ -1696,7 +1753,9 @@ class Add2lineResolver:
                     )
                     return rf, self._frame_has_usable_output(rf), None
 
-        if function and offset:
+        # Windows 日志经常已经带函数名，但 PDB 仍可补出源码文件与行号；
+        # 其它平台保留原有的函数名快速回退，避免改变既有解析成本。
+        if function and offset and crash_os_type != "windows":
             demangled_function = self._demangle_cpp_symbol(function)
             rf = ResolvedFrame(
                 **base_kw,

@@ -27,10 +27,9 @@ open http://127.0.0.1:8765/
 ## 安装依赖
 
 - **Python**：最低 3.9，推荐 3.10–3.12（详见 [INSTALL_TROUBLESHOOTING.md](./INSTALL_TROUBLESHOOTING.md)）
-- **核心**（解析 / 符号化 / LLM）：`pip install stability-analysis-agent` 或 `pipx install stability-analysis-agent`
-- **含向量库 RAG**：`pip install "stability-analysis-agent[rag]"` 或 `pipx install "stability-analysis-agent[rag]"`
+- **完整安装**（解析 / 符号化 / LLM / 向量库 RAG）：`pip install stability-analysis-agent` 或 `pipx install stability-analysis-agent`
 
-未安装 `[rag]` 时，崩溃分析主流程仍可用，相似案例向量检索会自动跳过。ML 栈导入失败、SSL、`nn` 未定义等见 [INSTALL_TROUBLESHOOTING.md](./INSTALL_TROUBLESHOOTING.md)。
+在异常环境中 RAG 运行时仍会自动降级，不会阻断基础的解析和符号化流程。ML 栈导入失败、SSL、`nn` 未定义等见 [INSTALL_TROUBLESHOOTING.md](./INSTALL_TROUBLESHOOTING.md)。
 
 ## 快速开始
 

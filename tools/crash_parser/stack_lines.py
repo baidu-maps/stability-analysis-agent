@@ -73,6 +73,29 @@ def _try_parse_ios_macos_stack_line(line: str) -> Optional[Tuple[str, str, str, 
 # 无指令地址、仅「序号 模块  符号 + 偏移」的符号化栈（导出/裁剪后常见）
 _IOS_STACK_SYMBOL_ONLY_RE = re.compile(r"^\s*\d+\s+(\S+)\s+(.+)$")
 
+# WinDbg / crash reporter 常见的已符号化 native 栈：
+# ``demo.exe!CrashDemo::run+0x2a`` 或 ``demo.dll!CrashDemo::run``。
+_WINDOWS_SYMBOLIZED_STACK_RE = re.compile(
+    r"^\s*(?:(\d+)\s+)?(?:(0x[0-9a-fA-F]+|[0-9a-fA-F]{8,16})\s+)?"
+    r"([A-Za-z0-9_.-]+\.(?:exe|dll))!(.+?)(?:\+\s*(0x[0-9a-fA-F]+|[0-9]+))?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _try_parse_windows_stack_line(
+    line: str,
+) -> Optional[Tuple[str, str, str, str, Optional[int]]]:
+    """解析 Windows native 栈，返回 ``(module, address, function, offset, frame)``。"""
+    m = _WINDOWS_SYMBOLIZED_STACK_RE.match(line)
+    if not m:
+        return None
+    frame_number = int(m.group(1)) if m.group(1) is not None else None
+    address = m.group(2) or ""
+    module = m.group(3)
+    function = m.group(4).strip()
+    offset = m.group(5) or "0"
+    return module, address, function, offset, frame_number
+
 
 def _try_parse_ios_symbol_only_stack_line(line: str) -> Optional[Tuple[str, str, str, str]]:
     """

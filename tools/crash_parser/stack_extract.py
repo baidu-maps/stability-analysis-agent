@@ -22,6 +22,7 @@ from tools.crash_parser.android import (
     _parse_art_native_pc_tail,
 )
 from tools.crash_parser.stack_lines import (
+    _try_parse_windows_stack_line,
     _try_parse_ios_macos_stack_line,
     _try_parse_ios_pre_parsed_stack_line,
     _try_parse_ios_symbol_only_stack_line,
@@ -120,7 +121,7 @@ def extract_stack_frames(
         - 输出: "libxxx.so"
         - 输入: "/product/.../Foo.apk!libxxx.so" → ``libxxx.so``（APK 内嵌 so）
         """
-        module = module_path.split('/')[-1] if '/' in module_path else module_path
+        module = module_path.replace('\\', '/').split('/')[-1]
         # 去掉括号中的符号信息，例如 "libxxx.so (_Zfoo+12"
         if '(' in module:
             module = module.split('(')[0]
@@ -179,6 +180,22 @@ def extract_stack_frames(
             current_stack_type = "thread_created"
         elif 'read of size' in line_lower or 'write of size' in line_lower:
             current_stack_type = "read"
+
+        windows_parsed = _try_parse_windows_stack_line(stripped)
+        if windows_parsed:
+            module, address, function, offset, frame_num = windows_parsed
+            stack_frames.append(StackFrame(
+                frame_number=frame_num if frame_num is not None else len(stack_frames),
+                address=address or (f"0x{offset}" if offset.startswith("0x") else offset),
+                function=function,
+                module=module,
+                offset=offset,
+                library_type=_classify_library(module),
+                layer="native",
+                language="cpp",
+                raw_log_line=raw_log_line,
+            ))
+            continue
 
         # Android ART / HarmonyOS："#NN pc" 或 "native: #NN pc"（含 [anon:dalvik-DEX data] 等含空格的模块名）
         match = _ART_NATIVE_PC_LINE_RE.match(stripped)

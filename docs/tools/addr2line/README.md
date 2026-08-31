@@ -48,6 +48,17 @@
 
 - macOS：优先 `atos`，其次 `llvm-atos`，再到 `llvm-addr2line`
 - Android：优先 `llvm-addr2line`，其次 `addr2line`、`gdb`、`ndk-stack`
+- Windows：优先 `llvm-symbolizer.exe`，其次 `llvm-addr2line.exe`；PE/COFF 文件的源码行号依赖匹配的 PDB
+
+### 3.1 Windows PE/PDB
+
+Windows 原生栈符号化建议准备同一构建产出的 `.exe` / `.dll` 和 `.pdb`。将它们放入 `--library-dir` 指定的目录，或通过 CLI 的“配置堆栈地址解析工具”设置包含 `llvm-symbolizer.exe` 的目录。解析器调用 LLVM 的 PE 目标模式：
+
+```text
+llvm-symbolizer.exe --obj=C:\symbols\demo.exe --demangle 0x140001234
+```
+
+如果日志中的地址是模块内偏移而不是进程虚拟地址，应先确认崩溃采集器的地址语义；错误的模块基址或 ASLR 处理会导致 PDB 无法命中。没有匹配 PDB 时，Agent 仍可保留日志中的函数名和偏移，但不能保证源码文件、行号和后续自动修复质量。
 
 ## 4. 常见问题
 

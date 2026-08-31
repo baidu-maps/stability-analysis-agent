@@ -11,6 +11,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows:
+    name: Windows (Python ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package and test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Ensure LLVM is available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command llvm-symbolizer.exe -ErrorAction SilentlyContinue)) {
+            choco install llvm -y --no-progress
+            Add-Content $env:GITHUB_PATH "C:\Program Files\LLVM\bin"
+          }
+          llvm-symbolizer.exe --version
+
+      - name: Verify Windows entrypoint and imports
+        shell: pwsh
+        run: |
+          sa-agent --help
+          python -c "from tools.crash_parser.format_detect import detect_os_type; assert detect_os_type('Exception Code: 0xc0000005`nFaulting Module: demo.exe`nCall Stack:') == 'windows'"
+          python -c "from daemon.server import Handler; from rag.case_writer import commit_from_report_dir; print('windows_imports_ok')"
+
+      - name: Run Windows compatibility tests
+        shell: pwsh
+        run: |
+          python -B -m unittest test.agent_py_tool.test_windows_compatibility -v
+
   deterministic:
     name: Deterministic (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest

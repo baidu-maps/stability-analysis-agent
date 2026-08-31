@@ -32,7 +32,7 @@ docs/
 
 
 
-> 快速开始请直接阅读项目根目录 [README.md](../README.md)（[中文版](../README.zh-CN.md)）。
+> 快速开始请直接阅读项目根目录 [README.md](../README.md)（[英文版](../README.en.md)）。
 
 ## 文档列表
 

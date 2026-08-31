@@ -4,4 +4,4 @@ pytest
 mock
 openai
 -e .
-# RAG/向量库 ML 栈见 requirements-rag.txt 或: pip install -e ".[rag]"
+# RAG/向量库 ML 栈已由 pyproject.toml 作为默认依赖安装。

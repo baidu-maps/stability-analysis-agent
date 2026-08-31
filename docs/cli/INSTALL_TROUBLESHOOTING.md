@@ -5,9 +5,9 @@
 | 场景 | 建议版本 |
 |------|----------|
 | 最低支持 | **Python 3.9**（`pyproject.toml` → `requires-python = ">=3.9"`） |
-| 推荐（核心 + 交互 CLI） | **3.10 – 3.12** |
-| 含 `[rag]` extra | **3.10 – 3.12**（torch / transformers 组合在 3.9 上更容易踩坑） |
-| 未在 CI 中验证 | 3.13+：可尝试安装，但不保证 `[rag]` 依赖均有 wheel |
+| 推荐（完整 CLI + RAG） | **3.10 – 3.12** |
+| 默认完整安装（含 RAG） | **3.10 – 3.12**（torch / transformers 组合在 3.9 上更容易踩坑） |
+| 未在 CI 中验证 | 3.13+：可尝试安装，但不保证完整 ML 依赖均有 wheel |
 
 查看当前环境：
 
@@ -27,11 +27,8 @@ sa-agent config doctor
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
-# 核心能力：崩溃解析、符号化、代码上下文、LLM 分析
+# 完整能力：崩溃解析、符号化、代码上下文、LLM 分析和 RAG
 pip install stability-analysis-agent
-
-# 含向量库 / 相似案例 RAG（ChromaDB 等）
-pip install "stability-analysis-agent[rag]"
 ```
 
 源码开发：
@@ -52,8 +49,8 @@ pipx ensurepath
 # 核心 CLI
 pipx install stability-analysis-agent
 
-# 含 RAG（下载体积大，首次安装较慢）
-pipx install "stability-analysis-agent[rag]"
+# 默认包含 RAG（下载体积较大，首次安装可能较慢）
+pipx install stability-analysis-agent
 
 # 验证
 sa-agent --help
@@ -69,7 +66,7 @@ sa-agent config doctor
 
 ### 预编译二进制（无需 Python）
 
-见 [README.zh-CN.md](../../README.zh-CN.md) 中「使用预编译 CLI 二进制」。
+见 [README.md](../../README.md) 中「使用预编译 CLI 二进制」。
 
 ## `PyTorch >= 2.4 is required but found 2.2.x` / NumPy 2.x 与 torch 不兼容
 
@@ -78,7 +75,7 @@ sa-agent config doctor
 - transformers 禁用 PyTorch 或报 `Failed to initialize NumPy`
 - 后续 `NameError: name 'nn' is not defined`
 
-请安装与 `[rag]` extra 一致的版本（或整体重装 `[rag]`）：
+请按项目默认版本范围重装 ML 依赖：
 
 ```bash
 pip install --upgrade "numpy>=1.24,<2" "torch>=2.4.0" \
@@ -86,7 +83,7 @@ pip install --upgrade "numpy>=1.24,<2" "torch>=2.4.0" \
   "sentence-transformers>=2.2.2,<3.0.0" \
   "accelerate>=0.26.0"
 # 或
-pip install --upgrade "stability-analysis-agent[rag]"
+pip install --upgrade stability-analysis-agent
 ```
 
 ## 启动分析时报 `NameError: name 'nn' is not defined`
@@ -95,13 +92,13 @@ pip install --upgrade "stability-analysis-agent[rag]"
 
 处理建议：
 
-1. 使用带 `[rag]` 的依赖组合重装（已锁定兼容区间）：
+1. 重装项目默认依赖组合（已锁定兼容区间）：
 
    ```bash
-   pip install --upgrade "stability-analysis-agent[rag]"
+   pip install --upgrade stability-analysis-agent
    ```
 
-2. 或在当前 venv 中显式安装（与 `[rag]` extra 约束一致）：
+2. 或在当前 venv 中显式安装（与项目默认约束一致）：
 
    ```bash
    pip install "numpy>=1.24,<2" "torch>=2.4.0" \
@@ -110,9 +107,9 @@ pip install --upgrade "stability-analysis-agent[rag]"
      "accelerate>=0.26.0"
    ```
 
-3. **不需要向量检索时**：可只装核心包；分析主流程会在 RAG 不可用时自动降级（规则+向量记忆跳过），不再因 ML 栈导入失败而整体退出。
+3. 即使 RAG 运行时不可用，分析主流程也会自动降级（跳过相似案例检索），不会因此阻断基础解析和符号化。
 
-4. 默认 **不** 在启动时加载 `SentenceTransformer`（避免拉取 HuggingFace）。仅在使用哈希嵌入 + ChromaDB 时无需 `sentence-transformers`。若需预训练嵌入，设置环境变量 `AI_STABILITY_ANALYZER_ENABLE_SENTENCE_MODEL=1` 并确保 `[rag]` 依赖完整。
+4. 默认 **不** 在启动时加载 `SentenceTransformer`（避免拉取 HuggingFace 模型）。仅在使用哈希嵌入 + ChromaDB 时无需额外配置；若需预训练嵌入，设置环境变量 `AI_STABILITY_ANALYZER_ENABLE_SENTENCE_MODEL=1`。
 
 ## SSL：`CERTIFICATE_VERIFY_FAILED`
 
@@ -126,7 +123,7 @@ pip install --upgrade "stability-analysis-agent[rag]"
 ## 向量库子命令提示「向量数据库不可用」
 
 ```bash
-pip install "stability-analysis-agent[rag]"
+pip install --upgrade stability-analysis-agent
 ```
 
 然后重试 `sa-agent vector-db ...` 等子命令。
