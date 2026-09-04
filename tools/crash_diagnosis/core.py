@@ -35,6 +35,7 @@ def run_crash_diagnosis(
     crash_log_content: str = "",
     library_dir: str = "",
     force_disassembly: bool = False,
+    trace: Any = None,
 ) -> Dict[str, Any]:
     """执行完整崩溃诊断流程。
 
@@ -132,6 +133,7 @@ def run_crash_diagnosis(
             data_availability=data_availability,
             library_dir=library_dir or str(resolved_stack.get("library_path") or ""),
             force=bool(force_disassembly),
+            trace=trace,
         )
     except Exception as dis_exc:
         logger.debug("disassembly gate skipped: %s", dis_exc)

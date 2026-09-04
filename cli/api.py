@@ -49,15 +49,10 @@ _VALID_SCOPES = {"full", "gen_prompt_only", "parse_stack_only", "parse_log_only"
 
 
 def _resolve_state_scope(state: Dict[str, Any]) -> str:
-    """从 state 解析 scope，兼容旧字段（skip_ai + run_scope）。"""
+    """Resolve scope from the current interactive state contract."""
     raw_scope = str(state.get("scope") or "").strip()
     if raw_scope in _VALID_SCOPES:
         return raw_scope
-    legacy_scope = str(state.get("run_scope") or "").strip()
-    if legacy_scope in {"parse_stack_only", "parse_log_only"}:
-        return legacy_scope
-    if bool(state.get("skip_ai", False)):
-        return "gen_prompt_only"
     return "full"
 
 
@@ -69,7 +64,7 @@ def interactive_state_to_argv(state: Dict[str, Any]) -> List[str]:
     crash_log, library_dir, code_roots, engine, scope
     """
     argv: List[str] = [
-        "--crash-log",
+        "--crash-log-file",
         str(state["crash_log"]),
         "--engine",
         str(state.get("engine") or "direct"),
@@ -80,7 +75,7 @@ def interactive_state_to_argv(state: Dict[str, Any]) -> List[str]:
         argv.extend(["--library-dir", lib])
     for root in state.get("code_roots") or []:
         if root and str(root).strip():
-            argv.extend(["--code-root", str(root)])
+            argv.extend(["--code-roots", str(root)])
     scope = _resolve_state_scope(state)
     if scope != "full":
         argv.extend(["--scope", scope])

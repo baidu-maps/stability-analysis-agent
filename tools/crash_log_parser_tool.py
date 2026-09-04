@@ -156,6 +156,11 @@ class CrashLogParserTool(BaseTool):
             },
             category="parser",
             version="1.1.0",
+            risk="read_only",
+            side_effect=False,
+            idempotent=True,
+            requires_approval=False,
+            cost_class="low",
         )
 
     def execute(self, input_data: Dict[str, Any]) -> Dict[str, Any]:

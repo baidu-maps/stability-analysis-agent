@@ -1,0 +1,1 @@
+{"root_cause":"unvalidated length_offset reaches template VectorView","confidence":0.86,"evidence":["code/src/frame_parser.cpp","code/include/vector_view.hpp"]}

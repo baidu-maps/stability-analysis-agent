@@ -59,7 +59,7 @@ bash scripts/pypi_release/publish_pypi.sh --test
 ```bash
 python3 -m venv .venv_testpypi_verify
 source .venv_testpypi_verify/bin/activate
-pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple "stability-analysis-agent==1.3.5"
+pip install -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple "stability-analysis-agent==1.3.6"
 sa-agent --help
 ```
 
@@ -77,9 +77,9 @@ sa-agent config init
 
 # 3) No-config path should still work with --scope gen_prompt_only
 sa-agent \
-  --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
+  --crash-log-file examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
-  --code-root examples/crash_cases/demo_basic/code_dir \
+  --code-roots examples/crash_cases/demo_basic/code_dir \
   --scope gen_prompt_only
 ```
 
@@ -123,7 +123,7 @@ python3 -m twine upload --repository-url https://upload.pypi.org/legacy/ output/
 
 | 触发 | 行为 |
 |------|------|
-| 推送 tag `v*`（如 `v1.3.5`） | 跑确定性套件 → 构建 → 上传 **正式 PyPI** |
+| 推送 tag `v*`（如 `v1.3.6`） | 跑确定性套件 → 构建 → 上传 **正式 PyPI** |
 | Actions 页手动 `workflow_dispatch` | 可选 `testpypi` / `pypi`；可勾选跳过测试（紧急） |
 
 **版本对齐**：tag 名去掉 `v` 前缀后必须与 `pyproject.toml` 的 `version` 一致，否则构建 job 失败。

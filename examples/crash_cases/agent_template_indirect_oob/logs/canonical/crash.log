@@ -1,0 +1,5 @@
+signal=SIGSEGV fault_address=0x4
+#00 parser VectorView<unsigned char>::at code/include/vector_view.hpp:19
+#01 parser FrameParser::readLength code/src/frame_parser.cpp:57
+#02 parser ImageDecoder::decode code/src/image_decoder.cpp:22
+diagnosis=out_of_bounds

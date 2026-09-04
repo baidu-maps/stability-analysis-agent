@@ -64,6 +64,14 @@
           placeholder="示例：&#10;examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash&#10;&#10;或直接粘贴崩溃日志全文…"
           autofocus
         ></textarea>
+        <label class="field run-option">
+          <span>LLM backend</span>
+          <select id="engineSelect">
+            <option value="direct">direct</option>
+            <option value="langchain">langchain</option>
+            <option value="langgraph">langgraph</option>
+          </select>
+        </label>
         <div class="actions">
           <button type="submit" id="btnRun" class="btn primary lg">运行全流程修复</button>
           <button type="button" id="btnCancel" class="btn danger" disabled>取消</button>
@@ -80,6 +88,33 @@
 
       <p id="runMeta" class="meta"></p>
 
+      <section id="approvalPanel" class="card hidden">
+        <h3>等待工具审批</h3>
+        <p class="hint">写操作或高风险工具需要显式批准后才能继续。</p>
+        <p id="approvalToolName" class="meta"></p>
+        <div class="actions">
+          <button type="button" id="btnApproveTool" class="btn primary sm">批准并执行</button>
+        </div>
+        <p id="approvalMsg" class="meta"></p>
+      </section>
+
+      <section id="checkpointPanel" class="card hidden">
+        <h3>Runtime Checkpoints</h3>
+        <p class="hint">Harness 阶段 checkpoint（stage / status / idempotency_key）</p>
+        <ul id="checkpointList" class="skill-list compact"></ul>
+      </section>
+
+      <section id="verificationPanel" class="card hidden">
+        <h3>等待验证配置</h3>
+        <p class="hint">候选命令不会自动执行。请输入已确认的命令后继续。</p>
+        <ul id="verificationCandidates" class="skill-list compact"></ul>
+        <input id="verificationCommand" class="text-input" placeholder="例如：./gradlew test" />
+        <div class="actions">
+          <button type="button" id="btnVerify" class="btn primary sm">执行验证</button>
+        </div>
+        <p id="verificationMsg" class="meta"></p>
+      </section>
+
       <section id="vectorDbCommit" class="card vector-db-card hidden">
         <h3>写入向量知识库</h3>
         <p class="hint">修复已完成。可将此次案例写入本地向量库，供后续相似崩溃检索。</p>
@@ -93,6 +128,39 @@
       <section class="card result-card">
         <h3>结果</h3>
         <pre id="resultSummary" class="result">等待运行…</pre>
+      </section>
+
+      <section id="evaluationPanel" class="card hidden">
+        <h3>Evaluation 摘要</h3>
+        <div id="evaluationSummary" class="evaluation-summary"></div>
+      </section>
+
+      <section id="tracePanel" class="card hidden">
+        <h3>Runtime Trace</h3>
+        <div id="traceBudgetBar" class="trace-budget hidden"></div>
+        <div class="trace-filters">
+          <label>Stage <select id="traceFilterStage"><option value="">全部</option></select></label>
+          <label>Kind <select id="traceFilterKind"><option value="">全部</option></select></label>
+          <label>Status <select id="traceFilterStatus"><option value="">全部</option></select></label>
+        </div>
+        <p class="hint">来自 runtime_trace.events 的时间线</p>
+        <div class="trace-table-wrap">
+          <table id="traceTable" class="trace-table">
+            <thead>
+              <tr>
+                <th>seq</th>
+                <th>stage</th>
+                <th>kind</th>
+                <th>name</th>
+                <th>event</th>
+                <th>status</th>
+                <th>timestamp</th>
+                <th>duration_ms</th>
+              </tr>
+            </thead>
+            <tbody id="traceTableBody"></tbody>
+          </table>
+        </div>
       </section>
 
       <details class="console-details">

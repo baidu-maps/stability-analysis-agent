@@ -248,9 +248,9 @@ python3 rag/init_vector_db_data.py
 
 ```bash
 python3 cli/main.py \
-  --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
+  --crash-log-file examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
-  --code-root examples/crash_cases/demo_basic/code_dir \
+  --code-roots examples/crash_cases/demo_basic/code_dir \
   --scope gen_prompt_only
 ```
 

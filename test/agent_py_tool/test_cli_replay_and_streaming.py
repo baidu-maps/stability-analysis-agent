@@ -110,6 +110,7 @@ class TestCliReplayAndStreaming(unittest.TestCase):
                 min_key_read_related_functions=2,
                 use_ctags_index=False,
                 include_memory_in_05=False,
+                external_agent_evaluation=False,
                 code_context_timeout_sec=360,
                 find_source_timeout_sec=600,
                 plugin_modules=[],
@@ -127,8 +128,11 @@ class TestCliReplayAndStreaming(unittest.TestCase):
             self.assertEqual(record["schema_version"], 2)
             self.assertEqual(record["crash_input"]["source"], "file")
             self.assertEqual(record["effective_parameters"]["agent_loop"], "context_loop")
-            self.assertEqual(record["effective_parameters"]["max_agent_rounds"], 3)
+            self.assertEqual(record["effective_parameters"]["max_agent_rounds"], 5)
             self.assertTrue(record["effective_parameters"]["streaming"])
+            self.assertFalse(
+                record["effective_parameters"]["external_agent_evaluation"]
+            )
             self.assertNotIn("api_key", json.dumps(record))
         finally:
             Path(crash_path).unlink(missing_ok=True)
@@ -160,6 +164,7 @@ class TestCliReplayAndStreaming(unittest.TestCase):
                 "vector_db_max_results": 3,
                 "rule_confidence_threshold": 0.85,
                 "plugin_modules": [],
+                "external_agent_evaluation": True,
             },
         }
         argv, cleanup_paths = _build_replay_argv_from_record(record)
@@ -172,6 +177,7 @@ class TestCliReplayAndStreaming(unittest.TestCase):
         self.assertIn("analysis", argv)
         self.assertIn("--no-apply-ai-fixes", argv)
         self.assertIn("--streaming", argv)
+        self.assertIn("--external-agent-evaluation", argv)
         self.assertFalse(cleanup_paths)
 
     def test_write_cli_report_summarizes_execution_diagnostics(self) -> None:
@@ -328,7 +334,7 @@ class TestCliReplayAndStreaming(unittest.TestCase):
         self.assertEqual(result["crash_log_content"], "line1\nline2")
 
     def test_emit_stdout_line_parses_ai_stream(self) -> None:
-        run = RunState(run_id="run-1", status="running", created_at=0.0)
+        run = RunState(run_id="run-1", transport_status="running", created_at=0.0)
         run.events = queue.Queue()
         stdout_acc = []
         _emit_stdout_line(

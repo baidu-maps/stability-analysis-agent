@@ -31,6 +31,11 @@ class NativeLeakAnalyzerTool(BaseTool):
             category="analysis",
             version="1.0.0",
             metadata={"platform": "HarmonyOS", "sidecar": True},
+            risk="read_only",
+            side_effect=False,
+            idempotent=True,
+            requires_approval=False,
+            cost_class="medium",
         )
 
     def validate_input(self, input_data: Dict[str, Any]) -> "tuple[bool, Optional[str]]":

@@ -135,7 +135,7 @@ def handle_native_leak_command(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--max-callchains", type=int, default=5)
     parser.add_argument("--min-callchain-percentage", type=float, default=0.0)
     parser.add_argument("--output-dir", default="", help="报告输出目录；默认写入 reports/native_leak_<时间>")
-    parser.add_argument("--code-root", action="append", default=[], help="源码目录，可重复指定；用于定位分配函数和成对释放 API")
+    parser.add_argument("--code-roots", action="append", default=[], help="源码目录，可重复指定；用于定位分配函数和成对释放 API")
     parser.add_argument("--json", action="store_true", help="在标准输出打印完整 JSON")
     args = parser.parse_args(argv)
     try:
@@ -145,18 +145,21 @@ def handle_native_leak_command(argv: Optional[List[str]] = None) -> int:
             max_callchains=max(1, args.max_callchains),
             min_callchain_percentage=max(0.0, args.min_callchain_percentage),
         )
-        if args.code_root:
-            from tools.repo_search_tool import RepoSearchTool
-            search_tool = RepoSearchTool()
+        if args.code_roots:
+            from services.tool_invoke import invoke_tool
+
             code_search = []
             for query in collect_source_search_queries(result):
-                found = search_tool.execute({
-                    "code_roots": args.code_root,
-                    "mode": "find_symbol",
-                    "query": query,
-                    "symbol_name": query,
-                    "max_matches": 20,
-                })
+                found = invoke_tool(
+                    "repo_search",
+                    {
+                        "code_roots": args.code_roots,
+                        "mode": "find_symbol",
+                        "query": query,
+                        "symbol_name": query,
+                        "max_matches": 20,
+                    },
+                )
                 if isinstance(found, dict) and found.get("success"):
                     found["query"] = query
                     code_search.append(found)
@@ -168,15 +171,14 @@ def handle_native_leak_command(argv: Optional[List[str]] = None) -> int:
     if args.output_dir:
         report_dir = Path(args.output_dir).expanduser().resolve()
     else:
-        from cli.report_paths import ensure_reports_migrated, report_root
+        from cli.report_paths import report_root
 
-        ensure_reports_migrated(Path.cwd())
         report_dir = report_root() / f"native_leak_{stamp}"
     report_dir.mkdir(parents=True, exist_ok=True)
     _write_json(report_dir / "00_native_leak_request.json", {
         "input": str(Path(args.input_path).expanduser().resolve()),
         "trace_db": args.trace_db,
-        "code_roots": [str(Path(root).expanduser().resolve()) for root in args.code_root],
+        "code_roots": [str(Path(root).expanduser().resolve()) for root in args.code_roots],
     })
     _write_json(report_dir / "04d_native_leak_diagnosis.json", result)
     markdown = render_native_leak_report(result)

@@ -1,0 +1,6 @@
+{
+  "items": [
+    {"kind": "crash_diagnosis", "source": "deterministic_diagnosis", "relevance": 1.0, "content": "verify failed"},
+    {"kind": "pc_vs_fault", "source": "evidence_compass", "relevance": 0.93, "content": "summary"}
+  ]
+}

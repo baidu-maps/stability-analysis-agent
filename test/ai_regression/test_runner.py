@@ -43,7 +43,7 @@ class TestAIRegressionRunner(unittest.TestCase):
         env: Mapping[str, str],
     ) -> subprocess.CompletedProcess:
         del cwd, timeout_seconds, env
-        workspace = Path(command[command.index("--code-root") + 1])
+        workspace = Path(command[command.index("--code-roots") + 1])
         patch = PROJECT_ROOT / "test" / "ai_regression" / "expected" / "demo_basic_nullptr.patch"
         applied = subprocess.run(
             ["git", "apply", "--whitespace=nowarn", str(patch)],
@@ -128,7 +128,7 @@ void crash_nullptr() {
     def test_fails_when_ai_code_differs(self) -> None:
         def wrong_fix(command, cwd, output_json, timeout_seconds, env):
             completed = self._apply_expected(command, cwd, output_json, timeout_seconds, env)
-            workspace = Path(command[command.index("--code-root") + 1])
+            workspace = Path(command[command.index("--code-roots") + 1])
             source = workspace / "common" / "src" / "my_lib.cpp"
             source.write_text(
                 source.read_text(encoding="utf-8").replace("错误: 尝试解引用空指针", "忽略错误"),
@@ -147,7 +147,7 @@ void crash_nullptr() {
     def test_fails_when_ai_changes_unapproved_file(self) -> None:
         def extra_fix(command, cwd, output_json, timeout_seconds, env):
             completed = self._apply_expected(command, cwd, output_json, timeout_seconds, env)
-            workspace = Path(command[command.index("--code-root") + 1])
+            workspace = Path(command[command.index("--code-roots") + 1])
             (workspace / "unexpected.cpp").write_text("int unexpected = 1;\n", encoding="utf-8")
             return completed
 

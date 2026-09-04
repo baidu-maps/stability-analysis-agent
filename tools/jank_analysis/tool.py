@@ -9,7 +9,7 @@ from .core import analyze_jank_artifact
 class JankAnalyzerTool(BaseTool):
     @property
     def definition(self) -> ToolDefinition:
-        return ToolDefinition(name="jank_analyzer", description="Normalize trace analyzer JSON/CSV results into frame jank, CPU thread, completion latency, and fault-mode evidence.", input_schema={"type": "object", "properties": {"path": {"type": "string"}, "mode": {"type": "string"}, "deadline_ms": {"type": "number"}, "top_n": {"type": "integer"}}, "required": ["path"]}, output_schema={"type": "object"}, category="analyzer")
+        return ToolDefinition(name="jank_analyzer", description="Normalize trace analyzer JSON/CSV results into frame jank, CPU thread, completion latency, and fault-mode evidence.", input_schema={"type": "object", "properties": {"path": {"type": "string"}, "mode": {"type": "string"}, "deadline_ms": {"type": "number"}, "top_n": {"type": "integer"}}, "required": ["path"]}, output_schema={"type": "object"}, category="analyzer", risk="read_only", side_effect=False, idempotent=True, requires_approval=False, cost_class="medium")
 
     def validate_input(self, input_data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         if not isinstance(input_data, dict) or not str(input_data.get("path") or "").strip():

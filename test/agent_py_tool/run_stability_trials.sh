@@ -14,8 +14,8 @@ for i in 1 2 3; do
   git -C "$MAPSDK" diff -w --stat src/app/walk/ | head -3 || true
 
   python3 cli/main.py \
-    --crash-log "$CRASH" \
-    --code-root "/Users/liuhong_cd/baidu/mapclient/mapsdk-vector" \
+    --crash-log-file "$CRASH" \
+    --code-roots "/Users/liuhong_cd/baidu/mapclient/mapsdk-vector" \
     --scope full 2>&1 | tee "$OUT_BASE/trial_${i}_cli.log"
 
   LATEST=$(ls -td "$REPO"/reports/*_analysis_full_direct_crash "$REPO"/cli_reports/*_analysis_full_direct_crash 2>/dev/null | head -1)

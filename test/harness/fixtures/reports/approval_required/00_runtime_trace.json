@@ -1,0 +1,7 @@
+{
+  "run_id": "fixture-approval",
+  "events": [
+    {"seq": 1, "event": "tool.policy", "kind": "policy", "name": "fix_code_applier", "status": "denied"}
+  ],
+  "budget": {"llm_calls": 2, "tool_calls": 4}
+}

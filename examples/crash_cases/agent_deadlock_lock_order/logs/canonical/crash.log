@@ -1,0 +1,7 @@
+type=ANR
+thread=main waits=cache_mutex
+thread=worker waits=worker_mutex
+cycle=cache_mutex->worker_mutex->cache_mutex
+frame=Cache::flush code/src/cache.cpp:80
+frame=Worker::publish code/src/worker.cpp:44
+diagnosis=deadlock

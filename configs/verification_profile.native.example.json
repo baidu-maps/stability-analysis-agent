@@ -1,0 +1,33 @@
+{
+  "profile_id": "crash_verification_v1",
+  "pre_fix_baseline": true,
+  "frontend_available": false,
+  "runtime_available": false,
+  "checks": [
+    {
+      "id": "target_compile",
+      "kind": "compile",
+      "provider": "local_command",
+      "description": "Compile the affected target",
+      "evidence_types": ["compiler_diagnostic"],
+      "verification_level": "L2",
+      "command": ["ninja", "-C", "out", "engine"],
+      "working_directory": "out",
+      "allowed_changed_files": ["src/**"],
+      "requires_approval": true
+    },
+    {
+      "id": "native_replay",
+      "kind": "replay",
+      "provider": "test_runner",
+      "description": "Replay the fixed crash fixture",
+      "evidence_types": ["stack_signature", "sanitizer_diagnostic"],
+      "verification_level": "L3",
+      "fixture": "fixtures/crash.json",
+      "command": ["./out/tests/crash_harness", "--fixture", "fixtures/crash.json"],
+      "iterations": 1000,
+      "expected_signature": "use-after-free",
+      "requires_approval": true
+    }
+  ]
+}

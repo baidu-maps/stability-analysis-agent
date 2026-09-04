@@ -7,12 +7,17 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Generator
 
 from .config import SystemConfig, ToolConfig, WorkflowConfig
 from .registry import ToolAndWorkflowRegistry, Priority
 from .workflow import WorkflowContext
+from .runtime import RunTrace, RuntimeBudget
 from .llm.llm_adapter import BaseLLMAdapter, LLMAdapterFactory, LLMResponse
+from services.policy import PolicyEngine
+from .tool_gateway import ToolExecutionGateway
+from services.action_security import ActionSecurityAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,17 @@ class ConfigDrivenExecutor:
         self.registry = registry
         self.config = config
         self.last_execution_events: List[Dict[str, Any]] = []
+        self.last_run_trace = None
+        self.last_workflow_context = None
+        self.last_workflow_instance = None
+        policy_config = config.metadata.get("policy", {}) if isinstance(config.metadata, dict) else {}
+        self.policy = PolicyEngine(
+            allowed_commands=policy_config.get("allowed_commands", []) if isinstance(policy_config, dict) else [],
+            allowed_roots=policy_config.get("allowed_roots", []) if isinstance(policy_config, dict) else [],
+            allow_network=bool(policy_config.get("allow_network", False)) if isinstance(policy_config, dict) else False,
+            allow_destructive=bool(policy_config.get("allow_destructive", False)) if isinstance(policy_config, dict) else False,
+        )
+        self._tool_gateway = ToolExecutionGateway(self.policy, security_analyzer=ActionSecurityAnalyzer())
 
         # 初始化 LLM 适配器
         if llm_adapter is None:
@@ -52,6 +68,8 @@ class ConfigDrivenExecutor:
             tool_registry=registry,
             config=config.metadata
         )
+        self.last_run_trace = self._workflow_context.trace
+        self._pending_run_trace = None
 
         # 实例化缓存
         self._tool_instances: Dict[str, Any] = {}
@@ -128,7 +146,9 @@ class ConfigDrivenExecutor:
                 tool = tool()
                 self._tool_instances[name] = tool
 
-        return self._execute_tool_with_validation(name, tool, input_data)
+        self._tool_gateway.trace = self.last_run_trace
+        self._tool_gateway.policy = self.policy
+        return self._tool_gateway.execute(name, tool, input_data)
 
     @staticmethod
     def _validate_tool_input(name: str, tool: Any,
@@ -142,9 +162,13 @@ class ConfigDrivenExecutor:
 
     @classmethod
     def _execute_tool_with_validation(cls, name: str, tool: Any,
-                                      input_data: Dict[str, Any]) -> Dict[str, Any]:
+                                      input_data: Dict[str, Any],
+                                      *, gateway: Any = None) -> Dict[str, Any]:
         cls._validate_tool_input(name, tool, input_data)
-        return tool.execute(input_data)
+        if gateway is not None:
+            return gateway.execute(name, tool, input_data)
+        from tool_system.tool_gateway import ToolExecutionGateway
+        return ToolExecutionGateway().execute(name, tool, input_data)
 
     def execute_tool_stream(self, name: str, input_data: Dict[str, Any]) -> Generator[str, None, None]:
         """执行工具（流式版本，如果有）"""
@@ -152,17 +176,64 @@ class ConfigDrivenExecutor:
         if tool is None:
             raise ValueError(f"Tool '{name}' not initialized")
 
+        self._tool_gateway.trace = self.last_run_trace
+        self._tool_gateway.policy = self.policy
+        payload = dict(input_data or {})
+        context = self.last_workflow_context or self._workflow_context
+        if context is not None and hasattr(context, "observations"):
+            payload.setdefault("_observation_store", context.observations)
+
         # 如果工具支持流式执行
         if hasattr(tool, "execute_stream"):
-            self._validate_tool_input(name, tool, input_data)
-            for chunk in tool.execute_stream(input_data):
+            for chunk in self._tool_gateway.execute_stream(name, tool, payload):
                 yield chunk
         else:
-            # 否则返回普通结果
-            result = self._execute_tool_with_validation(name, tool, input_data)
+            result = self._tool_gateway.execute(name, tool, payload)
             yield str(result)
 
     # ==================== Workflow 执行 ====================
+
+    def _runtime_budget_from_config(self, problem: Optional[Dict[str, Any]] = None) -> RuntimeBudget:
+        meta = self.config.metadata if isinstance(self.config.metadata, dict) else {}
+        budget_cfg = meta.get("runtime_budget") if isinstance(meta.get("runtime_budget"), dict) else {}
+        max_llm = int(budget_cfg.get("max_llm_calls") or 0)
+        if max_llm <= 0 and isinstance(problem, dict):
+            try:
+                rounds = int(problem.get("max_agent_rounds") or 0)
+            except (TypeError, ValueError):
+                rounds = 0
+            if rounds > 0:
+                max_llm = max(1, min(rounds, 8))
+        return RuntimeBudget(
+            max_llm_calls=max_llm,
+            max_tool_calls=int(budget_cfg.get("max_tool_calls") or 0),
+            max_total_seconds=float(budget_cfg.get("max_total_seconds") or 0),
+            max_total_tokens=int(budget_cfg.get("max_total_tokens") or 0),
+            max_estimated_cost=float(budget_cfg.get("max_estimated_cost") or 0),
+            max_cost_class=dict(budget_cfg.get("max_cost_class") or {}),
+        )
+
+    @staticmethod
+    def _resolve_run_id(problem: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        env_id = str(os.environ.get("STABILITY_AGENT_RUN_ID") or "").strip()
+        if env_id:
+            return env_id
+        if isinstance(problem, dict):
+            rid = str(problem.get("run_id") or "").strip()
+            if rid:
+                return rid
+        return None
+
+    def create_run_trace(self, *, engine: Optional[str] = None, problem: Optional[Dict[str, Any]] = None) -> RunTrace:
+        """Create the single trace shared by Runtime and the workflow."""
+        run_id = self._resolve_run_id(problem)
+        self._pending_run_trace = RunTrace(
+            run_id=run_id,
+            engine=engine,
+            budget=self._runtime_budget_from_config(problem),
+        )
+        self.last_run_trace = self._pending_run_trace
+        return self._pending_run_trace
 
     def execute_workflow(self, name: str, problem: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -186,19 +257,45 @@ class ConfigDrivenExecutor:
                 self._workflow_instances[name] = workflow
 
         # 创建新的 WorkflowContext（包含当前 LLM 适配器）
+        trace = self._pending_run_trace or RunTrace(
+            run_id=self._resolve_run_id(problem),
+            engine=str(getattr(self.config.llm, "engine", "") or "") or None,
+            budget=self._runtime_budget_from_config(problem),
+        )
+        self._pending_run_trace = None
         context = WorkflowContext(
             llm_adapter=self.llm_adapter,
             tool_registry=self.registry,
-            config=self.config.metadata
+            config=self.config.metadata,
+            trace=trace,
+            policy=self.policy,
         )
+        self.last_run_trace = context.trace
+        context.trace.emit("workflow.started", kind="workflow", name=name, status="success")
+        self._tool_gateway.trace = context.trace
 
         valid, error_msg = workflow.validate_problem(problem)
         if not valid:
             raise ValueError(f"Workflow '{name}' input validation failed: {error_msg}")
 
         result = workflow.solve(problem, context)
+        context.trace.emit("workflow.finished", kind="workflow", name=name,
+                           status="success" if isinstance(result, dict) and result.get("status") in {"success", "verification_pending"} else "failed")
+        if isinstance(result, dict):
+            metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+            metadata["evidence_items"] = context.evidence_package().get("items", [])
+            metadata["evidence_package"] = context.evidence_package()
+            result["metadata"] = metadata
         self.last_execution_events = list(context.execution_events)
+        self.last_workflow_context = context
+        self.last_workflow_instance = workflow
         return result
+
+    def execute_workflow_prepare(self, name: str, problem: Dict[str, Any]) -> Dict[str, Any]:
+        """Run workflow through prepare; context loop owned by AgentRuntime when flagged."""
+        payload = dict(problem or {})
+        payload["_runtime_owned_context_loop"] = True
+        return self.execute_workflow(name, payload)
 
     def execute_workflow_stream(self, name: str, problem: Dict[str, Any]) -> Generator[str, None, None]:
         """执行工作流（流式版本）"""
@@ -208,11 +305,20 @@ class ConfigDrivenExecutor:
 
         # 如果工作流支持流式执行
         if hasattr(workflow, "solve_stream"):
+            trace = self._pending_run_trace or RunTrace(
+                engine=str(getattr(self.config.llm, "engine", "") or "") or None,
+                budget=self._runtime_budget_from_config(problem),
+            )
+            self._pending_run_trace = None
+            self.last_run_trace = trace
             context = WorkflowContext(
                 llm_adapter=self.llm_adapter,
                 tool_registry=self.registry,
-                config=self.config.metadata
+                config=self.config.metadata,
+                trace=trace,
+                policy=self.policy,
             )
+            self._tool_gateway.trace = context.trace
             valid, error_msg = workflow.validate_problem(problem)
             if not valid:
                 raise ValueError(f"Workflow '{name}' input validation failed: {error_msg}")

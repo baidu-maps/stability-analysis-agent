@@ -149,9 +149,13 @@ class RepoSearchService:
         *,
         use_ctags_index: bool = False,
         max_matches: int = 80,
+        trace: Any = None,
+        repo_map: Any = None,
     ) -> None:
         self.code_roots = normalize_code_roots(code_roots)
         self.max_matches = max(1, min(int(max_matches), 500))
+        self.trace = trace
+        self.repo_map = repo_map
         cfg = LocatorConfig(
             exclude_dirs=_DEFAULT_EXCLUDE,
             supported_extensions=_SUPPORTED_EXT,
@@ -171,12 +175,29 @@ class RepoSearchService:
         mode = str(input_data.get("mode") or "grep").strip().lower()
         query = str(input_data.get("query") or input_data.get("pattern") or "").strip()
         symbol = str(input_data.get("symbol_name") or input_data.get("symbol") or query).strip()
+        if self.repo_map is None and input_data.get("use_repo_map"):
+            try:
+                from services.crash_repo_map import CrashRepoMap
+                mapper = CrashRepoMap(self.code_roots)
+                self.repo_map = mapper.build()
+                self._repo_map_service = mapper
+            except Exception:
+                self.repo_map = None
 
         try:
             if mode == "read_file":
                 out = self._read_file(input_data)
+            elif mode == "history":
+                from services.repository_evidence import RepositoryEvidenceService
+                out = RepositoryEvidenceService(self.code_roots).find_history(
+                    str(input_data.get("file_path") or input_data.get("path") or ""),
+                    line=int(input_data.get("line") or 0), symbol=symbol,
+                )
+            elif mode == "find_tests":
+                from services.repository_evidence import RepositoryEvidenceService
+                out = RepositoryEvidenceService(self.code_roots).find_tests(symbol)
             elif mode == "find_symbol":
-                out = self._find_symbol(symbol or query)
+                out = self._find_symbol(symbol or query, input_data)
             elif mode == "find_references":
                 out = self._find_references(symbol or query, input_data)
             elif mode == "grep":
@@ -224,16 +245,21 @@ class RepoSearchService:
         if not symbol_name:
             return {"success": False, "error": "find_references 需要 symbol_name/query"}
         from tools.symbol_callsite_finder_tool import SymbolCallsiteFinderTool
+        from services.trace_only_gateway import emit_traced_operation
 
         max_results = self._int_cap(input_data.get("max_matches"), self.max_matches)
         tool = SymbolCallsiteFinderTool()
-        raw = tool.execute(
-            {
-                "symbol_name": symbol_name,
-                "code_roots": self.code_roots,
-                "resolved_stack": input_data.get("resolved_stack"),
-                "max_results": max_results,
-            }
+        raw = emit_traced_operation(
+            self.trace,
+            "symbol_callsite_finder",
+            lambda: tool.execute(
+                {
+                    "symbol_name": symbol_name,
+                    "code_roots": self.code_roots,
+                    "resolved_stack": input_data.get("resolved_stack"),
+                    "max_results": max_results,
+                }
+            ),
         )
         candidates = raw.get("callsite_candidates") or []
         matches = []
@@ -255,7 +281,7 @@ class RepoSearchService:
             "stats_extra": raw.get("stats"),
         }
 
-    def _find_symbol(self, name: str) -> Dict[str, Any]:
+    def _find_symbol(self, name: str, input_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if not name:
             return {"success": False, "error": "find_symbol 需要 symbol_name/query"}
         definitions: List[Dict[str, Any]] = []
@@ -284,6 +310,22 @@ class RepoSearchService:
                         )
                     if len(definitions) >= max_matches:
                         break
+        if self.repo_map is not None and definitions:
+            anchors = dict(input_data or {})
+            anchors.setdefault("stack_symbols", [name])
+            try:
+                from services.crash_repo_map import CrashRepoMap
+                mapper = getattr(self, "_repo_map_service", None) or CrashRepoMap(self.code_roots)
+                ranked = mapper.rank(self.repo_map, anchors, max_files=max(30, len(definitions)))
+                by_file = {entry.file: entry for entry in ranked}
+                for item in definitions:
+                    entry = by_file.get(str(Path(str(item.get("file") or "")).resolve()))
+                    if entry is not None:
+                        item["candidate_score"] = entry.score
+                        item["ranking_reasons"] = list(entry.ranking_reasons)
+                definitions.sort(key=lambda item: (-float(item.get("candidate_score") or 0.0), str(item.get("file") or "")))
+            except Exception:
+                pass
         return {"definitions": definitions, "truncated": len(definitions) >= self.max_matches}
 
     def _read_file(self, input_data: Dict[str, Any]) -> Dict[str, Any]:

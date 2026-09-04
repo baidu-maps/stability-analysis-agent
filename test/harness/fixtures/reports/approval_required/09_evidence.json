@@ -1,0 +1,6 @@
+{
+  "items": [
+    {"kind": "crash_log", "source": "crash_log_parser", "relevance": 0.9, "content": "fixture"},
+    {"kind": "missing_evidence", "source": "evidence_compass", "relevance": 0.8, "content": "approval gate"}
+  ]
+}

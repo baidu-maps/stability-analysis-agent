@@ -9,7 +9,7 @@ from .core import analyze_appfreeze
 class AppFreezeDiagnosisTool(BaseTool):
     @property
     def definition(self) -> ToolDefinition:
-        return ToolDefinition(name="appfreeze_diagnosis", description="Diagnose HarmonyOS AppFreeze using freeze type, multi-sample stacks, EventHandler/Binder evidence and FFRT dependency cycles.", input_schema={"type": "object", "properties": {"parse_result": {"type": "object"}, "raw_content": {"type": "string"}, "samples": {"type": "array"}, "ffrt_edges": {"type": "array"}}, "additionalProperties": True}, output_schema={"type": "object"}, category="analyzer")
+        return ToolDefinition(name="appfreeze_diagnosis", description="Diagnose HarmonyOS AppFreeze using freeze type, multi-sample stacks, EventHandler/Binder evidence and FFRT dependency cycles.", input_schema={"type": "object", "properties": {"parse_result": {"type": "object"}, "raw_content": {"type": "string"}, "samples": {"type": "array"}, "ffrt_edges": {"type": "array"}}, "additionalProperties": True}, output_schema={"type": "object"}, category="analyzer", risk="read_only", side_effect=False, idempotent=True, requires_approval=False, cost_class="medium")
 
     def validate_input(self, input_data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         if not isinstance(input_data, dict) or not any(key in input_data for key in ("parse_result", "raw_content", "samples", "freeze_type", "freeze_reason")):

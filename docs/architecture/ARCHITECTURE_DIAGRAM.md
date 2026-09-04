@@ -22,10 +22,11 @@ graph TB
 
     subgraph "Core 层（核心能力中心）"
         direction TB
-        C1[Agent 引擎<br/>LangGraph/Sequential]
+        C1[AgentRuntime<br/>统一生命周期]
         C2[Analyzers<br/>解析/定位/上下文]
-        C3[RAG<br/>向量检索增强]
+        C3[RAG / EvidenceStore<br/>向量检索与证据账本]
         C4[Report<br/>报告生成]
+        C5[DecideScorer<br/>修复四维判定]
     end
 
     subgraph "数据层（外部服务）"
@@ -65,9 +66,10 @@ graph TB
 - **RunResult**：结果协议
 
 ### Core 层
-- **Agent 引擎**：LangGraph/Sequential 工作流
+- **AgentRuntime**：统一 observe/analyze/act/verify/decide 生命周期（LangGraph 仅作 LLM backend）
 - **Analyzers**：解析器、地址解析、代码上下文
-- **RAG**：向量检索增强
+- **RAG / EvidenceStore**：向量检索与 LLM 上下文证据账本
+- **DecideScorer**：patch / diff / verify / post_fix_diagnosis 四维聚合判定
 - **Report**：报告生成
 
 ### 数据层
@@ -100,7 +102,7 @@ RunResult / RunEvent
 
 ## 与闭源工作区关系
 
-开源项目与闭源工作区（`map_sdk_crash_agent/`）共享 Core 层和工具链，闭源工作区可以在此基础上添加：
+开源项目与闭源工作区（`stability-analysis-agent/` sibling checkout）共享 Core 层和工具链，闭源工作区可以在此基础上添加：
 - 私有崩溃案例
 - 自定义配置
 - 私有 UI 层（如有）

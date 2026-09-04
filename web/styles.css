@@ -128,7 +128,8 @@ html, body {
 }
 
 input[type="text"],
-textarea {
+textarea,
+select {
   width: 100%;
   background: var(--surface-2);
   border: 1px solid var(--border);
@@ -140,6 +141,8 @@ textarea {
   line-height: 1.5;
 }
 textarea { resize: vertical; font-family: var(--mono); }
+select { appearance: auto; }
+.run-option { max-width: 280px; margin: 0.8rem 0; }
 
 .main {
   flex: 1;
@@ -234,6 +237,19 @@ textarea { resize: vertical; font-family: var(--mono); }
   border-radius: 10px;
   padding: 0.95rem 1.1rem;
 }
+
+.text-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 10px;
+  border: 1px solid var(--line, #d7dce5);
+  border-radius: 4px;
+  background: var(--surface, #fff);
+  color: inherit;
+  font: inherit;
+}
+
+#verificationPanel.hidden { display: none; }
 .result-card h3 {
   margin: 0 0 0.55rem;
   font-weight: 600;
@@ -329,6 +345,55 @@ textarea { resize: vertical; font-family: var(--mono); }
 }
 .toggle input:checked + span { background: var(--ok); }
 .toggle input:checked + span::before { transform: translateX(1rem); }
+
+#tracePanel.hidden { display: none; }
+.trace-budget {
+  font-family: var(--mono, monospace);
+  font-size: 12px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  border-radius: 6px;
+  background: rgba(120, 160, 255, 0.08);
+  border: 1px solid rgba(120, 160, 255, 0.18);
+}
+.trace-budget.hidden { display: none; }
+.trace-filters {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+.trace-row-denied {
+  background: rgba(255, 120, 120, 0.12);
+}
+.trace-status-success td:nth-child(6) { color: #3d9a5d; }
+.trace-status-failed td:nth-child(6) { color: #c44; }
+.trace-status-pending td:nth-child(6) { color: #b8860b; }
+.evaluation-summary {
+  display: grid;
+  gap: 6px;
+  font-size: 14px;
+}
+#evaluationPanel.hidden { display: none; }
+
+.trace-table-wrap {
+  overflow-x: auto;
+}
+
+.trace-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.trace-table th,
+.trace-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+  white-space: nowrap;
+}
 
 @media (max-width: 800px) {
   .app { flex-direction: column; }

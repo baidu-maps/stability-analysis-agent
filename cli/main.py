@@ -72,7 +72,6 @@ from cli.phase_spinner import PhaseSpinner
 from cli.upgrade import run_upgrade_check_interactive
 from cli.report_paths import (
     clear_cli_reports,
-    ensure_reports_migrated,
     format_bytes,
     print_cli_reports_overview,
     report_root,
@@ -96,6 +95,7 @@ from tool_system import (  # type: ignore
     ToolConfig,
     WorkflowConfig,
     ConfigDrivenExecutor,
+    AgentRuntime,
     LLMAdapterFactory,
     register_all_tools_and_workflows,
 )
@@ -222,12 +222,11 @@ def _resolve_crash_input_mode(args: argparse.Namespace) -> Tuple[str, Optional[s
     - crash_log_content: 直接文本输入或 stdin 读取结果
     - crash_log_files: 目录模式下的文件列表
     """
-    legacy = str(getattr(args, "crash_log_legacy", "") or "").strip()
     file_path = str(getattr(args, "crash_log_file", "") or "").strip()
     content = getattr(args, "crash_log_content", None)
     dir_path = str(getattr(args, "crash_log_dir", "") or "").strip()
 
-    file_choice = file_path or legacy
+    file_choice = file_path
     has_file = bool(file_choice)
     has_content = content is not None
     has_dir = bool(dir_path)
@@ -238,7 +237,7 @@ def _resolve_crash_input_mode(args: argparse.Namespace) -> Tuple[str, Optional[s
     if has_dir and (has_content or has_file):
         raise ValueError("--crash-log-dir 不能与 --crash-log-file / --crash-log-content 同时使用")
     if has_content and has_file:
-        raise ValueError("--crash-log-content 不能与 --crash-log-file / --crash-log 同时使用")
+        raise ValueError("--crash-log-content 不能与 --crash-log-file 同时使用")
 
     if has_dir:
         files = [str(p) for p in _collect_crash_log_files(dir_path)]
@@ -417,7 +416,9 @@ def _build_llm_config_from_agent_config(
     if not isinstance(llm_cfg, dict):
         llm_cfg = {}
 
-    mapped_engine = engine if engine in ("direct", "langchain", "langgraph") else "direct"
+    if engine not in {"direct", "langchain", "langgraph"}:
+        raise ValueError("engine must be one of: direct, langchain, langgraph")
+    mapped_engine = engine
     ctx = routing_ctx
     if ctx is None:
         ctx = RoutingContext(mode=resolve_mode_from_config(llm_cfg, cli_mode=cli_mode))
@@ -2509,7 +2510,6 @@ def _describe_llm_endpoint_for_display(llm_config: LLMConfig) -> str:
 def _connectivity_probe_via_llm_adapter(engine: str, provider_key: Optional[str] = None) -> Dict[str, Any]:
     """
     通过 LLMAdapterFactory 探测联通性，与正式分析共用同一 HTTP/SSL 栈。
-    langchain 模式在 CLI 未注入 AgentExecutor 时回退为 direct 传输探测。
     菜单内联通性检测固定读取用户目录配置，与「大模型配置检测」一致。
     """
     user_cfg = _load_agent_config_file()
@@ -2535,11 +2535,6 @@ def _connectivity_probe_via_llm_adapter(engine: str, provider_key: Optional[str]
     adapter_cfg["timeout"] = max(1, min(10, configured_timeout))
     adapter_cfg["temperature"] = 0.0
     adapter_cfg["max_tokens"] = 16
-
-    if engine == "langchain":
-        # crash_analysis 的 LLM 直调走 chat()；langchain 引擎需 AgentExecutor，探测改用 direct。
-        probe_engine = "direct"
-        adapter_cfg["engine"] = "direct"
 
     adapter = LLMAdapterFactory.create(adapter_cfg)
     response = adapter.chat(
@@ -3380,23 +3375,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="批量分析目录中的崩溃日志文件（递归收集目录下所有文件）",
     )
     p.add_argument(
-        "--crash-log",
-        dest="crash_log_legacy",
-        required=False,
-        help="兼容旧参数：等同于 --crash-log-file；使用 '-' 表示从 stdin 读取",
-    )
-    p.add_argument(
         "--library-dir",
         required=False,
         help="符号库目录（含 .so / .dylib / .dSYM 等带调试符号的二进制；日志已被解析过可省略）",
     )
     p.add_argument(
-        "--code-root",
+        "--code-roots",
         action="append",
         dest="code_roots",
         help="项目 C/C++ 源码目录（可重复指定；建议精确到工程/模块根目录，避免传整个仓库根目录）",
     )
     p.add_argument("--config", required=False, help="SystemConfig JSON 文件")
+    p.add_argument(
+        "--verification-config-json", default=None,
+        help="显式验证配置 JSON；未配置时 scope=full 会尝试自动 smoke build/test",
+    )
+    p.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="跳过自动/显式 verify（仅 apply patch，不执行 build/test/reproduce）",
+    )
     p.add_argument("--vector-db-path", default="./vector_db", help="向量数据库目录（默认: ./vector_db）")
     p.add_argument("--vector-db-max-results", type=int, default=3, help="向量检索最大返回数")
     p.add_argument(
@@ -3533,10 +3531,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="context_loop 模式下最多 LLM 轮数（默认：analysis=3，其它=1；显式指定时以参数为准，硬上限 8）。",
     )
     p.add_argument(
+        "--max-llm-calls",
+        type=int,
+        default=8,
+        help="单次运行 LLM 调用硬上限（0=不限；未指定时可用 max-agent-rounds 映射默认值）。",
+    )
+    p.add_argument(
+        "--max-tool-calls",
+        type=int,
+        default=32,
+        help="单次运行工具调用硬上限（0=不限）。",
+    )
+    p.add_argument(
+        "--max-runtime-seconds",
+        type=float,
+        default=3600.0,
+        help="单次运行总时长硬上限（秒，0=不限）。",
+    )
+    p.add_argument(
+        "--checkpoint-id",
+        default="",
+        help="从指定 runtime checkpoint 恢复（需配合 --replay-source-report）。",
+    )
+    p.add_argument(
+        "--from-stage",
+        choices=("observe", "analyze", "plan", "verify", "decide"),
+        default="",
+        help="checkpoint 恢复起始阶段（默认 analyze）。",
+    )
+    p.add_argument(
+        "--replay-source-report",
+        default="",
+        help="checkpoint 恢复时读取 artifact/trace 的历史报告目录（replay 内部使用）。",
+    )
+    p.add_argument(
         "--max-context-requests-per-round",
         type=int,
-        default=5,
-        help="context_loop 每轮最多处理的补充上下文请求数（默认 5，硬上限 16）。",
+        default=8,
+        help="context_loop 每轮最多处理的补充上下文请求数（默认 8，硬上限 16）。",
     )
     p.add_argument(
         "--backup-original-sources",
@@ -3558,10 +3590,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="是否启用 LLM 流式输出（daemon 透传；默认沿用 provider 配置）",
     )
     p.add_argument(
-        "--engine",
-        default="direct",
-        choices=["direct", "langchain", "langgraph"],
-        help="AI 推理模式：direct=直调 LLM, langchain=工具编排, langgraph=状态图编排",
+        "--engine", default="direct", choices=["direct", "langchain", "langgraph"],
+        help="LLM backend；Agent 编排统一由 AgentRuntime 管理",
     )
     p.add_argument(
         "--plugin-module",
@@ -3683,6 +3713,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "06 / LLM 提示词是否并入向量库检索的「规则与经验模式参考」（默认关闭，避免 RAG 误导；"
             "使用 --include-memory-in-05 开启，--no-include-memory-in-05 显式关闭）"
+        ),
+    )
+    p.add_argument(
+        "--external-agent-evaluation",
+        dest="external_agent_evaluation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "生成供外部通用编程 Agent 对比使用的独立任务与提交契约文件"
+            "（默认关闭；使用 --no-external-agent-evaluation 显式关闭）"
         ),
     )
     return p
@@ -3814,7 +3854,6 @@ def _run_vector_db_command(args: argparse.Namespace) -> Optional[int]:
         snapshot = analyzer.export_snapshot()
         output_path = args.export_vector_db.strip() if isinstance(args.export_vector_db, str) else ""
         if not output_path:
-            ensure_reports_migrated(_runtime_output_root())
             output_path = str((report_root() / "vector_db_snapshot.json").resolve())
         out_file = Path(output_path)
         out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -3890,7 +3929,6 @@ def _build_report_dir(args: argparse.Namespace) -> Path:
     crash_ref = str(
         getattr(args, "crash_log", None)
         or getattr(args, "crash_log_file", None)
-        or getattr(args, "crash_log_legacy", None)
         or ""
     ).strip()
     if not crash_ref:
@@ -3902,7 +3940,6 @@ def _build_report_dir(args: argparse.Namespace) -> Path:
     run_id = _sanitize_report_name(str(os.environ.get("STABILITY_AGENT_RUN_ID") or "").strip())
     run_suffix = f"_{run_id}" if run_id else ""
     dirname = f"{stamp}_{mode}_{args.engine}_{crash_name}{run_suffix}"
-    ensure_reports_migrated(_runtime_output_root())
     return report_root() / dirname
 
 
@@ -4009,12 +4046,14 @@ def _llm_request_snapshot(args: argparse.Namespace, scope: str) -> Dict[str, Any
         from tool_system.llm.routing_policy import RoutingContext
 
         prompt_mode = str(getattr(args, "prompt_mode", "fix") or "fix")
+        from services.context_engine import resolve_agent_loop as _resolve_agent_loop
+
         route_ctx = RoutingContext(
             prompt_mode=prompt_mode,
             apply_ai_fixes=bool(getattr(args, "apply_ai_fixes", True)),
-            agent_loop=str(
-                getattr(args, "agent_loop", None)
-                or ("context_loop" if prompt_mode == "analysis" else "single")
+            agent_loop=_resolve_agent_loop(
+                {"scope": scope, "prompt_mode": prompt_mode},
+                explicit=str(getattr(args, "agent_loop", None) or "").strip() or None,
             ),
             round_index=0,
         )
@@ -4287,9 +4326,16 @@ def _final_run_summary(
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
     pipeline_skipped = bool(metadata.get("pipeline_skipped"))
     raw_status = str(result.get("status") or "error")
-    if raw_status != "success":
+    explicit_completion_reason = str(result.get("completion_reason") or "").strip()
+    if raw_status == "verification_pending":
+        status = "verification_pending"
+        completion_reason = "verification_pending"
+    elif raw_status == "approval_required":
+        status = "approval_required"
+        completion_reason = "approval_required"
+    elif raw_status != "success":
         status = "failed"
-        completion_reason = "workflow_error"
+        completion_reason = explicit_completion_reason or "workflow_error"
     elif pipeline_skipped:
         status = "partial"
         note = str(result.get("note") or "")
@@ -4339,6 +4385,16 @@ def _final_run_summary(
         "warnings": warnings,
         "artifacts": _artifact_manifest(report_dir, scope=scope),
         "llm": _llm_summary_from_result(result, scope=scope, request_record=request_record),
+        "verification": result.get("verification"),
+        "diff_review": result.get("diff_review"),
+        "evidence_package": metadata.get("evidence_package") or {
+            "items": [], "item_count": 0, "chars": 0, "tokens": 0,
+        },
+        "runtime_state": metadata.get("runtime_state"),
+        "trace": metadata.get("runtime_trace"),
+        "judge": result.get("judge"),
+        "observations": metadata.get("observations"),
+        "memory_feedback": metadata.get("memory_feedback"),
     }
 
 
@@ -4406,6 +4462,7 @@ def _write_cli_report(
     run_duration_ms: Optional[int] = None,
     apply_fix_duration_ms: Optional[int] = None,
     execution_events: Optional[List[Dict[str, Any]]] = None,
+    verification_result: Optional[Dict[str, Any]] = None,
 ) -> Optional[Path]:
     try:
         report_dir.mkdir(parents=True, exist_ok=True)
@@ -4502,6 +4559,9 @@ def _write_cli_report(
         if final_tip is None:
             final_tip = result.get("analysis")
         agent_rounds = result.get("agent_rounds")
+        context_session = result.get("context_session")
+        if isinstance(context_session, dict):
+            _write_json(report_dir / "context_session.json", context_session)
         if isinstance(agent_rounds, list) and agent_rounds:
             rounds_summary = []
             for idx, round_payload in enumerate(agent_rounds):
@@ -4526,18 +4586,19 @@ def _write_cli_report(
                 if isinstance(pre_round_add_res, dict):
                     _write_json(round_dir / "05b_pre_round_add_res.json", pre_round_add_res)
                 if context_requests or resolved_context:
-                    from workflows.crash_analysis_workflow import (
-                        BaseCrashAnalysisWorkflow,
+                    from services.context_request_contract import (
+                        CONTEXT_REQUEST_RETURN_FORM_LABELS,
+                        CONTEXT_REQUEST_RETURN_FORMS,
                     )
 
                     _write_json(
                         round_dir / "06b_next_round_ai_request.json",
                         {
                             "return_form_legend": (
-                                BaseCrashAnalysisWorkflow.CONTEXT_REQUEST_RETURN_FORM_LABELS
+                                CONTEXT_REQUEST_RETURN_FORM_LABELS
                             ),
                             "type_to_expected_return_form": (
-                                BaseCrashAnalysisWorkflow.CONTEXT_REQUEST_RETURN_FORMS
+                                CONTEXT_REQUEST_RETURN_FORMS
                             ),
                             "context_requests": context_requests or [],
                             "resolved_context": resolved_context or [],
@@ -4557,7 +4618,14 @@ def _write_cli_report(
                     }
                 )
             if rounds_summary:
-                _write_json(report_dir / "agent_rounds_summary.json", rounds_summary)
+                _write_json(
+                    report_dir / "agent_rounds_summary.json",
+                    {
+                        "schema_version": 2,
+                        "termination_reason": result.get("termination_reason"),
+                        "rounds": rounds_summary,
+                    },
+                )
         elif final_tip is not None:
             round_dir = report_dir / "round_0"
             round_dir.mkdir(parents=True, exist_ok=True)
@@ -4570,6 +4638,50 @@ def _write_cli_report(
                 (round_dir / "07_ai_gen_res.md").write_text(str(analysis_text), encoding="utf-8")
         if applied_fix_result is not None:
             _write_json(report_dir / "08_apply_ai_fixes.json", applied_fix_result)
+        if verification_result is not None:
+            _write_json(report_dir / "09_verification.json", verification_result)
+        pending_tool_approval = result.get("pending_tool_approval") if isinstance(result, dict) else None
+        if isinstance(pending_tool_approval, dict) and pending_tool_approval:
+            _write_json(report_dir / "09_pending_tool_approval.json", pending_tool_approval)
+        metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        runtime_trace = metadata.get("runtime_trace") if isinstance(metadata, dict) else None
+        if isinstance(runtime_trace, dict) and runtime_trace:
+            _write_json(report_dir / "00_runtime_trace.json", runtime_trace)
+        evidence_items = metadata.get("evidence_items") if isinstance(metadata, dict) else None
+        evidence_package = metadata.get("evidence_package") if isinstance(metadata, dict) else None
+        if not isinstance(evidence_package, dict):
+            evidence_package = {
+                "items": evidence_items if isinstance(evidence_items, list) else [],
+                "item_count": len(evidence_items) if isinstance(evidence_items, list) else 0,
+                "chars": 0,
+                "tokens": 0,
+            }
+        _write_json(report_dir / "09_evidence.json", {
+            "items": list(evidence_package.get("items") or []),
+            "evidence_package": evidence_package,
+        })
+        external_agent_evaluation = bool(
+            (
+                request_record.get("effective_parameters", {})
+                if isinstance(request_record, dict)
+                else {}
+            ).get("external_agent_evaluation", False)
+        )
+        if external_agent_evaluation and scope in {
+            "full",
+            "gen_prompt_only",
+            "parse_stack_only",
+        }:
+            try:
+                from services.external_agent_evaluation import build_external_agent_evaluation
+
+                evaluation_artifacts = build_external_agent_evaluation(
+                    report_dir, request=request_record, result=result,
+                )
+                if evaluation_artifacts is not None:
+                    result.setdefault("metadata", {})["external_agent_evaluation"] = evaluation_artifacts
+            except Exception as exc:
+                logger.warning("failed to write external agent evaluation task: %s", exc)
         if write_readme_output:
             final_output_text = analysis_text if analysis_text is not None else rendered_output
             (report_dir / "final_output.md").write_text(str(final_output_text), encoding="utf-8")
@@ -4603,6 +4715,22 @@ def _write_cli_report(
         return None
 
 
+def _apply_runtime_budget_to_config(config: SystemConfig, args: argparse.Namespace) -> None:
+    meta = dict(config.metadata) if isinstance(config.metadata, dict) else {}
+    budget = dict(meta.get("runtime_budget") or {}) if isinstance(meta.get("runtime_budget"), dict) else {}
+    for key, arg_name, cast in (
+        ("max_llm_calls", "max_llm_calls", int),
+        ("max_tool_calls", "max_tool_calls", int),
+        ("max_total_seconds", "max_runtime_seconds", float),
+    ):
+        raw = getattr(args, arg_name, 0) or 0
+        if raw:
+            budget[key] = cast(raw)
+    if budget:
+        meta["runtime_budget"] = budget
+        config.metadata = meta
+
+
 def _build_run_request_record(
     args: argparse.Namespace,
     *,
@@ -4616,17 +4744,20 @@ def _build_run_request_record(
     crash_log_source_norm = str(crash_log_source or "").strip().lower() or "file"
     crash_log_value_norm = str(crash_log_value or "").strip()
     prompt_mode = str(getattr(args, "prompt_mode", "fix") or "fix")
-    explicit_agent_loop = str(getattr(args, "agent_loop", None) or "").strip()
-    agent_loop = explicit_agent_loop or ("context_loop" if prompt_mode == "analysis" else "single")
+    from services.context_engine import resolve_agent_loop, resolve_max_agent_rounds
+
+    explicit_agent_loop = str(getattr(args, "agent_loop", None) or "").strip() or None
+    _loop_problem = {"scope": scope, "prompt_mode": prompt_mode}
+    agent_loop = resolve_agent_loop(_loop_problem, explicit=explicit_agent_loop)
     configured_rounds = int(getattr(args, "max_agent_rounds", 0) or 0)
-    max_agent_rounds = (
-        max(1, min(configured_rounds, 8))
-        if configured_rounds > 0
-        else (3 if prompt_mode == "analysis" else 1)
-    )
+    max_agent_rounds = resolve_max_agent_rounds({
+        "scope": scope,
+        "prompt_mode": prompt_mode,
+        "max_agent_rounds": configured_rounds,
+    })
     max_context_requests = max(
         1,
-        min(int(getattr(args, "max_context_requests_per_round", 5) or 5), 16),
+        min(int(getattr(args, "max_context_requests_per_round", 8) or 8), 16),
     )
     code_context_timeout = (
         float(args.code_context_timeout_sec)
@@ -4668,6 +4799,13 @@ def _build_run_request_record(
     library_dir = str(getattr(args, "library_dir", None) or "").strip()
     config_path = str(getattr(args, "config", None) or "").strip()
     vector_db_path = str(getattr(args, "vector_db_path", "./vector_db") or "./vector_db")
+    verification_raw = getattr(args, "verification_config_json", None)
+    try:
+        verification_record = _parse_verification_config_json(verification_raw)
+    except ValueError:
+        # The execution path reports malformed configuration; a run snapshot
+        # must remain writable so the failure can still be audited.
+        verification_record = None
     effective_parameters: Dict[str, Any] = {
         "scope": scope,
         "output_format": getattr(args, "output_format", "markdown"),
@@ -4678,6 +4816,8 @@ def _build_run_request_record(
         "apply_ai_fixes": bool(getattr(args, "apply_ai_fixes", True)),
         "backup_original_sources": bool(getattr(args, "backup_original_sources", True)),
         "engine": getattr(args, "engine", "direct"),
+        "verification": verification_record,
+        "skip_verify": bool(getattr(args, "skip_verify", False)),
         "optimized": bool(getattr(args, "optimized", False)),
         "streaming": llm_snapshot.get("streaming"),
         "vector_db_max_results": int(getattr(args, "vector_db_max_results", 3) or 3),
@@ -4722,17 +4862,36 @@ def _build_run_request_record(
         ),
         "use_ctags_index": bool(getattr(args, "use_ctags_index", False)),
         "include_memory_in_05": bool(getattr(args, "include_memory_in_05", False)),
+        "external_agent_evaluation": bool(
+            getattr(args, "external_agent_evaluation", False)
+        ),
         "native_leak_dir": str(getattr(args, "native_leak_dir", None) or ""),
         "native_leak_trace_db": str(getattr(args, "native_leak_trace_db", None) or ""),
         "code_context_timeout_sec": code_context_timeout,
         "find_source_timeout_sec": find_source_timeout,
-        "max_symbol_only_rescues": getattr(args, "max_symbol_only_rescues", None),
-        "max_crash_caller_search_files": getattr(args, "max_crash_caller_search_files", None),
+        "max_symbol_only_rescues": (
+            getattr(args, "max_symbol_only_rescues", None)
+            if isinstance(getattr(args, "max_symbol_only_rescues", None), (int, float))
+            else None
+        ),
+        "max_crash_caller_search_files": (
+            getattr(args, "max_crash_caller_search_files", None)
+            if isinstance(getattr(args, "max_crash_caller_search_files", None), (int, float))
+            else None
+        ),
         "uaf_nullptr_guard_policy": _effective_uaf_nullptr_guard_policy(),
         "plugin_modules": plugin_modules,
         "output_file": getattr(args, "output_file", None),
         "print_full_report": bool(getattr(args, "print_full_report", False)),
     }
+    source_revision = worktree_revision = None
+    try:
+        from services.git_worktree_manager import revision_for_code_roots
+
+        source_revision = revision_for_code_roots(code_roots, include_diff=False)
+        worktree_revision = revision_for_code_roots(code_roots, include_diff=True)
+    except Exception:
+        pass
     return {
         "schema_version": 2,
         "run_id": datetime.datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8],
@@ -4756,6 +4915,10 @@ def _build_run_request_record(
             "platform": platform.platform(),
             "agent_version": _runtime_version(),
             "git": _git_runtime_snapshot(),
+        },
+        "workspace_snapshot": {
+            "source_revision": source_revision,
+            "worktree_revision": worktree_revision,
         },
     }
 
@@ -4828,11 +4991,7 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
         for root in code_roots:
             root_text = str(root or "").strip()
             if root_text:
-                argv += ["--code-root", root_text]
-    else:
-        single_root = str(record.get("code_root") or "").strip()
-        if single_root:
-            argv += ["--code-root", single_root]
+                argv += ["--code-roots", root_text]
 
     config = str(record.get("config") or "").strip()
     if config:
@@ -4850,9 +5009,21 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
     if prompt_mode != "fix":
         argv += ["--prompt-mode", prompt_mode]
 
+    engine = str(record.get("engine") or "direct").strip() or "direct"
+    if engine not in {"direct", "langchain", "langgraph"}:
+        raise ValueError("run_request 中的 engine 无效")
+    if engine != "direct":
+        argv += ["--engine", engine]
+
     agent_loop = str(record.get("agent_loop") or "").strip()
     if agent_loop in {"single", "context_loop"}:
         argv += ["--agent-loop", agent_loop]
+
+    verification = record.get("verification")
+    if isinstance(verification, dict):
+        argv += ["--verification-config-json", json.dumps(verification, ensure_ascii=False)]
+    elif isinstance(verification, str) and verification.strip():
+        argv += ["--verification-config-json", verification]
 
     max_agent_rounds = int(record.get("max_agent_rounds") or 0)
     if max_agent_rounds:
@@ -4862,9 +5033,6 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
     if max_context_requests:
         argv += ["--max-context-requests-per-round", str(max_context_requests)]
 
-    engine = str(record.get("engine") or "direct").strip() or "direct"
-    if engine != "direct":
-        argv += ["--engine", engine]
 
     if not bool(record.get("apply_ai_fixes", True)):
         argv += ["--no-apply-ai-fixes"]
@@ -4891,6 +5059,8 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
         argv += ["--use-ctags-index"]
     if bool(record.get("include_memory_in_05", False)):
         argv += ["--include-memory-in-05"]
+    if bool(record.get("external_agent_evaluation", False)):
+        argv += ["--external-agent-evaluation"]
 
     max_sibling = record.get("max_sibling_member_functions")
     if max_sibling is not None:
@@ -4924,7 +5094,62 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
         module_text = str(module or "").strip()
         if module_text:
             argv += ["--plugin-module", module_text]
+    checkpoint_id = str(record.get("_replay_checkpoint_id") or record.get("checkpoint_id") or "").strip()
+    if checkpoint_id:
+        argv += ["--checkpoint-id", checkpoint_id]
+    from_stage = str(record.get("_replay_from_stage") or record.get("from_stage") or "").strip()
+    if from_stage:
+        argv += ["--from-stage", from_stage]
+    replay_source = str(record.get("_replay_source_report") or "").strip()
+    if replay_source:
+        argv += ["--replay-source-report", replay_source]
+    for budget_key, arg_name in (
+        ("max_llm_calls", "max_llm_calls"),
+        ("max_tool_calls", "max_tool_calls"),
+        ("max_total_seconds", "max_runtime_seconds"),
+    ):
+        value = record.get(budget_key)
+        if value:
+            flag = {
+                "max_llm_calls": "--max-llm-calls",
+                "max_tool_calls": "--max-tool-calls",
+                "max_total_seconds": "--max-runtime-seconds",
+            }[budget_key]
+            argv += [flag, str(value)]
     return argv, cleanup_paths
+
+
+def _load_replay_llm_adapter(record: Dict[str, Any]) -> Any:
+    """Best-effort LLM adapter for offline analysis replay."""
+    try:
+        from tool_system.llm.llm_adapter import LLMAdapterFactory
+        from tool_system.config import SystemConfig
+
+        config_path = str(record.get("config") or "").strip()
+        if config_path:
+            config = SystemConfig.from_file(config_path)
+        else:
+            config = SystemConfig()
+        agent_cfg = _load_agent_config_file()
+        llm_cfg = agent_cfg.get("llm_config", {}) if isinstance(agent_cfg, dict) else {}
+        if config.llm is None and isinstance(llm_cfg, dict) and llm_cfg:
+            from tool_system.llm.routing_policy import RoutingContext
+
+            route_ctx = RoutingContext(prompt_mode=str(record.get("prompt_mode") or "fix"), apply_ai_fixes=True)
+            built, _ = _build_llm_config_from_agent_config(
+                str(record.get("engine") or "direct"),
+                agent_cfg=agent_cfg,
+                routing_ctx=route_ctx,
+                engage=True,
+                return_router_state=True,
+            )
+            if built is not None:
+                config.llm = built
+        if config.llm is None:
+            return None
+        return LLMAdapterFactory.create(config.llm.to_dict())
+    except Exception:
+        return None
 
 
 def _handle_replay_command(argv: List[str]) -> int:
@@ -4932,6 +5157,11 @@ def _handle_replay_command(argv: List[str]) -> int:
     parser.add_argument("report_dir", help="历史报告目录（含 00_run_request.json）")
     parser.add_argument("--dry-run", action="store_true", help="仅打印将要执行的命令，不真正重放")
     parser.add_argument("--show-request", action="store_true", help="打印读取到的 run_request 内容")
+    parser.add_argument("--from-stage", choices=("observe", "analyze", "plan", "verify", "decide"), default="analyze",
+                        help="从指定阶段恢复；verify 只允许显式验证 replay")
+    parser.add_argument("--checkpoint-id", default="", help="从 runtime checkpoint 恢复（跳过已完成 stage）")
+    parser.add_argument("--verification-config-json", default=None,
+                        help="verify replay 使用的显式验证配置 JSON；不会执行报告中的候选命令")
     args = parser.parse_args(argv)
 
     report_dir = Path(args.report_dir).expanduser().resolve()
@@ -4949,6 +5179,100 @@ def _handle_replay_command(argv: List[str]) -> int:
 
     if args.show_request:
         print(json.dumps(record, ensure_ascii=False, indent=2))
+
+    try:
+        restored = AgentRuntime.restore_from_report(
+            report_dir, stage=args.from_stage, checkpoint_id=args.checkpoint_id,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"错误: 无法恢复 checkpoint: {exc}", file=sys.stderr)
+        return 2
+    selected_checkpoint = restored.get("resume_plan", {}).get("checkpoint")
+    if isinstance(selected_checkpoint, dict):
+        from services.git_worktree_manager import (
+            revision_for_code_roots,
+            workspace_revision,
+            workspace_source_revision,
+        )
+        roots = record.get("code_roots") if isinstance(record.get("code_roots"), list) else []
+        current_source = revision_for_code_roots(roots, include_diff=False)
+        current_worktree = revision_for_code_roots(roots, include_diff=True)
+        manifest_path = report_dir / "09_ai_fix_workspace.json"
+        if manifest_path.is_file():
+            from daemon.server import RunState, _restore_workspace_from_manifest
+            probe = RunState(str(record.get("run_id") or "replay"), "done", 0.0,
+                             workspace_manifest=str(manifest_path))
+            restored_workspace = _restore_workspace_from_manifest(probe)
+            if restored_workspace is not None:
+                current_source = workspace_source_revision(restored_workspace)
+                current_worktree = workspace_revision(restored_workspace)
+        if selected_checkpoint.get("source_revision") and selected_checkpoint.get("source_revision") != current_source:
+            print("错误: checkpoint source revision 与当前源码不一致", file=sys.stderr)
+            return 2
+        if selected_checkpoint.get("worktree_revision") and selected_checkpoint.get("worktree_revision") != current_worktree:
+            print("错误: checkpoint worktree revision 与当前工作区不一致", file=sys.stderr)
+            return 2
+
+    if args.from_stage == "verify":
+        from services.repair_pipeline import resume_verification_from_report
+        from tool_system.runtime import RunTrace
+
+        try:
+            verification = _parse_verification_config_json(args.verification_config_json)
+        except ValueError as exc:
+            print(f"错误: {exc}", file=sys.stderr)
+            return 2
+        if verification is None:
+            verification = record.get("verification")
+        if not isinstance(verification, dict):
+            effective = record.get("effective_parameters")
+            if isinstance(effective, dict) and isinstance(effective.get("verification"), dict):
+                verification = effective.get("verification")
+        if not isinstance(verification, dict):
+            summary_path = report_dir / "00_run_summary.json"
+            if summary_path.is_file():
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                verification = summary.get("verification")
+        if not isinstance(verification, dict):
+            verification = {}
+        if not verification.get("command"):
+            print("错误: verify replay 必须显式提供 --verification-config-json，候选命令不会自动执行", file=sys.stderr)
+            return 2
+        if args.dry_run:
+            print(f"verify resume: report_dir={report_dir} verification={json.dumps(verification, ensure_ascii=False)}")
+            return 0
+        trace_path = report_dir / "00_runtime_trace.json"
+        trace_payload = json.loads(trace_path.read_text(encoding="utf-8")) if trace_path.is_file() else {}
+        trace = RunTrace.from_dict(trace_payload, run_id=str(record.get("run_id") or "replay"))
+        pipeline = resume_verification_from_report(
+            report_dir=report_dir,
+            verification_config=verification,
+            trace=trace,
+            run_id=str(record.get("run_id") or "replay"),
+        )
+        trace_payload = trace.snapshot()
+        _write_json(report_dir / "00_runtime_trace.json", trace_payload)
+        print(json.dumps(pipeline.result_updates, ensure_ascii=False, indent=2))
+        return 0 if pipeline.result_updates.get("status") in {"success", "done"} else 1
+
+    if args.from_stage == "decide":
+        print(json.dumps({"status": "restored", "runtime_state": restored.get("runtime_state")}, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.checkpoint_id:
+        from services.stage_artifacts import analyze_artifact_path
+
+        skip = restored.get("resume_plan", {}).get("skip_stages") or []
+        artifact_path = analyze_artifact_path(report_dir)
+        print(f"checkpoint_id={args.checkpoint_id} skip_stages={skip} artifact={artifact_path}", file=sys.stderr)
+        record["_replay_checkpoint_id"] = args.checkpoint_id
+        record["_replay_from_stage"] = args.from_stage
+        record["_replay_source_report"] = str(report_dir)
+        record["resume_plan"] = restored.get("resume_plan")
+        if restored.get("runtime_trace"):
+            record["_restored_runtime_trace"] = restored["runtime_trace"]
+    if restored.get("runtime_state"):
+        record["runtime_state"] = restored["runtime_state"]
 
     try:
         replay_argv, cleanup_paths = _build_replay_argv_from_record(record)
@@ -5370,17 +5694,12 @@ _VALID_SCOPES = {"full", "gen_prompt_only", "parse_stack_only", "parse_log_only"
 
 
 def _resolve_scope_from_record(record: Dict[str, Any]) -> str:
-    """从历史 last_run/profile 记录里解析 scope，兼容旧字段（skip_ai + run_scope）。"""
+    """Resolve scope from a current run record."""
     if not isinstance(record, dict):
         return "full"
     raw_scope = str(record.get("scope", "")).strip()
     if raw_scope in _VALID_SCOPES:
         return raw_scope
-    legacy_scope = str(record.get("run_scope", "")).strip()
-    if legacy_scope in {"parse_stack_only", "parse_log_only"}:
-        return legacy_scope
-    if bool(record.get("skip_ai", False)):
-        return "gen_prompt_only"
     return "full"
 
 
@@ -5462,14 +5781,14 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
         print("2) --crash-log-content TEXT：直接传入崩溃日志文本")
         print("3) --crash-log-dir DIR：批量分析目录中的崩溃日志文件")
         print("4) --library-dir DIR：符号库目录（含 .so / .dylib / .dSYM；日志已含函数名+行号可省略）")
-        print("5) --code-root DIR：项目 C/C++ 源码目录（可重复指定；建议精确到工程/模块根目录，避免传整个仓库根目录）")
+        print("5) --code-roots DIR：项目 C/C++ 源码目录（可重复指定；建议精确到工程/模块根目录，避免传整个仓库根目录）")
         print("6) --config PATH：指定 SystemConfig JSON（不填则使用内置默认工具链与工作流）")
         print("7) --scope {full|gen_prompt_only|parse_stack_only|parse_log_only}：Agent 执行流程范围")
         print("   - full（默认）：解析+maps+符号化+诊断族+定位源码+AI 分析+自动改码")
         print("   - gen_prompt_only：同上但不调用 AI，仅生成可复用提示词（round_0/06_ai_prompt.md）")
         print("   - parse_stack_only：解析+maps+符号化+04a 诊断（条件旁路 04c/04d/04e）")
         print("   - parse_log_only：仅解析崩溃日志")
-        print("8) --engine {direct|langchain|langgraph}：AI 推理模式（直调 / 工具编排 / 状态图编排）")
+        print("8) --engine {direct|langchain|langgraph}：LLM backend（不改变统一 AgentRuntime 编排）")
         print("")
         print("[RAG 上下文参数（进入分析 problem）]")
         print("1) --vector-db-path PATH：向量数据库目录（默认 ./vector_db）")
@@ -5507,7 +5826,7 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
         print("3) sa-agent run ...：显式使用参数模式执行分析")
         print("")
         print("[常见组合]")
-        print("1) 完整分析：--crash-log-file ... --library-dir ... --code-root ...")
+        print("1) 完整分析：--crash-log-file ... --library-dir ... --code-roots ...")
         print("2) 只分析不改码：加 --no-apply-ai-fixes")
         print("3) 只跑工具链不走 LLM：加 --scope gen_prompt_only")
         print("4) 仅解析+符号化+诊断：加 --scope parse_stack_only")
@@ -5520,12 +5839,12 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
 
     def _pick_engine(current_engine: str) -> str:
         engine_choice = _prompt_select(
-            "请选择 AI 推理模式",
+            "请选择 LLM backend",
             [
                 ("back", "返回"),
                 ("direct", "direct（默认，直调 LLM，启动快）"),
-                ("langchain", "langchain（工具编排，适合增强流程）"),
-                ("langgraph", "langgraph（状态图编排，适合复杂流程）"),
+                ("langchain", "langchain backend"),
+                ("langgraph", "langgraph backend"),
             ],
             default_index=(["direct", "langchain", "langgraph"].index(current_engine) + 1)
             if current_engine in {"direct", "langchain", "langgraph"}
@@ -5624,7 +5943,7 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                                         f"find_source={_effective_find_source_timeout_sec():.0f}s）"
                                     ),
                                 ),
-                                ("engine", f"调整 AI 推理模式（当前: {preferred_engine}）"),
+                                ("engine", f"调整 LLM backend（当前: {preferred_engine}）"),
                                 (
                                     "scope",
                                     f"调整Agent执行流程（当前: {scope_label_map.get(preferred_scope, preferred_scope)}）",
@@ -5663,7 +5982,7 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                             chosen = _pick_engine(preferred_engine)
                             if chosen != preferred_engine:
                                 preferred_engine = chosen
-                                print(f"已调整 AI 推理模式: {preferred_engine}")
+                                print(f"已调整 LLM backend: {preferred_engine}")
                             print("")
                             continue
                         if adv == "scope":
@@ -5706,7 +6025,7 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
                     print("")
                     print("推荐：输入 1 进入交互引导（新手首选）。")
                     print("或直接命令运行（适合熟手/脚本）：")
-                    print("sa-agent --crash-log-file <log.crash> --library-dir <lib_dir> --code-root <code_dir>")
+                    print("sa-agent --crash-log-file <log.crash> --library-dir <lib_dir> --code-roots <code_dir>")
                     print("更多参数：sa-agent --help")
                     print("━━━━━━━━━━━━━━━━━━━━━━")
                     _prompt_select(
@@ -5975,6 +6294,19 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
     return state
 
 
+def _parse_verification_config_json(raw: Optional[str]) -> Optional[Dict[str, Any]]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"验证配置 JSON 无效: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("验证配置必须是 JSON object")
+    return value
+
+
 def _execute_analysis_single(args: argparse.Namespace) -> int:
     _configure_cli_analysis_logging()
     vector_cmd_exit = _run_vector_db_command(args)
@@ -6028,11 +6360,24 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         _initialize_run_report(report_dir, request_record)
     except Exception as exc:
         print(f"警告: 初始化 reports 运行记录失败: {exc}", file=sys.stderr)
+    verification_config = _parse_verification_config_json(
+        getattr(args, "verification_config_json", None)
+    )
+    if bool(getattr(args, "skip_verify", False)):
+        verification_config = dict(verification_config or {})
+        verification_config["skip_verify"] = True
+    tool_approval_raw = getattr(args, "tool_approval_json", None)
+    if tool_approval_raw:
+        approval_payload = _parse_verification_config_json(tool_approval_raw)
+        if isinstance(approval_payload, dict):
+            verification_config = dict(verification_config or {})
+            approval = approval_payload.get("approval")
+            if isinstance(approval, dict):
+                verification_config["approval"] = approval
     problem = {
         "crash_log": crash_log_content,
         "library_dir": args.library_dir,
         "code_roots": code_roots,
-        "engine": args.engine,
         "scope": scope,
         "apply_ai_fixes": bool(args.apply_ai_fixes),
         "force_disassembly": bool(getattr(args, "force_disassembly", False)),
@@ -6042,11 +6387,13 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         "native_leak_trace_db": str(getattr(args, "native_leak_trace_db", None) or ""),
         "force_timeline_analysis": bool(getattr(args, "force_timeline_analysis", False)),
         "prompt_mode": str(getattr(args, "prompt_mode", "fix") or "fix"),
+        "verification": verification_config,
+        "skip_verify": bool(getattr(args, "skip_verify", False)),
         # 0 表示让 workflow 按 prompt_mode 决定默认轮数
         "max_agent_rounds": int(getattr(args, "max_agent_rounds", 0) or 0),
         "max_context_requests_per_round": max(
             1,
-            min(int(getattr(args, "max_context_requests_per_round", 5) or 5), 16),
+            min(int(getattr(args, "max_context_requests_per_round", 8) or 8), 16),
         ),
         "vector_db_path": args.vector_db_path,
         "vector_db_max_results": args.vector_db_max_results,
@@ -6096,9 +6443,17 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
             getattr(args, "include_memory_in_05", False)
         ),
     }
+    from services.context_engine import resolve_agent_loop as _resolve_agent_loop_for_problem
+
     _explicit_agent_loop = getattr(args, "agent_loop", None)
-    if _explicit_agent_loop in {"single", "context_loop"}:
-        problem["agent_loop"] = _explicit_agent_loop
+    problem["agent_loop"] = _resolve_agent_loop_for_problem(
+        problem,
+        explicit=_explicit_agent_loop if _explicit_agent_loop in {"single", "context_loop"} else None,
+    )
+    if not int(problem.get("max_agent_rounds") or 0):
+        from services.context_engine import resolve_max_agent_rounds as _resolve_max_rounds
+
+        problem["max_agent_rounds"] = _resolve_max_rounds(problem)
     _apply_analysis_timeouts_to_problem(problem, args)
     _prepare_analysis_acceleration(problem, code_roots, scope)
 
@@ -6135,6 +6490,8 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
                 WorkflowConfig(name="anr_freeze_analysis", enabled=True),
             ],
         )
+
+    _apply_runtime_budget_to_config(config, args)
 
     # 预分类路由：只读分类原文 → crash_analysis | anr_freeze_analysis
     force_anr = bool(getattr(args, "force_anr_analysis", False))
@@ -6234,9 +6591,39 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
 
     if llm_router_state is not None:
         problem["_llm_router_state"] = llm_router_state
+    problem["_report_dir"] = str(report_dir)
+    if isinstance(request_record, dict):
+        problem["run_id"] = str(request_record.get("run_id") or "")
+
+    resume_plan = None
+    restored_state = None
+    replay_source = str(getattr(args, "replay_source_report", "") or "").strip()
+    checkpoint_id = str(getattr(args, "checkpoint_id", "") or "").strip()
+    from_stage = str(getattr(args, "from_stage", "") or "analyze").strip() or "analyze"
+    if replay_source and checkpoint_id:
+        try:
+            restored_payload = AgentRuntime.restore_from_report(
+                Path(replay_source).expanduser().resolve(),
+                stage=from_stage,
+                checkpoint_id=checkpoint_id,
+            )
+            resume_plan = restored_payload.get("resume_plan")
+            restored_state = restored_payload.get("runtime_state")
+            if isinstance(restored_payload.get("runtime_trace"), dict):
+                problem["_restored_trace"] = restored_payload["runtime_trace"]
+            problem["_replay_source_report"] = replay_source
+        except (OSError, ValueError) as exc:
+            print(f"警告: checkpoint 恢复失败，将全量重跑: {exc}", file=sys.stderr)
 
     executor = ConfigDrivenExecutor(registry, config, llm_adapter)
-    result = executor.execute_workflow(workflow_name, problem)
+    runtime = AgentRuntime(executor, engine=args.engine)
+    result = runtime.run(
+        workflow_name,
+        problem,
+        defer_decision=True,
+        resume_plan=resume_plan if isinstance(resume_plan, dict) else None,
+        restored_state=restored_state if isinstance(restored_state, dict) else None,
+    )
     execution_events = list(executor.last_execution_events)
 
     # Persist routing summary into result metadata for 00_run_summary
@@ -6261,36 +6648,58 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
 
     applied_fix_result: Optional[Dict[str, Any]] = None
     apply_fix_duration_ms: Optional[int] = None
+    verification_result: Optional[Dict[str, Any]] = None
 
-    meta = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-    pipeline_skipped = bool(meta.get("pipeline_skipped"))
-    llm_skipped = bool(meta.get("llm_skipped"))
-    analysis_text_for_fix = str(result.get("analysis") or "")
-    final_still_needs_context = bool(
-        re.search(r'"(?:agent_can_fetch_more|need_more_context)"\s*:\s*true', analysis_text_for_fix, re.I)
-    )
-    if (
-        args.apply_ai_fixes
-        and result.get("status") == "success"
-        and scope == "full"
-        and not pipeline_skipped
-        and not llm_skipped
-        and not final_still_needs_context
+    from services.repair_pipeline import should_run_repair_pipeline
+
+    verification_config = problem.get("verification")
+    if not isinstance(verification_config, dict):
+        verification_config = config.metadata.get("verification") if isinstance(config.metadata, dict) else None
+
+    if should_run_repair_pipeline(
+        apply_ai_fixes=bool(args.apply_ai_fixes),
+        result=result if isinstance(result, dict) else {},
+        scope=scope,
     ):
-        apply_fix_started_perf = time.perf_counter()
-        with PhaseSpinner("应用代码修复", step=5, total_steps=5):
-            fixer = CodeFixer(llm_adapter, uaf_nullptr_guard_policy=_effective_uaf_nullptr_guard_policy())
-            fix_result = fixer.generate_and_apply(
-                result=result,
-                code_roots=code_roots,
-                report_dir=report_dir,
-                backup_original_sources=args.backup_original_sources,
-            )
-            applied_fix_result = fix_result.to_dict()
-            result["applied_ai_fixes"] = applied_fix_result
-        apply_fix_duration_ms = int(
-            round((time.perf_counter() - apply_fix_started_perf) * 1000)
+        repair_out = runtime.run_repair_and_verify(
+            result=result,
+            code_roots=code_roots,
+            report_dir=report_dir,
+            run_id=str(request_record.get("run_id") or ""),
+            verification_config=verification_config if isinstance(verification_config, dict) else None,
+            llm_adapter=llm_adapter,
+            backup_original_sources=bool(args.backup_original_sources),
+            uaf_nullptr_guard_policy=_effective_uaf_nullptr_guard_policy,
+            request_record=request_record,
+            post_fix_diagnosis=True,
         )
+        result = repair_out.get("result", result)
+        applied_fix_result = repair_out.get("applied_fix_result")
+        verification_result = repair_out.get("verification_result")
+        apply_fix_duration_ms = repair_out.get("apply_fix_duration_ms")
+        if result.get("status") == "verification_pending":
+            print("verification_pending: 未配置验证 provider；请通过 daemon 验证恢复接口提交明确命令", file=sys.stderr)
+            print("completion_reason=verification_pending", file=sys.stderr)
+        elif result.get("status") == "approval_required":
+            pending = repair_out.get("pending_tool_approval") or result.get("pending_tool_approval")
+            if isinstance(pending, dict):
+                result["pending_tool_approval"] = pending
+            print("approval_required: 工具策略要求显式批准；请创建新的显式修复任务", file=sys.stderr)
+            print("completion_reason=approval_required", file=sys.stderr)
+    elif isinstance(result, dict):
+        runtime._finalize_decision(result)
+        runtime._transition(
+            "decide",
+            status="completed" if result.get("status") == "success" else "error",
+            reason=result.get("error"),
+        )
+        runtime.state.checkpoint(
+            state={"result_status": result.get("status")},
+            status="completed" if result.get("status") == "success" else "error",
+        )
+        metadata = result.setdefault("metadata", {})
+        metadata["runtime_state"] = runtime.state.to_dict()
+        metadata["runtime_trace"] = runtime.trace.snapshot() if runtime.trace is not None else {}
 
     if args.output_format == "json":
         output = json.dumps(result, ensure_ascii=False, indent=2)
@@ -6516,6 +6925,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         run_duration_ms=None,
         apply_fix_duration_ms=apply_fix_duration_ms,
         execution_events=execution_events,
+        verification_result=verification_result,
     )
 
     use_tty_brief = (
@@ -6551,7 +6961,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
             scope=scope,
         )
 
-    return 0 if result.get("status") == "success" else 1
+    return 0 if result.get("status") in {"success", "verification_pending", "approval_required"} else 1
 
 
 def execute_analysis(args: argparse.Namespace) -> int:
@@ -6578,7 +6988,6 @@ def execute_analysis(args: argparse.Namespace) -> int:
             sub_args = argparse.Namespace(**vars(args))
             sub_args.crash_log_file = str(crash_file)
             sub_args.crash_log_content = None
-            sub_args.crash_log_legacy = None
             sub_args.crash_log_dir = None
             rc = _execute_analysis_single(sub_args)
             if rc == 0:
@@ -6605,11 +7014,14 @@ def _interactive_state_to_argv(state: Dict[str, Any]) -> List[str]:
             raise ValueError("交互状态缺少 crash_log_file")
         argv += ["--crash-log-file", crash_file]
 
-    argv += ["--engine", str(state.get("engine", "direct")).strip() or "direct", "--no-interactive"]
+    engine = str(state.get("engine", "direct")).strip() or "direct"
+    if engine not in {"direct", "langchain", "langgraph"}:
+        raise ValueError("交互状态中的 engine 无效")
+    argv += ["--engine", engine, "--no-interactive"]
     if state.get("library_dir"):
         argv.extend(["--library-dir", str(state["library_dir"])])
     for code_root in state.get("code_roots", []):
-        argv.extend(["--code-root", str(code_root)])
+        argv.extend(["--code-roots", str(code_root)])
     scope = str(state.get("scope", "full")).strip() or "full"
     if scope != "full":
         argv.extend(["--scope", scope])
@@ -6650,7 +7062,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 bool(getattr(args, "crash_log_file", None)),
                 bool(getattr(args, "crash_log_content", None) is not None),
                 bool(getattr(args, "crash_log_dir", None)),
-                bool(getattr(args, "crash_log_legacy", None)),
                 bool(args.init_vector_db),
                 bool(args.vector_db_stats),
                 args.export_vector_db is not None,
@@ -6683,7 +7094,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 getattr(args, "crash_log_file", None),
                 getattr(args, "crash_log_content", None) is not None,
                 getattr(args, "crash_log_dir", None),
-                getattr(args, "crash_log_legacy", None),
             ]
         ) and not has_business_args:
             print(

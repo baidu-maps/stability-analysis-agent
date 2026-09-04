@@ -9,6 +9,7 @@ from .llm_adapter import (
     DirectLLMAdapter,
     LangChainLLMAdapter,
     LangGraphLLMAdapter,
+    ReplayLLMAdapter,
     LLMAdapterFactory,
     LLMResponse,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "DirectLLMAdapter",
     "LangChainLLMAdapter",
     "LangGraphLLMAdapter",
+    "ReplayLLMAdapter",
     "LLMAdapterFactory",
     "LLMResponse",
     "LLMRouterState",

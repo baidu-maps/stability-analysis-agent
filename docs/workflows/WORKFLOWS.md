@@ -161,10 +161,11 @@ registry.register(
 ### 使用示例
 
 ```python
-result = executor.execute_workflow("crash_analysis", {
+runtime = AgentRuntime(executor, engine="direct")
+result = runtime.run("crash_analysis", {
     "crash_log": "...",      # 崩溃日志内容
     "library_dir": "...",     # .dylib/.so 目录
-    "code_root": "...",      # 源代码目录
+    "code_roots": ["..."],   # 源代码目录列表
 })
 ```
 
@@ -357,10 +358,11 @@ config = SystemConfig(
 
 # 执行分析
 executor = ConfigDrivenExecutor(registry, config, llm_adapter=None)
-result = executor.execute_workflow("crash_analysis", {
+runtime = AgentRuntime(executor, engine="direct")
+result = runtime.run("crash_analysis", {
     "crash_log": "...",
     "library_dir": "...",
-    "code_root": "..."
+    "code_roots": ["..."]
 })
 ```
 

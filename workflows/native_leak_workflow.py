@@ -10,7 +10,7 @@ from tool_system import BaseWorkflow, WorkflowContext, WorkflowDefinition
 from tools.native_leak_diagnosis.core import collect_source_search_queries
 
 
-def _build_prompt(diagnosis: Dict[str, Any], code_search: List[Dict[str, Any]]) -> str:
+def _build_prompt(diagnosis: Dict[str, Any], code_search: List[Dict[str, Any]], *, agent_loop: str = "single") -> str:
     lines = [str(diagnosis.get("prompt_section_zh") or "").rstrip(), ""]
     modes = diagnosis.get("fault_mode_matches") or []
     if modes:
@@ -41,6 +41,16 @@ def _build_prompt(diagnosis: Dict[str, Any], code_search: List[Dict[str, Any]]) 
         "4. 给出可实施的代码修复；证据不足时只给验证步骤，不虚构唯一泄漏点。",
         "5. OOM 或高内存不等同于泄漏，需排除有界缓存和业务峰值。",
     ])
+    agent_loop = str(agent_loop or "single")
+    if agent_loop == "context_loop":
+        from services.context_loop_contract import (
+            build_round0_must_provide_lines,
+            build_round0_output_format_lines,
+        )
+
+        lines.append("")
+        lines.extend(build_round0_must_provide_lines(agent_loop=agent_loop))
+        lines.extend(build_round0_output_format_lines(agent_loop=agent_loop))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -87,8 +97,30 @@ class NativeLeakAnalysisWorkflow(BaseWorkflow):
                 except Exception:
                     continue
 
-        prompt = _build_prompt(diagnosis, code_search)
+        prompt = _build_prompt(
+            diagnosis,
+            code_search,
+            agent_loop=str(problem.get("agent_loop") or "single"),
+        )
         scope = str(problem.get("scope") or "gen_prompt_only")
+        if isinstance(problem, dict) and problem.get("_runtime_owned_context_loop"):
+            return {
+                "status": "success",
+                "workflow": self.definition.name,
+                "platform": "HarmonyOS",
+                "native_leak_diagnosis": diagnosis,
+                "code_search": code_search,
+                "analysis": None,
+                "final_tip": prompt,
+                "metadata": {"problem_type": self.definition.problem_type},
+                "_analyze_prepare": {
+                    "initial_prompt": prompt,
+                    "code_roots": list(code_roots or []),
+                    "step": 3,
+                    "total_steps": 3,
+                    "skip_context_loop": context.llm is None,
+                },
+            }
         analysis = None
         note = "Native leak deterministic analysis completed"
         if scope == "full" and context.llm is not None:

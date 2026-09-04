@@ -1,0 +1,6 @@
+signal=SIGSEGV fault_address=0xdeadbeef
+thread=7
+#00 engine Resource::use code/src/resource.cpp:42
+#01 engine Session::onCallback code/src/session.cpp:88
+#02 engine CallbackQueue::flush code/src/callback_queue.cpp:31
+diagnosis=use_after_free

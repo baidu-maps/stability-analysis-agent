@@ -55,7 +55,7 @@ sh examples/crash_cases/demo_multithread/demo_mtd3/mk/build.sh
 
 ```bash
 python3 cli/main.py \
-  --crash-log examples/crash_cases/demo_multithread/demo_mtd3/log/mac/AtomicFail_SIGSEGV_2026-04-08_10-56-54.crash \
+  --crash-log-file examples/crash_cases/demo_multithread/demo_mtd3/log/mac/AtomicFail_SIGSEGV_2026-04-08_10-56-54.crash \
   --library-dir examples/crash_cases/demo_multithread/demo_mtd3/lib
 ```
 

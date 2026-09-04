@@ -30,6 +30,12 @@ class WebContractTests(unittest.TestCase):
         js_ids = set(re.findall(r'\$\("([^"]+)"\)', self.javascript))
         self.assertFalse(js_ids - html_ids, f"JavaScript references missing DOM ids: {sorted(js_ids - html_ids)}")
 
+    def test_engine_selector_is_available_and_submitted(self) -> None:
+        self.assertIn('id="engineSelect"', self.html)
+        for engine in ("direct", "langchain", "langgraph"):
+            self.assertIn(f'value="{engine}"', self.html)
+        self.assertIn('engine: $("engineSelect").value', self.javascript)
+
     def test_web_uses_daemon_run_contract(self) -> None:
         for endpoint in (
             'fetch("/health")',
@@ -52,6 +58,28 @@ class WebContractTests(unittest.TestCase):
         self.assertIn("examples/crash_cases/demo_basic/logs/mac/", self.javascript)
         self.assertIn("examples/crash_cases/demo_basic/lib/mac", self.javascript)
         self.assertIn("examples/crash_cases/demo_basic/code_dir", self.javascript)
+
+    def test_trace_panel_dom_contract(self) -> None:
+        for dom_id in (
+            "tracePanel",
+            "traceTable",
+            "traceTableBody",
+            "traceBudgetBar",
+            "traceFilterStage",
+            "traceFilterKind",
+            "traceFilterStatus",
+            "evaluationPanel",
+            "evaluationSummary",
+            "checkpointPanel",
+            "checkpointList",
+            "verificationCandidates",
+        ):
+            self.assertIn(f'id="{dom_id}"', self.html)
+        for header in ("kind", "name", "timestamp"):
+            self.assertIn(f"<th>{header}</th>", self.html)
+        self.assertIn("renderTraceTimeline", self.javascript)
+        self.assertIn("renderTraceBudget", self.javascript)
+        self.assertIn("renderCheckpoints", self.javascript)
 
 
 if __name__ == "__main__":

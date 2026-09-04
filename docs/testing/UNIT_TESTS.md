@@ -36,7 +36,7 @@ python3 test_evidence_compass.py
 python3 -m unittest test.cli.test_report_paths test.cli.test_vector_db_commit_prompt -v
 ```
 
-覆盖：`reports/` 默认目录、`cli_reports` 迁移、修复后向量库确认与 `--save-to-vector-db` 旗标。
+覆盖：`reports/` 默认目录、修复后向量库确认与 `--save-to-vector-db` 旗标。
 
 ### RAG / 向量库写库（`test/rag/`）
 

@@ -23,6 +23,8 @@ import socket
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
+from services.evaluation import evaluate_case
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_IGNORES = {
@@ -72,6 +74,7 @@ class RegressionResult:
     entrypoint: str = "cli"
     report_dir: str = ""
     attempt: int = 1
+    evaluation: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -231,7 +234,7 @@ class AIRegressionRunner:
             str(self.project_root / "cli" / "main.py"),
             "--crash-log-file", str(case.crash_log),
             "--library-dir", str(case.library_dir),
-            "--code-root", str(workspace),
+            "--code-roots", str(workspace),
             "--scope", "full",
             "--apply-ai-fixes",
             "--backup-original-sources",
@@ -406,6 +409,49 @@ class AIRegressionRunner:
                 return value
         return {}
 
+    @staticmethod
+    def _evaluation_payload(report_dir: str, agent_payload: Dict[str, Any], changed_files: List[str]) -> Dict[str, Any]:
+        """Build evaluation input from persisted report artifacts, not CLI text."""
+        payload = dict(agent_payload) if isinstance(agent_payload, dict) else {}
+        root = Path(report_dir) if report_dir else None
+        def load(name: str) -> Dict[str, Any]:
+            if root is None:
+                return {}
+            try:
+                value = json.loads((root / name).read_text(encoding="utf-8"))
+                return value if isinstance(value, dict) else {}
+            except (OSError, ValueError):
+                return {}
+        fixes = load("08_apply_ai_fixes.json")
+        verification = load("09_verification.json")
+        diagnosis = load("04a_crash_diagnosis.json")
+        summary = load("00_run_summary.json")
+        evidence = load("09_evidence.json")
+        runtime_trace = load("00_runtime_trace.json")
+        if fixes:
+            payload["applied_ai_fixes"] = fixes
+        if verification:
+            payload["verification"] = verification
+        if diagnosis:
+            payload["crash_diagnosis"] = diagnosis
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        metadata["runtime"] = summary.get("runtime") or summary.get("runtime_state") or metadata.get("runtime")
+        metadata["execution_events"] = summary.get("execution_events") or metadata.get("execution_events", [])
+        metadata["runtime_trace"] = runtime_trace or summary.get("trace") or metadata.get("runtime_trace", {})
+        metadata["evidence_items"] = evidence.get("items", [])
+        metadata["evidence_package"] = evidence.get("evidence_package", {})
+        payload["metadata"] = metadata
+        payload["status"] = str((summary.get("workflow") or {}).get("status") or summary.get("status") or payload.get("status") or "")
+        payload["completion_reason"] = summary.get("completion_reason") or payload.get("completion_reason")
+        if isinstance(summary.get("diff_review"), dict):
+            payload["diff_review"] = summary["diff_review"]
+        applied = payload.get("applied_ai_fixes") if isinstance(payload.get("applied_ai_fixes"), dict) else {}
+        # Source snapshots are repository-relative; use that same coordinate
+        # system for deterministic authorization evaluation.
+        applied["applied"] = [{"file": item} for item in changed_files]
+        payload["applied_ai_fixes"] = applied
+        return payload
+
     def run(
         self,
         case: RegressionCase,
@@ -507,6 +553,8 @@ class AIRegressionRunner:
         else:
             verdict, reason = "passed", "final source matches the expected patch"
 
+        evaluation_payload = self._evaluation_payload(report_dir, agent_payload, actual_changed)
+
         if keep_workspace:
             kept = output_dir / "workspace"
             if kept.exists():
@@ -517,6 +565,7 @@ class AIRegressionRunner:
             case, output_dir, started, verdict, reason,
             actual_changed, expected_changed, unauthorized, mismatched,
             process.returncode, fix_success, command, report_dir, self.entrypoint,
+            evaluation_payload,
         )
 
     @staticmethod
@@ -535,8 +584,28 @@ class AIRegressionRunner:
         command: List[str],
         report_dir: str = "",
         entrypoint: str = "cli",
+        evaluation_payload: Optional[Dict[str, Any]] = None,
     ) -> RegressionResult:
         duration = int((dt.datetime.now(dt.timezone.utc) - started).total_seconds() * 1000)
+        evaluation = evaluate_case(
+            case.case_id,
+            result=evaluation_payload
+            or {
+                "applied_ai_fixes": {
+                    "success": bool(fix_success),
+                    "applied": [{"file": f} for f in actual_changed],
+                }
+            },
+            allowed_files=case.allowed_changed_files,
+            duration_ms=duration,
+        )
+        if report_dir:
+            try:
+                from services.evaluation import write_evaluation_artifact
+
+                write_evaluation_artifact(report_dir, evaluation)
+            except Exception:
+                pass
         result = RegressionResult(
             case_id=case.case_id,
             verdict=verdict,
@@ -552,6 +621,7 @@ class AIRegressionRunner:
             command=command,
             entrypoint=entrypoint,
             report_dir=report_dir,
+            evaluation=evaluation.to_dict(),
         )
         return result
 

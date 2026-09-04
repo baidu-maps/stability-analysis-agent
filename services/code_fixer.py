@@ -9,13 +9,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import difflib
 import logging
 import re
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,9 @@ class FixResult:
     model_response_preview: str = ""
     rolled_back_files: List[str] = field(default_factory=list)
     missing_required: List[Dict[str, str]] = field(default_factory=list)
+    schema_violations: List[Dict[str, Any]] = field(default_factory=list)
+    edit_feedback: List[Dict[str, Any]] = field(default_factory=list)
+    edits: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -56,6 +61,14 @@ class FixResult:
             d["rolled_back_files"] = list(self.rolled_back_files)
         if self.missing_required:
             d["missing_required"] = list(self.missing_required)
+        if self.schema_violations:
+            d["schema_violations"] = list(self.schema_violations)
+        if self.fix_plan is not None:
+            d["fix_plan"] = dict(self.fix_plan)
+        if self.edit_feedback:
+            d["edit_feedback"] = list(self.edit_feedback)
+        if self.edits:
+            d["edits"] = list(self.edits)
         return d
 
 
@@ -338,6 +351,8 @@ def _extract_current_function_block(
     signature: str,
     node: Dict[str, Any],
     original_source: str,
+    *,
+    tool_executor: Optional[Any] = None,
 ) -> Optional[str]:
     """基于当前源码重新提取目标函数体，避免依赖过期 snippet。"""
     line_no = 1
@@ -348,15 +363,17 @@ def _extract_current_function_block(
     except (TypeError, ValueError):
         line_no = 1
     try:
-        from tools.snippet_extractor_tool import SnippetExtractorTool
+        from services.tool_invoke import invoke_tool
 
-        out = SnippetExtractorTool().execute(
+        out = invoke_tool(
+            "snippet_extractor",
             {
                 "file_path": str(file_path),
                 "line_number": line_no,
                 "function_name": _extract_simple_function_name(signature),
                 "max_code_length": 0,
-            }
+            },
+            tool_executor=tool_executor,
         )
         snippet = out.get("snippet") if isinstance(out, dict) else None
         if bool(out.get("is_complete_function")) and isinstance(snippet, list) and snippet:
@@ -439,6 +456,34 @@ def _is_within_code_roots(path: Path, code_roots: List[str]) -> bool:
         except ValueError:
             continue
     return False
+
+
+def _match_feedback(source: str, expected: str, *, file_path: str = "") -> Dict[str, Any]:
+    """Return deterministic repair feedback without attempting fuzzy mutation."""
+    actual = str(source or "")
+    target = str(expected or "")
+    occurrences = actual.count(target) if target else 0
+    expected_lines = [line.strip() for line in target.splitlines() if line.strip()]
+    actual_lines = actual.splitlines()
+    anchor = expected_lines[0] if expected_lines else ""
+    candidates = [line.strip() for line in actual_lines if line.strip()]
+    best = max((difflib.SequenceMatcher(None, anchor, line).ratio() for line in candidates), default=0.0)
+    nearby: List[str] = []
+    if anchor:
+        for index, line in enumerate(actual_lines):
+            if difflib.SequenceMatcher(None, anchor, line.strip()).ratio() >= max(0.55, best - 0.05):
+                nearby.extend(actual_lines[max(0, index - 2): index + 3])
+                if len(nearby) >= 8:
+                    break
+    return {
+        "file": str(file_path or ""),
+        "expected_preview": target[:1200],
+        "actual_nearby": "\n".join(nearby)[:1600],
+        "similarity": round(float(best), 4),
+        "duplicate_matches": int(occurrences),
+        "already_present": bool(target and target in actual),
+        "exact_match": bool(target and occurrences == 1),
+    }
 
 
 def _validate_and_fix_member_references(original_source: str, replacement: str) -> Tuple[str, Optional[str]]:
@@ -827,20 +872,24 @@ def _find_candidate_node_for_edit(
 def _build_candidate_node_from_current_source(
     file_path: Path,
     signature: str,
+    *,
+    tool_executor: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """当 graph.nodes 未包含目标函数时，直接从当前源码重提取一个临时候选节点。"""
     if not file_path.is_file() or not signature:
         return None
     try:
-        from tools.snippet_extractor_tool import SnippetExtractorTool
+        from services.tool_invoke import invoke_tool
 
-        out = SnippetExtractorTool().execute(
+        out = invoke_tool(
+            "snippet_extractor",
             {
                 "file_path": str(file_path),
                 "line_number": 1,
                 "function_name": _extract_simple_function_name(signature),
                 "max_code_length": 0,
-            }
+            },
+            tool_executor=tool_executor,
         )
     except Exception:
         return None
@@ -1709,9 +1758,10 @@ def parse_json_payload(raw_text: str) -> Dict[str, Any]:
 class CodeFixer:
     """AI Fix 主入口：从分析结果生成修复计划并应用到源码。"""
 
-    def __init__(self, llm_adapter: Any = None, uaf_nullptr_guard_policy: str = "strict"):
+    def __init__(self, llm_adapter: Any = None, uaf_nullptr_guard_policy: str = "strict", file_context_tracker: Any = None):
         self._llm = llm_adapter
         self._uaf_policy = uaf_nullptr_guard_policy
+        self.file_context_tracker = file_context_tracker
 
     def _try_extract_fix_plan_from_analysis(
         self,
@@ -1823,8 +1873,28 @@ class CodeFixer:
         code_roots: List[str],
         report_dir: Optional[Path] = None,
         backup_original_sources: bool = True,
+        tool_executor: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+        tool_authorization: Any = None,
     ) -> FixResult:
         """完整流程：提取候选 → evidence gate → LLM 生成 plan → 应用。"""
+
+        def _invoke_tool(name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+            data = dict(payload)
+            if tool_authorization is not None:
+                data["_runtime_authorization"] = tool_authorization
+            if tool_executor is not None:
+                return tool_executor(name, data)
+            from tool_system.registry import ToolAndWorkflowRegistry
+            from tool_system.tool_gateway import ToolExecutionGateway
+            from services.policy import PolicyEngine
+
+            tool = ToolAndWorkflowRegistry().get_tool(name)
+            if tool is None:
+                raise ValueError(f"tool not found: {name}")
+            if isinstance(tool, type):
+                tool = tool()
+            gateway = ToolExecutionGateway(PolicyEngine())
+            return gateway.execute(name, tool, data)
         if self._llm is None or not code_roots:
             return FixResult(
                 success=False,
@@ -1862,14 +1932,14 @@ class CodeFixer:
             from tools.fix_code_extractor_tool import FixCodeExtractorTool
             from tools.fix_code_applier_tool import FixCodeApplierTool
 
-            extractor = FixCodeExtractorTool()
-            extract_out = extractor.execute(
+            extract_out = _invoke_tool(
+                "fix_code_extractor",
                 {
                     "analysis_text": analysis_text,
                     "code_context": code_context,
                     "required_targets": required_targets,
                     "strict_required": False,
-                }
+                },
             )
             if not bool(extract_out.get("success")):
                 missing_required = (
@@ -1885,7 +1955,19 @@ class CodeFixer:
                     ),
                     missing_required=[x for x in missing_required if isinstance(x, dict)],
                 )
-            fix_plan = extract_out.get("fix_plan") if isinstance(extract_out.get("fix_plan"), dict) else {"summary": "", "edits": []}
+            from services.agent_schema import RepairPlan
+
+            raw_fix_plan = extract_out.get("fix_plan")
+            repair_plan, schema_violations = RepairPlan.from_mapping(raw_fix_plan)
+            if repair_plan is None:
+                logger.warning("[CodeFixer] rejected malformed repair plan: %s", schema_violations)
+                return FixResult(
+                    success=False,
+                    error="修复计划未通过严格 schema 校验，已禁止自动改码",
+                    skipped_reason="schema_violation",
+                    schema_violations=schema_violations,
+                )
+            fix_plan = repair_plan.to_dict()
             missing_required = (
                 extract_out.get("missing_required", [])
                 if isinstance(extract_out.get("missing_required"), list)
@@ -1907,8 +1989,8 @@ class CodeFixer:
                     )
                 except Exception:
                     pass
-            applier = FixCodeApplierTool()
-            apply_out = applier.execute(
+            apply_out = _invoke_tool(
+                "fix_code_applier",
                 {
                     "fix_plan": fix_plan,
                     "code_context": code_context,
@@ -1916,13 +1998,17 @@ class CodeFixer:
                     "required_targets": required_targets,
                     "report_dir": str(report_dir) if report_dir is not None else "",
                     "backup_original_sources": backup_original_sources,
-                }
+                },
             )
             apply_result = FixResult(
                 success=bool(apply_out.get("success")),
                 applied=apply_out.get("applied", []) if isinstance(apply_out.get("applied"), list) else [],
                 error=str(apply_out.get("error", "") or "") or None,
                 summary=str(apply_out.get("summary", "") or ""),
+                edit_feedback=[
+                    item.get("match_feedback") for item in (apply_out.get("applied") or [])
+                    if isinstance(item, dict) and isinstance(item.get("match_feedback"), dict)
+                ],
             )
             apply_result.missing_required = [
                 x for x in missing_required if isinstance(x, dict)
@@ -1971,14 +2057,38 @@ class CodeFixer:
         backup_original_sources: bool = True,
         required_targets: Optional[List[Dict[str, str]]] = None,
         code_context: Optional[Dict[str, Any]] = None,
+        tool_executor: Optional[Any] = None,
+        file_context_tracker: Any = None,
     ) -> FixResult:
         """仅应用已有 plan（不调 LLM）。"""
-        edits = fix_plan.get("edits", []) if isinstance(fix_plan, dict) else []
+        from services.agent_schema import RepairPlan
+
+        repair_plan, schema_violations = RepairPlan.from_mapping(fix_plan)
+        if repair_plan is None:
+            return FixResult(
+                success=False,
+                error="修复计划未通过严格 schema 校验，已禁止自动改码",
+                skipped_reason="schema_violation",
+                schema_violations=schema_violations,
+            )
+        fix_plan = repair_plan.to_dict()
+        edits = fix_plan["edits"]
         applied: List[Dict[str, Any]] = []
-        for edit in edits:
+        tracker = file_context_tracker or self.file_context_tracker
+        for edit_index, edit in enumerate(edits):
             if not isinstance(edit, dict):
                 continue
             edit_type = str(edit.get("edit_type", "")).strip()
+            edit_id = str(edit.get("edit_id") or f"edit_{edit_index + 1}")
+            target = str(edit.get("file") or "")
+            if target and tracker is not None:
+                stale = tracker.check_stale(target)
+                if stale.get("stale"):
+                    applied.append({"edit_id": edit_id, "file": str(Path(target).resolve()),
+                                    "status": "stale", "failure_class": "stale_file",
+                                    "error": "文件在读取后发生变化，已禁止覆盖写入",
+                                    "match_feedback": stale})
+                    continue
 
             # ========== include 指令插入（include_directive）==========
             if edit_type == "include_directive":
@@ -2089,6 +2199,7 @@ class CodeFixer:
                         continue
                 if old_text not in original:
                     record["error"] = "old_text 未能在文件中精确匹配"
+                    record["match_feedback"] = _match_feedback(original, old_text, file_path=str(file_path))
                     applied.append(record)
                     continue
                 eol = _source_newline_style(original)
@@ -2151,7 +2262,9 @@ class CodeFixer:
                 continue
             node = _find_candidate_node_for_edit(candidate_nodes, file_path, signature)
             if node is None:
-                node = _build_candidate_node_from_current_source(file_path, signature)
+                node = _build_candidate_node_from_current_source(
+                    file_path, signature, tool_executor=tool_executor,
+                )
                 if node is None:
                     record["error"] = "目标函数不在本次代码上下文候选列表中"
                     applied.append(record)
@@ -2179,7 +2292,7 @@ class CodeFixer:
             snippet_text = "\n".join(node["snippet"])
             new_text_content = original
             old_block: Optional[str] = _extract_current_function_block(
-                file_path, signature, node, original
+                file_path, signature, node, original, tool_executor=tool_executor,
             )
             if old_block:
                 new_text_content = original.replace(old_block, replacement_code, 1)
@@ -2206,10 +2319,20 @@ class CodeFixer:
                 new_text_content, old_block = CodeFixer.replace_function_block(original, signature, replacement_code)
             if old_block is None or new_text_content == original:
                 record["error"] = "未能在源码中定位待替换函数"
+                record["match_feedback"] = _match_feedback(
+                    original,
+                    snippet_text or signature,
+                    file_path=str(file_path),
+                )
                 applied.append(record)
                 continue
             if not _extracted_block_matches_signature(old_block, signature):
                 record["error"] = "定位到的函数块与目标签名不匹配（可能跨函数误截断）"
+                record["match_feedback"] = _match_feedback(
+                    original,
+                    old_block or signature,
+                    file_path=str(file_path),
+                )
                 applied.append(record)
                 continue
             if _normalize_code_for_equivalence(old_block) == _normalize_code_for_equivalence(replacement_code):
@@ -2252,13 +2375,32 @@ class CodeFixer:
                 record["backup_path"] = str(backup_path)
             record["status"] = "applied"
             record["replaced_preview"] = replacement_code
+            # Keep the actual on-disk change as a reviewable unified diff. The
+            # preview remains for backward compatibility with older reports.
+            record["diff"] = "".join(difflib.unified_diff(
+                original.splitlines(keepends=True),
+                new_text_content.splitlines(keepends=True),
+                fromfile=str(file_path), tofile=str(file_path),
+            ))
+            record["actual_fingerprint"] = hashlib.sha256(
+                new_text_content.encode("utf-8", errors="replace")
+            ).hexdigest()[:20]
             applied.append(record)
 
+        for index, item in enumerate(applied):
+            if isinstance(item, dict):
+                item.setdefault("edit_id", f"edit_{index + 1}")
+                item.setdefault("status", "failed")
         success = any(item.get("status") == "applied" for item in applied)
         return FixResult(
             success=success,
             applied=applied,
             summary=str(fix_plan.get("summary", "")) if isinstance(fix_plan, dict) else "",
+            edit_feedback=[
+                item.get("match_feedback") for item in applied
+                if isinstance(item, dict) and isinstance(item.get("match_feedback"), dict)
+            ],
+            edits=applied,
         )
 
     @staticmethod

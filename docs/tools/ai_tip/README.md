@@ -80,9 +80,9 @@
 
 ## 5. 两套入口的一致性
 
-- **统一流程**（`ai_stability_agent.py`）：  
+- **统一流程**（`tool_system/agent_runtime.py`）：
   `analyze_crash_with_ai` 中先做规则/向量上下文收集，再 `_get_guidance_for_prompt`，最后拼装完整提示词并调用 LLM。
-- **LangGraph 流程**（`ai_stability_agent.py`）：  
+- **LangGraph backend**（`tool_system/llm/llm_adapter.py`）：
   `_node_ai_analysis`（及另一处非图执行路径）中从 state 取 `rule_hits` / `pattern_hits`，同样通过 `_get_guidance_for_prompt` 得到 guidance_text，再调用 `_build_full_prompt(..., guidance_text, memory_context)`；`_build_full_prompt` 在结构上与上述顺序一致（先指导/上下文，再规则与经验模式，再输出格式等），只是把「分析指导」整段改为使用传入的 **guidance_text**。
 
 因此，**无论走哪条入口，发个大模型的提示词都遵循同一套拼装逻辑**：崩溃数据 + 规则与经验模式参考 + 指导片段（向量库或默认 JSON）。
@@ -93,7 +93,7 @@
 
 | 逻辑 | 文件 | 方法或位置 |
 |------|------|------------|
-| 拼装完整提示词（顺序/图模式） | `agent/ai_stability_agent.py` | `_build_full_prompt`、`_get_guidance_for_prompt` |
+| 拼装完整提示词（工作流） | `workflows/crash_analysis_workflow.py` | 当前提示词组装入口 |
 | 规则/向量召回与 memory_context | 同上 | `_render_memory_context` |
 | 指导片段表与 API | `tools/core/rag/metadata_store.py`、`vector_database_integration.py` | `analysis_guidance_blocks`、`get_guidance_blocks`、`add_guidance_block` |
 | 默认指导片段 JSON | `configs/default_guidance_blocks.json` | 兜底内容 |

@@ -232,7 +232,7 @@ if not required_targets:
 
 ```bash
 python3 cli/main.py \
-  --crash-log <path> --library-dir <path> --code-root <path> \
+  --crash-log-file <path> --library-dir <path> --code-roots <path> \
   --scope full 2>&1 | grep -E "^\[阶段"
 ```
 
@@ -257,7 +257,7 @@ Phase 4 耗时波动大（8-38s）时，通常是 LLM API 服务端问题：
 
 ```bash
 for i in 1 2 3; do
-  python3 cli/main.py --crash-log <path> --library-dir <path> --code-root <path> \
+  python3 cli/main.py --crash-log-file <path> --library-dir <path> --code-roots <path> \
     --scope full 2>&1 | grep "阶段 4"
 done
 ```

@@ -21,7 +21,7 @@ python3 cli/main.py [参数...]
 | `--crash-log-content TEXT` | 否 | 直接传入崩溃日志文本；适合脚本、短日志或上游已读入文本内容的场景。 |
 | `--crash-log-dir DIR` | 否 | 批量分析目录中的崩溃日志文件；当前会递归收集目录下所有文件并逐个分析。 |
 | `--library-dir DIR` | 建议填写 | 符号库目录，供 `add2line_resolver`（如 `atos` / `addr2line`）解析堆栈。 |
-| `--code-root DIR` | 建议填写 | 代码根目录；可**多次**指定，在多根目录下查找源码。 |
+| `--code-roots DIR` | 建议填写 | 代码根目录；可**多次**指定，在多根目录下查找源码。 |
 | `--config PATH` | 否 | `SystemConfig` JSON 文件；不指定时使用内置默认工具链 + `crash_analysis` 工作流。 |
 | `--scope {full,gen_prompt_only,parse_stack_only,parse_log_only}` | 否 | Agent 执行流程范围，默认 `full`。详见下方“`--scope` 取值”。 |
 | `--prompt-mode {analysis,fix}` | 否 | `round_0/06_ai_prompt.md` / LLM 输入的提示词输出模式，默认 `fix`。详见下方“`--prompt-mode` 取值”。 |
@@ -30,7 +30,7 @@ python3 cli/main.py [参数...]
 | `--max-context-requests-per-round N` | 否 | `context_loop` 每轮最多处理的源码补充请求数，默认 `5`，硬上限 `16`。 |
 | `--max-stack-frames-symbol-enrich N` | 否 | 栈顶最多几帧补齐 `file:line`（已符号化但缺 addr2line 行号）。默认 `8`，范围 `2～16`。Daemon 字段 `max_stack_frames_symbol_enrich`。 |
 | `--max-stack-frames-in-prompt N` | 否 | `06` / LLM 提示词最多纳入的工程栈帧源码数。默认 `4`，范围 `2～16`。Daemon 字段 `max_stack_frames_in_prompt`。 |
-| `--engine {direct,langchain,langgraph}` | 否 | 传给 `LLMConfig` 的引擎标记，默认 `direct`。 |
+| `--engine {direct,langchain,langgraph}` | 否 | 选择统一 `AgentRuntime` 使用的 LLM backend，默认 `direct`；不改变 Agent 业务编排。 |
 | `--llm-mode {fixed,auto}` | 否 | LLM 路由模式；默认读 `llm_config.mode`（配置缺省为 `fixed`）。`fixed`=仅 `active_provider`；`auto`=发现可用厂商并按内置策略选档。 |
 | `--llm-profile {default,strong,fast}` | 否 | 强制路由档位（覆盖 auto 内置策略）。 |
 | `--output-format {markdown,json,text}` | 否 | 终端打印/写入 `--output-file` 的格式，默认 `markdown`。 |
@@ -70,7 +70,7 @@ python3 cli/main.py [参数...]
 |------|------|
 | （省略） | 随 `--prompt-mode`：`analysis`→`context_loop`，`fix` 等→`single`。 |
 | `single` | 只调用一次 LLM；`round_0/06_ai_prompt.md` 作为输入，`round_0/07_ai_gen_res.md` 保存模型输出。 |
-| `context_loop` | 当模型在输出中返回 `agent_can_fetch_more=true` 和 `context_requests[]` 时，Agent 按请求定位函数源码，在首轮 prompt 基座上追加 `## 其它代码上下文` 后继续询问；`round_N/05b_pre_round_add_res.json` 记录该轮补充结果。直到 `agent_can_fetch_more=false`、请求耗尽或达到 `--max-agent-rounds`。兼容旧字段 `need_more_context`。 |
+| `context_loop` | 当模型在输出中返回 `agent_can_fetch_more=true` 和 `context_requests[]` 时，Agent 按请求定位函数源码，在首轮 prompt 基座上追加 `## 其它代码上下文` 后继续询问；`round_N/05b_pre_round_add_res.json` 记录该轮补充结果。直到 `agent_can_fetch_more=false`、请求耗尽或达到 `--max-agent-rounds`。 |
 
 ### 1.2 传给工作流的问题上下文（内部字段）
 
@@ -82,6 +82,7 @@ python3 cli/main.py [参数...]
 | `--vector-db-max-results` | `3` | 向量检索最大条数。 |
 | `--vector-db-record-usage` | 关闭 | 分析时检索是否累加 `hit_count`（默认**只读**，避免污染库；显式加此 flag 才写入）。 |
 | `--include-memory-in-05` / `--no-include-memory-in-05` | 关闭 | 是否将向量库检索得到的「规则与经验模式参考」并入 `06_ai_prompt.md` / LLM 输入；默认只写 `05_memory_context.json`，不并入提示词。 |
+| `--external-agent-evaluation` / `--no-external-agent-evaluation` | 关闭 | 是否生成 `external_agent_evaluation/` 对比任务、输入清单和提交契约；只生成文件，不调用外部 Agent。 |
 | `--rule-confidence-threshold` | `0.85` | 规则高置信阈值。 |
 
 ### 1.3 最小示例（完整分析 + AI）
@@ -90,7 +91,7 @@ python3 cli/main.py [参数...]
 python3 cli/main.py \
   --crash-log-file examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
-  --code-root examples/crash_cases/demo_basic/code_dir
+  --code-roots examples/crash_cases/demo_basic/code_dir
 ```
 
 LLM 配置模板见 **`configs/agent_config.local.example.json`**。实际密钥与默认厂商/模型：
@@ -120,7 +121,7 @@ LLM 配置模板见 **`configs/agent_config.local.example.json`**。实际密钥
 
 | 参数 | 默认 | 作用 |
 |------|------|------|
-| `--apply-ai-fixes` / `--no-apply-ai-fixes` | **开启** | 是否在首轮 AI 分析后，再经一次结构化调用，将候选函数**回写到 `--code-root` 内源码**。关闭后只分析、不改文件。 |
+| `--apply-ai-fixes` / `--no-apply-ai-fixes` | **开启** | 是否在首轮 AI 分析后，再经一次结构化调用，将候选函数**回写到 `--code-roots` 内源码**。关闭后只分析、不改文件。 |
 | `--backup-original-sources` / `--no-backup-original-sources` | **开启** | 回写前是否在当次 **`reports/<run>/original_sources/`** 下保存**改前**源码副本。若工程已由 Git 管理、习惯用 `git checkout` 撤销，可加 **`--no-backup-original-sources`** 省略磁盘备份。 |
 
 **说明**：
@@ -133,7 +134,7 @@ LLM 配置模板见 **`configs/agent_config.local.example.json`**。实际密钥
 
 ## 3. 输出与 `reports` 落盘
 
-> 历史目录名 `cli_reports/` 在首次解析报告根时会自动迁移到 `reports/`。也可用环境变量 `STABILITY_AGENT_REPORT_DIR` 覆盖报告根路径。
+> 报告统一写入 `reports/`。也可用环境变量 `STABILITY_AGENT_REPORT_DIR` 覆盖报告根路径。
 
 | 行为 | 说明 |
 |------|------|
@@ -155,11 +156,12 @@ LLM 配置模板见 **`configs/agent_config.local.example.json`**。实际密钥
 | `04e_log_timeline.json` | 条件 | 崩溃前时序/业务路径 |
 | `05_memory_context.json` | `full` / `gen_prompt_only` | 向量记忆检索快照（默认不并入提示词） |
 | `round_0/06_ai_prompt.md` | `full` / `gen_prompt_only` | LLM / 可复用提示词 |
+| `external_agent_evaluation/` | 显式开启且已生成解析后堆栈 | 供 Codex、Cursor 等外部通用编程 Agent 使用的隔离对比任务文件；默认不生成 |
 | `round_0/07_ai_gen_res.md` | `full` 且 LLM 成功 | 模型输出 |
 | `08_apply_ai_fixes.json` | 改码执行时 | 自动改码结果 |
 | `final_output.md` | 通常 `full` | 人类可读汇总 |
 
-多轮 `context_loop` 时另有 `round_N/`、`05b_pre_round_add_res.json`、`06b_next_round_ai_request.json`、`agent_rounds_summary.json`。旧报告可能仍使用 `02_add2line` / `03_code` / `04_memory` / `05_ai_prompt` 等历史命名，CLI 读取时做兼容。
+多轮 `context_loop` 时另有 `round_N/`、`05b_pre_round_add_res.json`、`06b_next_round_ai_request.json`、`agent_rounds_summary.json`。报告读取遵循当前 artifact 协议，不转换旧报告命名。
 
 ---
 
@@ -202,7 +204,7 @@ LLM 配置模板见 **`configs/agent_config.local.example.json`**。实际密钥
 python3 cli/main.py native-leak \
   --input /path/to/nativeleak_bundle \
   --trace-db /path/to/trace.db \
-  --code-root /path/to/source
+  --code-roots /path/to/source
 ```
 
 默认生成：
@@ -266,7 +268,7 @@ python3 cli/main.py cancel <run_id> --daemon http://127.0.0.1:8765
 
 | 场景 | 建议参数 |
 |------|----------|
-| 完整分析 + 默认改码 + 默认备份 | `--crash-log-file ... --library-dir ... --code-root ...` |
+| 完整分析 + 默认改码 + 默认备份 | `--crash-log-file ... --library-dir ... --code-roots ...` |
 | 分析且改码，但不要磁盘备份（Git 撤销） | 在上行基础上加 `--no-backup-original-sources` |
 | 只分析、不改源码 | `--no-apply-ai-fixes` |
 | 提示词要求完整修复代码（默认） | `--prompt-mode fix` |
@@ -285,4 +287,4 @@ python3 cli/main.py cancel <run_id> --daemon http://127.0.0.1:8765
 - **最后更新**：2026-06-08（新增 skill 子命令与 skill system 文档入口）。
 - 若增减参数或改变 `reports` / 改码语义，请同步更新本文件。
 
-**说明**：若你曾在旧版本文档中见到 `tools/cli/main.py`、`--daemon` 等条目，**当前本仓库以 `cli/main.py` 为准**；其他入口（如 `agent/ai_stability_agent.py`、daemon）的参数不在此文件覆盖范围内。
+**说明**：当前本仓库以 `cli/main.py` 为 CLI 入口；daemon 使用同一个 `AgentRuntime`。

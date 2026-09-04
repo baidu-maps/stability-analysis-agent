@@ -13,7 +13,10 @@ from tool_system import (
     WorkflowConfig,
     WorkflowContext,
     WorkflowDefinition,
+    RuntimeBudget,
+    RunTrace,
 )
+from tool_system.agent_runtime import AgentRuntime
 
 
 class ValidationTool(BaseTool):
@@ -67,6 +70,20 @@ class InputValidationTest(unittest.TestCase):
         self.registry.register("validation_tool", self.tool, Priority.CUSTOM, is_tool=True)
         self.registry.register("validation_workflow", self.workflow, Priority.CUSTOM, is_tool=False)
 
+    def test_runtime_accepts_all_llm_backends_and_records_selected_backend(self):
+        class Executor:
+            last_run_trace = None
+            def execute_workflow(self, workflow, problem):
+                return {"status": "success"}
+
+        for engine in ("direct", "langchain", "langgraph"):
+            result = AgentRuntime(Executor(), engine=engine).run("x", {})
+            self.assertEqual(result["metadata"]["runtime_engine"], engine)
+
+    def test_runtime_rejects_unknown_backend(self):
+        with self.assertRaisesRegex(ValueError, "engine must be one of"):
+            AgentRuntime(object(), engine="sequential")
+
     def test_workflow_context_rejects_invalid_input_before_execute(self):
         context = WorkflowContext(None, self.registry, {})
 
@@ -114,6 +131,26 @@ class InputValidationTest(unittest.TestCase):
             )
 
         self.assertFalse(self.workflow.solved)
+
+    def test_workflow_context_records_trace_and_tool_policy(self):
+        context = WorkflowContext(None, self.registry, {})
+        result = context.execute_tool("validation_tool", {"required": True})
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(context.trace.run_id, context.execution_events[0]["run_id"])
+        self.assertEqual(context.execution_events[0]["event"], "tool.success")
+        self.assertTrue(context.execution_events[0]["input_hash"])
+        self.assertEqual(context.get_tool_definition("validation_tool").risk, "read_only")
+
+    def test_runtime_budget_rejects_calls_before_execution(self):
+        trace = RunTrace(budget=RuntimeBudget(max_tool_calls=1))
+        context = WorkflowContext(None, self.registry, {}, trace=trace)
+        context.execute_tool("validation_tool", {"required": True})
+
+        with self.assertRaisesRegex(RuntimeError, "runtime budget exceeded"):
+            context.execute_tool("validation_tool", {"required": True})
+        self.assertTrue(self.tool.executed)
+        self.assertEqual(trace.budget.tool_calls, 2)
 
 
 if __name__ == "__main__":

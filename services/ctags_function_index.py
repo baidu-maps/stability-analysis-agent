@@ -188,11 +188,6 @@ class CtagsFunctionIndex:
             return False
         return True
 
-    def _build_with_legacy_ctags(self, ctags: str, tags_path: str) -> bool:
-        files = self._collect_source_files()
-        logger.info("Legacy/BSD ctags：将扫描 %d 个源文件", len(files))
-        return self._run_ctags_batches(ctags, tags_path, files)
-
     @staticmethod
     def _cache_dir() -> str:
         base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
@@ -311,10 +306,11 @@ class CtagsFunctionIndex:
             return
         tags_path, _ = self._cache_paths()
         try:
-            if self._is_universal_ctags(ctags):
-                ok = self._build_with_universal_ctags(ctags, tags_path)
-            else:
-                ok = self._build_with_legacy_ctags(ctags, tags_path)
+            if not self._is_universal_ctags(ctags):
+                logger.info("ctags 不是 Universal Ctags，函数索引跳过并回退全仓扫描")
+                self._ready = True
+                return
+            ok = self._build_with_universal_ctags(ctags, tags_path)
             if not ok:
                 self._ready = True
                 return

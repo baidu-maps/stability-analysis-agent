@@ -10,6 +10,16 @@ from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from rag.memory_retriever import collect_memory_context, render_memory_context
+from services.context_loop_contract import assemble_loop_prompt
+from services.context_engine import resolve_agent_loop, resolve_max_agent_rounds
+from services.context_request_contract import (
+    all_context_requests_blocked,
+    attach_return_form_metadata,
+    build_pre_round_add_res,
+    format_context_resolution,
+    parse_context_requests,
+)
+from services.context_source_resolver import CodeContextRequestResolver
 from tools.vector_memory_retriever_tool import VectorMemoryRetrieverTool
 from workflows.crash_analysis_workflow import BaseCrashAnalysisWorkflow, iOSCrashAnalyzeWorkflow
 
@@ -138,13 +148,13 @@ class TestMemoryRetriever(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(
             [
-                "--crash-log",
+                "--crash-log-file",
                 "-",
                 "--include-memory-in-05",
             ]
         )
         self.assertTrue(args.include_memory_in_05)
-        args_off = parser.parse_args(["--crash-log", "-", "--no-include-memory-in-05"])
+        args_off = parser.parse_args(["--crash-log-file", "-", "--no-include-memory-in-05"])
         self.assertFalse(args_off.include_memory_in_05)
 
     def test_prompt_mode_default_fix(self):
@@ -192,32 +202,32 @@ class TestMemoryRetriever(unittest.TestCase):
 
     def test_agent_loop_defaults_and_context_loop_prompt(self):
         wf = iOSCrashAnalyzeWorkflow()
-        self.assertEqual(BaseCrashAnalysisWorkflow._resolve_agent_loop({}), "single")
+        self.assertEqual(resolve_agent_loop({}), "single")
         self.assertEqual(
-            BaseCrashAnalysisWorkflow._resolve_agent_loop({"prompt_mode": "fix"}),
+            resolve_agent_loop({"prompt_mode": "fix"}),
             "single",
         )
         self.assertEqual(
-            BaseCrashAnalysisWorkflow._resolve_agent_loop(
+            resolve_agent_loop(
                 {"agent_loop": "single", "prompt_mode": "analysis"}
             ),
             "single",
         )
         self.assertEqual(
-            BaseCrashAnalysisWorkflow._resolve_agent_loop({"agent_loop": "context_loop"}),
+            resolve_agent_loop({"agent_loop": "context_loop"}),
             "context_loop",
         )
         # analysis 模式默认 3 轮，其它模式默认 1 轮
         self.assertEqual(
-            BaseCrashAnalysisWorkflow._resolve_max_agent_rounds({"prompt_mode": "analysis"}),
+            resolve_max_agent_rounds({"prompt_mode": "analysis"}),
             3,
         )
         self.assertEqual(
-            BaseCrashAnalysisWorkflow._resolve_max_agent_rounds({"prompt_mode": "fix"}),
+            resolve_max_agent_rounds({"prompt_mode": "fix"}),
             1,
         )
         self.assertEqual(
-            BaseCrashAnalysisWorkflow._resolve_max_agent_rounds({"max_agent_rounds": 3}),
+            resolve_max_agent_rounds({"max_agent_rounds": 3}),
             3,
         )
         text = wf._build_prompt_final_tip(
@@ -283,12 +293,13 @@ class TestMemoryRetriever(unittest.TestCase):
                 "error": "未定位到函数定义: VTaskQueue::PushTask",
             }
         ]
-        prompt = BaseCrashAnalysisWorkflow._build_context_loop_prompt(
+        prompt = assemble_loop_prompt(
             base_prompt,
-            1,
-            resolved,
-            accumulated_context=resolved,
-        )
+            evidence_package={"items": [{
+                "kind": "context_result", "source": "context_loop",
+                "content": format_context_resolution(resolved[0]),
+            }]},
+        )["content"]
         self.assertIn("## 其它代码上下文", prompt)
         self.assertIn("#### 其它代码上下文: VTaskQueue::PushTask（function）", prompt)
         self.assertIn("- 状态: 未定位", prompt)
@@ -299,29 +310,25 @@ class TestMemoryRetriever(unittest.TestCase):
         self.assertNotIn("## 第 1 轮补充上下文", prompt)
         self.assertLess(prompt.index("## 其它代码上下文"), prompt.index("# 崩溃分析任务"))
 
-        final_prompt = BaseCrashAnalysisWorkflow._build_context_loop_prompt(
+        final_prompt = assemble_loop_prompt(
             base_prompt,
-            4,
-            resolved,
-            accumulated_context=resolved,
+            evidence_package={"items": []},
             is_final_round=True,
-        )
+        )["content"]
         self.assertIn("当前已经达到允许的最大多轮次数", final_prompt)
         self.assertIn("不得再请求 Agent 补充上下文", final_prompt)
 
-        early_final_prompt = BaseCrashAnalysisWorkflow._build_context_loop_prompt(
+        early_final_prompt = assemble_loop_prompt(
             base_prompt,
-            2,
-            resolved,
-            accumulated_context=resolved,
+            evidence_package={"items": []},
             is_final_round=True,
             early_final_reason="all_requests_blocked",
-        )
+        )["content"]
         self.assertIn("均已由 Agent 处理过", early_final_prompt)
         self.assertNotIn("当前已经达到允许的最大多轮次数", early_final_prompt)
 
     def test_build_pre_round_add_res_payload(self):
-        payload = BaseCrashAnalysisWorkflow._build_pre_round_add_res(
+        payload = build_pre_round_add_res(
             source_round=0,
             target_round=1,
             resolved_context=[
@@ -366,14 +373,14 @@ class TestMemoryRetriever(unittest.TestCase):
             {"success": False, "lookup_exhausted": True, "request": {"symbol": "C"}, "error": "此前已尝试但未定位"},
         ]
         mixed = blocked + [{"success": True, "request": {"symbol": "D"}}]
-        self.assertTrue(BaseCrashAnalysisWorkflow._all_context_requests_blocked(blocked))
-        self.assertFalse(BaseCrashAnalysisWorkflow._all_context_requests_blocked(failed_lookup))
-        self.assertTrue(BaseCrashAnalysisWorkflow._all_context_requests_blocked(exhausted_failed))
-        self.assertFalse(BaseCrashAnalysisWorkflow._all_context_requests_blocked(mixed))
-        self.assertFalse(BaseCrashAnalysisWorkflow._all_context_requests_blocked([]))
+        self.assertTrue(all_context_requests_blocked(blocked))
+        self.assertFalse(all_context_requests_blocked(failed_lookup))
+        self.assertTrue(all_context_requests_blocked(exhausted_failed))
+        self.assertFalse(all_context_requests_blocked(mixed))
+        self.assertFalse(all_context_requests_blocked([]))
 
     def test_rejects_package_like_context_request_symbols(self):
-        result = BaseCrashAnalysisWorkflow._resolve_context_requests(
+        result = CodeContextRequestResolver.resolve_requests(
             [
                 {
                     "type": "function",
@@ -435,7 +442,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            result = BaseCrashAnalysisWorkflow._resolve_context_requests(
+            result = CodeContextRequestResolver.resolve_requests(
                 [
                     {
                         "type": "function",
@@ -480,12 +487,13 @@ class TestMemoryRetriever(unittest.TestCase):
                 "请基于以上信息，并严格遵循前文要求，给出专业的崩溃分析。",
             ]
         )
-        prompt = BaseCrashAnalysisWorkflow._build_context_loop_prompt(
+        prompt = assemble_loop_prompt(
             base_prompt,
-            2,
-            result,
-            accumulated_context=result,
-        )
+            evidence_package={"items": [{
+                "kind": "context_result", "source": "context_loop",
+                "content": format_context_resolution(item),
+            } for item in result]},
+        )["content"]
         self.assertIn("## 其它代码上下文", prompt)
         self.assertIn("#### 其它代码上下文: CVMapSchedule::m_lastTask（field）", prompt)
         self.assertIn("- 状态: 已定位", prompt)
@@ -503,14 +511,28 @@ class TestMemoryRetriever(unittest.TestCase):
 }
 ```
 """
-        parsed = BaseCrashAnalysisWorkflow._parse_context_requests(text)
+        parsed = parse_context_requests(text)
         self.assertTrue(parsed["agent_can_fetch_more"])
-        self.assertTrue(parsed["need_more_context"])
+        self.assertNotIn("need_more_context", parsed)
         self.assertEqual(len(parsed["context_requests"]), 1)
         self.assertEqual(parsed["context_requests"][0]["symbol"], "Foo::bar")
         self.assertEqual(
             parsed["context_requests"][0]["expected_return_form"], "function_source"
         )
+
+    def test_parse_context_requests_rejects_invalid_and_deduplicates(self):
+        text = """```json
+{"agent_can_fetch_more": true, "context_requests": [
+  {"type": "function", "symbol": "Foo::bar"},
+  {"type": "function", "symbol": "Foo::bar"},
+  {"type": "shell", "symbol": "rm -rf /"},
+  {"type": "function"}
+]}
+```"""
+        parsed = parse_context_requests(text)
+        self.assertEqual(len(parsed["context_requests"]), 1)
+        self.assertEqual(len(parsed["invalid_context_requests"]), 3)
+        self.assertEqual(parsed["context_requests"][0]["symbol"], "Foo::bar")
 
     def test_parse_context_requests_expected_return_form(self):
         text = """```json
@@ -528,7 +550,7 @@ class TestMemoryRetriever(unittest.TestCase):
   ]
 }
 ```"""
-        parsed = BaseCrashAnalysisWorkflow._parse_context_requests(text)
+        parsed = parse_context_requests(text)
         req = parsed["context_requests"][0]
         self.assertEqual(req["expected_return_form"], "member_declaration")
         self.assertEqual(req["fulfillment_note"], "需要容器类型声明")
@@ -555,7 +577,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 ],
             }
         ]
-        payload = BaseCrashAnalysisWorkflow._build_pre_round_add_res(
+        payload = build_pre_round_add_res(
             source_round=0,
             target_round=1,
             resolved_context=resolved,
@@ -565,7 +587,7 @@ class TestMemoryRetriever(unittest.TestCase):
         self.assertEqual(entry["actual_return_form"], "member_declaration")
         self.assertTrue(entry.get("fulfillment_matched"))
 
-    def test_parse_context_requests_legacy_need_more_context(self):
+    def test_parse_context_requests_rejects_legacy_need_more_context(self):
         text = """```json
 {
   "need_more_context": true,
@@ -574,8 +596,8 @@ class TestMemoryRetriever(unittest.TestCase):
   ]
 }
 ```"""
-        parsed = BaseCrashAnalysisWorkflow._parse_context_requests(text)
-        self.assertTrue(parsed["agent_can_fetch_more"])
+        parsed = parse_context_requests(text)
+        self.assertFalse(parsed["agent_can_fetch_more"])
 
     def test_duplicate_failed_context_request_stays_unlocated(self):
         outcomes: dict = {}
@@ -585,7 +607,7 @@ class TestMemoryRetriever(unittest.TestCase):
             "reason": "查看实现",
             "priority": "medium",
         }
-        first = BaseCrashAnalysisWorkflow._resolve_context_requests(
+        first = CodeContextRequestResolver.resolve_requests(
             [req],
             code_roots=[],
             max_requests=5,
@@ -593,7 +615,7 @@ class TestMemoryRetriever(unittest.TestCase):
         )
         self.assertFalse(first[0]["success"])
         self.assertFalse(first[0].get("skipped"))
-        second = BaseCrashAnalysisWorkflow._resolve_context_requests(
+        second = CodeContextRequestResolver.resolve_requests(
             [req],
             code_roots=[],
             max_requests=5,
@@ -629,7 +651,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            result = BaseCrashAnalysisWorkflow._resolve_context_requests(
+            result = CodeContextRequestResolver.resolve_requests(
                 [
                     {
                         "type": "function",
@@ -694,7 +716,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            result = BaseCrashAnalysisWorkflow._resolve_context_requests(
+            result = CodeContextRequestResolver.resolve_requests(
                 [
                     {
                         "type": "function",
@@ -762,7 +784,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            result = BaseCrashAnalysisWorkflow._resolve_context_requests(
+            result = CodeContextRequestResolver.resolve_requests(
                 [
                     {
                         "type": "field",
@@ -808,7 +830,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            result = BaseCrashAnalysisWorkflow._resolve_context_requests(
+            result = CodeContextRequestResolver.resolve_requests(
                 [
                     {
                         "type": "field",
@@ -843,7 +865,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            result = BaseCrashAnalysisWorkflow._resolve_context_requests(
+            result = CodeContextRequestResolver.resolve_requests(
                 [
                     {
                         "type": "function",
@@ -881,7 +903,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 encoding="utf-8",
             )
             for symbol in ("m_Layers.RemoveAll", "m_Layers.RemoveAll()"):
-                result = BaseCrashAnalysisWorkflow._resolve_context_requests(
+                result = CodeContextRequestResolver.resolve_requests(
                     [
                         {
                             "type": "references",
@@ -914,7 +936,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            result = BaseCrashAnalysisWorkflow._resolve_context_requests(
+            result = CodeContextRequestResolver.resolve_requests(
                 [
                     {
                         "type": "function",
@@ -950,7 +972,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            result = BaseCrashAnalysisWorkflow._resolve_context_requests(
+            result = CodeContextRequestResolver.resolve_requests(
                 [
                     {
                         "type": "function",
@@ -986,7 +1008,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            result = BaseCrashAnalysisWorkflow._resolve_context_requests(
+            result = CodeContextRequestResolver.resolve_requests(
                 [
                     {
                         "type": "field",
@@ -1005,7 +1027,7 @@ class TestMemoryRetriever(unittest.TestCase):
         snippet = "\n".join(matches[0].get("context") or [])
         self.assertIn("class CVList", snippet)
         self.assertNotIn("CVList<TYPE, ARG_TYPE>::CVList", snippet)
-        enriched = BaseCrashAnalysisWorkflow._attach_return_form_metadata(result[0])
+        enriched = attach_return_form_metadata(result[0])
         self.assertTrue(enriched.get("fulfillment_matched"))
 
     def test_template_function_duplicate_key_across_symbol_forms(self):
@@ -1024,7 +1046,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 encoding="utf-8",
             )
             outcomes: dict = {}
-            first = BaseCrashAnalysisWorkflow._resolve_context_requests(
+            first = CodeContextRequestResolver.resolve_requests(
                 [
                     {
                         "type": "function",
@@ -1036,7 +1058,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 max_requests=5,
                 request_outcomes=outcomes,
             )
-            second = BaseCrashAnalysisWorkflow._resolve_context_requests(
+            second = CodeContextRequestResolver.resolve_requests(
                 [
                     {
                         "type": "function",
@@ -1060,7 +1082,7 @@ class TestMemoryRetriever(unittest.TestCase):
             vmap.parent.mkdir(parents=True, exist_ok=True)
             gmap.write_text("class CGMapControl {\n  int m_Layers;\n};\n", encoding="utf-8")
             vmap.write_text("class CVMapControl {\n  CVList<CBaseLayer*, CBaseLayer*> m_Layers;\n};\n", encoding="utf-8")
-            result = BaseCrashAnalysisWorkflow._resolve_context_requests(
+            result = CodeContextRequestResolver.resolve_requests(
                 [
                     {
                         "type": "field",
@@ -1097,7 +1119,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            result = BaseCrashAnalysisWorkflow._resolve_context_requests(
+            result = CodeContextRequestResolver.resolve_requests(
                 [
                     {
                         "type": "function",
@@ -1119,24 +1141,24 @@ class TestMemoryRetriever(unittest.TestCase):
         from cli.main import build_parser
 
         parser = build_parser()
-        args = parser.parse_args(["--crash-log", "-"])
+        args = parser.parse_args(["--crash-log-file", "-"])
         self.assertEqual(args.prompt_mode, "fix")
-        args_analysis = parser.parse_args(["--crash-log", "-", "--prompt-mode", "analysis"])
+        args_analysis = parser.parse_args(["--crash-log-file", "-", "--prompt-mode", "analysis"])
         self.assertEqual(args_analysis.prompt_mode, "analysis")
-        args_fix = parser.parse_args(["--crash-log", "-", "--prompt-mode", "fix"])
+        args_fix = parser.parse_args(["--crash-log-file", "-", "--prompt-mode", "fix"])
         self.assertEqual(args_fix.prompt_mode, "fix")
 
     def test_cli_agent_loop_flags(self):
         from cli.main import build_parser
 
         parser = build_parser()
-        args = parser.parse_args(["--crash-log", "-"])
+        args = parser.parse_args(["--crash-log-file", "-"])
         self.assertIsNone(args.agent_loop)
         # 默认 0 表示让 workflow 自行根据 prompt_mode 决定
         self.assertEqual(args.max_agent_rounds, 0)
         args_loop = parser.parse_args(
             [
-                "--crash-log",
+                "--crash-log-file",
                 "-",
                 "--agent-loop",
                 "context_loop",

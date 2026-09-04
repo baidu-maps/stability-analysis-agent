@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -59,7 +59,6 @@ _LOCAL_PATH_FIELDS = frozenset(
     {
         "crash_log",
         "crash_log_dir",
-        "code_root",
         "code_roots",
         "library_dir",
         "config",
@@ -84,6 +83,16 @@ def _prepare_http_run_body(body: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(body or {})
     if "apply_ai_fixes" not in payload:
         payload["apply_ai_fixes"] = False
+    if "external_agent_evaluation" in payload and not isinstance(
+        payload["external_agent_evaluation"], bool
+    ):
+        raise DaemonHttpError(
+            HTTPStatus.BAD_REQUEST,
+            {
+                "error": "invalid_external_agent_evaluation",
+                "message": "external_agent_evaluation 必须是 boolean",
+            },
+        )
     fmt = str(payload.get("output_format") or "markdown").strip().lower() or "markdown"
     if fmt not in _OUTPUT_FORMATS:
         raise DaemonHttpError(
@@ -151,9 +160,8 @@ def reset_idempotency_for_tests() -> None:
 # ---------------------------------------------------------------------------
 # Tool System executor（用于 /tool-system/* 端点）
 # ---------------------------------------------------------------------------
-_ts_executor = None
+_ts_runtimes: Dict[str, Any] = {}
 _ts_lock = threading.Lock()
-_worktree_setup_lock = threading.Lock()
 _SHUTTING_DOWN = False
 _EVICTION_STARTED = False
 _TERMINAL_RUN_STATUSES = frozenset({"done", "error", "canceled"})
@@ -174,64 +182,125 @@ class DropOldestQueue(queue.Queue):
             self.not_empty.notify()
 
 
+class RecordingEventQueue(DropOldestQueue):
+    """Live queue plus a bounded in-memory replay log for reconnecting SSE clients."""
+    def __init__(self, owner: Any, maxsize: int):
+        super().__init__(maxsize=maxsize)
+        self.owner = owner
+
+    def put(self, item: Any, block: bool = True, timeout: Optional[float] = None) -> None:
+        if isinstance(item, RunEvent):
+            item = RunEvent(item.run_id, item.type, item.data, seq=len(self.owner.event_log) + 1)
+            self.owner.event_log.append(item)
+            del self.owner.event_log[:-512]
+            _persist_run_event(self.owner)
+        super().put(item, block=block, timeout=timeout)
+
+
 def _new_event_queue() -> queue.Queue:
     """Create the per-run SSE queue with a drop-oldest bound."""
     maxsize = _env_int("STABILITY_AGENT_DAEMON_EVENT_QUEUE_MAX", 256)
     return DropOldestQueue(maxsize=max(1, maxsize))
 
 
-def _get_ts_executor():
-    """延迟初始化 tool_system ConfigDrivenExecutor（仅在首次调用 /tool-system/* 时触发）。"""
-    global _ts_executor
-    if _ts_executor is not None:
-        return _ts_executor
-    with _ts_lock:
-        if _ts_executor is not None:
-            return _ts_executor
+_ENGINE_TYPES = frozenset({"direct", "langchain", "langgraph"})
+
+
+def _resolve_tool_system_engine(engine: Optional[str]) -> str:
+    """Resolve tool-system engine; explicit invalid values raise ValueError."""
+    if engine is None or not str(engine).strip():
+        value = str(os.environ.get("STABILITY_AGENT_DAEMON_ENGINE") or "direct").strip() or "direct"
+    else:
+        value = str(engine).strip()
+    if value not in _ENGINE_TYPES:
+        raise ValueError("engine must be one of: direct, langchain, langgraph")
+    return value
+
+
+def _build_ts_agent_runtime(engine: str):
+    from tool_system import (
+        ToolAndWorkflowRegistry, SystemConfig, LLMConfig,
+        ToolConfig, WorkflowConfig, ConfigDrivenExecutor,
+        LLMAdapterFactory, register_all_tools_and_workflows, AgentRuntime,
+    )
+    registry = ToolAndWorkflowRegistry()
+    register_all_tools_and_workflows(registry)
+    config = SystemConfig(
+        tools=[
+            ToolConfig(name="crash_log_parser", enabled=True),
+            ToolConfig(name="add2line_resolver", enabled=True),
+            ToolConfig(name="code_content_provider", enabled=True),
+        ],
+        workflows=[
+            WorkflowConfig(name="crash_analysis", enabled=True),
+            WorkflowConfig(name="anr_freeze_analysis", enabled=True),
+            WorkflowConfig(name="native_leak_analysis", enabled=True),
+        ],
+    )
+    llm_adapter = None
+    api_key = os.environ.get("WENXIN_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if api_key:
         try:
-            from tool_system import (
-                ToolAndWorkflowRegistry, SystemConfig, LLMConfig,
-                ToolConfig, WorkflowConfig, ConfigDrivenExecutor,
-                LLMAdapterFactory, register_all_tools_and_workflows,
-            )
-            registry = ToolAndWorkflowRegistry()
-            register_all_tools_and_workflows(registry)
-            config = SystemConfig(
-                tools=[
-                    ToolConfig(name="crash_log_parser", enabled=True),
-                    ToolConfig(name="add2line_resolver", enabled=True),
-                    ToolConfig(name="code_content_provider", enabled=True),
-                ],
-                workflows=[
-                    WorkflowConfig(name="crash_analysis", enabled=True),
-                    WorkflowConfig(name="anr_freeze_analysis", enabled=True),
-                ],
-            )
-            llm_adapter = None
-            api_key = os.environ.get("WENXIN_API_KEY") or os.environ.get("OPENAI_API_KEY")
-            if api_key:
-                try:
-                    llm_cfg = {
-                        "engine": "direct",
-                        "provider": "openai",
-                        "model": os.environ.get("OPENAI_MODEL", "glm-4"),
-                        "api_key": api_key,
-                        "base_url": os.environ.get("OPENAI_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
-                    }
-                    llm_adapter = LLMAdapterFactory.create(llm_cfg)
-                    config.llm = LLMConfig(**llm_cfg)
-                except Exception:
-                    pass
-            _ts_executor = ConfigDrivenExecutor(registry, config, llm_adapter)
+            llm_cfg = {
+                "provider": "openai",
+                "model": os.environ.get("OPENAI_MODEL", "glm-4"),
+                "api_key": api_key,
+                "base_url": os.environ.get("OPENAI_BASE_URL", "https://open.bigmodel.cn/api/paas/v4"),
+            }
+            llm_adapter = LLMAdapterFactory.create(llm_cfg)
+            config.llm = LLMConfig(**llm_cfg)
+        except Exception:
+            pass
+    return AgentRuntime(
+        ConfigDrivenExecutor(registry, config, llm_adapter),
+        engine=engine,
+    )
+
+
+def _get_ts_agent_runtime(engine: Optional[str] = None):
+    """延迟初始化 AgentRuntime（按 engine 缓存，tool-system 与 daemon 内联执行共用）。"""
+    resolved = _resolve_tool_system_engine(engine)
+    cached = _ts_runtimes.get(resolved)
+    if cached is not None:
+        return cached
+    with _ts_lock:
+        cached = _ts_runtimes.get(resolved)
+        if cached is not None:
+            return cached
+        try:
+            _ts_runtimes[resolved] = _build_ts_agent_runtime(resolved)
         except Exception as e:
             raise RuntimeError(f"tool_system 初始化失败: {e}") from e
-    return _ts_executor
+    return _ts_runtimes[resolved]
+
+
+def _run_tool_system_workflow(
+    workflow_name: str,
+    problem: Dict[str, Any],
+    *,
+    engine: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Execute a workflow through the unified AgentRuntime lifecycle."""
+    resolved_engine = engine or (problem or {}).get("engine")
+    runtime = _get_ts_agent_runtime(resolved_engine)
+    result = runtime.run(workflow_name, dict(problem or {}), defer_decision=False)
+    if isinstance(result, dict):
+        metadata = result.setdefault("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+            result["metadata"] = metadata
+        metadata["runtime_state"] = runtime.state.to_dict()
+        trace = runtime.trace
+        if trace is not None and hasattr(trace, "snapshot"):
+            metadata["runtime_trace"] = trace.snapshot()
+        metadata["runtime_decision"] = runtime.state.decision
+    return result if isinstance(result, dict) else {"status": "error", "error": "invalid workflow result"}
 
 
 @dataclass
 class RunState:
     run_id: str
-    status: str  # queued/running/done/error/canceled
+    transport_status: str  # queued/running/verification_pending/done/error/canceled
     created_at: float
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
@@ -247,28 +316,194 @@ class RunState:
     last_progress: Optional[str] = None
     last_progress_percent: Optional[int] = None
     completion_reason: Optional[str] = None
+    runtime_state: Optional[Dict[str, Any]] = None
+    approval: Optional[Dict[str, Any]] = None
     cancel_requested: bool = False
 
     process: Optional[subprocess.Popen] = None
     events: "queue.Queue[RunEvent]" = field(default_factory=_new_event_queue)
     result: Optional[RunResult] = None
+    request: Optional[RunRequest] = None
+    pending_workspace: Any = None
+    pending_changed_files: List[str] = field(default_factory=list)
+    pending_verification: Optional[Dict[str, Any]] = None
+    pending_tool_approval: Optional[Dict[str, Any]] = None
+    runtime_trace: Optional[Dict[str, Any]] = None
+    event_log: List[RunEvent] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        maxsize = _env_int("STABILITY_AGENT_DAEMON_EVENT_QUEUE_MAX", 256)
+        self.events = RecordingEventQueue(self, max(1, maxsize))
+
+    def runtime_core(self) -> Any:
+        from tool_system.runtime import RuntimeState
+
+        payload = self.runtime_state if isinstance(self.runtime_state, dict) else {}
+        if not payload:
+            payload = {"stage": "observe", "status": "running"}
+        return RuntimeState.from_dict(payload)
+
+    @property
+    def stage(self) -> str:
+        return str(self.runtime_core().stage or "observe")
+
+    @property
+    def runtime_status(self) -> str:
+        return str(self.runtime_core().status or "running")
+
+    @property
+    def runtime_decision(self) -> Optional[str]:
+        return self.runtime_core().decision
+
+    @property
+    def runtime_checkpoints(self) -> List[Any]:
+        return list(self.runtime_core().checkpoints)
+
+    def apply_runtime_core(self, state: Any) -> None:
+        if hasattr(state, "to_dict"):
+            payload = state.to_dict()
+        elif isinstance(state, dict):
+            payload = state
+        else:
+            return
+        _adopt_runtime_payload(self, payload)
+
+    @property
+    def status(self) -> str:
+        """HTTP/transport alias for ``transport_status`` (not harness ``RuntimeState.status``)."""
+        return self.transport_status
+
+    @status.setter
+    def status(self, value: str) -> None:
+        self.transport_status = value
+
+
+_TRANSPORT_RUNTIME_SYNC = {
+    "verification_pending": ("verify", "pending", "verification_pending"),
+    "approval_required": ("verify", "pending", "approval_required"),
+    "running": (None, "running", None),
+    "done": ("decide", "completed", None),
+    "error": ("decide", "error", None),
+    "canceled": (None, "error", "canceled"),
+}
+
+
+def _set_transport_status(run: RunState, value: str, *, sync_runtime: bool = True) -> None:
+    """Set daemon transport status and optionally sync harness RuntimeState."""
+    run.transport_status = str(value or "").strip() or "queued"
+    if not sync_runtime:
+        return
+    mapping = _TRANSPORT_RUNTIME_SYNC.get(run.transport_status)
+    if mapping is None:
+        return
+    stage, runtime_status, reason = mapping
+    payload = dict(run.runtime_state or {})
+    if stage is not None:
+        run.runtime_state = _runtime_payload_transition(payload, stage, status=runtime_status, reason=reason)
+    elif payload:
+        state = run.runtime_core()
+        state.transition(state.stage, status=runtime_status, reason=reason)
+        run.runtime_state = state.to_dict()
+    else:
+        run.runtime_state = _runtime_payload_transition(
+            None, "observe", status=runtime_status, reason=reason,
+        )
+
+
+def _map_logical_transport_status(logical_status: str) -> str:
+    return {
+        "success": "done",
+        "error": "error",
+        "approval_required": "approval_required",
+        "verification_pending": "verification_pending",
+    }.get(str(logical_status or "").strip(), str(logical_status or "").strip() or "error")
+
+
+def _runtime_payload_transition(payload: Optional[Dict[str, Any]], stage: str, *,
+                                status: str, reason: Optional[str] = None) -> Dict[str, Any]:
+    """Use core RuntimeState as the only lifecycle state transition owner."""
+    from tool_system.runtime import RuntimeState
+
+    original = dict(payload or {})
+    state = RuntimeState.from_dict(original)
+    state.transition(stage, status=status, reason=reason)
+    normalized = state.to_dict()
+    for key, value in original.items():
+        if key not in normalized:
+            normalized[key] = value
+    return normalized
+
+
+def _adopt_runtime_payload(run: RunState, payload: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(payload, dict):
+        return
+    from tool_system.runtime import RuntimeState
+
+    normalized = RuntimeState.from_dict(payload).to_dict()
+    for key, value in payload.items():
+        if key not in normalized:
+            normalized[key] = value
+    run.runtime_state = normalized
 
 
 class RunManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._runs: Dict[str, RunState] = {}
+        self._restore_persisted_runs()
+
+    def _restore_persisted_runs(self) -> None:
+        try:
+            from services.run_store import load_snapshots
+            for item in load_snapshots():
+                # Only resumable runs are restored. Finished runs remain useful
+                # on disk for audit but must not repopulate daemon memory.
+                if item.get("transport_status") not in {"verification_pending", "approval_required"}:
+                    continue
+                request = run_request_from_dict(item.get("request") or {}) if item.get("request") else None
+                transport = str(item.get("transport_status") or "queued")
+                run = RunState(run_id=str(item.get("run_id")), transport_status=transport,
+                               created_at=float(item.get("created_at") or time.time()),
+                               output_format=str(item.get("output_format") or "markdown"), request=request)
+                for name in ("started_at", "finished_at", "exit_code", "error", "report_dir", "workspace_dir",
+                             "workspace_manifest", "patch_path", "last_progress", "last_progress_percent", "completion_reason",
+                             "runtime_state", "approval", "runtime_trace", "pending_tool_approval"):
+                    if name in item:
+                        setattr(run, name, item[name])
+                run.original_code_roots = list(item.get("original_code_roots") or [])
+                run.isolated_code_roots = list(item.get("isolated_code_roots") or [])
+                run.pending_changed_files = list(item.get("pending_changed_files") or [])
+                run.pending_verification = item.get("pending_verification") if isinstance(item.get("pending_verification"), dict) else None
+                saved_result = item.get("result")
+                if isinstance(saved_result, dict):
+                    run.result = RunResult(run.run_id, run.status, run.output_format,
+                                           str(saved_result.get("output") or ""), saved_result.get("error"))
+                saved_events = item.get("events")
+                if isinstance(saved_events, list):
+                    run.event_log = [RunEvent(str(x.get("run_id") or run.run_id), str(x.get("type") or "replayed"),
+                                              x.get("data") if isinstance(x.get("data"), dict) else {}, int(x.get("seq") or i + 1))
+                                      for i, x in enumerate(saved_events) if isinstance(x, dict)]
+                if run.status == "verification_pending":
+                    run.pending_workspace = _restore_workspace_from_manifest(run)
+                elif run.status == "approval_required":
+                    if not run.pending_tool_approval:
+                        run.pending_tool_approval = _load_report_pending_tool_approval(run)
+                self._runs[run.run_id] = run
+        except Exception:
+            return
 
     def create_run(self, req: RunRequest) -> RunState:
         run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
         st = RunState(
             run_id=run_id,
-            status="queued",
+            transport_status="queued",
             created_at=time.time(),
             output_format=req.output_format,
+            request=req,
         )
         with self._lock:
             self._runs[run_id] = st
+        _persist_run_state(st)
         return st
 
     def get(self, run_id: str) -> Optional[RunState]:
@@ -286,6 +521,18 @@ class RunManager:
 
 
 RUNS = RunManager()
+
+def _persist_run_state(run: RunState) -> None:
+    try:
+        from services.run_store import save_snapshot
+        save_snapshot(run)
+    except Exception:
+        # Persistence must not take down the analysis process.
+        return
+
+
+def _persist_run_event(run: RunState) -> None:
+    _persist_run_state(run)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -628,6 +875,7 @@ def _run_fingerprint(body: Dict[str, Any]) -> str:
         "sdk_version": body.get("sdk_version"),
         "apply_ai_fixes": body.get("apply_ai_fixes"),
         "output_format": body.get("output_format"),
+        "external_agent_evaluation": body.get("external_agent_evaluation", False),
     }
     blob = json.dumps(relevant, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -759,20 +1007,16 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
     if req.library_dir:
         cmd += ["--library-dir", req.library_dir]
     for cr in normalize_run_code_roots(req):
-        cmd += ["--code-root", cr]
+        cmd += ["--code-roots", cr]
     if req.config:
         cmd += ["--config", req.config]
+
+    if req.engine != "direct":
+        cmd += ["--engine", req.engine]
 
     output_format = req.output_format or getattr(defaults, "output_format", "markdown")
     if output_format != getattr(defaults, "output_format", "markdown"):
         cmd += ["--output-format", output_format]
-
-    engine = str(getattr(req, "engine", None) or "direct")
-    if engine == "sequential":
-        engine = "direct"
-    default_engine = str(getattr(defaults, "engine", "direct") or "direct")
-    if engine and engine != default_engine:
-        cmd += ["--engine", engine]
 
     scope = str(getattr(req, "scope", "full") or "full")
     default_scope = str(getattr(defaults, "scope", "full") or "full")
@@ -852,6 +1096,14 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
         getattr(defaults, "include_memory_in_05", False)
     ):
         cmd += ["--include-memory-in-05" if req.include_memory_in_05 else "--no-include-memory-in-05"]
+    if bool(getattr(req, "external_agent_evaluation", False)) != bool(
+        getattr(defaults, "external_agent_evaluation", False)
+    ):
+        cmd += [
+            "--external-agent-evaluation"
+            if req.external_agent_evaluation
+            else "--no-external-agent-evaluation"
+        ]
 
     _append_nondefault_value(cmd, "--vector-db-path", req.vector_db_path, getattr(defaults, "vector_db_path", None))
     _append_nondefault_value(
@@ -934,18 +1186,14 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
         if module_text:
             cmd += ["--plugin-module", module_text]
 
+    if isinstance(getattr(req, "verification", None), dict):
+        cmd += ["--verification-config-json", json.dumps(req.verification, ensure_ascii=False)]
     cmd += ["--no-interactive", "--no-save-to-vector-db"]
 
     return cmd, stdin_text
 
 
 def _persist_result(run: RunState) -> None:
-    try:
-        from cli.report_paths import ensure_reports_migrated
-
-        ensure_reports_migrated(PROJECT_ROOT)
-    except Exception:
-        pass
     DEFAULT_REPORT_DIR.mkdir(exist_ok=True)
     suffix = {"json": "json", "markdown": "md", "text": "txt"}.get(run.output_format, "txt")
     out_path = DEFAULT_REPORT_DIR / f"{run.run_id}.{suffix}"
@@ -1018,89 +1266,15 @@ def _subprocess_env_for_run(run_id: Optional[str] = None) -> dict:
     return env
 
 
-def _prepare_isolated_run(run: RunState, req: RunRequest):
-    code_roots = normalize_run_code_roots(req)
-    should_isolate = bool(req.apply_ai_fixes) and str(req.scope or "full") == "full" and bool(code_roots)
-    if not should_isolate:
-        return req, None
-
-    from services.git_worktree_manager import prepare_isolated_workspace
-
-    # Git serializes parts of worktree administration through shared metadata.
-    # Keep setup short and deterministic when several runs target the same repo.
-    with _worktree_setup_lock:
-        workspace = prepare_isolated_workspace(run.run_id, code_roots)
-    run.workspace_dir = str(workspace.root)
-    run.original_code_roots = list(workspace.original_code_roots)
-    run.isolated_code_roots = list(workspace.isolated_code_roots)
-    run.events.put(
-        RunEvent(
-            run.run_id,
-            "workspace_prepared",
-            workspace.to_dict(),
-        )
-    )
-    isolated_req = replace(
-        req,
-        code_root=None,
-        code_roots=list(workspace.isolated_code_roots),
-    )
-    return isolated_req, workspace
-
-
-def _write_run_workspace_artifacts(run: RunState, workspace) -> None:
-    from services.git_worktree_manager import write_workspace_artifacts
-
-    if run.report_dir:
-        report_dir = Path(run.report_dir).expanduser()
-        if not report_dir.is_absolute():
-            report_dir = PROJECT_ROOT / report_dir
-        report_dir = report_dir.resolve()
-    else:
-        report_dir = (DEFAULT_REPORT_DIR / run.run_id).resolve()
-        run.report_dir = str(report_dir)
-    artifacts = write_workspace_artifacts(workspace, report_dir)
-    run.workspace_manifest = artifacts.get("manifest_path")
-    run.patch_path = artifacts.get("patch_path")
-    run.events.put(
-        RunEvent(
-            run.run_id,
-            "workspace_artifacts_written",
-            {
-                "workspace_dir": run.workspace_dir,
-                "manifest_path": run.workspace_manifest,
-                "patch_path": run.patch_path,
-            },
-        )
-    )
-
-
 def _run_worker(run: RunState, req: RunRequest) -> None:
     if run.status == "canceled":
         return
-    run.status = "running"
+    _set_transport_status(run, "running")
     run.started_at = time.time()
     run.events.put(RunEvent(run.run_id, "run_started", {"request": req.to_dict()}))
 
     workspace = None
-    try:
-        effective_req, workspace = _prepare_isolated_run(run, req)
-    except Exception as exc:
-        run.status = "error"
-        run.error = f"failed to prepare isolated Git worktree: {exc}"
-        run.finished_at = time.time()
-        run.result = RunResult(
-            run_id=run.run_id,
-            status="error",
-            output_format=req.output_format,
-            output="",
-            error=run.error,
-        )
-        run.events.put(RunEvent(run.run_id, "workspace_error", {"error": run.error}))
-        run.events.put(RunEvent(run.run_id, "run_finished", {"status": run.status, "exit_code": None}))
-        return
-
-    cmd, stdin_text = _build_cli_cmd(effective_req)
+    cmd, stdin_text = _build_cli_cmd(req)
     run.events.put(RunEvent(run.run_id, "process_spawn", {"cmd": cmd, "cwd": str(PROJECT_ROOT)}))
 
     try:
@@ -1120,7 +1294,7 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
                 p.terminate()
             except Exception:
                 pass
-            run.status = "canceled"
+            _set_transport_status(run, "canceled")
 
         if stdin_text is not None and p.stdin is not None:
             p.stdin.write(stdin_text)
@@ -1175,15 +1349,27 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
         reason = _extract_completion_reason(output_text)
         if reason:
             run.completion_reason = reason
+        report_summary = _load_run_summary(run)
+        if isinstance(report_summary, dict):
+            saved_runtime = report_summary.get("runtime_state")
+            if isinstance(saved_runtime, dict):
+                _adopt_runtime_payload(run, saved_runtime)
+            run.runtime_trace = _load_report_runtime_trace(run)
+            _emit_trace_handoff(run, run.runtime_trace)
+        workspace = _restore_workspace_from_report(run)
         if run.cancel_requested or run.status == "canceled":
             status = "canceled"
+        elif reason == "verification_pending":
+            status = "verification_pending"
+        elif reason == "approval_required":
+            status = "approval_required"
         elif reason and reason.startswith("skipped_"):
             status = "error"
         elif exit_code == 0:
             status = "done"
         else:
             status = "error"
-        run.status = status
+        _set_transport_status(run, status)
         result_error = _summarize_cli_outcome(run, output_text, exit_code)
         run.error = result_error
         run.result = RunResult(
@@ -1193,19 +1379,49 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
             output=output_text,
             error=result_error,
         )
-        if workspace is not None:
-            try:
-                _write_run_workspace_artifacts(run, workspace)
-            except Exception as exc:
-                run.events.put(
-                    RunEvent(run.run_id, "workspace_artifact_error", {"error": str(exc)})
-                )
+        if status == "verification_pending":
+            if not run.runtime_state:
+                _adopt_runtime_payload(run, _runtime_payload_transition(
+                    None, "verify", status="pending",
+                    reason="verification_provider_not_configured",
+                ))
+            run.pending_workspace = workspace
+            run.pending_verification = _load_report_verification(run)
+            run.pending_changed_files = list(
+                (run.pending_verification or {}).get("changed_files") or []
+            )
+            run.events.put(RunEvent(
+                run.run_id,
+                "verification_pending",
+                {
+                    "message": "等待用户提交明确验证配置；候选命令不会自动执行",
+                    "verification": run.pending_verification or {},
+                    "resume": f"/runs/{run.run_id}/verification",
+                },
+            ))
+        elif status == "approval_required":
+            if not run.runtime_state:
+                _adopt_runtime_payload(run, _runtime_payload_transition(
+                    None, "verify", status="pending", reason="approval_required",
+                ))
+            run.pending_tool_approval = _load_report_pending_tool_approval(run)
+            run.events.put(RunEvent(
+                run.run_id,
+                "tool_approval_required",
+                {
+                    "message": "等待用户批准工具调用",
+                    "pending_tool_approval": run.pending_tool_approval or {},
+                    "resume": f"/runs/{run.run_id}/tool-approval",
+                },
+            ))
+        _persist_run_state(run)
         _persist_result(run)
     except Exception as e:
-        run.status = "error"
+        _set_transport_status(run, "error")
         run.error = str(e)
         run.finished_at = time.time()
         run.events.put(RunEvent(run.run_id, "run_error", {"error": str(e)}))
+        _persist_run_state(run)
     finally:
         run.events.put(RunEvent(run.run_id, "run_finished", {"status": run.status, "exit_code": run.exit_code}))
 
@@ -1218,7 +1434,7 @@ def _wait_cli_process(process: subprocess.Popen, run: RunState) -> int:
     try:
         return int(process.wait(timeout=timeout))
     except subprocess.TimeoutExpired:
-        run.status = "canceled"
+        _set_transport_status(run, "canceled")
         run.error = f"run timed out after {timeout}s"
         try:
             process.terminate()
@@ -1271,7 +1487,136 @@ def _extract_completion_reason(text: str) -> Optional[str]:
     for token in _SKIP_REASON_TOKENS:
         if token in blob:
             return token
+    if "verification_pending" in blob:
+        return "verification_pending"
     return None
+
+
+def _load_report_verification(run: RunState) -> Optional[Dict[str, Any]]:
+    if not run.report_dir:
+        return None
+    path = Path(run.report_dir).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    try:
+        payload = json.loads((path / "09_verification.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _load_report_applied_fixes(run: RunState) -> Optional[Dict[str, Any]]:
+    if not run.report_dir:
+        return None
+    path = Path(run.report_dir).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    try:
+        payload = json.loads((path / "08_apply_ai_fixes.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _emit_trace_handoff(run: RunState, trace: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(trace, dict):
+        return
+    events = trace.get("events") if isinstance(trace.get("events"), list) else []
+    run.events.put(
+        RunEvent(
+            type="trace_loaded",
+            data={
+                "event_count": len(events),
+                "report_dir": run.report_dir,
+                "run_id": trace.get("run_id"),
+            },
+        )
+    )
+
+
+def _load_report_runtime_trace(run: RunState) -> Optional[Dict[str, Any]]:
+    if not run.report_dir:
+        return None
+    path = Path(run.report_dir).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    sidecar = path / "00_runtime_trace.json"
+    if sidecar.is_file():
+        try:
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else None
+        except (OSError, ValueError):
+            pass
+    summary = _load_run_summary(run)
+    if isinstance(summary, dict) and isinstance(summary.get("trace"), dict):
+        return summary.get("trace")
+    return None
+
+
+def _load_report_pending_tool_approval(run: RunState) -> Optional[Dict[str, Any]]:
+    if not run.report_dir:
+        return None
+    path = Path(run.report_dir).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    sidecar = path / "09_pending_tool_approval.json"
+    if not sidecar.is_file():
+        return None
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _restore_workspace_from_manifest(run: RunState) -> Any:
+    """Rehydrate only the metadata needed to sync a pending worktree."""
+    path = Path(run.workspace_manifest or "").expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        from services.git_worktree_manager import IsolatedCodeWorkspace, RepositoryWorktree
+        repositories = [RepositoryWorktree(Path(x["repository"]), Path(x["worktree"]), str(x["base_commit"]))
+                        for x in payload.get("repositories", [])]
+        return IsolatedCodeWorkspace(str(payload["run_id"]), Path(payload["workspace_root"]),
+                                     list(payload.get("original_code_roots") or []),
+                                     list(payload.get("isolated_code_roots") or []), repositories)
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _restore_workspace_from_report(run: RunState) -> Any:
+    """Load the AgentRuntime-owned worktree manifest from a CLI report."""
+    if not run.report_dir:
+        return None
+    report_dir = Path(run.report_dir).expanduser()
+    if not report_dir.is_absolute():
+        report_dir = PROJECT_ROOT / report_dir
+    manifest = (report_dir.resolve() / "09_ai_fix_workspace.json")
+    if not manifest.is_file():
+        return None
+    run.workspace_manifest = str(manifest)
+    patch = report_dir / "09_ai_fix.patch"
+    run.patch_path = str(patch) if patch.is_file() else None
+    workspace = _restore_workspace_from_manifest(run)
+    if workspace is not None:
+        run.workspace_dir = str(workspace.root)
+        run.original_code_roots = list(workspace.original_code_roots)
+        run.isolated_code_roots = list(workspace.isolated_code_roots)
+        run.events.put(RunEvent(run.run_id, "workspace_restored", workspace.to_dict()))
+    return workspace
+
+
+def _post_fix_diagnosis(run: RunState) -> Dict[str, Any]:
+    """Re-run deterministic diagnosis after a verified sync, without applying fixes."""
+    from services.post_fix_diagnosis import run_post_fix_diagnosis_from_request
+
+    return run_post_fix_diagnosis_from_request(
+        run.request,
+        project_root=PROJECT_ROOT,
+        env=_subprocess_env_for_run(run.run_id),
+    )
 
 
 def _summarize_cli_outcome(
@@ -1342,6 +1687,8 @@ def _status_message(run: RunState) -> str:
         return "排队等待执行"
     if run.status == "running":
         return run.last_progress or "分析进行中"
+    if run.status == "verification_pending":
+        return "等待用户配置验证命令"
     if run.status == "done":
         return "分析完成"
     if run.status == "canceled":
@@ -1355,6 +1702,12 @@ def _run_links(run_id: str) -> Dict[str, str]:
         "status": f"/status/{run_id}",
         "result": f"/result/{run_id}",
         "cancel": f"/cancel/{run_id}",
+        "verification": f"/runs/{run_id}/verification",
+        "cleanup": f"/runs/{run_id}/cleanup",
+        "checkpoints": f"/runs/{run_id}/checkpoints",
+        "resume": f"/runs/{run_id}/resume",
+        "retry_stage": f"/runs/{run_id}/retry-stage",
+        "tool_approval": f"/runs/{run_id}/tool-approval",
         "events": f"/runs/{run_id}/events",
     }
 
@@ -1371,9 +1724,10 @@ def _single_id_path(path: str, prefix: str) -> Optional[str]:
 
 def _run_public_dict(run: RunState) -> Dict[str, Any]:
     """JSON view of a run for GET /runs, GET /runs/<id> and GET /status/<id>."""
-    return {
+    payload = {
         "run_id": run.run_id,
         "status": run.status,
+        "transport_status": run.transport_status,
         "message": _status_message(run),
         "progress": run.last_progress,
         "progress_percent": run.last_progress_percent,
@@ -1384,6 +1738,11 @@ def _run_public_dict(run: RunState) -> Dict[str, Any]:
         "exit_code": run.exit_code,
         "error": run.error,
         "completion_reason": run.completion_reason,
+        "stage": run.stage,
+        "runtime_status": run.runtime_status,
+        "runtime_decision": run.runtime_decision,
+        "runtime_state": run.runtime_state,
+        "approval": run.approval,
         "output_format": run.output_format,
         "report_dir": run.report_dir,
         "workspace_dir": run.workspace_dir,
@@ -1391,8 +1750,40 @@ def _run_public_dict(run: RunState) -> Dict[str, Any]:
         "isolated_code_roots": run.isolated_code_roots,
         "workspace_manifest": run.workspace_manifest,
         "patch_path": run.patch_path,
+        "verification": run.pending_verification,
+        "discovered_candidates": (
+            (run.pending_verification or {}).get("discovered_candidates")
+            if isinstance(run.pending_verification, dict) else None
+        ),
+        "pending_tool_approval": run.pending_tool_approval,
+        "runtime_trace": run.runtime_trace,
+        "timeline_event_count": len((run.runtime_trace or {}).get("events") or [])
+        if isinstance(run.runtime_trace, dict) else 0,
         "links": _run_links(run.run_id),
     }
+    try:
+        from services.run_snapshot import HarnessRunSnapshot
+
+        snapshot = HarnessRunSnapshot.from_daemon_run(run)
+        payload["timeline_summary"] = snapshot.timeline_summary()
+    except Exception:
+        pass
+    report_dir = str(run.report_dir or "").strip()
+    if report_dir:
+        eval_path = Path(report_dir).expanduser().resolve() / "00_evaluation.json"
+        if eval_path.is_file():
+            try:
+                payload["evaluation"] = json.loads(eval_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+        elif run.status in {"done", "success", "error", "failed"} and run.runtime_trace:
+            try:
+                from services.evaluation import evaluate_report_dir
+
+                payload["evaluation"] = evaluate_report_dir(report_dir).to_dict()
+            except Exception:
+                pass
+    return payload
 
 
 def _result_public_dict(run: RunState) -> Dict[str, Any]:
@@ -1402,6 +1793,7 @@ def _result_public_dict(run: RunState) -> Dict[str, Any]:
     payload["report"] = _extract_report(output)
     payload["error"] = run.error if payload.get("error") is None else payload.get("error")
     payload["completion_reason"] = run.completion_reason
+    payload["verification"] = run.pending_verification
     payload["links"] = _run_links(run.run_id)
     return payload
 
@@ -1413,6 +1805,145 @@ def _respond_status(handler: BaseHTTPRequestHandler, run_id: str) -> None:
         _json_response(handler, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
         return
     _json_response(handler, HTTPStatus.OK, _run_public_dict(run))
+
+
+def _respond_checkpoints(handler: BaseHTTPRequestHandler, run_id: str) -> None:
+    run = RUNS.get(run_id)
+    if not run:
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
+        return
+    state = run.runtime_state if isinstance(run.runtime_state, dict) else {}
+    checkpoints = state.get("checkpoints") if isinstance(state.get("checkpoints"), list) else []
+    _json_response(handler, HTTPStatus.OK, {"run_id": run_id, "stage": run.stage,
+                                            "status": run.status, "checkpoints": checkpoints})
+
+
+def _respond_retry_stage(handler: BaseHTTPRequestHandler, run_id: str,
+                         body: Optional[Dict[str, Any]] = None) -> None:
+    run = RUNS.get(run_id)
+    if not run:
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
+        return
+    if run.status in {"queued", "running"}:
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "run_still_active", "status": run.status})
+        return
+    body = body if isinstance(body, dict) else _read_json_body(handler)
+    stage = str(body.get("stage") or "").strip()
+    if stage not in {"observe", "analyze", "plan", "act", "verify", "decide"}:
+        _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_stage"})
+        return
+    state = dict(run.runtime_state or {})
+    checkpoints = list(state.get("checkpoints") or [])
+    source_revision = str(body.get("source_revision") or "")
+    checkpoint_id = str(body.get("checkpoint_id") or "").strip()
+    selected = next((x for x in reversed(checkpoints) if isinstance(x, dict) and
+                     ((checkpoint_id and x.get("checkpoint_id") == checkpoint_id) or
+                      (not checkpoint_id and x.get("stage") == stage))), None)
+    if selected is None:
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": "checkpoint_not_found", "stage": stage, "checkpoint_id": checkpoint_id})
+        return
+    if selected.get("stage") != stage:
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "checkpoint_stage_mismatch"})
+        return
+    if not selected.get("source_revision") or not selected.get("worktree_revision"):
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "checkpoint_revision_missing"})
+        return
+    workspace = run.pending_workspace or _restore_workspace_from_report(run)
+    actual_source = actual_worktree = None
+    if workspace is not None:
+        from services.git_worktree_manager import workspace_revision, workspace_source_revision
+        actual_source = workspace_source_revision(workspace)
+        actual_worktree = workspace_revision(workspace)
+    elif run.request is not None:
+        from services.git_worktree_manager import revision_for_code_roots
+        roots = normalize_run_code_roots(run.request)
+        actual_source = revision_for_code_roots(roots, include_diff=False)
+        actual_worktree = revision_for_code_roots(roots, include_diff=True)
+    if selected.get("source_revision") != actual_source:
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "source_revision_changed"})
+        return
+    if selected.get("worktree_revision") != actual_worktree:
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "worktree_revision_changed"})
+        return
+    if selected.get("source_revision") != source_revision:
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "source_revision_mismatch"})
+        return
+    if selected.get("worktree_revision") and str(body.get("worktree_revision") or "") != str(selected.get("worktree_revision")):
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "worktree_revision_mismatch"})
+        return
+    idempotency_key = str(body.get("idempotency_key") or "").strip()
+    if not idempotency_key:
+        _json_response(handler, HTTPStatus.BAD_REQUEST, {"error": "idempotency_key_required"})
+        return
+    previous_keys = {str(x.get("idempotency_key")) for x in checkpoints if isinstance(x, dict)}
+    previous_keys.update(
+        str(x.get("idempotency_key"))
+        for x in state.get("retry_requests", []) if isinstance(x, dict)
+    )
+    if idempotency_key in previous_keys:
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "duplicate_idempotency_key"})
+        return
+    if stage == "act":
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "act_replay_forbidden", "message": "act 禁止从 checkpoint 重放，必须创建新的显式修复任务"})
+        return
+    state = _runtime_payload_transition(
+        state, stage,
+        status="completed" if stage == "decide" else "retry_requested",
+        reason="state_restored" if stage == "decide" else "explicit_stage_retry",
+    )
+    state.setdefault("retry_requests", []).append({
+        "stage": stage, "requested_at": time.time(),
+        "idempotency_key": idempotency_key,
+        "checkpoint_id": selected.get("checkpoint_id"),
+    })
+    _adopt_runtime_payload(run, state)
+    run.error = None
+    if bool(body.get("execute")) and stage != "decide" and run.report_dir:
+        if stage == "verify":
+            verification_config = body.get("verification") if isinstance(body.get("verification"), dict) else None
+            if not isinstance(verification_config, dict) or not verification_config.get("command"):
+                _json_response(handler, HTTPStatus.BAD_REQUEST, {
+                    "error": "verification_config_required",
+                    "message": "verify retry 必须显式提交 verification.command，候选命令不会自动执行",
+                })
+                return
+        cmd = [
+            sys.executable,
+            str(PROJECT_ROOT / "cli" / "main.py"),
+            "replay",
+            str(run.report_dir),
+            "--from-stage",
+            stage,
+            "--checkpoint-id",
+            str(selected.get("checkpoint_id") or ""),
+        ]
+        if stage == "verify":
+            cmd += ["--verification-config-json", json.dumps(verification_config, ensure_ascii=False)]
+        proc = subprocess.run(cmd, cwd=str(PROJECT_ROOT), capture_output=True, text=True, check=False,
+                              env=_subprocess_env_for_run(run.run_id))
+        state.setdefault("retry_executions", []).append({
+            "stage": stage,
+            "exit_code": proc.returncode,
+            "stdout_tail": (proc.stdout or "")[-4000:],
+            "stderr_tail": (proc.stderr or "")[-2000:],
+        })
+        run.runtime_state = state
+        run.runtime_trace = _load_report_runtime_trace(run)
+        run.pending_tool_approval = _load_report_pending_tool_approval(run)
+        reason = _extract_completion_reason((proc.stdout or "") + "\n" + (proc.stderr or ""))
+        if reason == "verification_pending":
+            _set_transport_status(run, "verification_pending")
+        elif reason == "approval_required":
+            _set_transport_status(run, "approval_required")
+        else:
+            _set_transport_status(run, "done" if proc.returncode == 0 else "error")
+    elif stage == "decide":
+        if run.transport_status not in {"error", "canceled"}:
+            _set_transport_status(run, "done")
+    _persist_run_state(run)
+    _json_response(handler, HTTPStatus.OK, {"run_id": run_id, "status": run.status,
+                                            "runtime_state": run.runtime_state,
+                                            "message": "重试状态已记录；execute=true 会按指定阶段执行 replay，act 始终禁止重放"})
 
 
 def _respond_result(
@@ -1478,6 +2009,278 @@ def _respond_cancel(handler: BaseHTTPRequestHandler, run_id: str) -> None:
     )
 
 
+def _respond_verification(handler: BaseHTTPRequestHandler, run_id: str,
+                          body: Optional[Dict[str, Any]] = None) -> None:
+    """Run explicitly configured verification for a pending fix."""
+    run = RUNS.get(run_id)
+    if not run:
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
+        return
+    if run.status not in {"verification_pending", "approval_required"}:
+        _json_response(handler, HTTPStatus.CONFLICT, {
+            "error": "verification_not_pending",
+            "status": run.status,
+        })
+        return
+    try:
+        body = body if isinstance(body, dict) else _read_json_body(handler)
+        config = body.get("verification") if isinstance(body.get("verification"), dict) else body
+        command = config.get("command") if isinstance(config, dict) else None
+        if not command or (not isinstance(command, (list, str))):
+            raise DaemonHttpError(HTTPStatus.BAD_REQUEST, {
+                "error": "verification_command_required",
+                "message": "必须显式提交 verification.command，候选命令不会自动执行",
+            })
+        if not run.report_dir:
+            raise DaemonHttpError(HTTPStatus.CONFLICT, {"error": "verification_report_missing"})
+        from services.repair_pipeline import resume_verification_from_report
+        from tool_system.runtime import RunTrace
+
+        trace = RunTrace.from_dict(
+            run.runtime_trace, run_id=run.run_id,
+            engine=(run.runtime_trace or {}).get("engine"),
+        )
+        pipeline = resume_verification_from_report(
+            report_dir=Path(run.report_dir).expanduser().resolve(),
+            verification_config=dict(config),
+            trace=trace,
+            run_id=run.run_id,
+        )
+        payload = pipeline.verification_result or {}
+        updates = pipeline.result_updates
+        run.pending_verification = payload
+        run.approval = payload.get("approval") if isinstance(payload.get("approval"), dict) else run.approval
+        run.pending_tool_approval = pipeline.pending_tool_approval
+        _adopt_runtime_payload(run, pipeline.runtime_state or run.runtime_state)
+        run.runtime_trace = trace.snapshot()
+        logical_status = str(updates.get("status") or "verification_pending")
+        _set_transport_status(run, _map_logical_transport_status(logical_status))
+        run.error = str(updates.get("error") or "") or None
+        run.completion_reason = str(updates.get("completion_reason") or "") or None
+        run.finished_at = time.time() if run.status != "verification_pending" else None
+        if run.result is not None:
+            run.result = RunResult(run.run_id, run.status, run.output_format, run.result.output, run.error)
+        run.events.put(RunEvent(run.run_id, "verification_finished", {"status": run.status, "verification": payload}))
+        if run.status != "verification_pending":
+            _persist_result(run)
+        _persist_run_state(run)
+        _json_response(handler, HTTPStatus.OK, _run_public_dict(run))
+    except DaemonHttpError as exc:
+        _json_response(handler, int(exc.status), exc.payload)
+    except Exception as exc:
+        _json_response(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "verification_error", "message": str(exc)})
+
+
+def _respond_resume(handler: BaseHTTPRequestHandler, run_id: str) -> None:
+    """Resume state or explicit verification without implicit side effects."""
+    body = _read_json_body(handler)
+    if str(body.get("stage") or "").strip():
+        _respond_retry_stage(handler, run_id, body)
+        return
+    run = RUNS.get(run_id)
+    if run is not None and run.status in {"verification_pending", "approval_required"}:
+        _respond_verification(handler, run_id, body)
+        return
+    _json_response(handler, HTTPStatus.BAD_REQUEST, {
+        "error": "resume_stage_required",
+        "message": "resume 需要显式 stage；等待验证的 run 也可提交 verification.command",
+    })
+
+
+def _respond_tool_approval(handler: BaseHTTPRequestHandler, run_id: str) -> None:
+    run = RUNS.get(run_id)
+    if not run:
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
+        return
+    if run.status not in {"approval_required", "verification_pending"}:
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "tool_approval_not_applicable", "status": run.status})
+        return
+    try:
+        body = _read_json_body(handler)
+        pending = run.pending_tool_approval
+        if not isinstance(pending, dict) or not isinstance(pending.get("approval"), dict):
+            raise DaemonHttpError(HTTPStatus.CONFLICT, {
+                "error": "tool_approval_not_pending",
+                "message": "只能确认 runtime 已生成的 pending tool approval",
+            })
+        pending_approval = dict(pending["approval"])
+        pending_status = str(pending_approval.get("status") or "required")
+        if pending_status != "required":
+            raise DaemonHttpError(HTTPStatus.CONFLICT, {
+                "error": "approval_already_submitted",
+                "status": pending_status,
+            })
+        tool_name = str(body.get("tool") or "").strip()
+        if not tool_name:
+            raise DaemonHttpError(HTTPStatus.BAD_REQUEST, {"error": "tool_name_required"})
+        from services.verification import consume_approval
+
+        fingerprint = str(body.get("fingerprint") or body.get("input_hash") or "").strip()
+        if not fingerprint:
+            raise DaemonHttpError(HTTPStatus.BAD_REQUEST, {"error": "command_fingerprint_required"})
+        expected_tool = str(pending.get("tool") or "").strip()
+        expected_call_id = str(pending_approval.get("tool_call_id") or pending.get("tool_call_id") or "").strip()
+        expected_scope = str(pending_approval.get("scope") or "single_tool").strip()
+        tool_call_id = str(body.get("tool_call_id") or expected_call_id).strip()
+        scope = str(body.get("scope") or expected_scope).strip()
+        submitted_approval_id = str(body.get("approval_id") or "").strip()
+        if (tool_name != expected_tool or tool_call_id != expected_call_id or
+                fingerprint != str(pending_approval.get("command_fingerprint") or "") or
+                scope != expected_scope or
+                (submitted_approval_id and submitted_approval_id != str(pending_approval.get("approval_id") or ""))):
+            raise DaemonHttpError(HTTPStatus.CONFLICT, {"error": "approval_binding_mismatch"})
+        requested_status = str(body.get("status") or "granted").strip().lower()
+        if requested_status not in {"granted", "rejected"}:
+            raise DaemonHttpError(HTTPStatus.BAD_REQUEST, {"error": "invalid_approval_status"})
+        approval = dict(pending_approval)
+        if requested_status == "rejected":
+            approval.update(status="rejected", granted_by="user", source="explicit_user_request")
+        else:
+            approval.update(status="granted", granted_by="user", source="explicit_user_request")
+            # verify is consumed inside resume_verification_from_report; other tools
+            # are consumed after RuntimeActionExecutor succeeds.
+        run.approval = approval
+        run.pending_tool_approval = dict(pending)
+        run.pending_tool_approval["approval"] = approval
+        if requested_status == "rejected":
+            _set_transport_status(run, "error")
+            run.error = "tool approval rejected"
+            run.events.put(RunEvent(run.run_id, "tool_approval_finished", {"status": "rejected", "approval": approval}))
+            _persist_run_state(run)
+            _json_response(handler, HTTPStatus.OK, _run_public_dict(run) | {"tool_approval": {"status": "rejected", "approval": approval}})
+            return
+        if tool_name == "verify":
+            from tool_system.runtime import RunTrace
+            from services.repair_pipeline import resume_verification_from_report
+
+            pending_input = pending.get("input") if isinstance(pending.get("input"), dict) else {}
+            verification_config = pending_input.get("verification")
+            if not isinstance(verification_config, dict):
+                raise DaemonHttpError(HTTPStatus.CONFLICT, {"error": "verification_config_missing"})
+            verification_config = dict(verification_config)
+            verification_config["approval"] = approval
+            trace = RunTrace.from_dict(
+                run.runtime_trace or {}, run_id=run.run_id,
+                engine=(run.runtime_trace or {}).get("engine"),
+            )
+            pipeline = resume_verification_from_report(
+                report_dir=Path(run.report_dir).expanduser().resolve(),
+                verification_config=verification_config,
+                trace=trace,
+                run_id=run.run_id,
+            )
+            payload = pipeline.verification_result or {}
+            run.pending_verification = payload
+            run.pending_tool_approval = pipeline.pending_tool_approval
+            run.approval = payload.get("approval") if isinstance(payload.get("approval"), dict) else approval
+            _adopt_runtime_payload(run, pipeline.runtime_state or run.runtime_state)
+            run.runtime_trace = trace.snapshot()
+            logical_status = str(pipeline.result_updates.get("status") or "error")
+            _set_transport_status(run, _map_logical_transport_status(logical_status))
+            run.error = str(pipeline.result_updates.get("error") or "") or None
+            run.completion_reason = str(pipeline.result_updates.get("completion_reason") or "") or None
+            run.finished_at = time.time() if run.status != "verification_pending" else None
+            result_payload = {"status": run.status, "approval": run.approval,
+                              "verification": payload}
+            run.events.put(RunEvent(run.run_id, "tool_approval_finished", result_payload))
+            if run.status != "verification_pending":
+                _persist_result(run)
+            _persist_run_state(run)
+            _json_response(handler, HTTPStatus.OK, _run_public_dict(run) | {"tool_approval": result_payload})
+            return
+        from tool_system.runtime import RunTrace
+        from services.repair_pipeline import resume_tool_approval_from_report
+
+        if not run.report_dir:
+            raise DaemonHttpError(HTTPStatus.CONFLICT, {"error": "report_dir_missing"})
+        trace = RunTrace.from_dict(
+            run.runtime_trace or {}, run_id=run.run_id,
+            engine=(run.runtime_trace or {}).get("engine"),
+        )
+        runtime = _get_ts_agent_runtime((run.runtime_trace or {}).get("engine"))
+        tool_executor = None
+        if hasattr(runtime, "execute_tool"):
+            tool_executor = lambda name, data: runtime.execute_tool(name, data)
+        llm_adapter = getattr(getattr(runtime, "executor", None), "llm_adapter", None)
+        try:
+            pipeline = resume_tool_approval_from_report(
+                report_dir=Path(run.report_dir).expanduser().resolve(),
+                tool_name=tool_name,
+                pending=pending,
+                approval=approval,
+                trace=trace,
+                run_id=run.run_id,
+                tool_executor=tool_executor,
+                runtime_state=run.runtime_state,
+                llm_adapter=llm_adapter,
+            )
+            run.approval = consume_approval(
+                approval,
+                fingerprint=fingerprint,
+                run_id=run_id,
+                tool_call_id=tool_call_id,
+                scope=scope,
+            )
+            _adopt_runtime_payload(run, pipeline.runtime_state or run.runtime_state)
+            run.runtime_trace = trace.snapshot()
+            logical_status = str(pipeline.result_updates.get("status") or "done")
+            _set_transport_status(run, _map_logical_transport_status(logical_status))
+            run.error = str(pipeline.result_updates.get("error") or "") or None
+            run.completion_reason = str(pipeline.result_updates.get("completion_reason") or "") or None
+            run.pending_verification = pipeline.verification_result
+            run.pending_tool_approval = pipeline.pending_tool_approval
+            run.finished_at = time.time() if run.status not in {"verification_pending", "approval_required"} else None
+            result_payload = {
+                "status": run.status,
+                "approval": run.approval,
+                "output": pipeline.applied_fix_result or pipeline.verification_result,
+            }
+            if run.status == "approval_required":
+                result_payload["pending_tool_approval"] = pipeline.pending_tool_approval
+            if run.status not in {"verification_pending", "approval_required"}:
+                run.pending_tool_approval = None
+            run.events.put(RunEvent(run.run_id, "tool_approval_finished", result_payload))
+            if run.status not in {"verification_pending", "approval_required"}:
+                _persist_result(run)
+            _persist_run_state(run)
+            _json_response(handler, HTTPStatus.OK, _run_public_dict(run) | {"tool_approval": result_payload})
+        except Exception as exc:
+            result_payload = {"status": "error", "approval": approval, "error": str(exc)}
+            _set_transport_status(run, "error")
+            run.error = str(exc)
+            run.events.put(RunEvent(run.run_id, "tool_approval_finished", result_payload))
+            _persist_run_state(run)
+            _json_response(handler, HTTPStatus.OK, _run_public_dict(run) | {"tool_approval": result_payload})
+    except DaemonHttpError as exc:
+        _json_response(handler, int(exc.status), exc.payload)
+    except Exception as exc:
+        _json_response(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "tool_approval_error", "message": str(exc)})
+
+
+def _respond_cleanup(handler: BaseHTTPRequestHandler, run_id: str) -> None:
+    run = RUNS.get(run_id)
+    if not run:
+        _json_response(handler, HTTPStatus.NOT_FOUND, {"error": "run_not_found"})
+        return
+    if run.status == "running":
+        _json_response(handler, HTTPStatus.CONFLICT, {"error": "run_still_running"})
+        return
+    try:
+        body = _read_json_body(handler)
+        workspace = run.pending_workspace or _restore_workspace_from_manifest(run)
+        removed = []
+        if workspace is not None:
+            from services.git_worktree_manager import cleanup_isolated_workspace
+            removed = cleanup_isolated_workspace(workspace, force=bool(body.get("force", False)))
+        run.pending_workspace = None
+        run.workspace_dir = None
+        run.events.put(RunEvent(run.run_id, "workspace_cleaned", {"removed": removed}))
+        _persist_run_state(run)
+        _json_response(handler, HTTPStatus.OK, {"run_id": run_id, "status": run.status, "removed": removed})
+    except Exception as exc:
+        _json_response(handler, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "cleanup_error", "message": str(exc)})
+
+
 def _scheduler_snapshot() -> Dict[str, int]:
     """Queue counters; start the pool lazily so /health works before the first POST."""
     return ensure_run_scheduler().snapshot()
@@ -1487,7 +2290,7 @@ def _cancel_run(run: RunState) -> None:
     """Cancel a queued job in-place, or terminate a running CLI subprocess."""
     run.cancel_requested = True
     if run.status == "queued":
-        run.status = "canceled"
+        _set_transport_status(run, "canceled")
         run.finished_at = time.time()
         run.error = "任务已取消，未产出分析结果（尚未启动）"
         run.result = RunResult(
@@ -1515,7 +2318,7 @@ def _cancel_run(run: RunState) -> None:
                 run.process.kill()
             except Exception:
                 pass
-        run.status = "canceled"
+        _set_transport_status(run, "canceled")
         run.finished_at = time.time()
         run.error = "任务已取消，未产出分析结果（exit_code=-15）"
         run.events.put(RunEvent(run.run_id, "run_canceled", {"phase": "running"}))
@@ -1826,9 +2629,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if path in ("/tool-system/tools", "/tool-system/workflows"):
             try:
-                executor = _get_ts_executor()
-                active = executor.list_active()
+                engine = _resolve_tool_system_engine(query.get("engine"))
+                executor = _get_ts_agent_runtime(engine)
+                active = executor.executor.list_active() if hasattr(executor, "executor") else executor.list_active()
                 _json_response(self, HTTPStatus.OK, active)
+            except ValueError as exc:
+                if "engine must be one of" in str(exc):
+                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid_engine", "message": str(exc)})
+                else:
+                    raise
             except Exception as e:
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
             return
@@ -1839,6 +2648,16 @@ class Handler(BaseHTTPRequestHandler):
             payload = {"runs": items}
             payload.update(_scheduler_snapshot())
             _json_response(self, HTTPStatus.OK, payload)
+            return
+
+        if path == "/workspaces":
+            try:
+                from services.git_worktree_manager import scan_worktree_runs
+                active = {run.workspace_dir for run in RUNS.list().values() if run.workspace_dir}
+                items = [item for item in scan_worktree_runs() if item.get("path") not in active]
+                _json_response(self, HTTPStatus.OK, {"workspaces": items})
+            except Exception as exc:
+                _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
 
         if path.startswith("/runs/") and path.endswith("/events"):
@@ -1855,6 +2674,23 @@ class Handler(BaseHTTPRequestHandler):
             _send_cors_headers(self)
             self.end_headers()
 
+            try:
+                after_id = int(self.headers.get("Last-Event-ID") or query.get("after") or 0)
+            except ValueError:
+                after_id = 0
+            if after_id > 0:
+                for replay in list(run.event_log):
+                    if replay.seq > after_id:
+                        self.wfile.write(f"data: {json.dumps(replay.to_dict(), ensure_ascii=False)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                # Drop already replayed live events without calling ``put``;
+                # calling put would assign a new sequence number.
+                with run.events.mutex:
+                    retained = [item for item in list(run.events.queue)
+                                if not isinstance(item, RunEvent) or item.seq > after_id]
+                    run.events.queue.clear()
+                    run.events.queue.extend(retained)
+
             hello = RunEvent(run_id, "events_opened", {}).to_dict()
             self.wfile.write(f"data: {json.dumps(hello, ensure_ascii=False)}\n\n".encode("utf-8"))
             self.wfile.flush()
@@ -1867,13 +2703,17 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     self.wfile.flush()
                 except queue.Empty:
-                    if run.status in ("done", "error", "canceled"):
+                    if run.status in ("done", "error", "canceled", "verification_pending"):
                         break
                     keep = RunEvent(run_id, "keepalive", {}).to_dict()
                     self.wfile.write(f"data: {json.dumps(keep, ensure_ascii=False)}\n\n".encode("utf-8"))
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     break
+            return
+
+        if path.startswith("/runs/") and path.endswith("/checkpoints"):
+            _respond_checkpoints(self, path.split("/")[2])
             return
 
         result_id = _single_id_path(path, "/result/")
@@ -1963,6 +2803,11 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     headers={"Retry-After": "5"},
                 )
+            except ValueError as exc:
+                if "engine must be one of" in str(exc):
+                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid_engine", "message": str(exc)})
+                else:
+                    raise
             except DaemonHttpError as exc:
                 _json_response(self, int(exc.status), exc.payload)
             except Exception as e:
@@ -1983,6 +2828,28 @@ class Handler(BaseHTTPRequestHandler):
             _respond_cancel(self, run_id)
             return
 
+        if path.startswith("/runs/") and path.endswith("/verification"):
+            run_id = path.split("/")[2]
+            _respond_verification(self, run_id)
+            return
+
+        if path.startswith("/runs/") and path.endswith("/resume"):
+            _respond_resume(self, path.split("/")[2])
+            return
+
+        if path.startswith("/runs/") and path.endswith("/tool-approval"):
+            _respond_tool_approval(self, path.split("/")[2])
+            return
+
+        if path.startswith("/runs/") and path.endswith("/retry-stage"):
+            _respond_retry_stage(self, path.split("/")[2])
+            return
+
+        if path.startswith("/runs/") and path.endswith("/cleanup"):
+            run_id = path.split("/")[2]
+            _respond_cleanup(self, run_id)
+            return
+
         if _handle_run_vector_db_commit(self, path):
             return
 
@@ -1995,7 +2862,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/tool-system/analyze":
             try:
                 body = _read_json_body(self)
-                executor = _get_ts_executor()
                 crash_log = body.get("crash_log", "")
                 force_anr = bool(body.get("force_anr_analysis") or body.get("force_anr"))
                 try:
@@ -2009,14 +2875,20 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 except Exception:
                     workflow_name = "anr_freeze_analysis" if force_anr else "crash_analysis"
-                result = executor.execute_workflow(workflow_name, {
+                result = _run_tool_system_workflow(workflow_name, {
                     "crash_log": crash_log,
                     "library_dir": body.get("library_dir"),
                     "code_roots": body.get("code_roots", []),
                     "force_anr_analysis": force_anr,
                     "scope": body.get("scope", "full"),
-                })
+                    "engine": body.get("engine"),
+                }, engine=body.get("engine"))
                 _json_response(self, HTTPStatus.OK, result)
+            except ValueError as exc:
+                if "engine must be one of" in str(exc):
+                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid_engine", "message": str(exc)})
+                else:
+                    raise
             except DaemonHttpError as exc:
                 _json_response(self, int(exc.status), exc.payload)
             except Exception as e:
@@ -2026,16 +2898,21 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/tool-system/native-leak":
             try:
                 body = _read_json_body(self)
-                executor = _get_ts_executor()
-                result = executor.execute_workflow("native_leak_analysis", {
+                result = _run_tool_system_workflow("native_leak_analysis", {
                     "native_leak_path": body.get("path") or body.get("native_leak_dir"),
                     "native_leak_trace_db": body.get("trace_db") or body.get("native_leak_trace_db"),
                     "code_roots": body.get("code_roots", []),
                     "scope": body.get("scope", "gen_prompt_only"),
                     "max_callchains": body.get("max_callchains", 5),
                     "min_callchain_percentage": body.get("min_callchain_percentage", 0.0),
-                })
+                    "engine": body.get("engine"),
+                }, engine=body.get("engine"))
                 _json_response(self, HTTPStatus.OK, result)
+            except ValueError as exc:
+                if "engine must be one of" in str(exc):
+                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid_engine", "message": str(exc)})
+                else:
+                    raise
             except DaemonHttpError as exc:
                 _json_response(self, int(exc.status), exc.payload)
             except Exception as e:
@@ -2099,7 +2976,7 @@ def main() -> int:
     parser.add_argument(
         "--allow-local-path-fields",
         action="store_true",
-        help="Allow crash_log/code_root/library_dir in POST /runs (local Web UI)",
+        help="Allow crash_log/code_roots/library_dir in POST /runs (local Web UI)",
     )
     parser.add_argument(
         "--access-log",
@@ -2123,13 +3000,6 @@ def main() -> int:
         max_queue=args.max_queue,
         run_timeout_sec=args.run_timeout,
     )
-
-    try:
-        from cli.report_paths import ensure_reports_migrated
-
-        ensure_reports_migrated(PROJECT_ROOT)
-    except Exception:
-        pass
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
 

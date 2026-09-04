@@ -1,0 +1,42 @@
+{
+  "suite_id": "demo_multithread",
+  "report_root": "",
+  "cases": [
+    {
+      "id": "mtd1_data_corruption",
+      "crash_log": "examples/crash_cases/demo_multithread/demo_mtd1/log/mac/",
+      "expected_category": "MultiThreadDataCorruption",
+      "expected_fault_mode": "MultiThreadDataCorruption"
+    },
+    {
+      "id": "mtd2_processing_error",
+      "crash_log": "examples/crash_cases/demo_multithread/demo_mtd2/log/mac/",
+      "expected_category": "DataProcessingError",
+      "expected_fault_mode": "DataProcessingError"
+    },
+    {
+      "id": "mtd3_race_condition",
+      "crash_log": "examples/crash_cases/demo_multithread/demo_mtd3/log/mac/",
+      "expected_category": "RaceCondition",
+      "expected_fault_mode": "RaceCondition"
+    },
+    {
+      "id": "mtd3_deadlock",
+      "crash_log": "examples/crash_cases/demo_multithread/demo_mtd3/log/mac/",
+      "expected_category": "Deadlock",
+      "expected_fault_mode": "Deadlock"
+    },
+    {
+      "id": "mtd3_atomic_fail",
+      "crash_log": "examples/crash_cases/demo_multithread/demo_mtd3/log/mac/AtomicFail_SIGSEGV_2026-04-08_10-56-54.crash",
+      "expected_category": "AtomicFail",
+      "expected_fault_mode": "AtomicFail"
+    },
+    {
+      "id": "mtd3_double_lock",
+      "crash_log": "examples/crash_cases/demo_multithread/demo_mtd3/log/mac/",
+      "expected_category": "DoubleLock",
+      "expected_fault_mode": "DoubleLock"
+    }
+  ]
+}

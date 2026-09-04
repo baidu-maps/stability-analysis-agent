@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import tempfile
 import unittest
+import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -106,34 +106,19 @@ class GitWorktreeIsolationTests(unittest.TestCase):
                     workspace_base=root / "worktrees",
                 )
 
-    def test_daemon_rewrites_request_roots_to_worktree(self) -> None:
+    def test_daemon_delegates_worktree_creation_to_agent_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repository = self._make_repository(root)
-            run = server.RunState(
-                run_id="run-daemon-map",
-                status="queued",
-                created_at=0.0,
-            )
             request = RunRequest(
                 crash_log="/tmp/crash.log",
                 code_roots=[str(repository / "src")],
                 apply_ai_fixes=True,
             )
-            old_root = os.environ.get("STABILITY_AGENT_WORKTREE_DIR")
-            os.environ["STABILITY_AGENT_WORKTREE_DIR"] = str(root / "worktrees")
-            try:
-                isolated_request, workspace = server._prepare_isolated_run(run, request)
-            finally:
-                if old_root is None:
-                    os.environ.pop("STABILITY_AGENT_WORKTREE_DIR", None)
-                else:
-                    os.environ["STABILITY_AGENT_WORKTREE_DIR"] = old_root
-
-            self.assertIsNotNone(workspace)
-            self.assertNotEqual(isolated_request.code_roots, request.code_roots)
-            self.assertTrue(Path(isolated_request.code_roots[0]).is_dir())
-            self.assertEqual(run.original_code_roots, [str((repository / "src").resolve())])
+            command, _ = server._build_cli_cmd(request)
+            root_arg = command[command.index("--code-roots") + 1]
+            self.assertTrue(os.path.samefile(root_arg, repository / "src"))
+            self.assertFalse(hasattr(server, "_prepare_isolated_run"))
 
     def test_uncommitted_changes_in_code_root_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

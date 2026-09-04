@@ -18,7 +18,7 @@ class DiagnosisInfrastructureTests(unittest.TestCase):
         result = normalize_diagnosis_result({"status": "success", "diagnosis_status": "confirmed", "fault_modes": [{"id": "X"}], "confidence": 0.9}, "cpp_crash")
         self.assertEqual(result["domain"], "cpp_crash")
         self.assertEqual(result["confidence"], 0.9)
-        self.assertIn("legacy_result", result)
+        self.assertNotIn("legacy_result", result)
 
     def test_knowledge_registry_search(self) -> None:
         registry = KnowledgeRegistry([KnowledgeEntry("x", "api_fault", "media", "service died", ["service died"])])

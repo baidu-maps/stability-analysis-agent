@@ -1,0 +1,6 @@
+{
+  "category": "NullPtr",
+  "fault_mode": "NullPtr",
+  "file": "my_lib.cpp",
+  "function": "crash_nullptr"
+}

@@ -21,11 +21,11 @@ Stability Analysis Agent is an AI-driven crash log analysis toolchain with a mul
 ```bash
 # Direct run (development) — full scope (default)
 python3 cli/main.py \
-  --crash-log <path> --library-dir <path> --code-root <path>
+  --crash-log <path> --library-dir <path> --code-roots <path>
 
 # gen_prompt_only: full toolchain but skip LLM, generate prompt file only (no LLM key required)
 python3 cli/main.py \
-  --crash-log <path> --library-dir <path> --code-root <path> \
+  --crash-log <path> --library-dir <path> --code-roots <path> \
   --scope gen_prompt_only
 
 # parse_stack_only: parse + symbolize + 04a diagnosis (no code-root required)
@@ -40,7 +40,7 @@ python3 cli/main.py \
 
 # Via daemon (recommended for VSCode / repeated runs)
 python3 cli/main.py --daemon http://127.0.0.1:8765 \
-  --crash-log <path> --library-dir <path> --code-root <path>
+  --crash-log <path> --library-dir <path> --code-roots <path>
 ```
 
 ### Scope values
@@ -119,7 +119,7 @@ RAG ML pins: `requirements-rag.txt` / `[rag]` extra (`numpy<2`, `torch>=2.4`, `t
 python3 cli/main.py \
   --crash-log examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
-  --code-root examples/crash_cases/demo_basic/code_dir \
+  --code-roots examples/crash_cases/demo_basic/code_dir \
   --scope gen_prompt_only
 # Output: reports/<timestamp>/01~04a (+ optional 04b/04b2/04c/04d/04e/05) + round_0/06_ai_prompt.md
 # 04b2 = 04b2_code_location_trace.json（代码定位审计，非 repo_search）

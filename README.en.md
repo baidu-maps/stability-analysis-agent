@@ -1,6 +1,6 @@
 # Stability Analysis Agent
 
-**An open-source Agent framework for app stability: extensible Tools, Workflows, Skills, and RAG turn crash addresses, threads, registers, symbols, and source code into a verifiable evidence chain that drives AI-powered code fixes.**
+**An open-source domain Agent for app stability engineering: built on a governed Agent Harness and informed by open-source AI coding tools' context management, multi-round investigation, tool invocation, permission control, checkpoint recovery, and verification-loop practices, it turns Crash, ANR, and OOM incident materials into auditable, verifiable root-cause analyses and code-fix results.**
 
 [简体中文](./README.md) | **English**
 
@@ -20,6 +20,8 @@ Stability logs are noisy, address-heavy, and spread across disconnected sources.
 | Logs, symbols, and source are separate | Developers must collect and paste context by hand | Automatic correlation and source-context extraction |
 | Similar failures happen repeatedly | Analysis knowledge is lost between conversations | Rules and vector-memory retrieval for similar cases |
 
+The project also adopts engineering practices from open-source AI coding tools: multi-round context retrieval, structured tool calls, context budgeting, permission controls, checkpoint recovery, failure feedback, and verification. These capabilities are constrained by the stability-analysis workflow; this is not an unrestricted autonomous coding agent.
+
 ## Installation
 
 ### Recommended
@@ -36,11 +38,12 @@ For mainland China network environments, add a pip mirror to the command. For in
 
 ### Run the Bundled Demo
 
-Clone the repository and start the interactive CLI. Choose `快速开始修复（推荐）` (Quick Start Fix), follow the prompts to configure an LLM and a stack symbolizer, and enter the bundled Demo paths. The flow parses the log, symbolizes the stack, builds the evidence chain, extracts source context, asks the AI to analyze the issue, and applies the source fix.
+Clone the repository, install it, and start the interactive CLI. Choose `快速开始修复（推荐）` (Quick Start Fix), follow the prompts to configure an LLM and a stack symbolizer, and enter the bundled Demo paths. The flow parses the log, symbolizes the stack, builds the evidence chain, extracts source context, asks the AI to analyze the issue, and can apply a source fix subject to review, approval, and verification.
 
 ```bash
 git clone https://github.com/baidu-maps/stability-analysis-agent.git
 cd stability-analysis-agent
+pip install -e .
 sa-agent
 ```
 
@@ -74,7 +77,7 @@ Source dir:     examples/crash_cases/demo_basic/code_dir
 
 ### View the Final Result
 
-The Demo's null-pointer Crash is located and fixed. The source changes from:
+The Demo's null-pointer Crash is located and, when repair is enabled and approved, fixed. The source changes from:
 
 ```cpp
 int* p = nullptr;
@@ -118,13 +121,41 @@ Its main sections are:
 - `需补充材料`: logs, source, or runtime information still needed
 - `总结`: root cause, fix result, and follow-up recommendations
 
+The run also preserves auditable process artifacts:
+
+- `09_evidence.json`: evidence-store snapshot
+- `00_runtime_trace.json`: model, tool, policy, and lifecycle events
+- `context_session.json`: multi-round context session and request ledger
+- `09_verification.json`: verification result and approval record
+- `10_decide.json`: aggregated repair decision
+- `11_judge.json`: deterministic harness judgment, when enabled
+
+## How the Agent Works
+
+The runtime combines a deterministic stability-analysis pipeline with a governed Agent Harness:
+
+```text
+incident materials
+  -> parse / symbolize / specialized diagnosis
+  -> evidence store
+  -> bounded context investigation
+  -> analysis and repair plan
+  -> patch and diff review
+  -> explicit verification
+  -> decide / judge
+```
+
+In `context_loop` mode, the model can request functions, fields, references, callers, or cross-file context. Each run is bounded by round, LLM-call, tool-call, and time budgets. Workspace writes and executable verification commands are subject to policy and explicit approval. Verification failures remain failures and may trigger rollback or a bounded reanalysis/edit cycle.
+
 ## Supported Platforms and Capability Boundaries
 
-The built-in Crash analysis pipeline covers iOS, macOS, Android, HarmonyOS, Linux, and Windows. It provides one consistent flow for log parsing, stack symbolization, evidence analysis, source-context extraction, and AI-powered repair. Each platform is connected through its own log adapters and symbolization tools; see [Crash Log Formats](./docs/tools/CRASH_LOG_FORMATS.md) for the supported input formats.
+The built-in Crash analysis pipeline covers iOS, macOS, Android, HarmonyOS, Linux, and Windows. It provides one consistent flow for log parsing, stack symbolization, evidence analysis, source-context extraction, and optional AI-powered repair. Each platform is connected through its own log adapters and symbolization tools; see [Crash Log Formats](./docs/tools/CRASH_LOG_FORMATS.md) for the supported input formats.
 
 The core boundary is not simply whether the Agent can read a platform name. It depends on whether a suitable log adapter, symbolization tool, and analysis Workflow are available. When an adapter is missing, third parties can add a Tool, Workflow, or Skill without changing the core execution framework.
 
 The project also includes dedicated analysis components for ANR, OOM, Jank, and JavaScript/ArkTS. Details about those capabilities and extension points are documented in [Diagnostic Tools](./docs/tools/), the [Tool System Extension Guide](./docs/tools/tool_system/TOOL_SYSTEM_EXTENSION.md), and the [Skill System](./docs/skills/README.md).
+
+The Agent is designed for stability engineering, not unrestricted autonomous coding. It does not implicitly execute discovered build, test, or reproduce commands, access paths outside the configured workspace, loop indefinitely after verification failures, or treat an unsuccessful reproduction as proof of a successful fix. Multi-agent collaboration and open-ended autonomous tool planning are not current promises.
 
 ## Troubleshooting and Contact
 
@@ -146,10 +177,14 @@ Version history and important changes are tracked in [GitHub Releases](https://g
 | Complete CLI parameters | [docs/cli/CLI_COMMANDS_REFERENCE.md](./docs/cli/CLI_COMMANDS_REFERENCE.md) |
 | Local Web panel | [docs/cli/WEB_UI_GUIDE.md](./docs/cli/WEB_UI_GUIDE.md) |
 | Crash log formats | [docs/tools/CRASH_LOG_FORMATS.md](./docs/tools/CRASH_LOG_FORMATS.md) |
-| C++, ANR, JS, and Jank diagnostics | [docs/tools/](./docs/tools/) |
+| C++, ANR, OOM, JS, and Jank diagnostics | [docs/tools/](./docs/tools/) |
 | Skill and extension system | [docs/skills/README.md](./docs/skills/README.md) |
 | System architecture | [docs/architecture/README.md](./docs/architecture/README.md) |
-| Testing | [docs/testing/README.md](./docs/testing/README.md) |
+| Agent Runtime, Harness lifecycle, and safety boundaries | [AGENT_RUNTIME_LIFECYCLE.md](./docs/architecture/AGENT_RUNTIME_LIFECYCLE.md) and [HARNESS_MIGRATION.md](./docs/cli/HARNESS_MIGRATION.md) |
+| Multi-round context investigation and request protocol | [CONTEXT_LOOP_CONTRACT.md](./docs/architecture/CONTEXT_LOOP_CONTRACT.md) |
+| Daemon, Run API, and event streaming | [DAEMON_SERVER_GUIDE.md](./docs/cli/DAEMON_SERVER_GUIDE.md) |
+| Post-fix build, test, and verification loop | [VERIFICATION_PROVIDERS.md](./docs/tools/VERIFICATION_PROVIDERS.md) |
+| Testing, regression, and Harness evaluation | [docs/testing/README.md](./docs/testing/README.md) and [EVALUATION_MATRIX.md](./docs/testing/EVALUATION_MATRIX.md) |
 | Roadmap | [docs/ROADMAP.md](./docs/ROADMAP.md) |
 | License and contribution requirements | [LICENSE](./LICENSE) and [CONTRIBUTING.md](./CONTRIBUTING.md) |
 

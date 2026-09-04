@@ -1,0 +1,5 @@
+{
+  "status": "failed",
+  "workflow": {"status": "error"},
+  "completion_reason": "verification_failed"
+}

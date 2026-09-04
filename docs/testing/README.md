@@ -32,6 +32,17 @@ python3 -B -m unittest \
   test.daemon.test_run_lifecycle \
   test.daemon.test_vector_db_commit_api \
   test.daemon.test_web_preferences \
+  test.daemon.test_harness_services \
+  test.harness.test_evaluation_matrix \
+  test.harness.test_repair_runtime_contract \
+  test.harness.test_checkpoint_replay \
+  test.harness.test_evaluate_report_dir \
+  test.harness.test_evaluation_suite \
+  test.harness.test_evidence_ingest \
+  test.harness.test_runtime_actions \
+  test.harness.test_tool_gateway \
+  test.harness.test_tool_invoke \
+  test.harness.test_agent_context_loop \
   test.skill_system.test_installed_skills_runtime \
   test.web.test_web_contract \
   test.tools.test_diagnosis_infrastructure \

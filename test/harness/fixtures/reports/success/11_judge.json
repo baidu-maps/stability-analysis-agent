@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "verdict": "accept",
+  "confidence": "high",
+  "gates": {
+    "analysis_completed": true,
+    "structured_output": true,
+    "diagnosis_evidence": true,
+    "diff_authorized": true,
+    "verification_passed": true
+  },
+  "questions": [],
+  "reasons": []
+}

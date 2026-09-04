@@ -276,26 +276,26 @@ DanglingPtr: 1 个日志
 cd /path/to/stability-analysis-agent/main
 
 python3 tools/cli/main.py \
-  --crash-log crash_cases/demo_basic/logs/mac/_SIGSEGV_2025-09-10_18-06-22.crash \
+  --crash-log-file crash_cases/demo_basic/logs/mac/_SIGSEGV_2025-09-10_18-06-22.crash \
   --library-dir crash_cases/demo_basic/lib/mac \
-  --code-root crash_cases/demo_basic/code_dir
+  --code-roots crash_cases/demo_basic/code_dir
 ```
 
 #### 2) 无密钥/快速回归：仅生成提示词（跑完整工具链但不调 LLM）
 
 ```bash
 python3 tools/cli/main.py \
-  --crash-log crash_cases/demo_basic/logs/mac/_SIGSEGV_2025-09-10_18-06-22.crash \
+  --crash-log-file crash_cases/demo_basic/logs/mac/_SIGSEGV_2025-09-10_18-06-22.crash \
   --library-dir crash_cases/demo_basic/lib/mac \
-  --code-root crash_cases/demo_basic/code_dir \
+  --code-roots crash_cases/demo_basic/code_dir \
   --scope gen_prompt_only
 ```
 
-#### 3) 更快：只做解析 + 地址解析（此模式不需要 code_root）
+#### 3) 更快：只做解析 + 地址解析（此模式不需要 code_roots / 代码根目录）
 
 ```bash
 python3 tools/cli/main.py \
-  --crash-log crash_cases/demo_basic/logs/mac/_SIGSEGV_2025-09-10_18-06-22.crash \
+  --crash-log-file crash_cases/demo_basic/logs/mac/_SIGSEGV_2025-09-10_18-06-22.crash \
   --library-dir crash_cases/demo_basic/lib/mac \
   --scope parse_stack_only
 ```
@@ -310,9 +310,9 @@ python3 tools/daemon/server.py --host 127.0.0.1 --port 8765
 ```bash
 # 终端 B：CLI 通过 daemon 执行（daemon 不可用会自动回退本地直跑）
 python3 tools/cli/main.py --daemon http://127.0.0.1:8765 \
-  --crash-log crash_cases/demo_basic/logs/mac/_SIGSEGV_2025-09-10_18-06-22.crash \
+  --crash-log-file crash_cases/demo_basic/logs/mac/_SIGSEGV_2025-09-10_18-06-22.crash \
   --library-dir crash_cases/demo_basic/lib/mac \
-  --code-root crash_cases/demo_basic/code_dir
+  --code-roots crash_cases/demo_basic/code_dir
 ```
 
 ### 🎯 堆栈地址信息

@@ -325,6 +325,8 @@ def clear_health_cache() -> None:
 
 def endpoint_to_adapter_dict(ep: LLMEndpoint, *, engine: str = "direct", probe: bool = False) -> Dict[str, Any]:
     """Build LLMAdapterFactory config dict from an endpoint."""
+    if engine not in {"direct", "langchain", "langgraph"}:
+        raise ValueError("engine must be one of: direct, langchain, langgraph")
     timeout = PROBE_TIMEOUT_SEC if probe else int(ep.request_timeout or 120)
     if probe:
         timeout = max(1, min(PROBE_TIMEOUT_SEC, timeout))

@@ -11093,6 +11093,11 @@ class CodeContentProviderTool(BaseTool):
             },
             category="provider",
             version="1.0.0",
+            risk="read_only",
+            side_effect=False,
+            idempotent=True,
+            requires_approval=False,
+            cost_class="low",
         )
 
     def execute(self, input_data: _Dict_tool[str, _Any_tool]) -> _Dict_tool[str, _Any_tool]:

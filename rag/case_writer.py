@@ -24,6 +24,14 @@ def _read_json(path: Path) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def _analysis_context(report_dir: Path) -> Dict[str, Any]:
+    for path in (report_dir / "artifacts" / "stage_analyze_result.json", report_dir / "analyze_result.json"):
+        payload = _read_json(path)
+        if payload:
+            return payload
+    return {}
+
+
 def _first_existing(report_dir: Path, names: List[str]) -> Optional[Path]:
     for name in names:
         p = report_dir / name
@@ -69,6 +77,9 @@ def build_case_record_from_report(report_dir: Path) -> Optional[Dict[str, Any]]:
     resolved_data = _read_json(resolved_path) or {}
     code_context = _read_json(code_path) if code_path else {}
     prompt_data: Dict[str, Any] = dict(code_context or {})
+    analyze_data = _analysis_context(report_dir)
+    analyze_meta = analyze_data.get("metadata") if isinstance(analyze_data.get("metadata"), dict) else {}
+    structured = analyze_meta.get("structured_analysis") if isinstance(analyze_meta.get("structured_analysis"), dict) else {}
 
     from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
 
@@ -143,6 +154,11 @@ def build_case_record_from_report(report_dir: Path) -> Optional[Dict[str, Any]]:
         "created_at": datetime.now().isoformat(),
         "fix_files": _applied_files_summary(apply_fix),
         "report_dir": str(report_dir),
+        "root_cause": structured.get("root_cause", ""),
+        "hypotheses": (analyze_data.get("context_session") or {}).get("hypotheses", []) if isinstance(analyze_data.get("context_session"), dict) else [],
+        "verification": analyze_data.get("verification", {}),
+        "reproduction_conditions": analyze_meta.get("reproduction_conditions", {}),
+        "build_config": analyze_meta.get("build_config", {}),
     }
 
     evidence_list: List[Dict[str, Any]] = []

@@ -1,0 +1,12 @@
+{
+  "patch_valid": true,
+  "diff_review_passed": true,
+  "verification_passed": true,
+  "diagnosis_stable": true,
+  "decision": "accept",
+  "reasons": [],
+  "dimensions": {
+    "mode": "repair",
+    "context_loop": {"context_request_valid_rate": 1.0, "invalid_context_requests": 0, "warn_only": true}
+  }
+}

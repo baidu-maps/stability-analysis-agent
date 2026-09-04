@@ -283,6 +283,20 @@ class SkillBundle:
     def entrypoint(self) -> str:
         return self.package.entrypoint or "prompt"
 
+    @property
+    def capabilities(self) -> Dict[str, Any]:
+        """Machine-readable capability and permission projection for harness use."""
+        metadata = self.package.metadata if isinstance(self.package.metadata, dict) else {}
+        return {
+            "name": self.command_name,
+            "type": self.package.type,
+            "allowed_tools": list(self.frontmatter.allowed_tools or []),
+            "context": self.frontmatter.context,
+            "agent": self.frontmatter.agent,
+            "permissions": dict(metadata.get("permissions") or {}),
+            "tags": list(self.package.tags or []),
+        }
+
     def render(self, arguments: Optional[str] = None, **context: Any) -> str:
         """渲染 SKILL.md 内容，做最小兼容替换。"""
         rendered = self.body

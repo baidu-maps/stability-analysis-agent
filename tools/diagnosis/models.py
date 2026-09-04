@@ -47,7 +47,7 @@ class DiagnosisResult:
 
 
 def normalize_diagnosis_result(result: Mapping[str, Any], domain: str = "unknown") -> Dict[str, Any]:
-    """Adapt legacy specialist output without discarding its original fields."""
+    """Normalize specialist output to the current diagnosis contract."""
     payload = dict(result)
     status = str(payload.get("diagnosis_status") or payload.get("status") or "preliminary")
     confidence = payload.get("confidence")
@@ -70,7 +70,6 @@ def normalize_diagnosis_result(result: Mapping[str, Any], domain: str = "unknown
         "root_cause": payload.get("root_cause") or payload.get("diagnosis") or {},
         "missing_evidence": payload.get("missing_evidence") or [],
         "repair_guidance": payload.get("repair_guidance") or {},
-        "metadata": {"legacy_fields_preserved": True},
+        "metadata": {},
     }
-    normalized["legacy_result"] = payload
     return normalized

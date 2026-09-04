@@ -1,0 +1,24 @@
+{
+  "items": [
+    {
+      "kind": "crash_log",
+      "source": "crash_log_parser",
+      "relevance": 0.96,
+      "content": "fixture"
+    },
+    {
+      "kind": "source_code",
+      "source": "code_content_provider",
+      "file": "my_lib.cpp",
+      "relevance": 1.0,
+      "content": "void crash_nullptr() {}"
+    },
+    {
+      "kind": "crash_diagnosis",
+      "source": "deterministic_diagnosis",
+      "relevance": 1.0,
+      "content": "NullPtr"
+    }
+  ],
+  "evidence_package": {}
+}

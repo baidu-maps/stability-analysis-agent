@@ -1,0 +1,8 @@
+{
+  "run_id": "fixture-success",
+  "engine": "direct",
+  "events": [
+    {"seq": 1, "stage": "analyze", "event": "tool.success", "kind": "tool", "name": "crash_log_parser", "status": "success"}
+  ],
+  "budget": {"llm_calls": 1, "tool_calls": 3, "token_usage": {"total_tokens": 120}, "estimated_cost": 0.01}
+}

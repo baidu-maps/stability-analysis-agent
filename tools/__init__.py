@@ -34,7 +34,9 @@ from .js_crash import JsCrashDiagnosisTool
 from .jank_analysis import JankAnalyzerTool
 from .cpp_crash import CppCrashDiagnosisTool
 from .appfreeze import AppFreezeDiagnosisTool
-from .api_fault import ApiFaultDiagnosisTool
+from .api_fault.tool import ApiFaultDiagnosisTool
+from .reproduce_crash_tool import ReproduceCrashTool
+from .verification_actions import RunBuildTool, RunStaticCheckTool, RunTestsTool
 
 __all__ = [
     # Tool classes
@@ -53,6 +55,10 @@ __all__ = [
     "FixCodeExtractorTool",
     "FixCodeApplierTool",
     "VectorMemoryRetrieverTool",
+    "RunBuildTool",
+    "RunTestsTool",
+    "RunStaticCheckTool",
+    "ReproduceCrashTool",
     "RepoSearchTool",
     "NativeLeakAnalyzerTool",
     # Registration helper
@@ -195,6 +201,38 @@ def register_all_tools(registry=None):
         is_tool=True,
         module="tools",
     )
+    for tool_name, tool_cls in (
+        ("run_build", RunBuildTool),
+        ("run_tests", RunTestsTool),
+        ("run_static_check", RunStaticCheckTool),
+        ("reproduce_crash", ReproduceCrashTool),
+    ):
+        registry.register(
+            tool_name,
+            tool_cls(),
+            priority=Priority.BUILTIN,
+            force_override=False,
+            is_tool=True,
+            module="tools",
+        )
     from tools.diagnosis.knowledge import register_builtin_knowledge
 
     register_builtin_knowledge()
+    _validate_harness_tool_metadata(registry)
+
+
+def _validate_harness_tool_metadata(registry) -> None:
+    """Ensure harness tools declare risk and cost_class metadata."""
+    for name in registry.list_all_tools():
+        tool = registry.get_tool(name)
+        if tool is None:
+            continue
+        definition = getattr(tool, "definition", None)
+        if definition is None:
+            continue
+        risk = str(getattr(definition, "risk", "") or "").strip()
+        cost = str(getattr(definition, "cost_class", "") or "").strip()
+        if not risk:
+            raise ValueError(f"harness tool missing risk metadata: {name}")
+        if not cost:
+            raise ValueError(f"harness tool missing cost_class metadata: {name}")

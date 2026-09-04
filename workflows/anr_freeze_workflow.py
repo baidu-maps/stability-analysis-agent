@@ -37,6 +37,7 @@ def _build_anr_prompt(
     *,
     crash_diagnosis: Optional[Dict[str, Any]] = None,
     log_kind: str = "",
+    problem: Optional[Dict[str, Any]] = None,
 ) -> str:
     """基于 01/03/04c（及 mixed 时 04a）构建 ANR 专用提示词。"""
     meta = parse_result.get("meta_info") if isinstance(parse_result.get("meta_info"), dict) else {}
@@ -127,6 +128,17 @@ def _build_anr_prompt(
         "4. 若证据不足，明确需要补充的材料（完整 traces、主线程消息队列等）",
         "",
     ])
+    agent_loop = str((problem or {}).get("agent_loop") or "single").strip()
+    if agent_loop == "context_loop":
+        from services.context_loop_contract import (
+            build_round0_must_provide_lines,
+            build_round0_output_format_lines,
+        )
+
+        lines.append("## 输出格式")
+        lines.extend(build_round0_must_provide_lines(agent_loop=agent_loop))
+        lines.append("")
+        lines.extend(build_round0_output_format_lines(agent_loop=agent_loop))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -156,6 +168,27 @@ class AnrFreezeAnalysisWorkflow(BaseWorkflow):
         if scope not in {"full", "gen_prompt_only", "parse_stack_only", "parse_log_only"}:
             return "full"
         return scope
+
+    @staticmethod
+    def _ingest_anr_evidence(context: WorkflowContext, **kwargs: Any) -> None:
+        store = getattr(context, "evidence", None)
+        if store is None:
+            return
+        from services.evidence_ingest import ingest_diagnosis, ingest_parse, ingest_symbolize
+
+        ingest_parse(store, kwargs.get("parse_result"))
+        ingest_symbolize(store, kwargs.get("resolved"), kwargs.get("memory_maps"))
+        anr = kwargs.get("anr_diagnosis")
+        if anr:
+            store.add_dict({
+                "kind": "anr_diagnosis",
+                "content": json.dumps(anr, ensure_ascii=False, sort_keys=True, default=str),
+                "source": "anr_freeze_diagnosis",
+                "layer": "inference",
+                "relevance": 1.0,
+                "round": 0,
+            })
+        ingest_diagnosis(store, kwargs.get("crash_diagnosis"))
 
     def solve(self, problem: Dict[str, Any], context: WorkflowContext) -> Dict[str, Any]:
         crash_log = problem.get("crash_log", "")
@@ -208,6 +241,8 @@ class AnrFreezeAnalysisWorkflow(BaseWorkflow):
                                 **skip_meta,
                             },
                         }
+
+            self._ingest_anr_evidence(context, parse_result=parse_result)
 
             log_kind = log_kind_from_parse_result(parse_result)
             if scope == "parse_log_only":
@@ -298,6 +333,14 @@ class AnrFreezeAnalysisWorkflow(BaseWorkflow):
                     }
 
             if scope == "parse_stack_only":
+                self._ingest_anr_evidence(
+                    context,
+                    parse_result=parse_result,
+                    resolved=resolved,
+                    memory_maps=memory_maps_data,
+                    anr_diagnosis=anr_diagnosis,
+                    crash_diagnosis=crash_diagnosis,
+                )
                 return {
                     "status": "success",
                     "platform": self.platform,
@@ -323,7 +366,39 @@ class AnrFreezeAnalysisWorkflow(BaseWorkflow):
                 anr_diagnosis,
                 crash_diagnosis=crash_diagnosis or None,
                 log_kind=log_kind,
+                problem=problem,
             )
+
+            if isinstance(problem, dict) and problem.get("_runtime_owned_context_loop"):
+                self._ingest_anr_evidence(
+                    context,
+                    parse_result=parse_result,
+                    resolved=resolved,
+                    memory_maps=memory_maps_data,
+                    anr_diagnosis=anr_diagnosis,
+                    crash_diagnosis=crash_diagnosis,
+                )
+                return {
+                    "status": "success",
+                    "platform": self.platform,
+                    "workflow": self.definition.name,
+                    "parse_result": parse_result,
+                    "memory_maps": memory_maps_data,
+                    "resolved_stack": resolved,
+                    "anr_diagnosis": anr_diagnosis,
+                    "crash_diagnosis": crash_diagnosis,
+                    "code_context": {},
+                    "analysis": None,
+                    "final_tip": final_tip,
+                    "metadata": {"problem_type": self.definition.problem_type, "log_kind": log_kind},
+                    "_analyze_prepare": {
+                        "initial_prompt": final_tip,
+                        "code_roots": list(problem.get("code_roots") or []),
+                        "step": 4,
+                        "total_steps": total_steps,
+                        "skip_context_loop": context.llm is None,
+                    },
+                }
 
             analysis = None
             if scope == "full":

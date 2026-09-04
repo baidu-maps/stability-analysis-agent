@@ -30,7 +30,7 @@ class RepoSearchTool(BaseTool):
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["grep", "read_file", "find_symbol", "find_references"],
+                        "enum": ["grep", "read_file", "find_symbol", "find_references", "history", "find_tests"],
                         "description": "检索模式",
                         "default": "grep",
                     },
@@ -51,6 +51,12 @@ class RepoSearchTool(BaseTool):
                         "description": "find_symbol 时是否使用 ctags 索引",
                         "default": False,
                     },
+                    "use_repo_map": {"type": "boolean", "description": "使用崩溃 anchor 个性化代码地图排序"},
+                    "stack_files": {"type": "array"},
+                    "stack_symbols": {"type": "array"},
+                    "fields": {"type": "array"},
+                    "callers": {"type": "array"},
+                    "include_tests": {"type": "boolean"},
                 },
                 "required": ["code_roots", "mode"],
             },
@@ -68,15 +74,20 @@ class RepoSearchTool(BaseTool):
             },
             category="provider",
             version="1.0.0",
+            risk="read_only",
+            side_effect=False,
+            idempotent=True,
+            requires_approval=False,
+            cost_class="medium",
         )
 
     def validate_input(self, input_data: Dict[str, Any]) -> "tuple[bool, Optional[str]]":
         if "code_roots" not in input_data:
             return False, "缺少 required 字段: code_roots"
         mode = str(input_data.get("mode") or "").strip().lower()
-        if mode not in ("grep", "read_file", "find_symbol", "find_references"):
+        if mode not in ("grep", "read_file", "find_symbol", "find_references", "history", "find_tests"):
             return False, f"无效 mode: {mode}"
-        if mode in ("grep", "find_symbol"):
+        if mode in ("grep", "find_symbol", "find_tests"):
             q = (
                 input_data.get("query")
                 or input_data.get("pattern")
@@ -97,6 +108,8 @@ class RepoSearchTool(BaseTool):
                 return False, "find_references 需要 symbol_name/query 或 resolved_stack"
         if mode == "read_file" and not str(input_data.get("file_path") or input_data.get("path") or "").strip():
             return False, "read_file 需要 file_path"
+        if mode == "history" and not str(input_data.get("file_path") or input_data.get("path") or "").strip():
+            return False, "history 需要 file_path"
         return True, None
 
     def execute(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -109,5 +122,6 @@ class RepoSearchTool(BaseTool):
             roots,
             use_ctags_index=bool(input_data.get("use_ctags_index", False)),
             max_matches=max_matches,
+            trace=input_data.get("_runtime_trace"),
         )
         return svc.execute(input_data)

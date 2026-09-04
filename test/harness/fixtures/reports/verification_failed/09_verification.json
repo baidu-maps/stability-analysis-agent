@@ -1,0 +1,5 @@
+{
+  "status": "failed",
+  "post_fix_diagnosis": {"status": "skipped"},
+  "reanalyze_diagnosis": {"status": "passed"}
+}

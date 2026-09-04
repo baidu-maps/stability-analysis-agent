@@ -2,6 +2,7 @@
   "use strict";
 
   const STORAGE_INPUT_KEY = "saa_web_task_input_v2";
+  const STORAGE_ENGINE_KEY = "saa_web_engine_v1";
 
   const TEMPLATES = [
     {
@@ -33,6 +34,7 @@
   let workspace = { library_dir: "", code_roots: [] };
   let vectorDbPrefs = { mode: "local", local_path: "" };
   let lastReportPath = "";
+  let lastTracePayload = null;
 
   function escapeHtml(s) {
     return String(s)
@@ -137,7 +139,7 @@
       apply_ai_fixes: true,
       backup_original_sources: true,
       output_format: "markdown",
-      engine: "direct",
+      engine: $("engineSelect").value,
     };
     return body;
   }
@@ -213,6 +215,8 @@
       vectorDbPrefs = data.vector_db || vectorDbPrefs;
       $("wsLibraryDir").value = workspace.library_dir || "";
       $("wsCodeRoots").value = (workspace.code_roots || []).join("\n");
+      const savedEngine = localStorage.getItem(STORAGE_ENGINE_KEY) || "direct";
+      $("engineSelect").value = ["direct", "langchain", "langgraph"].includes(savedEngine) ? savedEngine : "direct";
       const mode = vectorDbPrefs.mode || "local";
       const path = vectorDbPrefs.local_path || "";
       $("vectorDbInfo").textContent =
@@ -221,6 +225,7 @@
       $("wsLibraryDir").value = "examples/crash_cases/demo_basic/lib/mac";
       $("wsCodeRoots").value = "examples/crash_cases/demo_basic/code_dir";
       $("vectorDbInfo").textContent = "本地 · 默认路径";
+      $("engineSelect").value = localStorage.getItem(STORAGE_ENGINE_KEY) || "direct";
     }
   }
 
@@ -266,17 +271,207 @@
     $("resultSummary").textContent = text;
   }
 
-  async function fetchResult(runId) {
-    const res = await fetch(`/runs/${encodeURIComponent(runId)}/result`);
+  function showVerificationPanel(candidates) {
+    $("verificationPanel").classList.remove("hidden");
+    const list = $("verificationCandidates");
+    list.innerHTML = "";
+    const items = Array.isArray(candidates) ? candidates : [];
+    for (const item of items) {
+      const li = document.createElement("li");
+      const cmd = Array.isArray(item.command) ? item.command.join(" ") : String(item.command || "");
+      li.innerHTML = `<button type="button" class="btn ghost sm candidate-btn">${escapeHtml(cmd || item.reason || "candidate")}</button>`;
+      li.querySelector("button").onclick = () => { $("verificationCommand").value = cmd; };
+      list.appendChild(li);
+    }
+    $("btnVerify").onclick = resumeVerification;
+  }
+
+  async function renderCheckpoints(runId) {
+    const panel = $("checkpointPanel");
+    const list = $("checkpointList");
+    list.innerHTML = "";
+    try {
+      const res = await fetch(`/runs/${encodeURIComponent(runId)}/checkpoints`);
+      const data = await res.json();
+      const checkpoints = data.checkpoints || [];
+      if (!checkpoints.length) {
+        panel.classList.add("hidden");
+        return;
+      }
+      panel.classList.remove("hidden");
+      for (const item of checkpoints) {
+        const li = document.createElement("li");
+        li.textContent = `${item.stage || "?"} · ${item.status || "?"} · ${item.idempotency_key || item.checkpoint_id || ""}`;
+        list.appendChild(li);
+      }
+    } catch (_) {
+      panel.classList.add("hidden");
+    }
+  }
+
+  function showApprovalPanel(payload) {
+    $("approvalPanel").classList.remove("hidden");
+    const tool = (payload && payload.tool) || (payload && payload.pending_tool_approval && payload.pending_tool_approval.tool) || "unknown";
+    $("approvalToolName").textContent = `工具: ${tool}`;
+    $("btnApproveTool").onclick = () => resumeToolApproval(tool, payload);
+  }
+
+  async function resumeToolApproval(tool, payload) {
+    if (!currentRunId) return;
+    $("approvalMsg").textContent = "审批中…";
+    const body = {
+      tool,
+      approval_id: (payload && payload.approval && payload.approval.approval_id) || undefined,
+      fingerprint: (payload && payload.approval && payload.approval.command_fingerprint) || "",
+      input: (payload && payload.pending_tool_approval && payload.pending_tool_approval.input) || {},
+    };
+    const res = await fetch(`/runs/${encodeURIComponent(currentRunId)}/tool-approval`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
     const data = await res.json();
-    const status = data.status || "?";
+    $("approvalMsg").textContent = data.error || data.message || (data.tool_approval && data.tool_approval.status) || `状态: ${data.status || "?"}`;
+    if (res.ok) fetchResult(currentRunId).catch(() => {});
+  }
+
+  async function resumeVerification() {
+    if (!currentRunId) return;
+    const command = $("verificationCommand").value.trim();
+    if (!command) { $("verificationMsg").textContent = "请输入验证命令"; return; }
+    $("verificationMsg").textContent = "验证中…";
+    const res = await fetch(`/runs/${encodeURIComponent(currentRunId)}/verification`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command, post_fix_diagnosis: true }),
+    });
+    const data = await res.json();
+    $("verificationMsg").textContent = data.message || data.error || `状态: ${data.status || "?"}`;
+    if (res.ok && data.status !== "verification_pending") fetchResult(currentRunId).catch(() => {});
+  }
+
+  async function fetchResult(runId) {
+    const [resultRes, runRes] = await Promise.all([
+      fetch(`/runs/${encodeURIComponent(runId)}/result`),
+      fetch(`/runs/${encodeURIComponent(runId)}`),
+    ]);
+    const data = await resultRes.json();
+    const runData = runRes.ok ? await runRes.json() : {};
+    const status = data.status || runData.status || "?";
     const err = data.error ? `\n错误: ${data.error}` : "";
     const report = lastReportPath ? `\n报告目录: ${lastReportPath}` : "";
     const out = (data.output || "").slice(0, 4000);
     showResult(`状态: ${status}${err}${report}\n\n--- 输出摘要 ---\n${out}`);
+    renderTraceTimeline(runData.runtime_trace || data.runtime_trace);
+    renderEvaluationSummary(runData, data);
+    renderCheckpoints(runId).catch(() => {});
+    const candidates = runData.discovered_candidates
+      || (runData.verification && runData.verification.discovered_candidates)
+      || [];
+    if (candidates.length) showVerificationPanel(candidates);
     document.querySelectorAll(".step").forEach((el) => el.classList.add("done"));
     $("btnVectorDbCommit").disabled = false;
     maybeOfferVectorDbCommit(runId, data);
+  }
+
+  function renderEvaluationSummary(runData, resultData) {
+    const panel = $("evaluationPanel");
+    const box = $("evaluationSummary");
+    const diagnosis = (resultData && resultData.crash_diagnosis) || runData.crash_diagnosis || {};
+    const verification = (resultData && resultData.verification) || runData.verification || {};
+    const status = (resultData && resultData.status) || runData.status || "?";
+    const trace = runData.runtime_trace || (resultData && resultData.runtime_trace) || {};
+    const budget = trace.budget || {};
+    if (!status && !diagnosis.category && !verification.status) {
+      panel.classList.add("hidden");
+      box.innerHTML = "";
+      return;
+    }
+    panel.classList.remove("hidden");
+    box.innerHTML = [
+      `<div><strong>运行状态</strong>: ${escapeHtml(status)}</div>`,
+      `<div><strong>诊断类别</strong>: ${escapeHtml(diagnosis.category || diagnosis.fault_mode || "-")}</div>`,
+      `<div><strong>验证</strong>: ${escapeHtml(verification.status || "-")}</div>`,
+      `<div><strong>LLM/Tool</strong>: ${escapeHtml(String(budget.llm_calls || 0))}/${escapeHtml(String(budget.tool_calls || 0))}</div>`,
+    ].join("");
+  }
+
+  function statusClass(status) {
+    const value = String(status || "").toLowerCase();
+    if (value === "success" || value === "completed" || value === "passed") return "trace-status-success";
+    if (value === "denied" || value === "failed" || value === "error") return "trace-status-failed";
+    if (value === "pending") return "trace-status-pending";
+    return "";
+  }
+
+  function renderTraceBudget(trace) {
+    const bar = $("traceBudgetBar");
+    const budget = trace && trace.budget ? trace.budget : null;
+    if (!budget) {
+      bar.classList.add("hidden");
+      bar.textContent = "";
+      return;
+    }
+    bar.classList.remove("hidden");
+    const tokens = (budget.token_usage && budget.token_usage.total_tokens) || 0;
+    bar.textContent = [
+      `engine=${trace.engine || "-"}`,
+      `llm=${budget.llm_calls || 0}`,
+      `tool=${budget.tool_calls || 0}`,
+      `tokens=${tokens}`,
+      `cost=${budget.estimated_cost || 0}`,
+    ].join(" · ");
+  }
+
+  function populateTraceFilters(events) {
+    const fill = (id, key) => {
+      const select = $(id);
+      const current = select.value;
+      const values = Array.from(new Set(events.map((e) => String(e[key] || "")).filter(Boolean))).sort();
+      select.innerHTML = `<option value="">全部</option>` + values.map((v) => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join("");
+      if (values.includes(current)) select.value = current;
+    };
+    fill("traceFilterStage", "stage");
+    fill("traceFilterKind", "kind");
+    fill("traceFilterStatus", "status");
+  }
+
+  function renderTraceTimeline(trace) {
+    const panel = $("tracePanel");
+    const body = $("traceTableBody");
+    body.innerHTML = "";
+    const events = trace && Array.isArray(trace.events) ? trace.events : [];
+    renderTraceBudget(trace);
+    if (!events.length) {
+      panel.classList.add("hidden");
+      return;
+    }
+    panel.classList.remove("hidden");
+    lastTracePayload = trace;
+    populateTraceFilters(events);
+    const stageFilter = $("traceFilterStage").value;
+    const kindFilter = $("traceFilterKind").value;
+    const statusFilter = $("traceFilterStatus").value;
+    for (const event of events) {
+      if (stageFilter && event.stage !== stageFilter) continue;
+      if (kindFilter && event.kind !== kindFilter) continue;
+      if (statusFilter && event.status !== statusFilter) continue;
+      const row = document.createElement("tr");
+      row.className = [
+        statusClass(event.status),
+        event.event === "tool.policy" && event.status === "denied" ? "trace-row-denied" : "",
+      ].filter(Boolean).join(" ");
+      row.innerHTML = [
+        escapeHtml(event.seq ?? ""),
+        escapeHtml(event.stage ?? ""),
+        escapeHtml(event.kind ?? ""),
+        escapeHtml(event.name ?? ""),
+        escapeHtml(event.event ?? ""),
+        escapeHtml(event.status ?? ""),
+        escapeHtml(event.timestamp ?? ""),
+        escapeHtml(event.duration_ms ?? ""),
+      ].map((cell) => `<td>${cell}</td>`).join("");
+      body.appendChild(row);
+    }
   }
 
   async function startRun(ev) {
@@ -303,12 +498,20 @@
     $("consoleLog").textContent = "";
     lastReportPath = "";
     hideVectorDbCommit();
+    $("verificationPanel").classList.add("hidden");
+    $("approvalPanel").classList.add("hidden");
+    $("tracePanel").classList.add("hidden");
+    $("traceTableBody").innerHTML = "";
+    $("traceBudgetBar").classList.add("hidden");
+    $("evaluationPanel").classList.add("hidden");
+    $("evaluationSummary").innerHTML = "";
     resetProgress();
     setRunning(true);
     $("runMeta").textContent = "";
     showResult("运行中…");
 
     const body = buildFullRunRequest(parsed);
+    localStorage.setItem(STORAGE_ENGINE_KEY, body.engine);
     appendLog("POST /runs (full pipeline)", "req");
 
     let res;
@@ -356,6 +559,12 @@
           if (p.includes("reports/") && !p.endsWith(".md")) {
             lastReportPath = p.replace(/\/[^/]+\.(md|json|txt)$/, "");
           }
+        } else if (t === "verification_pending") {
+          showVerificationPanel((evObj.data && evObj.data.discovered_candidates) || []);
+          showResult("等待用户配置验证命令");
+        } else if (t === "approval_required" || t === "tool_approval_required") {
+          showApprovalPanel(evObj.data || {});
+          showResult("等待用户批准工具调用");
         } else if (t === "run_finished" || t === "run_canceled") {
           closeEvents();
           setRunning(false);
@@ -465,6 +674,11 @@
     $("btnCancel").addEventListener("click", cancelRun);
     $("btnSaveWorkspace").addEventListener("click", saveWorkspace);
     $("skillInstallForm").addEventListener("submit", installSkill);
+    for (const id of ["traceFilterStage", "traceFilterKind", "traceFilterStatus"]) {
+      $(id).addEventListener("change", () => {
+        if (lastTracePayload) renderTraceTimeline(lastTracePayload);
+      });
+    }
   }
 
   bind();

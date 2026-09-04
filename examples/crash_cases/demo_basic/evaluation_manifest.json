@@ -1,0 +1,47 @@
+{
+  "suite_id": "demo_basic",
+  "report_root": "",
+  "cases": [
+    {
+      "id": "null_ptr",
+      "crash_log": "examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash",
+      "expected_category": "NullPtr",
+      "expected_fault_mode": "NullPtr",
+      "expected_file": "my_lib.cpp",
+      "expected_function": "crash_nullptr",
+      "max_invalid_context_requests": 2
+    },
+    {
+      "id": "dangling_ptr",
+      "crash_log": "examples/crash_cases/demo_basic/logs/mac/DanglingPtr_2026-04-07_11-09-30.crash",
+      "expected_category": "DanglingPtr",
+      "expected_fault_mode": "DanglingPtr",
+      "expected_file": "my_lib.cpp",
+      "expected_function": "crash_dangling"
+    },
+    {
+      "id": "out_of_bounds",
+      "crash_log": "examples/crash_cases/demo_basic/logs/mac/OutOfBounds_2026-04-07_11-09-31.crash",
+      "expected_category": "OutOfBounds",
+      "expected_fault_mode": "OutOfBounds",
+      "expected_file": "my_lib.cpp",
+      "expected_function": "crash_oob"
+    },
+    {
+      "id": "div_zero",
+      "crash_log": "examples/crash_cases/demo_basic/logs/mac/DivZero_2026-04-07_11-09-32.crash",
+      "expected_category": "DivZero",
+      "expected_fault_mode": "DivZero",
+      "expected_file": "my_lib.cpp",
+      "expected_function": "crash_divzero"
+    },
+    {
+      "id": "stack_overflow",
+      "crash_log": "examples/crash_cases/demo_basic/logs/mac/StackOverflow_2026-04-07_11-09-34.crash",
+      "expected_category": "StackOverflow",
+      "expected_fault_mode": "StackOverflow",
+      "expected_file": "my_lib.cpp",
+      "expected_function": "crash_stackoverflow"
+    }
+  ]
+}

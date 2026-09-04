@@ -1,0 +1,4 @@
+signal=SIGSEGV fault_address=0x0 module=libcore.dylib
+#00 libcore.dylib core::Manager::reset code/core/Manager.cpp:41
+#01 app main code/app/main.cpp:10
+diagnosis=null_pointer

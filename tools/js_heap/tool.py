@@ -17,6 +17,11 @@ class JsHeapAnalyzerTool(BaseTool):
             input_schema={"type": "object", "properties": {"path": {"type": "string"}, "top_n": {"type": "integer"}}, "required": ["path"]},
             output_schema={"type": "object"},
             category="analyzer",
+            risk="read_only",
+            side_effect=False,
+            idempotent=True,
+            requires_approval=False,
+            cost_class="medium",
         )
 
     def validate_input(self, input_data: Dict[str, Any]) -> Tuple[bool, Optional[str]]:

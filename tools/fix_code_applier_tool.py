@@ -45,6 +45,11 @@ class FixCodeApplierTool(BaseTool):
             },
             category="provider",
             version="1.0.0",
+            risk="workspace_write",
+            side_effect=True,
+            requires_approval=True,
+            idempotent=False,
+            cost_class="medium",
         )
 
     def validate_input(self, input_data: Dict[str, Any]) -> "tuple[bool, Optional[str]]":

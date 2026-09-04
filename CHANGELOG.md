@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.3.6] - 2026-09-04
+
+### Added
+
+- **Harness alignment phase 2**: `services/feedback_analyze.py` (verify/judge failure → bounded analyze revision); `services/context_observation_resolver.py` (`memory_pattern`, `verification_log`, `trace_snippet`); `11_judge.json`; `record_run_memory()` case commit audit; Skill `permissions` → `PolicyEngine`; evaluation manifest `expected_decision` / `expected_judge_verdict` / `max_invalid_context_requests`.
+- **Harness alignment**: `services/context_loop_contract.py` unifies multi-round LLM protocol; verification presets + discover candidates; Web checkpoint/candidate UI; offline evaluation matrix in CI; round-level analyze replay (`analyze:round:N`).
+
+### Changed
+
+- **`--scope full` default**: enables `context_loop` with up to 3 rounds unless `--agent-loop single`.
+- Default runtime budgets: `--max-llm-calls=8`, `--max-tool-calls=32`, `--max-runtime-seconds=3600` (0 still means unlimited when explicitly set).
+- `_build_prompt_final_tip` context_loop sections sourced from contract module.
+
+### Documentation
+
+- [CONTEXT_LOOP_CONTRACT.md](docs/architecture/CONTEXT_LOOP_CONTRACT.md), [HARNESS_MIGRATION.md](docs/cli/HARNESS_MIGRATION.md)
+
 ## [Unreleased]
 
 ## [1.3.5] - 2026-08-24

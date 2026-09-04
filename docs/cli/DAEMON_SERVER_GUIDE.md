@@ -62,7 +62,7 @@ daemon listening on http://127.0.0.1:8765 (protocol=1)
 
 JSON 请求体默认上限 **16 MiB**（`--max-body-bytes` / `STABILITY_AGENT_DAEMON_MAX_BODY_BYTES`）。超过时在读入内存前返回 **413** `payload_too_large`。`GET /health` 的 `max_body_bytes` 为当前上限。1.2MB 崩溃日志可正常提交。
 
-远程/无鉴权端口建议加 `--deny-local-path-fields`（或 `STABILITY_AGENT_DAEMON_DENY_LOCAL_PATH_FIELDS=1`），命中 `crash_log` / `code_root` / `library_dir` 等本地路径字段时返回 **400** `forbidden_field`。省略 `apply_ai_fixes` 时 HTTP 默认为 `false`。空 `crash_log_content` 为 **400** `crash_log_content_required`。`--access-log`（或 `STABILITY_AGENT_DAEMON_ACCESS_LOG=1`）将 method/path/状态打到 stderr。`--allow-local-path-fields` 用于本机 Web UI。
+远程/无鉴权端口建议加 `--deny-local-path-fields`（或 `STABILITY_AGENT_DAEMON_DENY_LOCAL_PATH_FIELDS=1`），命中 `crash_log` / `code_roots` / `library_dir` 等本地路径字段时返回 **400** `forbidden_field`。省略 `apply_ai_fixes` 时 HTTP 默认为 `false`。空 `crash_log_content` 为 **400** `crash_log_content_required`。`--access-log`（或 `STABILITY_AGENT_DAEMON_ACCESS_LOG=1`）将 method/path/状态打到 stderr。`--allow-local-path-fields` 用于本机 Web UI。
 
 ---
 
@@ -141,6 +141,7 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
   "llm_mode": null,
   "llm_profile": null,
   "include_memory_in_05": false,
+  "external_agent_evaluation": false,
   "vector_db_path": null,
   "vector_db_max_results": null,
   "vector_db_record_usage": false,
@@ -159,16 +160,17 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
 - `crash_log` / `crash_log_content` / `crash_log_dir`：三选一；`crash_log_dir` 优先；`crash_log_content` 通过 stdin 传入（`--crash-log-file -`）
 - **省略字段 = 与直接跑 CLI 的 argparse 默认值相同**（daemon 对照 `build_parser().parse_args([])`，默认值不拼进子进程命令行）。例如不传 `max_agent_rounds` 时 CLI 仍为 `0`（随 `prompt_mode`：analysis=3，其它=1）；不传 `streaming` 时沿用 provider 配置。
 - 显式传值才会覆盖：`max_agent_rounds: 1` 会加上 `--max-agent-rounds 1`；`streaming: false` 会加上 `--no-streaming`。
-- `engine`：`direct`（默认）/ `langchain` / `langgraph`（旧值 `sequential` 会映射为 `direct`）
+- `engine`：`direct`（默认）/ `langchain` / `langgraph`；只选择统一 AgentRuntime 使用的 LLM backend
 - `output_format`：`markdown`（默认）/ `json` / `text`
 - `scope`：`full`（默认）/ `gen_prompt_only` / `parse_stack_only` / `parse_log_only`，控制 Agent 执行流程范围（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--scope-取值)）
 - `prompt_mode`：`fix`（默认）/ `analysis`，控制 `06_ai_prompt.md` / LLM 输入偏补丁输出还是偏证据分析；不控制是否自动应用修复（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--prompt-mode-取值)）
 - `agent_loop`：`null`（省略或传 `null` 时随 `prompt_mode`：`analysis`→`context_loop`，其它→`single`）/ `single` / `context_loop`，控制是否允许模型请求补充函数源码后继续多轮分析；独立于 `engine`（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--agent-loop-取值)）
 - `apply_ai_fixes` / `backup_original_sources`：默认 `true`；为 `false` 时分别传 `--no-apply-ai-fixes` / `--no-backup-original-sources`
+- `external_agent_evaluation`：默认 `false`；仅传 `true` 时生成 `external_agent_evaluation/` 对比任务文件，不会调用外部 Agent。该字段必须是 JSON boolean，字符串 `"true"` 会返回 400。
 - daemon 对 `scope=full` 且 `apply_ai_fixes=true` 的请求自动创建 detached Git worktree，CLI 只修改该 run 的隔离目录，不会直接回写请求中的源码目录。`code_roots` 必须位于 Git 仓库内，且对应范围不能有未提交修改；非 Git 或 dirty code root 会使 run 以 `workspace_error` 结束。
 - worktree 默认保留在系统临时目录的 `stability-analysis-agent/worktrees/<run_id>/` 下，便于检查和继续处理；可通过 `STABILITY_AGENT_WORKTREE_DIR` 指定管理根目录。
-- `force_*` / `native_leak_*` / `llm_mode` / `llm_profile` / `include_memory_in_05` / 向量库与 04b 超时裁剪字段 / `max_stack_frames_symbol_enrich` / `max_stack_frames_in_prompt`：透传对应 CLI 旗标（仅当与 CLI 默认不同）
-- `consultation` / `prompt` / `model`：兼容旧客户端，**不会**转成 CLI 参数（当前 CLI 无 `--consultation` / `--model`）
+- `force_*` / `native_leak_*` / `llm_mode` / `llm_profile` / `include_memory_in_05` / `external_agent_evaluation` / 向量库与 04b 超时裁剪字段 / `max_stack_frames_symbol_enrich` / `max_stack_frames_in_prompt`：透传对应 CLI 旗标（仅当与 CLI 默认不同）
+- 请求只接受当前协议字段；`consultation` / `prompt` / `model` 不属于当前协议，提交后会被忽略
 - 未知字段会被忽略（`run_request_from_dict`）
 
 **响应：**
@@ -217,13 +219,33 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
   "patch_path": "/path/to/report/09_ai_fix.patch"
 }
 ```
-`status` 取值：`queued` / `running` / `done` / `error` / `canceled`  
+`status` 取值：`queued` / `running` / `verification_pending` / `done` / `error` / `canceled`
 `progress`：阶段文案；对外另有 `progress_percent`（0–100，可 null）。  
 `error`：失败/取消时的中文摘要，可直接转述。  
 `workspace_dir`：自动改码隔离 worktree；任务未改码时经常为 `null`，不是必有字段。  
 `report_dir`：从 CLI stderr 行 `report 已保存到:` 解析，供 Web 写向量库使用。  
 `patch_path`：存在代码变化时生成的 Git patch；没有变化时为 `null`。  
-任务表在内存中，daemon 重启后旧 run_id 全部 404，应重新提交。  
+`verification_pending`：已产生 AI 修改，但未配置验证 provider；候选命令不会自动执行。提交
+`POST /runs/{run_id}/verification` 并提供明确的 `command` 后恢复验证，验证通过才同步隔离 worktree。
+验证失败时 daemon 会尝试从 `08_apply_ai_fixes.json` 备份回滚 worktree 内修改。
+
+`approval_required`：工具策略要求显式批准。Web UI 会显示审批面板；也可调用
+`POST /runs/{run_id}/tool-approval`。body 必须完整引用响应中的 pending approval，例如：
+`{"tool":"verify","tool_call_id":"...","fingerprint":"...","scope":"single_command","approval_id":"...","status":"granted"}`。
+Daemon 不接受客户端新建 approval，也不允许覆盖 approval_id、fingerprint 或 scope。
+Daemon 重启后会从 run 快照恢复 `verification_pending` **与** `approval_required` 任务，
+并发送 SSE `tool_approval_required`。CLI 落盘 `09_pending_tool_approval.json`，可用
+修复阶段不能通过 replay 隐式重放；必须创建新的修复任务并重新审批。
+
+`GET /runs/{run_id}/checkpoints` 查看 checkpoint；`POST /runs/{run_id}/resume` 用于状态恢复或提交显式验证。
+`POST /runs/{run_id}/retry-stage` 可重试 `observe` / `analyze` / `plan` / `verify` / `decide`，必须提供
+checkpoint、source/worktree revision 和幂等键；`act` replay 永远拒绝。verify 的 execute 请求还必须携带
+`{"verification":{"command":[...]}}`，候选命令不会自动执行。可选 `checkpoint_id` 与
+`runtime_state.checkpoints` 对齐。
+
+Run 快照（`services/run_snapshot.py` / `services/run_store.py`）统一 schema，包含
+`runtime_trace`、`runtime_state` 与 `pending_tool_approval`。
+运行快照会恢复处于 `verification_pending` 或 `approval_required` 的 run；其他已结束 run 只保留报告文件。  
 对 running 任务 POST `/cancel` 后可能仍返回 `status: running`，需再查 `/status`。
 
 ---

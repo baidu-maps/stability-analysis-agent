@@ -91,6 +91,11 @@ class SymbolCallsiteFinderTool(BaseTool):
             },
             category="provider",
             version="1.0.0",
+            risk="read_only",
+            side_effect=False,
+            idempotent=True,
+            requires_approval=False,
+            cost_class="low",
         )
 
     def _extract_symbol_from_resolved(self, resolved_function: str) -> str:

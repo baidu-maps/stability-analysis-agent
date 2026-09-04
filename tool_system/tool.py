@@ -24,6 +24,17 @@ class ToolDefinition:
     category: str                      # 分类: parser/resolver/provider/analysis/llm
     version: str = "1.0.0"             # 版本
     metadata: Dict[str, Any] = field(default_factory=dict)  # 额外元信息
+    # Harness metadata. Defaults preserve the behavior of existing extensions.
+    risk: str = "read_only"             # read_only/workspace_write/execute/network/destructive
+    side_effect: bool = False
+    idempotent: bool = True
+    timeout_sec: Optional[float] = None
+    # subprocess: tool uses subprocess.run(timeout=...) — gateway does not wrap in a
+    # blocking thread pool. best_effort: caller timeout only. none: no gateway timeout.
+    timeout_enforcement: str = "best_effort"
+    requires_approval: bool = False
+    cost_class: str = "low"
+    allowed_roots: List[str] = field(default_factory=list)
 
 
 class BaseTool(ABC):
@@ -67,6 +78,20 @@ class BaseTool(ABC):
         if not valid:
             raise ValueError(f"输入验证失败: {error_msg}")
         return self.execute(input_data)
+
+    def runtime_policy(self) -> Dict[str, Any]:
+        """Return execution policy without requiring every plugin to be updated."""
+        definition = self.definition
+        return {
+            "risk": getattr(definition, "risk", "read_only"),
+            "side_effect": bool(getattr(definition, "side_effect", False)),
+            "idempotent": bool(getattr(definition, "idempotent", True)),
+            "timeout_sec": getattr(definition, "timeout_sec", None),
+            "timeout_enforcement": getattr(definition, "timeout_enforcement", "best_effort"),
+            "requires_approval": bool(getattr(definition, "requires_approval", False)),
+            "cost_class": getattr(definition, "cost_class", "low"),
+            "allowed_roots": list(getattr(definition, "allowed_roots", []) or []),
+        }
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} name={self.definition.name}>"

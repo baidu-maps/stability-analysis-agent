@@ -36,7 +36,7 @@ from tools.crash_parser.abort_message import (
     thread_type_from_name,
 )
 from tools.crash_parser.meta import extract_crash_info
-from workflows.crash_analysis_workflow import _truncate_analysis_prompt
+from services.analyze_llm import truncate_analysis_prompt
 
 
 class TestAbortMessageAndHeapAbort(unittest.TestCase):
@@ -193,7 +193,7 @@ class TestPromptTruncateKeepsDiagnosis(unittest.TestCase):
             "## 变量相关函数\n" + ("noise\n" * 4000) + "\n"
             "## 输出要求\nmust keep tail\n"
         )
-        out = _truncate_analysis_prompt(prompt, 1800)
+        out = truncate_analysis_prompt(prompt, 1800)
         self.assertIn("崩溃证据诊断", out)
         self.assertIn("输出要求", out)
         self.assertNotIn("PROMPT TRUNCATED — 已优先保留诊断与输出约束", out)
@@ -207,7 +207,7 @@ class TestPromptTruncateKeepsDiagnosis(unittest.TestCase):
             "## 变量相关函数\n" + ("noise\n" * 5000) + "\n"
             "## 输出要求\nmust keep tail\n"
         )
-        out = _truncate_analysis_prompt(prompt, 2500)
+        out = truncate_analysis_prompt(prompt, 2500)
         self.assertIn("getAttributeInfo", out)
         self.assertIn("输出要求", out)
         self.assertNotIn("## 变量相关函数", out)
@@ -562,4 +562,3 @@ class TestNullPointerImplication(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

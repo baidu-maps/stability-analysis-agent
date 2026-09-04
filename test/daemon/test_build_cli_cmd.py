@@ -42,7 +42,7 @@ class BuildCliCmdTests(unittest.TestCase):
         self.assertIn("/tmp/logs", cmd)
         self.assertNotIn("--crash-log", cmd)
         self.assertIn("--library-dir", cmd)
-        self.assertIn("--code-root", cmd)
+        self.assertIn("--code-roots", cmd)
 
     def test_no_apply_ai_fixes_and_no_backup(self) -> None:
         req = run_request_from_dict(
@@ -68,6 +68,7 @@ class BuildCliCmdTests(unittest.TestCase):
                 "llm_mode": "auto",
                 "llm_profile": "strong",
                 "include_memory_in_05": True,
+                "external_agent_evaluation": True,
                 "native_leak_dir": "/tmp/leak",
                 "engine": "langgraph",
                 "scope": "parse_stack_only",
@@ -83,6 +84,7 @@ class BuildCliCmdTests(unittest.TestCase):
             "--force-memory-analysis",
             "--force-timeline-analysis",
             "--include-memory-in-05",
+            "--external-agent-evaluation",
             "--streaming",
         ):
             self.assertIn(flag, cmd)
@@ -99,22 +101,9 @@ class BuildCliCmdTests(unittest.TestCase):
         self.assertIn("--agent-loop", cmd)
         self.assertIn("single", cmd)
 
-    def test_legacy_sequential_engine_and_unknown_keys(self) -> None:
-        req = run_request_from_dict(
-            {
-                "crash_log": "/tmp/a.crash",
-                "engine": "sequential",
-                "unknown_web_field": "x",
-                "skip_ai": True,
-            }
-        )
-        self.assertEqual(req.engine, "direct")
-        self.assertEqual(req.scope, "gen_prompt_only")
-        cmd, _ = _build_cli_cmd(req)
-        # default direct → omit --engine
-        self.assertNotIn("--engine", cmd)
-        self.assertIn("--scope", cmd)
-        self.assertIn("gen_prompt_only", cmd)
+    def test_invalid_engine_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            run_request_from_dict({"crash_log": "/tmp/a.crash", "engine": "sequential"})
 
     def test_web_daemon_non_interactive_vector_db_flags(self) -> None:
         req = run_request_from_dict({"crash_log": "/tmp/a.crash", "scope": "full"})
@@ -174,6 +163,11 @@ class BuildCliCmdTests(unittest.TestCase):
         self.assertEqual(parsed.vector_db_path, defaults.vector_db_path)
         self.assertEqual(parsed.vector_db_max_results, defaults.vector_db_max_results)
         self.assertEqual(parsed.include_memory_in_05, defaults.include_memory_in_05)
+        self.assertEqual(
+            parsed.external_agent_evaluation,
+            defaults.external_agent_evaluation,
+        )
+        self.assertFalse(parsed.external_agent_evaluation)
         self.assertEqual(parsed.max_sibling_member_functions, defaults.max_sibling_member_functions)
         self.assertEqual(defaults.max_sibling_member_functions, 0)
         self.assertEqual(parsed.max_stack_frames_symbol_enrich, defaults.max_stack_frames_symbol_enrich)

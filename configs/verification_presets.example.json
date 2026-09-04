@@ -1,0 +1,39 @@
+{
+  "presets": {
+    "cmake_build": {
+      "provider": "preset",
+      "mode": "build",
+      "command": ["cmake", "--build", "{workspace}/build"],
+      "reason": "CMake 默认 build 目录编译",
+      "confidence": 0.85
+    },
+    "gradle_test": {
+      "provider": "preset",
+      "mode": "test",
+      "command": ["./gradlew", "test"],
+      "reason": "Gradle wrapper 单元测试",
+      "confidence": 0.9
+    },
+    "pytest": {
+      "provider": "preset",
+      "mode": "test",
+      "command": ["python3", "-m", "pytest"],
+      "reason": "Python pytest 默认入口",
+      "confidence": 0.7
+    },
+    "xcodebuild_test": {
+      "provider": "preset",
+      "mode": "test",
+      "command": ["xcodebuild", "-scheme", "{target}", "test"],
+      "reason": "Xcode scheme 测试（需确认 scheme）",
+      "confidence": 0.65
+    },
+    "engine_build": {
+      "provider": "preset",
+      "mode": "build",
+      "command": ["bash", "mk/cmake/build.sh"],
+      "reason": "引擎仓库常见 build.sh 入口（见 ROADMAP engine-build preset）",
+      "confidence": 0.55
+    }
+  }
+}

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
+import threading
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -86,6 +88,75 @@ class BaseLLMAdapter(ABC):
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} model={self.model}>"
+
+
+class ReplayLLMAdapter(BaseLLMAdapter):
+    """Deterministic, network-free adapter for CI and report replay."""
+
+    @staticmethod
+    def _load_responses_from_report(report_dir: Path) -> List[Any]:
+        root = Path(report_dir).expanduser().resolve()
+        responses: List[Any] = []
+        for round_dir in sorted(root.glob("round_*")):
+            for name in ("07_ai_gen_res.md", "07_ai_gen_res.txt"):
+                path = round_dir / name
+                if path.is_file():
+                    responses.append({"content": path.read_text(encoding="utf-8")})
+                    break
+        fixture = root / "offline_replay_responses.json"
+        if not responses and fixture.is_file():
+            payload = json.loads(fixture.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                responses = list(payload.get("responses") or [])
+            elif isinstance(payload, list):
+                responses = payload
+        return responses
+
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        responses = config.get("responses")
+        response_file = str(config.get("response_file") or "").strip()
+        report_dir = str(config.get("report_dir") or "").strip()
+        if response_file:
+            payload = json.loads(Path(response_file).expanduser().resolve().read_text(encoding="utf-8"))
+            responses = payload.get("responses") if isinstance(payload, dict) else payload
+        if report_dir and not responses:
+            responses = self._load_responses_from_report(Path(report_dir))
+        if not isinstance(responses, list) or not responses:
+            raise ValueError("offline_replay requires a non-empty responses list or response_file")
+        self._responses = list(responses)
+        self._cursor = 0
+        self._lock = threading.Lock()
+        self.provider = "offline_replay"
+
+    def _next(self) -> LLMResponse:
+        with self._lock:
+            if self._cursor >= len(self._responses):
+                raise RuntimeError("offline replay responses exhausted")
+            raw = self._responses[self._cursor]
+            index = self._cursor
+            self._cursor += 1
+        if isinstance(raw, str):
+            return LLMResponse(content=raw, metadata={"provider": self.provider, "replay_index": index})
+        if not isinstance(raw, dict) or not isinstance(raw.get("content"), str):
+            raise ValueError(f"offline replay response {index} must be a string or object with content")
+        metadata = dict(raw.get("metadata") or {}) if isinstance(raw.get("metadata"), dict) else {}
+        metadata.update(provider=self.provider, replay_index=index)
+        if raw.get("estimated_cost") is not None:
+            metadata["estimated_cost"] = float(raw["estimated_cost"])
+        return LLMResponse(
+            content=raw["content"],
+            tool_calls=list(raw.get("tool_calls") or []) or None,
+            usage=dict(raw.get("usage") or {}) or None,
+            metadata=metadata,
+        )
+
+    def chat(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None, **kwargs) -> LLMResponse:
+        del messages, tools, kwargs
+        return self._next()
+
+    def stream(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None, **kwargs) -> Generator[str, None, None]:
+        yield self.chat(messages, tools, **kwargs).content
 
 
 # ========== 三种实现 ==========
@@ -584,10 +655,7 @@ class DirectLLMAdapter(BaseLLMAdapter):
 
 
 class LangChainLLMAdapter(BaseLLMAdapter):
-    """
-    LangChain 方式：使用 LangChain Agent
-    适用于需要灵活工具调用的场景
-    """
+    """Pure LangChain model backend; orchestration belongs to AgentRuntime."""
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
@@ -595,16 +663,8 @@ class LangChainLLMAdapter(BaseLLMAdapter):
 
     def _init_langchain(self, config: Dict[str, Any]):
         """初始化 LangChain"""
-        self.agent_executor = None
-        self._langgraph_available = False
-
         try:
             from langchain_openai import ChatOpenAI
-            from langchain.agents import AgentExecutor, create_openai_functions_agent
-            from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-            from langchain.schema import HumanMessage, SystemMessage
-
-            # 初始化 LLM
             provider = config.get("provider", "openai")
             if provider in ("openai", "glm", "baidu_qianfan"):
                 api_key = (
@@ -639,49 +699,41 @@ class LangChainLLMAdapter(BaseLLMAdapter):
                     max_tokens=self.max_tokens
                 )
 
-            logger.info("LangChain initialized successfully")
-            self._langgraph_available = True
-
+            else:
+                raise ValueError(f"unsupported LangChain provider: {provider}")
+            self.provider = str(provider)
+            logger.info("LangChain model backend initialized successfully")
         except ImportError as e:
             logger.warning(f"LangChain not available: {e}")
             self.llm = None
 
-    def set_agent_executor(self, agent_executor: Any, tools: List[Any] = None):
-        """设置 Agent Executor（外部注入）"""
-        self.agent_executor = agent_executor
-        self.tools = tools or []
-
     def chat(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None, **kwargs) -> LLMResponse:
-        if self.agent_executor is None:
-            raise RuntimeError("AgentExecutor not set. Call set_agent_executor() first.")
-
-        # 提取最后一条 user 消息作为 input
-        user_input = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
-
-        try:
-            result = self.agent_executor.invoke({"input": user_input})
-            output = result.get("output", "")
-
-            return LLMResponse(
-                content=output,
-                metadata={"method": "langchain_agent"}
-            )
-        except Exception as e:
-            logger.error(f"LangChain agent failed: {e}")
-            raise RuntimeError(f"LangChain agent failed: {e}")
+        del tools
+        if self.llm is None:
+            raise RuntimeError("LangChain model backend is unavailable")
+        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+        role_types = {"system": SystemMessage, "assistant": AIMessage, "user": HumanMessage}
+        converted = [role_types.get(str(item.get("role") or "user"), HumanMessage)(content=str(item.get("content") or "")) for item in messages]
+        response = self.llm.invoke(converted, **kwargs)
+        usage = getattr(response, "usage_metadata", None) or getattr(response, "response_metadata", {}).get("token_usage")
+        return LLMResponse(content=str(getattr(response, "content", "")), usage=usage,
+                           metadata={"method": "langchain_model"})
 
     def stream(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None, **kwargs) -> Generator[str, None, None]:
-        # LangChain Agent 不支持真正的流式，返回空
-        # 可以考虑实现假流式
-        result = self.chat(messages, tools, **kwargs)
-        yield result.content
+        del tools
+        if self.llm is None:
+            raise RuntimeError("LangChain model backend is unavailable")
+        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+        role_types = {"system": SystemMessage, "assistant": AIMessage, "user": HumanMessage}
+        converted = [role_types.get(str(item.get("role") or "user"), HumanMessage)(content=str(item.get("content") or "")) for item in messages]
+        for chunk in self.llm.stream(converted, **kwargs):
+            content = getattr(chunk, "content", "")
+            if content:
+                yield str(content)
 
 
 class LangGraphLLMAdapter(BaseLLMAdapter):
-    """
-    LangGraph 方式：使用 LangGraph 图结构
-    适用于需要复杂流程控制的场景
-    """
+    """Pure LangGraph-stack model backend without a business state graph."""
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
@@ -689,15 +741,10 @@ class LangGraphLLMAdapter(BaseLLMAdapter):
 
     def _init_langgraph(self, config: Dict[str, Any]):
         """初始化 LangGraph"""
-        self.graph_app = None
-        self.checkpointer = None
-
         try:
-            from langgraph.graph import StateGraph, END
-            from langgraph.graph.message import add_messages
-            from langgraph.checkpoint.memory import MemorySaver
-
-            # 初始化 LLM
+            # Importing langgraph is intentional: this backend verifies that
+            # the selected stack is installed, but AgentRuntime owns the graph.
+            import langgraph  # noqa: F401
             from langchain_openai import ChatOpenAI
 
             provider = config.get("provider", "openai")
@@ -733,77 +780,37 @@ class LangGraphLLMAdapter(BaseLLMAdapter):
                     max_tokens=self.max_tokens
                 )
 
-            # 初始化 checkpointer
-            self.checkpointer = MemorySaver()
-
-            logger.info("LangGraph initialized successfully")
-            self._langgraph_available = True
-
+            else:
+                raise ValueError(f"unsupported LangGraph provider: {provider}")
+            self.provider = str(provider)
+            logger.info("LangGraph model backend initialized successfully")
         except ImportError as e:
             logger.warning(f"LangGraph not available: {e}")
             self.llm = None
 
-    def set_graph_app(self, graph_app: Any):
-        """设置 Graph App（外部注入）"""
-        self.graph_app = graph_app
-
     def chat(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None, **kwargs) -> LLMResponse:
-        if self.graph_app is None:
-            # 如果没有设置 graph_app，使用简单的 LLM 调用
-            if self.llm is None:
-                raise RuntimeError("Neither graph_app nor LLM available")
-
-            # 简单调用 LLM
-            from langchain.schema import HumanMessage
-            langchain_messages = [HumanMessage(content=m["content"]) for m in messages if m["role"] != "system"]
-            response = self.llm.invoke(langchain_messages)
-
-            return LLMResponse(
-                content=response.content,
-                metadata={"method": "langgraph_fallback"}
-            )
-
-        # 使用 LangGraph 图执行
-        try:
-            config = {"configurable": {"thread_id": kwargs.get("thread_id", "default")}}
-            result = self.graph_app.invoke(
-                {"messages": messages},
-                config
-            )
-
-            # 提取最后一条消息
-            last_message = result.get("messages", [])[-1] if result.get("messages") else None
-            content = last_message.content if hasattr(last_message, "content") else str(last_message)
-
-            return LLMResponse(
-                content=content,
-                metadata={"method": "langgraph"}
-            )
-        except Exception as e:
-            logger.error(f"LangGraph execution failed: {e}")
-            raise RuntimeError(f"LangGraph execution failed: {e}")
+        del tools
+        if self.llm is None:
+            raise RuntimeError("LangGraph model backend is unavailable")
+        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+        role_types = {"system": SystemMessage, "assistant": AIMessage, "user": HumanMessage}
+        converted = [role_types.get(str(item.get("role") or "user"), HumanMessage)(content=str(item.get("content") or "")) for item in messages]
+        response = self.llm.invoke(converted, **kwargs)
+        usage = getattr(response, "usage_metadata", None) or getattr(response, "response_metadata", {}).get("token_usage")
+        return LLMResponse(content=str(getattr(response, "content", "")), usage=usage,
+                           metadata={"method": "langgraph_model"})
 
     def stream(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None, **kwargs) -> Generator[str, None, None]:
-        if self.graph_app is None:
-            # 回退到简单流式
-            result = self.chat(messages, tools, **kwargs)
-            yield result.content
-            return
-
-        try:
-            config = {"configurable": {"thread_id": kwargs.get("thread_id", "default")}}
-            for event in self.graph_app.stream(
-                {"messages": messages},
-                config
-            ):
-                for node_name, node_output in event.items():
-                    if "messages" in node_output:
-                        last_msg = node_output["messages"][-1]
-                        if hasattr(last_msg, "content"):
-                            yield last_msg.content
-        except Exception as e:
-            logger.error(f"LangGraph stream failed: {e}")
-            raise RuntimeError(f"LangGraph stream failed: {e}")
+        del tools
+        if self.llm is None:
+            raise RuntimeError("LangGraph model backend is unavailable")
+        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+        role_types = {"system": SystemMessage, "assistant": AIMessage, "user": HumanMessage}
+        converted = [role_types.get(str(item.get("role") or "user"), HumanMessage)(content=str(item.get("content") or "")) for item in messages]
+        for chunk in self.llm.stream(converted, **kwargs):
+            content = getattr(chunk, "content", "")
+            if content:
+                yield str(content)
 
 
 # ========== 工厂类 ==========
@@ -822,16 +829,16 @@ class LLMAdapterFactory:
         Returns:
             LLM 适配器实例
         """
-        engine = config.get("engine", "direct")  # direct / langchain / langgraph
-
+        engine = config.get("engine", "direct")
+        if str(config.get("provider") or "").strip().lower() == "offline_replay":
+            return ReplayLLMAdapter(config)
         if engine == "direct":
             return DirectLLMAdapter(config)
-        elif engine == "langchain":
+        if engine == "langchain":
             return LangChainLLMAdapter(config)
-        elif engine == "langgraph":
+        if engine == "langgraph":
             return LangGraphLLMAdapter(config)
-        else:
-            raise ValueError(f"Unknown engine: {engine}. Supported: direct, langchain, langgraph")
+        raise ValueError(f"Unknown engine: {engine}")
 
     @staticmethod
     def create_from_json_file(path: str) -> BaseLLMAdapter:

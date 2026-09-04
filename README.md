@@ -1,6 +1,6 @@
 # Stability Analysis Agent
 
-**一个面向 App 稳定性问题的开源 Agent 框架：通过可扩展的 Tool、Workflow、Skill 和 RAG 组件，把 Crash 日志中的地址、线程、寄存器、符号与源码组织成可验证的证据链，并驱动 AI 直接修复代码。**
+**一个面向 App 稳定性工程的开源领域 Agent：以受治理的 Agent Harness 为运行底座，借鉴开源 AI 编程工具在上下文管理、多轮调查、工具调用、权限控制、检查点恢复与验证闭环等方面的能力，将 Crash、ANR、OOM 等事故材料转化为可审查、可验证的根因分析与代码修复结果。**
 
 **简体中文** | [English](./README.en.md)
 
@@ -150,10 +150,14 @@ ANR、OOM、Jank、JavaScript/ArkTS 等问题已经具备专项分析组件；�
 | 全部 CLI 参数 | [docs/cli/CLI_COMMANDS_REFERENCE.md](./docs/cli/CLI_COMMANDS_REFERENCE.md) |
 | 使用本地 Web 面板 | [docs/cli/WEB_UI_GUIDE.md](./docs/cli/WEB_UI_GUIDE.md) |
 | Crash 日志格式 | [docs/tools/CRASH_LOG_FORMATS.md](./docs/tools/CRASH_LOG_FORMATS.md) |
-| C++、ANR、JS、Jank 等诊断能力 | [docs/tools/](./docs/tools/) |
+| C++、ANR、OOM、JS、Jank 等诊断能力 | [docs/tools/](./docs/tools/) |
 | Skill 和扩展机制 | [docs/skills/README.md](./docs/skills/README.md) |
 | 系统架构 | [docs/architecture/README.md](./docs/architecture/README.md) |
-| 测试方式 | [docs/testing/README.md](./docs/testing/README.md) |
+| Agent Runtime、Harness 生命周期和安全边界 | [AGENT_RUNTIME_LIFECYCLE.md](./docs/architecture/AGENT_RUNTIME_LIFECYCLE.md) · [HARNESS_MIGRATION.md](./docs/cli/HARNESS_MIGRATION.md) |
+| 多轮上下文调查和请求协议 | [CONTEXT_LOOP_CONTRACT.md](./docs/architecture/CONTEXT_LOOP_CONTRACT.md) |
+| Daemon、Run API 和事件流 | [DAEMON_SERVER_GUIDE.md](./docs/cli/DAEMON_SERVER_GUIDE.md) |
+| 修复后的构建、测试和验证闭环 | [VERIFICATION_PROVIDERS.md](./docs/tools/VERIFICATION_PROVIDERS.md) |
+| 测试、回归与 Harness 评测 | [docs/testing/README.md](./docs/testing/README.md) · [EVALUATION_MATRIX.md](./docs/testing/EVALUATION_MATRIX.md) |
 | 后续规划 | [docs/ROADMAP.md](./docs/ROADMAP.md) |
 | 许可证与贡献协议 | [LICENSE](./LICENSE) · [CONTRIBUTING.md](./CONTRIBUTING.md) |
 

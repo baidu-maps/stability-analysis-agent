@@ -1,0 +1,5 @@
+--- a/code/src/session.cpp
++++ b/code/src/session.cpp
+@@
+-void Session::onCallback() { resource_->use(); }
++void Session::onCallback() { if (!resource_ || resource_->released()) return; resource_->use(); }

@@ -41,7 +41,7 @@ open http://127.0.0.1:8765/
 python3 cli/main.py native-leak \
   --input /path/to/nativeleak_bundle \
   --trace-db /path/to/trace.db \
-  --code-root /path/to/source
+  --code-roots /path/to/source
 ```
 
 该流程会量化 PSS/DMA/GPU 增长趋势，细分 jemalloc/ArkTS/ashmem/anon/file mapping，关联 NMD size class 与未释放分配栈，并用 HarmonyOS DMA 标签定位 Image、PixelMap、XComponent、Web、Codec 或 NativeBuffer 生命周期。`--trace-db` 必须是可信 `trace_streamer` 生成的 SQLite；Agent 不执行采集包中的二进制。
@@ -61,12 +61,12 @@ python3 cli/main.py native-leak \
 python3 cli/main.py \
   --crash-log-file examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
-  --code-root examples/crash_cases/demo_basic/code_dir
+  --code-roots examples/crash_cases/demo_basic/code_dir
 ```
 
 > 交互模式（直接运行 `sa-agent`）支持快捷复跑：当存在最近一次分析记录时，菜单会显示 `5) 再次进行上一次修复`，可一键复用上次参数重跑。
 > 菜单型选择支持上下键切换，回车确认（也兼容数字键）。
-> 交互首屏不做自动环境检测；配置大模型/配置 addr2line 工具时会先做对应检测并展示结论。`2) 设置` 提供 **配置大模型 / 配置堆栈地址解析工具 / 检查更新 / 查看与清理本地缓存 / 高级选项（手动编辑配置文件、AI 推理模式切换、Agent 执行流程切换等）**；`3) 帮助` 提供 **全部命令参考（完整参数手册）/ 命令快速示例（最小可运行）**。`q) 退出` 置顶，便于一键退出；`1) 快速开始修复（推荐）` 仍是默认高亮。
+> 交互首屏不做自动环境检测；配置大模型/配置 addr2line 工具时会先做对应检测并展示结论。`2) 设置` 提供 **配置大模型 / 配置堆栈地址解析工具 / 检查更新 / 查看与清理本地缓存 / 高级选项（LLM backend 切换、Agent 执行流程切换等）**；`3) 帮助` 提供 **全部命令参考（完整参数手册）/ 命令快速示例（最小可运行）**。`q) 退出` 置顶，便于一键退出；`1) 快速开始修复（推荐）` 仍是默认高亮。
 >
 > `6) 自动验证修复结果（基于 automation-testing-skill）` 与 `7) 自动生成修复后的新包（基于 cicd-pipeline-skill）` 是两个由原"修复闭环 Skill 模板"父菜单**提升到一级**的入口，分别负责把项目专属验证 / 打包 Skill 与 sa-agent 接通。它们只展示推荐 init / install 命令与当前安装状态，不会把 Skill 自动拼进 `06_ai_prompt.md`。
 >
@@ -79,7 +79,7 @@ python3 cli/main.py \
 python3 cli/main.py \
   --crash-log-file examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
-  --code-root examples/crash_cases/demo_basic/code_dir \
+  --code-roots examples/crash_cases/demo_basic/code_dir \
   --scope gen_prompt_only
 ```
 
@@ -89,32 +89,40 @@ python3 cli/main.py \
 python3 cli/main.py \
   --crash-log-file examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
-  --code-root examples/crash_cases/demo_basic/code_dir \
+  --code-roots examples/crash_cases/demo_basic/code_dir \
   --scope gen_prompt_only \
   --prompt-mode analysis
 ```
 
 `--prompt-mode` 只控制提示词内容，不控制是否自动应用修复。`--scope full` 下是否尝试回写源码仍由 `--apply-ai-fixes` / `--no-apply-ai-fixes` 决定；如果模型没有输出可提取的完整修复代码，自动改码会自然跳过。
 
-在弱归因或源码上下文不足的 case 中，可以启用轻量多轮上下文补充。该能力和 `--engine` 解耦，`direct` / `langchain` / `langgraph` 都可使用：
+在弱归因或源码上下文不足的 case 中，可以启用轻量多轮上下文补充。该能力和 `--engine` 解耦，`direct` / `langchain` / `langgraph` 都可使用。**`--scope full` 默认已启用 `context_loop`（最多 5 轮，每轮最多 8 个 request）**；若只需单轮分析，显式传 `--agent-loop single`。
+
+`context_loop` 支持的 `context_requests` 类型包括：`function` / `field` / `references` / `callers` / `grep` / `read_file` / `memory_pattern` / `verification_log` / `trace_snippet`。其中 `grep` / `read_file` 通过仓库检索补充跨文件证据。
+
+修复闭环方面：
+
+- 未配置 `--verification-config-json` 时，`scope=full` 会尝试从 workspace 自动选择 smoke build/test（可用 `--skip-verify` 关闭）。
+- verify 失败时，编译错误会触发 bounded `repair_edit_loop`（默认最多 2 轮）并在 worktree 内修订 patch；测试/reproduce 失败则在重试用尽后 rollback。
+- 模型可通过 `next_action.kind=propose_fix` 提前结束探索并进入改码（仍受 04a `repair_gate` 约束）。
 
 ```bash
 python3 cli/main.py \
   --crash-log-file examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
-  --code-root examples/crash_cases/demo_basic/code_dir \
+  --code-roots examples/crash_cases/demo_basic/code_dir \
   --scope full \
   --prompt-mode analysis \
   --agent-loop context_loop \
-  --max-agent-rounds 3
+  --max-agent-rounds 5
 ```
 
-`context_loop` 首轮仍使用 `round_0/06_ai_prompt.md`。如果模型输出 `agent_can_fetch_more=true` 和 `context_requests[]`，Agent 会按请求补充函数源码并生成 `round_1/06_ai_prompt.md` 继续询问。续轮 prompt 在首轮结构基础上于 `## 函数源码` 后插入 `## 其它代码上下文`（格式与函数源码小节一致），不再重复附上轮分析摘要。每轮另写 `round_N/05b_pre_round_add_res.json` 记录上一轮请求的补充结果（是否定位、文件行号、错误原因等）。每轮 AI 输出保存在 `round_N/07_ai_gen_res.md`。`agent_can_fetch_more=false` 表示停止 Agent 自动拉取上下文（仍可在正文中列出需人工补充的证据）；旧字段 `need_more_context` 仍兼容解析。
+`context_loop` 首轮仍使用 `round_0/06_ai_prompt.md`。如果模型输出 `agent_can_fetch_more=true` 和 `context_requests[]`，Agent 会按请求补充代码上下文（含 grep/read_file）并生成 `round_1/06_ai_prompt.md` 继续询问。续轮 prompt 在首轮结构基础上于 `## 函数源码` 后插入 `## 其它代码上下文`（格式与函数源码小节一致），不再重复附上轮分析摘要。每轮另写 `round_N/05b_pre_round_add_res.json` 记录上一轮请求的补充结果（是否定位、文件行号、错误原因等）。每轮 AI 输出保存在 `round_N/07_ai_gen_res.md`。`agent_can_fetch_more=false` 表示停止 Agent 自动拉取上下文（仍可在正文中列出需人工补充的证据）。
 
 ### 3) 解析模式
 
 ```bash
-# 只做解析 + 地址解析（不需要 code_root）
+# 只做解析 + 地址解析（不需要 code_roots / 代码根目录）
 python3 cli/main.py \
   --crash-log-file examples/crash_cases/demo_basic/logs/mac/NullPtr_SIGSEGV_2026-04-08_10-43-08.crash \
   --library-dir examples/crash_cases/demo_basic/lib/mac \
@@ -150,7 +158,8 @@ curl -sS -X POST http://127.0.0.1:8765/runs \
     "library_dir": "examples/crash_cases/demo_basic/lib/mac",
     "code_roots": ["examples/crash_cases/demo_basic/code_dir"],
     "scope": "gen_prompt_only",
-    "apply_ai_fixes": false
+    "apply_ai_fixes": false,
+    "external_agent_evaluation": true
   }'
 
 # 取消任务
@@ -158,6 +167,8 @@ python3 cli/main.py cancel <run_id> --daemon http://127.0.0.1:8765
 ```
 
 完整字段见 [DAEMON_SERVER_GUIDE.md](./DAEMON_SERVER_GUIDE.md)。
+
+`external_agent_evaluation` 默认关闭。启用后会额外生成供 Codex、Cursor 等工具手动分析和提交结果的 `external_agent_evaluation/` 文件，不会自动调用这些工具。
 
 ## 配置加载规则（LLM）
 

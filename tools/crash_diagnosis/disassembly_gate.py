@@ -48,6 +48,7 @@ def maybe_run_disassembly(
     data_availability: Optional[Dict[str, Any]] = None,
     library_dir: str = "",
     force: bool = False,
+    trace: Any = None,
 ) -> Dict[str, Any]:
     """评估是否反汇编；需要时执行并返回可写入 04a 的结构。"""
     data_availability = data_availability or {}
@@ -124,7 +125,15 @@ def maybe_run_disassembly(
 
     # --- 执行 ---
     try:
-        ctx = tool.disassemble_around_pc(binary_path, pc_for_tool)
+        from services.tool_invoke import invoke_tool
+
+        def _disassemble(_name: str, _payload: Dict[str, Any]) -> Dict[str, Any]:
+            return {"_disassembly_result": tool.disassemble_around_pc(binary_path, pc_for_tool)}
+
+        out = invoke_tool("disassembly", {}, trace=trace, tool_executor=_disassemble)
+        ctx = out.get("_disassembly_result")
+        if ctx is None:
+            raise TypeError("disassembly result missing")
         result_dict = ctx.to_dict()
         markdown = ctx.render_markdown() if not ctx.error else f"反汇编失败: {ctx.error}"
         return {

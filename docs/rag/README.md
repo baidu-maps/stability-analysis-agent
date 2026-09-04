@@ -122,7 +122,7 @@ CLI 示例：
 
 ```bash
 # 交互确认（TTY）
-python3 cli/main.py --crash-log ... --library-dir ... --code-root ... --scope full
+python3 cli/main.py --crash-log-file ... --library-dir ... --code-roots ... --scope full
 
 # 脚本强制写入
 python3 cli/main.py ... --scope full --save-to-vector-db --no-interactive

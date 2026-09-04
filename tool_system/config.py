@@ -162,21 +162,18 @@ class ConfigLoader:
         # LLM 配置
         if api_key := __import__("os").getenv("OPENAI_API_KEY"):
             config_data["llm"] = {
-                "engine": "direct",
                 "provider": "openai",
                 "model": "gpt-4",
                 "api_key": api_key,
             }
         elif api_key := __import__("os").getenv("DEEPSEEK_API_KEY"):
             config_data["llm"] = {
-                "engine": "direct",
                 "provider": "deepseek",
                 "model": "deepseek-chat",
                 "api_key": api_key,
             }
         elif api_key := __import__("os").getenv("WENXIN_API_KEY"):
             config_data["llm"] = {
-                "engine": "direct",
                 "provider": "wenxin",
                 "model": "ernie-4.0-8k",
                 "api_key": api_key,
@@ -202,7 +199,6 @@ def create_default_config() -> SystemConfig:
             WorkflowConfig(name="anr_freeze_analysis", enabled=True),
         ],
         llm=LLMConfig(
-            engine="direct",
             provider="openai",
             model="glm-4"
         )

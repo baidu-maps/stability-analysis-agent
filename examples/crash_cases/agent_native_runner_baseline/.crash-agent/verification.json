@@ -1,0 +1,1 @@
+{"profile_id":"native_uaf","pre_fix_baseline":true,"frontend_available":false,"runtime_available":true,"checks":[{"id":"native_replay","kind":"native_replay","command":["bash","scripts/run_case.sh","--fixture","fixtures/replay.json"],"iterations":1000,"expected_signature":"use-after-free","allowed_changed_files":["code/src/session.cpp"],"requires_approval":true}]}

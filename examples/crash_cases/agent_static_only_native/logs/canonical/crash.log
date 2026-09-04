@@ -1,0 +1,3 @@
+signal=SIGSEGV fault_address=0x0
+#00 engine Engine::dispatch code/src/engine.cpp:19
+diagnosis=null_pointer

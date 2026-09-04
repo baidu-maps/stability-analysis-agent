@@ -78,6 +78,11 @@ class VectorMemoryRetrieverTool(BaseTool):
             },
             category="provider",
             version="1.0.0",
+            risk="read_only",
+            side_effect=False,
+            idempotent=True,
+            requires_approval=False,
+            cost_class="medium",
         )
 
     def validate_input(self, input_data: Dict[str, Any]) -> "tuple[bool, Optional[str]]":

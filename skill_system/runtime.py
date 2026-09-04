@@ -111,7 +111,20 @@ def _extract_problem_from_input(input_data: Any) -> Dict[str, Any]:
     raise TypeError("workflow skill 的输入必须是字典")
 
 
-@dataclass
+def _policy_from_skill_capabilities(capabilities: Dict[str, Any]) -> Any:
+    from services.policy import PolicyEngine
+
+    permissions = capabilities.get("permissions") if isinstance(capabilities.get("permissions"), dict) else {}
+    allowed_roots = permissions.get("allowed_roots") or []
+    if isinstance(allowed_roots, str):
+        allowed_roots = [allowed_roots]
+    return PolicyEngine(
+        allow_network=bool(permissions.get("network")),
+        allow_destructive=bool(permissions.get("destructive")),
+        allowed_roots=[str(item) for item in allowed_roots if str(item).strip()],
+    )
+
+
 class SkillRuntime:
     """Skill 运行器。"""
 
@@ -153,7 +166,7 @@ class SkillRuntime:
         *,
         llm_adapter: Any = None,
     ) -> SkillRunResult:
-        from tool_system import ConfigDrivenExecutor, SystemConfig, ToolConfig, WorkflowConfig
+        from tool_system import AgentRuntime, ConfigDrivenExecutor, SystemConfig, ToolConfig, WorkflowConfig
         from tools import register_all_tools
         from workflows import register_all_workflows
         from tool_system import ToolAndWorkflowRegistry
@@ -167,12 +180,28 @@ class SkillRuntime:
         required_tools: List[str] = []
         if workflow is not None and hasattr(workflow, "definition"):
             required_tools = list(getattr(workflow.definition, "required_tools", []) or [])
+        allowed_tools = {str(name).strip() for name in (bundle.frontmatter.allowed_tools or []) if str(name).strip()}
+        if allowed_tools:
+            unauthorized = sorted(set(required_tools) - allowed_tools)
+            if unauthorized:
+                raise PermissionError(
+                    f"skill '{bundle.command_name}' is not authorized for workflow tools: {', '.join(unauthorized)}"
+                )
 
         tools = [ToolConfig(name=name, enabled=True) for name in required_tools]
         workflows = [WorkflowConfig(name=workflow_name, enabled=True)]
         config = SystemConfig(tools=tools, workflows=workflows)
         executor = ConfigDrivenExecutor(registry, config, llm_adapter=llm_adapter)
-        result = executor.execute_workflow(workflow_name, _extract_problem_from_input(input_payload))
+        result = AgentRuntime(executor).run(workflow_name, _extract_problem_from_input(input_payload))
+        # Preserve the lightweight skill-workflow return contract for generic
+        # exports; analyze-shaped runs retain their Harness metadata.
+        if isinstance(result, dict) and not any(
+            key in result for key in ("analysis", "crash_diagnosis", "applied_ai_fixes", "verification")
+        ):
+            result = {
+                key: value for key, value in result.items()
+                if key not in {"metadata", "judge", "decide"}
+            }
         return SkillRunResult(
             mode="workflow",
             skill_name=bundle.command_name,
@@ -183,6 +212,9 @@ class SkillRuntime:
 
     def _execute_tool_skill(self, bundle: SkillBundle, tool_name: str, input_payload: Dict[str, Any]) -> SkillRunResult:
         from tool_system import ToolAndWorkflowRegistry
+        from tool_system.runtime import RunTrace
+        from tool_system.tool_gateway import ToolExecutionGateway
+        from services.observations import ObservationStore
         from tools import register_all_tools
 
         registry = ToolAndWorkflowRegistry()
@@ -191,14 +223,31 @@ class SkillRuntime:
         tool = registry.get_tool(tool_name)
         if tool is None:
             raise KeyError(f"未找到 tool export: {tool_name}")
-        if hasattr(tool, "execute_with_validation"):
-            result = tool.execute_with_validation(input_payload)
-        else:
-            result = tool.execute(input_payload)
+        allowed_tools = set(bundle.frontmatter.allowed_tools or [])
+        if allowed_tools and tool_name not in allowed_tools:
+            raise PermissionError(
+                f"skill '{bundle.command_name}' is not authorized to invoke tool '{tool_name}'"
+            )
+
+        import os
+
+        run_id = str(os.environ.get("STABILITY_AGENT_RUN_ID") or "").strip()
+        trace = RunTrace(run_id=run_id or f"skill_{bundle.command_name}")
+        observations = ObservationStore()
+        policy = _policy_from_skill_capabilities(bundle.capabilities)
+        gateway = ToolExecutionGateway(policy, trace)
+        payload = dict(input_payload or {})
+        payload["_observation_store"] = observations
+        result = gateway.execute(tool_name, tool, payload)
         return SkillRunResult(
             mode="tool",
             skill_name=bundle.command_name,
             result=result,
             bundle=bundle,
-            metadata={"tool_name": tool_name, "input_keys": sorted(list(input_payload.keys()))},
+            metadata={
+                "tool_name": tool_name,
+                "input_keys": sorted(list(input_payload.keys())),
+                "runtime_trace": trace.snapshot(),
+                "observations": observations.snapshot(),
+            },
         )
