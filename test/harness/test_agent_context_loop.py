@@ -130,6 +130,57 @@ class AgentContextLoopTests(unittest.TestCase):
         events = [item.get("event") for item in trace.events]
         self.assertIn("agent.schema_degraded", events)
 
+    def test_invalid_schema_final_with_control_contract_becomes_model_final(self):
+        """Final analysis after a schema miss should not block repair via invalid_schema."""
+        hooks, _, engine = self._hooks(llm_texts=["need more", "final"])
+        texts = [
+            "need more",
+            '{"agent_can_fetch_more": false, "context_requests": [], "analysis": "final report"}',
+        ]
+        parse_by_round = [
+            {
+                "context_requests": [],
+                "invalid_context_requests": [{"error": "unsupported request type: file"}],
+                "agent_can_fetch_more": True,
+                "requested_more": True,
+                "has_control_contract": True,
+                "raw_payload": {"agent_can_fetch_more": True},
+                "degraded": False,
+                "next_action": {},
+            },
+            {
+                "context_requests": [],
+                "invalid_context_requests": [],
+                "agent_can_fetch_more": False,
+                "requested_more": False,
+                "has_control_contract": True,
+                "raw_payload": {"agent_can_fetch_more": False},
+                "degraded": False,
+                "next_action": {},
+            },
+        ]
+        calls = {"llm": 0}
+
+        def call_llm(prompt, *, round_index):
+            calls["llm"] += 1
+            idx = min(calls["llm"] - 1, len(texts) - 1)
+            return SimpleNamespace(content=texts[idx]), f"prompt-{round_index}"
+
+        def parse_requests(analysis_text):
+            idx = max(0, min(calls["llm"] - 1, len(parse_by_round) - 1))
+            return dict(parse_by_round[idx])
+
+        hooks.call_llm = call_llm
+        engine.decision_parser = parse_requests
+        out = run_agent_context_loop(
+            config=ContextLoopConfig(max_rounds=3, agent_loop_mode="context_loop"),
+            hooks=hooks,
+            initial_prompt="start",
+            context_engine=engine,
+        )
+        self.assertEqual(out.termination_reason, "model_final")
+        self.assertIn("final report", out.analysis_text)
+
     def test_mixed_valid_and_invalid_requests_resolves_valid_items(self):
         hooks, calls, engine = self._hooks(
             parse_result={
@@ -238,6 +289,55 @@ class AgentContextLoopTests(unittest.TestCase):
         self.assertIn("## 本轮任务", prompt)
         self.assertIn("本轮必须输出最终分析", prompt)
         self.assertIn('{"agent_can_fetch_more": false, "context_requests": []}', prompt)
+
+    def test_compress_stable_context_pins_sync_member_section(self):
+        head = "HEAD_FUNCS\n" + ("fn body line\n" * 400)
+        skel = (
+            "### 崩溃所属类骨架（CNaviEngineControl）\n"
+            "- 文件: walk_naviengine_control.h\n"
+            "- 疑似同步原语成员（优先复用，禁止假设新的 mutex/lock 成员名）："
+            "m_clRouteInfoMutex, m_clCurPosInfoMutex\n"
+            "- 同步/共享指针相关声明摘录（来自类骨架，优先复用这些成员）：\n"
+            "```cpp\n"
+            "\tCNMutex\t\t\t\t\t\t\tm_clRouteInfoMutex;\t\t\t/**< 路线信息保护 */\n"
+            "\tCRoute* \t\t\t\t\t\tm_pclCurRoute;\t\t\t\t/**< 当前路线 (仅是引用) */\n"
+            "```\n"
+            "```cpp\n"
+            + ("    VVoid MethodPad();\n" * 200)
+            + "};\n```\n"
+        )
+        keep = (
+            "### 关键同步与共享成员（CNaviEngineControl，压缩保活）\n"
+            "- 疑似同步原语成员（禁止臆造新 mutex/lock）：m_clRouteInfoMutex\n"
+            "- 声明摘录：\n"
+            "```cpp\n"
+            "CNMutex m_clRouteInfoMutex;\n"
+            "CRoute* m_pclCurRoute;\n"
+            "```\n"
+        )
+        write_keep = (
+            "### 写路径函数源码（压缩保活，可纳入需要修改的函数）\n"
+            "#### 写路径函数源码: void HandleRemoveRouteMessage()\n"
+            "- 代码片段:\n"
+            "void HandleRemoveRouteMessage() {\n"
+            "  m_pclCurRoute = nullptr;\n"
+            "}\n"
+        )
+        tail = "# 崩溃分析任务\n分析规则尾部\n"
+        text = head + skel + keep + write_keep + tail
+        compressed = ContextEngine._compress_stable_context(text, 3500)
+        self.assertLessEqual(len(compressed), 3500)
+        self.assertIn("stable context compressed by budget", compressed)
+        self.assertIn("m_clRouteInfoMutex", compressed)
+        self.assertIn("关键同步与共享成员", compressed)
+        self.assertIn("写路径函数源码", compressed)
+        self.assertIn("HandleRemoveRouteMessage", compressed)
+        self.assertIn("# 崩溃分析任务", compressed)
+        # 保活段应紧挨任务节之前
+        task_at = compressed.find("# 崩溃分析任务")
+        sync_at = compressed.find("关键同步与共享成员")
+        self.assertGreaterEqual(sync_at, 0)
+        self.assertLess(sync_at, task_at)
 
     def test_context_engine_ledger_records_rejected_and_duplicate_attempts(self):
         registry = ContextResolverRegistry([

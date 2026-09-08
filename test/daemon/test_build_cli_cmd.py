@@ -173,6 +173,14 @@ class BuildCliCmdTests(unittest.TestCase):
         self.assertIn("-", cmd)
         self.assertNotIn("--crash-log", cmd)
 
+    def test_missing_crash_log_omits_empty_crash_log_file_flag(self) -> None:
+        """Do not emit `--crash-log-file ""` so overlays can inject a real path."""
+        req = run_request_from_dict({})
+        cmd, stdin = _build_cli_cmd(req)
+        self.assertIsNone(stdin)
+        self.assertNotIn("--crash-log-file", cmd)
+        self.assertNotIn("--crash-log-dir", cmd)
+
     def test_omitted_agent_flags_match_cli_argparse_defaults(self) -> None:
         """HTTP 省略字段时，除 daemon 固定的非交互/禁写库外，不应覆盖 CLI 默认值。"""
         defaults = _cli_analysis_defaults()

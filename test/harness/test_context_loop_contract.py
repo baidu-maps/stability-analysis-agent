@@ -43,6 +43,18 @@ class ContextLoopContractTests(unittest.TestCase):
         self.assertTrue(parsed["agent_can_fetch_more"])
         self.assertEqual(len(parsed["context_requests"]), 1)
 
+    def test_round0_prompt_forbids_file_and_medium(self):
+        from services.context_loop_contract import build_round0_output_format_lines, build_round_task_section
+
+        blob = "\n".join(build_round0_output_format_lines(agent_loop="context_loop"))
+        self.assertIn("禁止：`type=file`", blob)
+        self.assertIn("priority=medium", blob)
+        self.assertIn("propose_fix", blob)
+        task = build_round_task_section(is_final_round=True, early_final_reason="invalid_schema")
+        self.assertIn("read_file", task)
+        self.assertIn("propose_fix", task)
+        self.assertIn("critical", task)
+
     def test_prompt_has_json_contract(self):
         self.assertTrue(prompt_has_json_contract('{"agent_can_fetch_more": true, "context_requests": []}'))
         self.assertFalse(prompt_has_json_contract("plain text"))

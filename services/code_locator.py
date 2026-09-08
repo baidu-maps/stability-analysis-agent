@@ -2225,7 +2225,7 @@ class VariableLocator:
         owner_member_fields: Optional[List[str]] = None,
         owner_definition_files: Optional[List[str]] = None,
     ) -> List[VariableFunction]:
-        """Find functions that use shared variables (4-tier scanning)."""
+        """Find functions that use shared variables (store-site first, then 4-tier)."""
         if not shared_vars:
             return []
         cap = max(1, self._ctx.config.max_shared_var_related_functions)
@@ -2249,102 +2249,210 @@ class VariableLocator:
         # Pre-compute bare variable names for fast pre-filter
         bare_vars = [v.split("::")[-1] if "::" in v else v for v in shared_vars]
 
-        def _enough() -> bool:
-            return len(unique_functions) >= enough_threshold
+        def _write_like_count() -> int:
+            return sum(
+                1
+                for vf in unique_functions.values()
+                if self._relation_strength(vf.relation) >= 2
+            )
 
-        def _scan_files(file_paths: List[str], tier_label: str) -> None:
-            if _enough():
+        def _enough(*, require_writes: bool = False) -> bool:
+            if len(unique_functions) < enough_threshold:
+                return False
+            if require_writes and _write_like_count() == 0:
+                return False
+            return True
+
+        def _record_hit(
+            *,
+            fp: str,
+            lines: List[str],
+            line_no: int,
+            line: str,
+            var: str,
+            bare_var: str,
+            tier_label: str,
+            store_only: bool = False,
+        ) -> None:
+            if not self.contains_variable_usage(line, bare_var):
+                return
+            if not self.is_variable_usage_line(line, bare_var):
+                return
+            if not self._line_usage_matches_owner_scoped_var(
+                line, bare_var, owner_class, owner_fields_set,
+                tier_label, fp, owner_def_abs,
+            ):
+                return
+            relation = self.determine_variable_relation(line, var)
+            if store_only and self._relation_strength(relation) < 2:
+                return
+            func_name = self._symbol.extract_function_name_at_line(lines, line_no)
+            if not func_name:
+                return
+            from tools.function_snippet_utils import is_plausible_function_code_head
+
+            code = self._symbol.extract_full_function_code(lines, line_no - 1, func_name)
+            if not code:
+                return
+            if not is_plausible_function_code_head(code):
+                return
+            snippet = [ln.rstrip() for ln in code.split("\n") if ln.strip()]
+            if self._ctx.config.max_code_length > 0:
+                snippet = self._ctx.truncate_snippet(snippet)
+            scoped_var = self._scoped_var_key(bare_var, owner_class)
+            key = (func_name, fp, scoped_var or bare_var, relation)
+            if key not in unique_functions:
+                unique_functions[key] = VariableFunction(
+                    variable=scoped_var or bare_var,
+                    relation=relation,
+                    name=func_name,
+                    file=fp,
+                    snippet=snippet,
+                )
+            else:
+                # 同函数同变量保留更强关系（key 含 relation 时通常不触发；兼容合并路径）
+                prev = unique_functions[key]
+                if self._relation_strength(relation) > self._relation_strength(prev.relation):
+                    unique_functions[key] = VariableFunction(
+                        variable=scoped_var or bare_var,
+                        relation=relation,
+                        name=func_name,
+                        file=fp,
+                        snippet=snippet,
+                    )
+
+        def _scan_files(
+            file_paths: List[str],
+            tier_label: str,
+            *,
+            store_only: bool = False,
+            allow_early_stop: bool = True,
+        ) -> None:
+            if allow_early_stop and _enough(require_writes=not store_only):
                 return
             norm = self._ctx.normalize_scan_file_list(file_paths)
             for fp in norm:
-                if _enough():
+                if allow_early_stop and _enough(require_writes=not store_only):
                     return
                 try:
                     ap = os.path.abspath(fp)
                 except Exception:
                     ap = fp
-                if ap in scanned_abs:
+                # store-site 只收集写类，不占用 scanned，避免挡住后续全量读扫描
+                if not store_only and ap in scanned_abs:
                     continue
-                scanned_abs.add(ap)
+                if not store_only:
+                    scanned_abs.add(ap)
                 self._ctx.code_context_phase_check("shared_var_scan")
                 content = self._ctx.read_file_cached(fp)
                 if not content:
                     continue
-                # File-level pre-filter
                 if not any(bv in content for bv in bare_vars):
                     continue
                 lines = content.split("\n")
                 for i, line in enumerate(lines, 1):
-                    if _enough():
+                    if allow_early_stop and _enough(require_writes=not store_only):
                         return
                     for var in shared_vars:
                         bare_var = var.split("::")[-1] if "::" in var else var
-                        if not self.contains_variable_usage(line, bare_var):
-                            continue
-                        if not self.is_variable_usage_line(line, bare_var):
-                            continue
-                        # Owner-scoped filter for non-priority tiers
-                        if not self._line_usage_matches_owner_scoped_var(
-                            line, bare_var, owner_class, owner_fields_set,
-                            tier_label, fp, owner_def_abs,
-                        ):
-                            continue
-                        func_name = self._symbol.extract_function_name_at_line(lines, i)
-                        if not func_name:
-                            continue
-                        from tools.function_snippet_utils import (
-                            is_plausible_function_signature,
+                        _record_hit(
+                            fp=fp,
+                            lines=lines,
+                            line_no=i,
+                            line=line,
+                            var=var,
+                            bare_var=bare_var,
+                            tier_label=tier_label,
+                            store_only=store_only,
                         )
 
-                        code = self._symbol.extract_full_function_code(lines, i - 1, func_name)
-                        if not code:
-                            continue
-                        snippet_probe = next(
-                            (ln.strip() for ln in code.split("\n") if ln.strip()),
-                            "",
-                        )
-                        if not is_plausible_function_signature(snippet_probe):
-                            continue
-                        relation = self.determine_variable_relation(line, var)
-                        snippet = [ln.rstrip() for ln in code.split("\n") if ln.strip()]
-                        if self._ctx.config.max_code_length > 0:
-                            snippet = self._ctx.truncate_snippet(snippet)
-                        scoped_var = self._scoped_var_key(bare_var, owner_class)
-                        key = (func_name, fp, scoped_var or bare_var, relation)
-                        if key not in unique_functions:
-                            unique_functions[key] = VariableFunction(
-                                variable=scoped_var or bare_var,
-                                relation=relation,
-                                name=func_name,
-                                file=fp,
-                                snippet=snippet,
-                            )
+        def _rg_store_site_files(seed_files: List[str]) -> List[str]:
+            """用 rg 在 seed 目录附近找赋值/释放点所在文件（变量名来自 shared_vars，非硬编码）。"""
+            if not bare_vars:
+                return list(seed_files or [])
+            # 身份赋值 / 置空 / delete|free；避免匹配 ==
+            parts = []
+            for bv in bare_vars:
+                eb = re.escape(bv)
+                parts.append(rf"{eb}\s*=")
+                parts.append(rf"(?:->|\.)\s*{eb}\s*=")
+                parts.append(rf"delete\s*(?:\[\s*\])?\s*{eb}\b")
+                parts.append(rf"free\s*\(\s*{eb}\s*\)")
+            pattern = "|".join(parts)
+            roots: List[str] = []
+            for fp in seed_files or []:
+                d = os.path.dirname(fp) if os.path.isfile(fp) else fp
+                if d and os.path.isdir(d) and d not in roots:
+                    roots.append(d)
+            for root in code_roots or []:
+                if root and os.path.isdir(root) and root not in roots:
+                    roots.append(root)
+            if not roots:
+                return list(seed_files or [])
+            hit = self._ctx.rg_grep_files(pattern, roots)
+            if hit is None:
+                return list(seed_files or [])
+            # 优先 seed 文件，再补 rg 命中
+            out: List[str] = []
+            seen: Set[str] = set()
+            for fp in list(seed_files or []) + list(hit):
+                try:
+                    ap = os.path.abspath(fp)
+                except Exception:
+                    ap = fp
+                if ap in seen:
+                    continue
+                seen.add(ap)
+                out.append(fp)
+            return out
 
-        # Tier 1: Crash file + adjacent sources
+        # Pass 0: store-site 优先（对齐人工 rg 'm_x\s*='），crash/owner 文件扫全、不早停
+        seed_store: List[str] = []
+        for src in (crash_local_files or []) + list(owner_definition_files or []):
+            if src:
+                seed_store.append(src)
+                # 头文件旁实现文件
+                stem, ext = os.path.splitext(src)
+                if ext.lower() in {".h", ".hpp", ".hh", ".hxx"}:
+                    for impl_ext in (".cpp", ".cc", ".cxx", ".mm", ".m", ".c"):
+                        cand = stem + impl_ext
+                        if os.path.isfile(cand):
+                            seed_store.append(cand)
+        store_files = _rg_store_site_files(seed_store)
+        if store_files:
+            _scan_files(
+                store_files,
+                "tier0_store_sites",
+                store_only=True,
+                allow_early_stop=False,
+            )
+
+        # Tier 1: Crash file + adjacent sources（写配额未满时不因读过多而早停）
         if crash_local_files:
-            _scan_files(crash_local_files, "tier1_crash_local")
+            _scan_files(
+                crash_local_files,
+                "tier1_crash_local",
+                allow_early_stop=(_write_like_count() > 0),
+            )
 
         # Tier 2: Stack frame source files
-        if not _enough() and stack_priority_files:
+        if not _enough(require_writes=True) and stack_priority_files:
             _scan_files(stack_priority_files, "tier2_stack_frames")
 
         # Tier 3: Nearby module files
-        if not _enough() and stack_priority_files:
+        if not _enough(require_writes=True) and stack_priority_files:
             nearby = self._file.collect_nearby_module_files(stack_priority_files, code_roots)
             _scan_files(nearby, "tier3_nearby_modules")
 
         # Tier 4: Full code-root walk (only if insufficient)
-        if not _enough():
+        if not _enough(require_writes=True):
             all_files: List[str] = []
-            # 尝试 rg 预筛：只找包含变量名的文件
             rg_pattern = "|".join(re.escape(bv) for bv in bare_vars) if bare_vars else None
             rg_hit_files = self._ctx.rg_grep_files(rg_pattern, code_roots) if rg_pattern else None
             if rg_hit_files is not None:
-                # rg 成功：直接使用命中的文件列表（已自动过滤扩展名和排除目录）
                 all_files = rg_hit_files[:5000]
                 logger.info(f"rg 预筛变量扫描 Tier4: {len(all_files)} 个文件包含变量名")
             else:
-                # fallback: 原有 os.walk
                 for code_root in code_roots:
                     if not os.path.isdir(code_root):
                         continue
@@ -2364,7 +2472,42 @@ class VariableLocator:
                         break
             _scan_files(all_files, "tier4_full_walk")
 
-        return list(unique_functions.values())[:cap]
+        # 截断时写路径优先，避免大量 read 挤掉 assign/delete
+        ordered = sorted(
+            unique_functions.values(),
+            key=lambda vf: (
+                self._relation_strength(vf.relation),
+                str(vf.name or ""),
+                str(vf.file or ""),
+            ),
+            reverse=True,
+        )
+        writes = [vf for vf in ordered if self._relation_strength(vf.relation) >= 2]
+        reads = [vf for vf in ordered if self._relation_strength(vf.relation) < 2]
+        min_write_slots = min(len(writes), max(2, cap // 2), cap)
+        chosen: List[VariableFunction] = []
+        chosen_keys: Set[tuple] = set()
+
+        def _vf_key(vf: VariableFunction) -> tuple:
+            return (str(vf.name or ""), str(vf.file or ""), str(vf.variable or ""), str(vf.relation or ""))
+
+        for vf in writes:
+            if len(chosen) >= min_write_slots:
+                break
+            k = _vf_key(vf)
+            if k in chosen_keys:
+                continue
+            chosen_keys.add(k)
+            chosen.append(vf)
+        for vf in writes + reads:
+            if len(chosen) >= cap:
+                break
+            k = _vf_key(vf)
+            if k in chosen_keys:
+                continue
+            chosen_keys.add(k)
+            chosen.append(vf)
+        return chosen
 
     def _line_usage_matches_owner_scoped_var(
         self,
@@ -2378,7 +2521,7 @@ class VariableLocator:
     ) -> bool:
         """Filter: only keep hits related to crash's owning class in non-priority tiers."""
         # Priority tiers pass through without filter
-        if tier_label in ("tier1_crash_local", "tier2_stack_frames"):
+        if tier_label in ("tier0_store_sites", "tier1_crash_local", "tier2_stack_frames"):
             return True
         if not owner_class or not owner_fields:
             return True
@@ -2457,14 +2600,17 @@ class VariableLocator:
         # Exclude function definitions
         if self._symbol.is_function_definition_line(stripped):
             return False
-        # Check usage patterns
+        # Check usage patterns（含 pclThis->m_xxx = 形式的赋值）
         patterns = [
             rf"\b{re.escape(variable_name)}\s*=",
+            rf"(?:->|\.)\s*{re.escape(variable_name)}\s*=",
             rf"\b{re.escape(variable_name)}\s*->",
             rf"\b{re.escape(variable_name)}\s*\.",
             rf"\b{re.escape(variable_name)}\s*\[",
             rf"=\s*{re.escape(variable_name)}\b",
             rf"\(\s*{re.escape(variable_name)}\s*[,)]",
+            rf"\bdelete\s*(?:\[\s*\])?\s*{re.escape(variable_name)}\b",
+            rf"\bfree\s*\(\s*{re.escape(variable_name)}\s*\)",
         ]
         for pat in patterns:
             if re.search(pat, stripped):
@@ -2472,28 +2618,46 @@ class VariableLocator:
         return False
 
     def determine_variable_relation(self, line: str, variable_name: str) -> str:
-        """Classify variable relation: read/write/assign/delete."""
+        """Classify variable relation: read / write / assign / delete.
+
+        - ``assign``: 改指针/对象身份（``m_x =`` / ``p->m_x =``）
+        - ``write``: 经指针改字段（``m_x->field =``）
+        - ``delete``: delete/free
+        - ``read``: 其它使用
+        """
         stripped = line.strip()
         bare = variable_name.split("::")[-1] if "::" in variable_name else variable_name
-        # Delete
-        if any(kw in stripped for kw in ['delete', 'free']):
-            if bare in stripped:
-                return 'delete'
-        # Pointer dereference assignment (var->field = ...)
-        if f"{bare}->" in stripped and "=" in stripped:
-            return 'read'
-        # Assignment LHS
-        if "=" in stripped:
-            parts = stripped.split("=")
-            for part in parts[:-1]:
-                if re.search(rf"\b{re.escape(bare)}\b", part):
-                    # Check it's not ==, !=, <=, >=
-                    eq_idx = stripped.find("=")
-                    if eq_idx > 0 and stripped[eq_idx - 1] not in ('!', '<', '>', '='):
-                        if eq_idx < len(stripped) - 1 and stripped[eq_idx + 1] != '=':
-                            return 'write'
-        # Assignment RHS or other usage
-        return 'read'
+        if not bare or not stripped:
+            return "read"
+        if re.search(rf"\bdelete\s*(?:\[\s*\])?\s*{re.escape(bare)}\b", stripped):
+            return "delete"
+        if re.search(rf"\bfree\s*\(\s*{re.escape(bare)}\s*\)", stripped):
+            return "delete"
+        # 经指针/成员访问改字段：m_x->field = / m_x.field =
+        if re.search(rf"\b{re.escape(bare)}\s*->\s*\w+\s*=(?!=)", stripped):
+            return "write"
+        if re.search(rf"\b{re.escape(bare)}\s*\.\s*\w+\s*=(?!=)", stripped):
+            return "write"
+        # 身份赋值：obj->m_x = / m_x =
+        if re.search(rf"(?:->|\.)\s*{re.escape(bare)}\s*=(?!=)", stripped):
+            return "assign"
+        if re.search(rf"(?<![.\w>])\b{re.escape(bare)}\s*=(?!=)", stripped):
+            return "assign"
+        return "read"
+
+    @staticmethod
+    def _relation_strength(rel: Optional[str]) -> int:
+        """写类优先排序强度：delete > assign > write > read。"""
+        r = str(rel or "").strip().lower()
+        if r == "delete":
+            return 4
+        if r == "assign":
+            return 3
+        if r == "write":
+            return 2
+        if r == "read":
+            return 1
+        return 0
 
     @staticmethod
     def _scoped_var_key(var_name: str, owner_class: Optional[str] = None) -> str:

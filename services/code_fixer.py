@@ -486,40 +486,150 @@ def _match_feedback(source: str, expected: str, *, file_path: str = "") -> Dict[
     }
 
 
-def _validate_and_fix_member_references(original_source: str, replacement: str) -> Tuple[str, Optional[str]]:
+def _collect_allowed_member_names(
+    original_source: str,
+    code_context: Optional[Dict[str, Any]] = None,
+) -> Set[str]:
+    """合并目标文件已有 m_* 与 owner 类声明中的成员名，作为改码白名单。"""
+    allowed: Set[str] = set(re.findall(r"\bm_\w+", str(original_source or "")))
+    try:
+        from tools.owner_class_context import resolve_owner_class_from_code_context
+
+        owner = resolve_owner_class_from_code_context(code_context) or {}
+    except Exception:
+        owner = {}
+    for name in owner.get("member_fields") or []:
+        text = str(name or "").strip()
+        if text.startswith("m_"):
+            allowed.add(text)
+        elif re.fullmatch(r"[A-Za-z_]\w*", text):
+            # 非 m_ 前缀成员（少见）也纳入，避免误伤
+            allowed.add(text)
+    for ln in owner.get("skeleton") or []:
+        allowed.update(re.findall(r"\bm_\w+", str(ln or "")))
+    for ln in owner.get("class_body_excerpt") or []:
+        allowed.update(re.findall(r"\bm_\w+", str(ln or "")))
+    # graph 上 class_skeleton 节点（resolve 失败时的兜底）
+    if isinstance(code_context, dict):
+        graph = code_context.get("graph")
+        nodes = graph.get("nodes") if isinstance(graph, dict) else None
+        if isinstance(nodes, list):
+            for node in nodes:
+                if not isinstance(node, dict) or node.get("type") != "class_skeleton":
+                    continue
+                for name in node.get("member_fields") or []:
+                    text = str(name or "").strip()
+                    if text.startswith("m_"):
+                        allowed.add(text)
+                allowed.update(re.findall(r"\bm_\w+", str(node.get("skeleton") or "")))
+    return allowed
+
+
+def _validate_and_fix_member_references(
+    original_source: str,
+    replacement: str,
+    *,
+    allowed_members: Optional[Set[str]] = None,
+    allow_fuzzy_rewrite: bool = False,
+) -> Tuple[str, Optional[str]]:
     """检查并修正 replacement 中的成员变量引用。
+
     返回 (修正后的 replacement, 错误描述或 None)。
-    如果幻觉变量名有唯一近似匹配（子串关系或编辑距离<=3），自动替换为正确名称。
+    默认（落盘门禁）拒绝任何不在白名单中的 `m_*`，避免幻觉成员被模糊改写误放行。
+    仅当 allow_fuzzy_rewrite=True 且近邻唯一时，才尝试自动改名。
     """
-    orig_members = set(re.findall(r'\bm_\w+', original_source))
-    repl_members = set(re.findall(r'\bm_\w+', replacement))
-    novel = repl_members - orig_members
+    known = set(allowed_members or ())
+    known |= set(re.findall(r"\bm_\w+", str(original_source or "")))
+    repl_members = set(re.findall(r"\bm_\w+", str(replacement or "")))
+    novel = repl_members - known
     if not novel:
         return replacement, None
+    if not allow_fuzzy_rewrite:
+        return (
+            replacement,
+            "成员变量 {} 不在目标文件/类声明白名单中（可能是 LLM 幻觉），已跳过".format(
+                ", ".join(sorted(novel))
+            ),
+        )
     fixed = replacement
-    truly_novel = set()
-    for m in novel:
-        candidates = []
-        for om in orig_members:
-            # 子串关系（短名可能是长成员名的前缀）
+    truly_novel: Set[str] = set()
+    ambiguous: Set[str] = set()
+    for m in sorted(novel):
+        candidates: List[str] = []
+        for om in known:
             if m in om or om in m:
                 candidates.append(om)
                 continue
-            # 简单编辑距离（Levenshtein 近似）
             if abs(len(m) - len(om)) > 4:
                 continue
-            # 使用 SequenceMatcher 比率
             from difflib import SequenceMatcher
+
             ratio = SequenceMatcher(None, m, om).ratio()
             if ratio >= 0.7:
                 candidates.append(om)
+        uniq: List[str] = []
+        seen_c: Set[str] = set()
+        for c in candidates:
+            if c in seen_c:
+                continue
+            seen_c.add(c)
+            uniq.append(c)
+        candidates = uniq
         if len(candidates) == 1:
-            fixed = re.sub(rf'\b{re.escape(m)}\b', candidates[0], fixed)
+            fixed = re.sub(rf"\b{re.escape(m)}\b", candidates[0], fixed)
         elif not candidates:
             truly_novel.add(m)
-    if truly_novel:
-        return replacement, f"成员变量 {', '.join(sorted(truly_novel))} 在源文件中不存在（可能是 LLM 幻觉），已跳过"
+        else:
+            ambiguous.add(m)
+    if truly_novel or ambiguous:
+        parts: List[str] = []
+        if truly_novel:
+            parts.append(
+                "成员变量 {} 不在目标文件/类声明白名单中（可能是 LLM 幻觉）".format(
+                    ", ".join(sorted(truly_novel))
+                )
+            )
+        if ambiguous:
+            parts.append(
+                "成员变量 {} 无法唯一映射到已有成员（存在多个近邻）".format(
+                    ", ".join(sorted(ambiguous))
+                )
+            )
+        return replacement, "；".join(parts) + "，已跳过"
     return fixed, None
+
+
+def _validate_sync_api_consistency(original_source: str, replacement: str) -> Optional[str]:
+    """拒绝把既有 Lock/Unlock 成员误写成文件中未用于该成员的 ScopedLock，或臆造无对象的 Lock()。"""
+    original = str(original_source or "")
+    replacement = str(replacement or "")
+    if "ScopedLock" in replacement:
+        for member in re.findall(r"ScopedLock\s+\w+\s*\(\s*(m_\w+)\s*\)", replacement):
+            uses_lock_unlock = bool(re.search(rf"\b{re.escape(member)}\s*\.\s*Lock\s*\(", original))
+            if not uses_lock_unlock:
+                continue
+            scoped_on_member = bool(
+                re.search(rf"ScopedLock\s+\w+\s*\(\s*{re.escape(member)}\s*\)", original)
+            )
+            if not scoped_on_member:
+                return (
+                    f"成员 {member} 在源文件中以 Lock/Unlock 使用，"
+                    "replacement 却使用了未用于该成员的 ScopedLock 风格，已跳过"
+                )
+    # 禁止臆造无接收者的 Lock()/Unlock()（即便源文件尚无 m_xxx.Lock，也不得凭空写 Lock()）
+    bare_lock = bool(re.search(r"(?<!\.)\bLock\s*\(\s*\)", replacement))
+    bare_unlock = bool(re.search(r"(?<!\.)\bUnlock\s*\(\s*\)", replacement))
+    if bare_lock and not re.search(r"(?<!\.)\bLock\s*\(\s*\)", original):
+        return (
+            "replacement 使用了无接收者的 Lock()；"
+            "须使用已有成员对象的加锁 API（如 m_xxx.Lock(...)/Unlock()），已跳过"
+        )
+    if bare_unlock and not re.search(r"(?<!\.)\bUnlock\s*\(\s*\)", original):
+        return (
+            "replacement 使用了无接收者的 Unlock()；"
+            "须使用已有成员对象的加锁 API（如 m_xxx.Lock(...)/Unlock()），已跳过"
+        )
+    return None
 
 
 # 改码允许调用的通用宏/关键字（非类成员方法；成员方法须出现在原文件）
@@ -570,15 +680,23 @@ def _forbidden_method_error(replacement: str) -> Optional[str]:
 
 
 def _validate_method_calls_in_replacement(original: str, replacement: str) -> Optional[str]:
-    """仅拒绝配置中明确禁止的方法；不以“原文件未出现”作为硬门禁。
-
-    修复代码可能合理引入标准库/已有类型的新方法调用，例如将 volatile 改为
-    std::atomic 后新增 load()/store()。这类场景无法靠“原文件是否出现过”判断，
-    过度拦截会误伤有效修复。
-    """
+    """拒绝明确禁止的方法，以及原文件未出现的常见臆造生命周期 API。"""
     forbidden = _forbidden_method_error(replacement)
     if forbidden:
         return forbidden
+    # 常见幻觉：在无 COM/智能指针证据时臆造 AddRef/Release/Retain
+    invented_life = re.findall(
+        r"(?:->|\.)\s*(AddRef|Release|Retain|retain|release)\s*\(",
+        str(replacement or ""),
+    )
+    if invented_life:
+        known = _collect_callable_names_from_source(str(original or ""))
+        novel = sorted({name for name in invented_life if name not in known})
+        if novel:
+            return (
+                "replacement 调用了源文件中未出现的生命周期 API（{}），"
+                "禁止臆造 AddRef/Release/Retain；应复用已有锁/同步成员，已跳过"
+            ).format(", ".join(novel))
     return None
 
 
@@ -2344,6 +2462,27 @@ class CodeFixer:
             )
             if guard_err:
                 record["error"] = guard_err
+                applied.append(record)
+                continue
+            allowed_members = _collect_allowed_member_names(original, code_context)
+            replacement_code, member_err = _validate_and_fix_member_references(
+                original,
+                replacement_code,
+                allowed_members=allowed_members,
+                allow_fuzzy_rewrite=False,
+            )
+            if member_err:
+                record["error"] = member_err
+                applied.append(record)
+                continue
+            sync_err = _validate_sync_api_consistency(original, replacement_code)
+            if sync_err:
+                record["error"] = sync_err
+                applied.append(record)
+                continue
+            method_err = _validate_method_calls_in_replacement(original, replacement_code)
+            if method_err:
+                record["error"] = method_err
                 applied.append(record)
                 continue
             # 仅拦截「同名转发 + 整函数入口判空」；其余质量由提示词与人工 review 控制。

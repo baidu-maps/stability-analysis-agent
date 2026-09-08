@@ -582,6 +582,80 @@ class TestBuildPromptFinalTip(unittest.TestCase):
         self.assertNotIn("owner_class_context", text)
         self.assertIn("### 崩溃所属类骨架（MTLVertexBuffer）", text)
 
+    def test_owner_class_sync_keepalive_and_usage_examples_in_prompt(self):
+        crash_id = "func|/tmp/walk_naviengine_control.cpp|CVArray<RenderStep> CNaviEngineControl::GetRenderSteps()"
+        skel_id = (
+            "class_skeleton|/tmp/walk_naviengine_control.h|CNaviEngineControl"
+        )
+        code_ctx = {
+            "crash_summary": {
+                "node_id": crash_id + " {",
+                "error_type": "SIGSEGV",
+                "selected_analysis_is_crash_thread": True,
+                "owner_class_node_id": skel_id,
+            },
+            "graph": {
+                "nodes": [
+                    {
+                        "id": crash_id,
+                        "type": "function",
+                        "signature": (
+                            "CVArray<RenderStep> CNaviEngineControl::GetRenderSteps()"
+                        ),
+                        "file": "/tmp/walk_naviengine_control.cpp",
+                        "snippet": [
+                            "CVArray<RenderStep> CNaviEngineControl::GetRenderSteps()",
+                            "{",
+                            "    if (m_pclCurRoute) {",
+                            "        return m_pclCurRoute->GetRenderSteps();",
+                            "    }",
+                            "    return CVArray<RenderStep>();",
+                            "}",
+                        ],
+                    },
+                    {
+                        "id": "func|/tmp/walk_naviengine_control.cpp|GetRouteInfo",
+                        "type": "function",
+                        "signature": "NE_Ret_Enum CNaviEngineControl::GetRouteInfo()",
+                        "file": "/tmp/walk_naviengine_control.cpp",
+                        "snippet": [
+                            "NE_Ret_Enum CNaviEngineControl::GetRouteInfo()",
+                            "{",
+                            "\tm_clRouteInfoMutex.Lock( V_INFINITY_WAIT );",
+                            "\t// copy",
+                            "\tm_clRouteInfoMutex.Unlock();",
+                            "}",
+                        ],
+                    },
+                    {
+                        "id": skel_id,
+                        "type": "class_skeleton",
+                        "class_name": "CNaviEngineControl",
+                        "file": "/tmp/walk_naviengine_control.h",
+                        "skeleton": (
+                            "class CNaviEngineControl {\n"
+                            "\tCNMutex m_clRouteInfoMutex;\n"
+                            "\tCRoute* m_pclCurRoute;\n"
+                            "};\n"
+                        ),
+                        "member_fields": ["m_clRouteInfoMutex", "m_pclCurRoute"],
+                    },
+                ],
+                "edges": [],
+            },
+        }
+        wf = iOSCrashAnalyzeWorkflow()
+        text = wf._build_prompt_final_tip({}, {"resolved_frames": []}, code_ctx, problem={})
+        self.assertIn("### 关键同步与共享成员（CNaviEngineControl，压缩保活）", text)
+        self.assertIn("m_clRouteInfoMutex", text)
+        self.assertIn("m_clRouteInfoMutex.Lock", text)
+        self.assertIn("无接收者的 Lock()/Unlock()", text)
+        # keepalive 出现在任务节之前
+        self.assertLess(
+            text.find("### 关键同步与共享成员"),
+            text.find("# 崩溃分析任务"),
+        )
+
     def test_fix_output_prompt_omits_no_change_optional_sections(self):
         crash_id = "func|/tmp/Crash.cpp|void Crash::hit()"
         code_ctx = {

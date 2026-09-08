@@ -6669,12 +6669,13 @@ class CodeContentProvider:
                 continue
             if line.startswith("using ") or line.startswith("friend ") or line.startswith("typedef "):
                 continue
-            if not line.endswith(";"):
-                continue
-            if "(" in line and ")" in line:
-                continue
-            head = line.split("//", 1)[0].strip()
+            # 去掉行尾/行内注释后再判断是否为「字段声明;」
+            # 常见写法：Type m_foo; /**< ... */  — 若不剥注释会因不以 ';' 结尾被漏掉
+            head = line.split("//", 1)[0]
+            head = re.sub(r"/\*.*?\*/", "", head).strip()
             if not head.endswith(";"):
+                continue
+            if "(" in head and ")" in head:
                 continue
             toks = re.findall(r"\b([A-Za-z_]\w*)\b", head.partition(";")[0])
             picked: Optional[str] = None
@@ -6689,33 +6690,42 @@ class CodeContentProvider:
                 names.add(picked)
         return names
 
-    def _collect_outer_class_field_names(
+    def _iter_owner_class_definition_candidates(
         self, class_name: str, crash_file: str, code_roots: List[str]
-    ) -> set:
-        """在 code_roots 下定位类定义所在头/源文件，收集最外层成员字段名集合。"""
-        out: set = set()
+    ) -> List[str]:
+        """按优先级列出可能含类定义的文件：同名头文件优先，再 crash 源文件。"""
+        candidates: List[str] = []
         if not class_name or not crash_file:
-            return out
+            return candidates
         try:
             actual = self._find_source_file(crash_file, code_roots) or crash_file
             ap = os.path.abspath(actual)
         except Exception:
             ap = os.path.abspath(crash_file)
         if not ap or not os.path.isfile(ap):
-            return out
+            return candidates
         dirname = os.path.dirname(ap)
         base_noext = os.path.splitext(os.path.basename(ap))[0]
-        candidates: List[str] = []
         for ext in (".h", ".hpp", ".hh", ".hxx"):
             hp = os.path.join(dirname, base_noext + ext)
             if os.path.isfile(hp):
                 candidates.append(os.path.abspath(hp))
         candidates.append(ap)
-        seen_paths: set = set()
+        seen: set = set()
+        ordered: List[str] = []
         for path in candidates:
-            if not path or path in seen_paths or not os.path.isfile(path):
+            if not path or path in seen or not os.path.isfile(path):
                 continue
-            seen_paths.add(path)
+            seen.add(path)
+            ordered.append(path)
+        return ordered
+
+    def _collect_outer_class_field_names(
+        self, class_name: str, crash_file: str, code_roots: List[str]
+    ) -> set:
+        """在 code_roots 下定位类定义所在头/源文件，收集最外层成员字段名集合。"""
+        out: set = set()
+        for path in self._iter_owner_class_definition_candidates(class_name, crash_file, code_roots):
             try:
                 text = Path(path).read_text(encoding="utf-8", errors="ignore")
             except Exception:
@@ -6725,6 +6735,36 @@ class CodeContentProvider:
             shallow = self._extract_shallow_class_body_text(text, class_name)
             out |= self._parse_field_names_from_shallow_class_body(shallow)
         return out
+
+    def _pick_owner_class_definition_source(
+        self, class_name: str, crash_file: str, code_roots: List[str]
+    ) -> Tuple[Optional[str], str]:
+        """
+        选择用于类骨架/摘录的定义文件。
+
+        优先含 class/struct 声明的同名头文件（C++ 成员通常在 .h），避免只扫 .cpp
+        导致骨架为空、模型臆造不存在的成员。
+        """
+        for path in self._iter_owner_class_definition_candidates(class_name, crash_file, code_roots):
+            try:
+                text = Path(path).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            m = re.search(rf"\b(?:class|struct)\s+{re.escape(class_name)}\b", text)
+            if not m:
+                continue
+            shallow = self._extract_shallow_class_body_text(text, class_name)
+            # 有浅层类体，或声明后不久出现 '{'，视为可用定义源
+            if shallow.strip() or ("{" in text[m.start() : m.start() + 800]):
+                return path, text
+        # 回退：仍返回 crash 源文件文本，便于至少带上 member_fields
+        actual = self._find_source_file(crash_file, code_roots) or crash_file
+        if actual and os.path.isfile(actual):
+            try:
+                return os.path.abspath(actual), Path(actual).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                return os.path.abspath(actual), ""
+        return None, ""
 
     def _build_owner_class_context_snapshot(
         self,
@@ -6749,12 +6789,12 @@ class CodeContentProvider:
         if not actual or not os.path.isfile(actual):
             return None
         fields = sorted(self._collect_outer_class_field_names(cls, actual, code_roots))
+        definition_file, text = self._pick_owner_class_definition_source(cls, actual, code_roots)
+        if not definition_file:
+            definition_file = os.path.abspath(actual)
         excerpt: List[str] = []
         skeleton_lines: List[str] = []
-        definition_file = os.path.abspath(actual)
-        try:
-            text = Path(actual).read_text(encoding="utf-8", errors="ignore")
-        except Exception:
+        if not text:
             return {
                 "class_name": cls,
                 "definition_file": definition_file,
@@ -6773,7 +6813,6 @@ class CodeContentProvider:
                 excerpt = lines[from_ln:to_ln]
             else:
                 excerpt = lines[from_ln : min(len(lines), from_ln + 24)]
-            # 构建类骨架：提取类声明头 + 成员变量 + 函数签名（不含函数体）
             skeleton_lines = self._build_class_skeleton_lines(text, cls, m.start())
         return {
             "class_name": cls,
@@ -7906,16 +7945,36 @@ class CodeContentProvider:
         merged_use_shared: Dict[Tuple[str, str], str] = {}
         for vf in use_same_var_related_fun:
             from tools.function_snippet_utils import (
+                is_plausible_function_code_head,
                 is_plausible_function_name,
                 is_plausible_function_signature,
             )
 
             if not is_plausible_function_name(vf.name):
                 continue
-            sig = vf.snippet[0].strip() if vf.snippet else None
+            snippet_lines = vf.snippet if isinstance(vf.snippet, list) else []
+            sig = snippet_lines[0].strip() if snippet_lines else None
             if not is_plausible_function_signature(sig):
-                sig = _normalize_signature(vf.name, vf.name)
+                # 多行函数头：拼到含右括号再判；否则回退规范化
+                acc: List[str] = []
+                for ln in snippet_lines[:12]:
+                    s = str(ln or "").strip()
+                    if not s or s.startswith("{"):
+                        break
+                    acc.append(s)
+                    joined = " ".join(acc)
+                    if "(" in joined and ")" in joined:
+                        sig = joined.split("{", 1)[0].strip()
+                        break
+                if not is_plausible_function_signature(sig):
+                    sig = _normalize_signature(vf.name, vf.name)
             if not is_plausible_function_signature(sig):
+                # 仍可能是合法多行定义（首行缺 )），用整段 head 兜底
+                if not is_plausible_function_code_head("\n".join(str(x) for x in snippet_lines[:16])):
+                    continue
+                if not sig or not is_plausible_function_signature(sig):
+                    sig = _normalize_signature(vf.name, vf.name) or str(vf.name or "").strip()
+            if not sig:
                 continue
             fn_id = ensure_func_node(vf.name, vf.file, sig, vf.snippet)
             v_id = var_node_id(vf.variable)
@@ -8411,33 +8470,8 @@ class CodeContentProvider:
         return False
     
     def _determine_variable_relation(self, line: str, variable_name: str) -> str:
-        """确定变量使用关系"""
-        line = line.strip()
-        
-        # 指针解引用赋值 - 如 tail->next = new_node
-        if f'{variable_name}->' in line and '=' in line:
-            return 'read'  # tail 是被读取的
-        
-        # 删除操作
-        if any(keyword in line for keyword in ['delete', 'free']):
-            return 'delete'
-        
-        # 赋值操作 - 变量在赋值号左边
-        if '=' in line:
-            # 处理多重赋值：head = tail = new_node
-            assignments = line.split('=')
-            for i, assignment in enumerate(assignments[:-1]):  # 除了最后一个
-                if variable_name in assignment.strip():
-                    return 'write'
-            # 最后一个赋值右边的变量是读取
-            if variable_name in assignments[-1].strip():
-                return 'read'
-        
-        # 读取操作
-        if variable_name in line:
-            return 'read'
-        
-        return 'unknown'
+        """确定变量使用关系（与 CodeLocator VariableLocator 对齐）。"""
+        return self._locator.variable_locator.determine_variable_relation(line, variable_name)
 
     def _find_variable_declaration(self, var_name: str, code_roots: Optional[List[str]]) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -9479,7 +9513,10 @@ class CodeContentProvider:
             and should_persist_owner_class_from_crash_summary(cs)
         ):
             skel_node = build_class_skeleton_node(owner_ctx)
-            if skel_node.get("skeleton", "").strip():
+            # 骨架文本或成员字段任一可用即落盘，避免「类只在头文件」时完全丢失成员名单
+            has_skel = bool(str(skel_node.get("skeleton") or "").strip())
+            has_fields = bool(skel_node.get("member_fields"))
+            if has_skel or has_fields:
                 nodes_list.append(skel_node)
                 cs["owner_class_node_id"] = skel_node["id"]
                 # 解耦重构：不再将 crash_summary 写入 03 输出

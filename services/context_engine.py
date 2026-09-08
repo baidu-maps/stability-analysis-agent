@@ -752,15 +752,137 @@ class ContextEngine:
         return items
 
     @staticmethod
-    def _compress_stable_context(text: str, limit: int) -> str:
+    def _compact_class_skeleton_pin(text: str) -> str:
+        """从类骨架段提取可压缩保活的同步/成员摘要（避免巨大骨架挤掉锁名）。"""
+        marker = "### 崩溃所属类骨架"
+        pos = str(text or "").find(marker)
+        if pos < 0:
+            return ""
+        rest = str(text)[pos:]
+        # 截到下一主要章节（其它上下文 / 分析任务），避免吞进后续规则全文
+        end = len(rest)
+        for pat in (r"\n## 其它代码上下文", r"\n# 崩溃分析任务", r"\n## 分析指导"):
+            m = re.search(pat, rest)
+            if m:
+                end = min(end, m.start())
+        section = rest[:end].strip()
+        if not section:
+            return ""
+        lines = section.splitlines()
+        kept: List[str] = []
+        in_fence = False
+        fence_kind = ""  # "sync" | "full" | ""
+        sync_fence_done = False
+        for ln in lines:
+            stripped = ln.strip()
+            if stripped.startswith("```"):
+                if not in_fence:
+                    in_fence = True
+                    # 第一段代码围栏视为同步声明摘录；其后为完整骨架，跳过
+                    fence_kind = "full" if sync_fence_done else "sync"
+                    if fence_kind == "sync":
+                        kept.append(ln)
+                    continue
+                # 关闭围栏
+                if fence_kind == "sync":
+                    kept.append(ln)
+                    sync_fence_done = True
+                in_fence = False
+                fence_kind = ""
+                continue
+            if in_fence:
+                if fence_kind == "sync":
+                    kept.append(ln)
+                continue
+            # 元信息与成员列表；跳过「完整骨架」说明后的冗余行已由 fence 处理
+            kept.append(ln)
+            if len(kept) >= 80:
+                kept.append("...[class skeleton pin truncated]...")
+                break
+        pin = "\n".join(kept).strip()
+        if "m_" not in pin and "同步" not in pin and "成员" not in pin:
+            return section[:4000]
+        return pin
+
+    @classmethod
+    def _extract_pinned_stable_sections(cls, text: str) -> List[str]:
+        """预算压缩时优先保留的稳定上下文片段。"""
+        pins: List[str] = []
+        body = str(text or "")
+        sync_marker = "### 关键同步与共享成员"
+        sync_pos = body.find(sync_marker)
+        if sync_pos >= 0:
+            rest = body[sync_pos:]
+            end = len(rest)
+            for pat in (r"\n# 崩溃分析任务", r"\n## 分析指导", r"\n## 输出格式"):
+                m = re.search(pat, rest)
+                if m:
+                    end = min(end, m.start())
+            block = rest[:end].strip()
+            if block:
+                pins.append(block)
+        write_marker = "### 写路径函数源码"
+        write_pos = body.find(write_marker)
+        if write_pos >= 0:
+            # 若写路径已含在「关键同步」到任务节的保活块中，不再重复抽取
+            already = any(write_marker in (p or "") for p in pins)
+            if not already:
+                rest = body[write_pos:]
+                end = len(rest)
+                for pat in (r"\n# 崩溃分析任务", r"\n## 分析指导", r"\n### 关键同步与共享成员"):
+                    m = re.search(pat, rest)
+                    if m:
+                        end = min(end, m.start())
+                block = rest[:end].strip()
+                if block and block not in pins:
+                    pins.append(block)
+        skel_pin = cls._compact_class_skeleton_pin(body)
+        if skel_pin and skel_pin not in pins:
+            # 已有同步保活且含锁名时，不再附加大块类骨架，省预算给写路径
+            if any("关键同步与共享成员" in (p or "") and "m_" in (p or "") for p in pins):
+                pass
+            else:
+                pins.append(skel_pin)
+        return pins
+
+    @classmethod
+    def _compress_stable_context(cls, text: str, limit: int) -> str:
         if len(text) <= limit:
             return text
         marker = "\n...[stable context compressed by budget]...\n"
         if limit <= len(marker):
             return text[: max(0, limit)]
-        available = max(0, limit - len(marker))
-        head = int(available * 0.7)
-        return text[:head] + marker + text[-(available - head):]
+        pinned_parts = cls._extract_pinned_stable_sections(text)
+        pinned = "\n\n".join(p for p in pinned_parts if p).strip()
+        task_marker = "\n# 崩溃分析任务"
+        task_idx = text.find(task_marker)
+        task_tail = text[task_idx:] if task_idx >= 0 else ""
+        # 任务节至少保留引导与关键规则头，避免压缩后丢失输出契约
+        task_reserve = min(len(task_tail), max(800, int(limit * 0.22))) if task_tail else 0
+        pinned_budget = min(
+            max(3500, int(limit * 0.50)),
+            max(0, limit - len(marker) - task_reserve - 256),
+        )
+        if pinned and len(pinned) > pinned_budget:
+            pinned = pinned[: max(0, pinned_budget - 48)].rstrip() + "\n...[pinned sync context truncated]...\n"
+        suffix = ""
+        if pinned:
+            suffix += "\n\n" + pinned
+        if task_tail:
+            suffix += "\n" + task_tail[:task_reserve]
+            if len(task_tail) > task_reserve:
+                suffix += "\n...[task section truncated by budget]...\n"
+        remaining = max(0, limit - len(marker) - len(suffix))
+        if remaining <= 0:
+            return (marker + suffix)[:limit]
+        # 头部优先保留崩溃摘要与崩溃函数源码
+        head = text[:remaining]
+        # 避免把头截断在任务节之后造成重复
+        if task_idx >= 0:
+            head = text[: min(remaining, task_idx)].rstrip()
+            if len(head) > remaining:
+                head = head[:remaining]
+        return (head + marker + suffix)[:limit]
 
     def build_prompt(
         self,

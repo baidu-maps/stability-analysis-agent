@@ -171,13 +171,16 @@ def _prepare_http_run_body(body: Dict[str, Any]) -> Dict[str, Any]:
     has_content = isinstance(content, str) and bool(content.strip())
     has_path = bool(str(payload.get("crash_log") or "").strip())
     has_dir = bool(str(payload.get("crash_log_dir") or "").strip())
+    # Enterprise overlays may supply logs later from icafe_card_id; treat a
+    # non-empty value as a valid remote log source for HTTP body guards.
+    has_icafe = bool(str(payload.get("icafe_card_id") or "").strip())
     if _DENY_LOCAL_PATH_FIELDS or not (has_path or has_dir):
-        if not has_content:
+        if not has_content and not has_icafe:
             raise DaemonHttpError(
                 HTTPStatus.BAD_REQUEST,
                 {
                     "error": "crash_log_content_required",
-                    "message": "crash_log_content 不能为空",
+                    "message": "crash_log_content 不能为空（或提供 icafe_card_id）",
                 },
             )
     return payload
@@ -919,6 +922,7 @@ def _run_fingerprint(body: Dict[str, Any]) -> str:
         "crash_log_content": body.get("crash_log_content"),
         "crash_log": body.get("crash_log"),
         "crash_log_dir": body.get("crash_log_dir"),
+        "icafe_card_id": str(body.get("icafe_card_id") or "").strip() or None,
         "platform": body.get("platform"),
         "sdk_version": body.get("sdk_version"),
         "apply_ai_fixes": body.get("apply_ai_fixes"),
@@ -1040,7 +1044,9 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
     stdin_text: Optional[str] = None
     defaults = _cli_analysis_defaults()
 
-    # analysis 模式：crash_log_dir 优先；否则 file / content
+    # analysis 模式：crash_log_dir 优先；否则 file / content。
+    # 无日志来源时不要塞空的 --crash-log-file，否则企业层 argv_has_option
+    # 会误判「调用方已自带日志」，无法再注入 iCafe 准备好的路径。
     crash_log_dir = (getattr(req, "crash_log_dir", None) or "").strip()
     if crash_log_dir:
         cmd += ["--crash-log-dir", crash_log_dir]
@@ -1049,9 +1055,6 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
         stdin_text = req.crash_log_content
     elif req.crash_log:
         cmd += ["--crash-log-file", req.crash_log]
-    else:
-        # 交给 CLI 自己报错
-        cmd += ["--crash-log-file", ""]
 
     if req.library_dir:
         cmd += ["--library-dir", req.library_dir]
@@ -1587,13 +1590,15 @@ def _load_report_applied_fixes(run: RunState) -> Optional[Dict[str, Any]]:
 
 
 def _emit_trace_handoff(run: RunState, trace: Optional[Dict[str, Any]]) -> None:
+    """Emit a trace_loaded SSE event after a successful CLI run loads runtime_trace."""
     if not isinstance(trace, dict):
         return
     events = trace.get("events") if isinstance(trace.get("events"), list) else []
     run.events.put(
         RunEvent(
-            type="trace_loaded",
-            data={
+            run.run_id,
+            "trace_loaded",
+            {
                 "event_count": len(events),
                 "report_dir": run.report_dir,
                 "run_id": trace.get("run_id"),

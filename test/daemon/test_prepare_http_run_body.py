@@ -15,10 +15,14 @@ if str(REPO_ROOT) not in sys.path:
 
 from daemon.server import (
     DaemonHttpError,
+    RunState,
+    _emit_trace_handoff,
     _prepare_http_run_body,
     _run_fingerprint,
     set_deny_local_path_fields,
 )
+from protocol.models import RunEvent
+import time
 
 
 class PrepareHttpRunBodyTests(unittest.TestCase):
@@ -114,6 +118,28 @@ class PrepareHttpRunBodyTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status, int(HTTPStatus.BAD_REQUEST))
         self.assertEqual(ctx.exception.payload["error"], "crash_log_content_required")
 
+    def test_icafe_card_id_allows_omitting_crash_log_content(self) -> None:
+        """Enterprise digital-employee path may send only icafe_card_id."""
+        set_deny_local_path_fields(True)
+        body = _prepare_http_run_body(
+            {
+                "icafe_card_id": (
+                    "https://console.cloud.baidu-int.com/devops/icafe/"
+                    "issue/openmap-client-3456/show"
+                ),
+            }
+        )
+        self.assertFalse(body["apply_ai_fixes"])
+        self.assertIn("icafe_card_id", body)
+
+    def test_icafe_card_id_changes_run_fingerprint(self) -> None:
+        """Different cards must not share the same idempotency fingerprint."""
+        base = {"apply_ai_fixes": False, "output_format": "markdown"}
+        self.assertNotEqual(
+            _run_fingerprint({**base, "icafe_card_id": "openmap-client-1"}),
+            _run_fingerprint({**base, "icafe_card_id": "openmap-client-2"}),
+        )
+
     def test_forbidden_local_path_when_denied(self) -> None:
         """code_roots is rejected in remote mode."""
         set_deny_local_path_fields(True)
@@ -129,6 +155,24 @@ class PrepareHttpRunBodyTests(unittest.TestCase):
         with self.assertRaises(DaemonHttpError) as ctx:
             _prepare_http_run_body({"crash_log_content": "x", "output_format": "pdf"})
         self.assertEqual(ctx.exception.payload["error"], "invalid_output_format")
+
+
+class EmitTraceHandoffTests(unittest.TestCase):
+    """Successful CLI runs must hand off runtime_trace without raising."""
+
+    def test_emit_trace_handoff_includes_run_id(self) -> None:
+        """Regression: keyword-only RunEvent missed required run_id."""
+        run = RunState(run_id="run-trace-1", transport_status="running", created_at=time.time())
+        _emit_trace_handoff(
+            run,
+            {"events": [{"type": "x"}], "run_id": "cli-trace"},
+        )
+        event = run.events.get_nowait()
+        self.assertIsInstance(event, RunEvent)
+        self.assertEqual(event.run_id, "run-trace-1")
+        self.assertEqual(event.type, "trace_loaded")
+        self.assertEqual(event.data.get("event_count"), 1)
+        self.assertEqual(event.data.get("run_id"), "cli-trace")
 
 
 if __name__ == "__main__":

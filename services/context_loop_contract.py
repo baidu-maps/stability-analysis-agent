@@ -110,7 +110,7 @@ def build_round0_output_format_lines(*, agent_loop: str) -> List[str]:
         "  1. `[符号]`（function/field/references/callers/grep/read_file）：",
         "     - 原因：[为什么当前证据不足]",
         "     - 希望验证：[补充后要验证的根因假设]",
-        "     - 优先级：[high/medium/low]",
+        "     - 优先级：[critical/high/normal/low]（禁止 medium）",
         "     - 请求类型说明：[该 type 将回填什么；若需多种证据请拆成多个请求]",
         "",
         "```json",
@@ -123,6 +123,13 @@ def build_round0_output_format_lines(*, agent_loop: str) -> List[str]:
         '      "expected_return_form": "function_source",',
         '      "reason": "说明为什么需要该上下文，以及补充后要验证什么假设",',
         '      "fulfillment_note": "可选：补充说明期望拿到什么形态的证据",',
+        '      "priority": "high"',
+        "    },",
+        "    {",
+        '      "type": "read_file",',
+        '      "file": "inc/vi/vos/VTempl.h",',
+        '      "expected_return_form": "file_snippet",',
+        '      "reason": "读取头文件中的模板实现（不要用 type=file）",',
         '      "priority": "high"',
         "    },",
         "    {",
@@ -148,10 +155,13 @@ def build_round0_output_format_lines(*, agent_loop: str) -> List[str]:
         "`function`→`function_source`；`field`→`member_declaration`；",
         "`references`→`read_write_references`；`callers`→`caller_snippets`；",
         "`grep`→`grep_matches`；`read_file`→`file_snippet`。",
+        "禁止：`type=file`（改用 `read_file`）、`priority=medium`（改用 `normal`）。",
         "```",
         "",
         "### 情况 B：不再需要 Agent 补充上下文时",
         "输出完整崩溃分析报告，并在末尾输出 `agent_can_fetch_more=false` JSON：",
+        "若证据充分且希望进入自动改码，可额外附带 "
+        '`"next_action": {"kind": "propose_fix"}`（Markdown 示例代码不能代替该字段）。',
         "",
     ]
 
@@ -171,7 +181,21 @@ def build_round_task_section(
             )
         elif early_final_reason == "invalid_schema":
             lines.append(
-                "- 上一轮的上下文请求协议无有效请求；本轮必须直接输出最终分析。"
+                "- 上一轮 `context_requests` 未产出任何**有效**请求（类型/优先级不合法或列表为空）。"
+            )
+            lines.append(
+                "- 合法 `type` 仅限：`function` / `field` / `references` / `callers` / "
+                "`grep` / `read_file` / `memory_pattern` / `verification_log` / `trace_snippet`。"
+                "不要使用 `file`（请改用 `read_file`，路径放在 `file` 字段）。"
+            )
+            lines.append(
+                "- 合法 `priority` 仅限：`low` / `normal` / `high` / `critical`（不要使用 `medium`）。"
+            )
+            lines.append("- 本轮必须直接输出最终分析；不得再请求 Agent 补充上下文。")
+            lines.append(
+                "- Markdown 中的「修复建议/示例代码」只供人阅读；若认为可自动改码，请在末尾 JSON 中增加 "
+                '`"next_action": {"kind": "propose_fix", "reason": "..."}`，'
+                "不要把示例代码块当成已经完成的补丁协议。"
             )
         else:
             lines.append("- 当前已经达到允许的最大多轮次数，本轮必须输出最终分析。")
@@ -274,7 +298,12 @@ def inject_extra_code_context(base_prompt: str, extra_context_markdown: str) -> 
     if not extra:
         return text
     section = f"## 其它代码上下文\n\n{extra}\n"
-    for marker in ("### 崩溃所属类骨架", "# 崩溃分析任务"):
+    for marker in (
+        "### 关键同步与共享成员",
+        "### 写路径函数源码",
+        "### 崩溃所属类骨架",
+        "# 崩溃分析任务",
+    ):
         pos = text.find(marker)
         if pos >= 0:
             return text[:pos].rstrip() + "\n\n" + section + "\n" + text[pos:].lstrip()

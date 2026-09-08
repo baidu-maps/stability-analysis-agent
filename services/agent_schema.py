@@ -21,6 +21,59 @@ CONTEXT_OBSERVATION_REQUEST_TYPES = frozenset({"memory_pattern", "verification_l
 CONTEXT_REPO_SEARCH_REQUEST_TYPES = frozenset({"grep", "read_file"})
 CONTEXT_PRIORITIES = frozenset({"low", "normal", "high", "critical"})
 
+# Common model slips → canonical contract values.
+_CONTEXT_REQUEST_TYPE_ALIASES = {
+    "file": "read_file",
+    "filepath": "read_file",
+    "path": "read_file",
+    "source_file": "read_file",
+    "header": "read_file",
+    "func": "function",
+    "method": "function",
+    "member": "field",
+    "ref": "references",
+    "refs": "references",
+    "caller": "callers",
+    "search": "grep",
+}
+_CONTEXT_PRIORITY_ALIASES = {
+    "medium": "normal",
+    "med": "normal",
+    "mid": "normal",
+    "urgent": "critical",
+    "p0": "critical",
+    "p1": "high",
+    "p2": "normal",
+    "p3": "low",
+}
+_READ_FILE_SUFFIXES = (
+    ".h", ".hpp", ".hh", ".c", ".cc", ".cpp", ".cxx", ".m", ".mm",
+    ".java", ".kt", ".swift", ".go", ".rs", ".py", ".ts", ".tsx", ".js",
+)
+
+
+def normalize_context_request_type(value: str) -> str:
+    """Map common aliases (e.g. ``file``) onto supported request types."""
+    text = str(value or "").strip().lower()
+    return _CONTEXT_REQUEST_TYPE_ALIASES.get(text, text)
+
+
+def normalize_context_priority(value: str) -> str:
+    """Map common aliases (e.g. ``medium``) onto supported priorities."""
+    text = str(value or "normal").strip().lower() or "normal"
+    return _CONTEXT_PRIORITY_ALIASES.get(text, text)
+
+
+def _looks_like_source_path(value: str) -> bool:
+    """Heuristic: treat a symbol as a file path for read_file remapping."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(lowered.endswith(suffix) for suffix in _READ_FILE_SUFFIXES):
+        return True
+    return "/" in text or "\\" in text
+
 
 @dataclass(frozen=True)
 class ContextRequest:
@@ -38,11 +91,21 @@ class ContextRequest:
     def from_mapping(cls, value: Any) -> Tuple[Optional["ContextRequest"], Optional[str]]:
         if not isinstance(value, dict):
             return None, "request must be an object"
-        req_type = str(value.get("type") or "function").strip().lower()
+        req_type = normalize_context_request_type(str(value.get("type") or "function"))
         if req_type not in CONTEXT_REQUEST_TYPES:
             return None, f"unsupported request type: {req_type}"
-        symbol = str(value.get("symbol") or value.get("function") or value.get("function_name") or value.get("name") or "").strip()
+        symbol = str(
+            value.get("symbol")
+            or value.get("function")
+            or value.get("function_name")
+            or value.get("name")
+            or ""
+        ).strip()
         file_path = str(value.get("file") or value.get("file_path") or "").strip()
+        # Models often put the path in ``symbol`` when type was ``file`` / ``read_file``.
+        if req_type == "read_file" and not file_path and _looks_like_source_path(symbol):
+            file_path = symbol
+            symbol = ""
         try:
             line = int(value.get("line") or value.get("line_number") or 0)
         except (TypeError, ValueError):
@@ -64,7 +127,7 @@ class ContextRequest:
                 return None, "symbol or file+line is required"
         if "\x00" in file_path or any(part == ".." for part in Path(file_path).parts):
             return None, "file path is unsafe"
-        priority = str(value.get("priority") or "normal").strip().lower()
+        priority = normalize_context_priority(str(value.get("priority") or "normal"))
         if priority not in CONTEXT_PRIORITIES:
             return None, "priority must be low/normal/high/critical"
         reason = str(value.get("reason") or "").strip()
@@ -115,7 +178,10 @@ class AgentDecision:
             else:
                 requests.append(request)
         if value["agent_can_fetch_more"] and not requests:
-            invalid.append({"error": "agent_can_fetch_more=true requires context_requests"})
+            # Only a true empty list is a contract error. Invalid items are reported
+            # per-request; do not also degrade the whole turn as "missing requests".
+            if not raw:
+                invalid.append({"error": "agent_can_fetch_more=true requires context_requests"})
         hypotheses = value.get("hypotheses")
         if hypotheses is None:
             hypotheses = []

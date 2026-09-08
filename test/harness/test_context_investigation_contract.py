@@ -35,6 +35,40 @@ class ContextInvestigationContractTest(unittest.TestCase):
         self.assertEqual(len(out["invalid_context_requests"]), 1)
         self.assertFalse(out["degraded"])
 
+    def test_file_and_medium_aliases_normalize(self):
+        """Model slips like type=file / priority=medium should still resolve."""
+        out = parse_agent_decision(
+            '{"agent_can_fetch_more":true,"context_requests":['
+            '{"type":"file","symbol":"inc/vi/vos/VTempl.h","priority":"medium","reason":"need Copy"},'
+            '{"type":"function","symbol":"CNaviEngineControl::UpdateRoute","priority":"medium","reason":"lifecycle"}'
+            "]}"
+        )
+        self.assertFalse(out["degraded"])
+        self.assertTrue(out["agent_can_fetch_more"])
+        self.assertEqual(len(out["context_requests"]), 2)
+        self.assertEqual(len(out["invalid_context_requests"]), 0)
+        types = {item["type"] for item in out["context_requests"]}
+        self.assertEqual(types, {"read_file", "function"})
+        read_file = next(item for item in out["context_requests"] if item["type"] == "read_file")
+        self.assertEqual(read_file["file"], "inc/vi/vos/VTempl.h")
+        self.assertEqual(read_file["priority"], "normal")
+        func = next(item for item in out["context_requests"] if item["type"] == "function")
+        self.assertEqual(func["priority"], "normal")
+
+    def test_all_invalid_requests_do_not_add_missing_list_contract_error(self):
+        out = parse_agent_decision(
+            '{"agent_can_fetch_more":true,"context_requests":[{"type":"bogus","symbol":"x"}]}'
+        )
+        self.assertEqual(len(out["context_requests"]), 0)
+        self.assertTrue(any("unsupported request type" in str(item.get("error")) for item in out["invalid_context_requests"]))
+        self.assertFalse(
+            any(
+                item.get("error") == "agent_can_fetch_more=true requires context_requests"
+                for item in out["invalid_context_requests"]
+            )
+        )
+        self.assertFalse(out["degraded"])
+
     def test_reproduction_plan_is_rejected_without_profile(self):
         engine = ContextEngine(ContextEngineConfig(), ContextResolverRegistry())
         decision = engine.parse_decision(

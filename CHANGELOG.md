@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+## [1.3.8] - 2026-09-09
+
+### Fixed
+
+- Daemon `_emit_trace_handoff` 构造 `RunEvent` 时补上 `run_id`，避免产出 `runtime_trace` 的成功任务被标成 `status=error`。
+- HTTP `_prepare_http_run_body` 在提供非空 `icafe_card_id` 时不再强制 `crash_log_content`；`_run_fingerprint` 纳入 `icafe_card_id`，避免不同卡片幂等指纹碰撞。
+- `_build_cli_cmd` 在无日志来源时不再追加空的 `--crash-log-file ""`，避免企业层误判「调用方已自带日志」。
+- Context-loop：接受 `file`→`read_file`、`medium`→`normal` 等常见别名；无效请求不再误标成「缺少 context_requests」合同错误；协议失败后的终局若已给出最终分析则记为 `model_final`，避免仅因 `invalid_schema` 阻断改码管道。提示词明确禁止 `type=file` / `priority=medium`，并区分 Markdown 修复示例与 `next_action.propose_fix`。
+- 自动改码：类骨架优先从头文件构建并落盘 `member_fields`；`apply_fix_plan` 接线成员白名单门禁，拒绝臆造的 `m_*`（含同步原语）；对已有 `Lock/Unlock` 成员拒绝改用未出现的 `ScopedLock`；prompt 禁止假设新 mutex/lock 成员，并要求 TOCTOU 评估写路径；共享变量源码配额优先保留写/删路径。
+- 类成员解析：剥离 `Type m_foo; /**< ... */` 行尾注释后再识别字段，避免 `CNMutex` 等声明漏入 `member_fields`；prompt 对大类骨架增加同步/共享指针声明摘录并截断完整骨架，避免锁名被裁掉。
+- TOCTOU 终局写路径完整性门禁：当 prompt 含「写路径函数源码（压缩保活）」且分析主张共享状态竞态，
+  但修复代码未给出写路径完整函数体时，context-loop 强制续一轮补齐（避免只改读侧就收工）。
+  仅认「修复建议/修复代码」章节内的带同步原语函数体；根因证据区的 cpp 块不算已提交补丁。
+- Context-loop / EvidenceStore 预算压缩共用保活逻辑：钉住「关键同步与共享成员 / 写路径函数源码」于「# 崩溃分析任务」前，避免 `select_prompt` 先裁掉锁名后再进 ContextEngine。
+- 自动改码：拒绝源文件未出现的 `AddRef`/`Release`/`Retain` 等臆造生命周期 API；臆造 `m_*Mutex` 仍由成员白名单拒绝。
+- 写路径保活优先崩溃共享变量的 assign 边（如置空路径），避免无关误报写边占满配额。
+- 共享变量检索：赋值点优先扫描（泛化 `m_x=` / `->m_x=` / delete|free，变量名来自崩溃点而非硬编码）；`assign`/`write`/`delete` 分类修正；截断与早停写路径优先；「共享变量写」纳入 prompt must 标签，强制完整函数体进改码上下文。
+
+### Documentation
+
+- README / PyPI 发布说明中的最新版本号更新为 1.3.8。
+
 ## [1.3.7] - 2026-09-08
 
 ### Added

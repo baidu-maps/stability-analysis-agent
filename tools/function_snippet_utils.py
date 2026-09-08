@@ -67,3 +67,24 @@ def is_plausible_function_signature(sig: Optional[str]) -> bool:
     if "(" not in s or ")" not in s:
         return False
     return True
+
+
+def is_plausible_function_code_head(code: Optional[str]) -> bool:
+    """对可能跨行的函数定义头做合法性判断（首行常缺右括号）。"""
+    lines = [ln.strip() for ln in str(code or "").splitlines() if ln.strip()]
+    if not lines:
+        return False
+    if is_plausible_function_signature(lines[0]):
+        return True
+    acc: list = []
+    for ln in lines[:12]:
+        if ln.startswith("{"):
+            break
+        acc.append(ln.rstrip("\\").strip())
+        joined = " ".join(acc)
+        # 截到函数体前
+        if "{" in joined:
+            joined = joined.split("{", 1)[0].strip()
+        if "(" in joined and ")" in joined:
+            return is_plausible_function_signature(joined)
+    return False

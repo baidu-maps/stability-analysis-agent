@@ -11,6 +11,7 @@ from services.code_fixer import (
     CodeFixer,
     extract_candidate_nodes,
     graph_auto_fix_allowed,
+    _collect_allowed_member_names,
     _contains_placeholder_code,
     _normalize_code_for_equivalence,
     _extract_include_directive_edits,
@@ -19,6 +20,7 @@ from services.code_fixer import (
     _replacement_signature_compatible,
     _ensure_owner_class_methods_in_targets,
     _select_required_targets,
+    _validate_and_fix_member_references,
     _validate_method_calls_in_replacement,
 )
 from tools.code_content_provider_tool import CodeContentProvider, CrashFunction
@@ -709,6 +711,276 @@ VINLINE VVoid VDelete(TYPE* pObjects)
             self.assertEqual(applied["status"], "applied")
             self.assertNotIn("NAMESPACE_BAIDU_VI_BEGIN void", applied["function_signature"])
             self.assertTrue(text.index("NAMESPACE_BAIDU_VI_BEGIN") < text.index("void MTLVertexBuffer::createPrivateBuffer"))
+
+    def test_validate_rejects_hallucinated_member_without_unique_match(self):
+        original = (
+            "class Demo {\n"
+            "  CNMutex m_clInfoMutex;\n"
+            "  CNMutex m_clOuterDataMutex;\n"
+            "};\n"
+            "int Demo::get() {\n"
+            "  m_clInfoMutex.Lock(-1);\n"
+            "  m_clInfoMutex.Unlock();\n"
+            "  return 0;\n"
+            "}\n"
+        )
+        replacement = (
+            "int Demo::get()\n"
+            "{\n"
+            "    CVMutex::ScopedLock lock(m_clDataMutex);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        allowed = {"m_clInfoMutex", "m_clOuterDataMutex"}
+        _, err = _validate_and_fix_member_references(
+            original, replacement, allowed_members=allowed, allow_fuzzy_rewrite=False
+        )
+        self.assertIsNotNone(err)
+        self.assertIn("m_clDataMutex", err or "")
+
+    def test_validate_rewrites_unique_near_member_when_enabled(self):
+        original = "void Foo::bar() { m_clInfoMutex.Lock(-1); m_clInfoMutex.Unlock(); }\n"
+        replacement = (
+            "void Foo::bar()\n{\n"
+            "    m_clInfMutex.Lock(-1);\n"
+            "    m_clInfMutex.Unlock();\n"
+            "}\n"
+        )
+        fixed, err = _validate_and_fix_member_references(
+            original,
+            replacement,
+            allowed_members={"m_clInfoMutex"},
+            allow_fuzzy_rewrite=True,
+        )
+        self.assertIsNone(err)
+        self.assertIn("m_clInfoMutex", fixed)
+        self.assertNotIn("m_clInfMutex", fixed)
+
+    def test_apply_rejects_hallucinated_mutex_member(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            hdr = root / "engine.h"
+            src = root / "engine.cpp"
+            hdr.write_text(
+                "class Engine {\n"
+                "public:\n"
+                "  CVArray<int> GetSteps();\n"
+                "private:\n"
+                "  CNMutex m_clRouteInfoMutex;\n"
+                "  CRoute* m_pclCurRoute;\n"
+                "};\n",
+                encoding="utf-8",
+            )
+            src.write_text(
+                '#include "engine.h"\n'
+                "CVArray<int> Engine::GetSteps()\n"
+                "{\n"
+                "    CVArray<int> routes;\n"
+                "    if (m_pclCurRoute) {\n"
+                "        routes = m_pclCurRoute->GetRenderSteps();\n"
+                "    }\n"
+                "    return routes;\n"
+                "}\n"
+                "void Engine::Release()\n"
+                "{\n"
+                "    m_clRouteInfoMutex.Lock(-1);\n"
+                "    m_clRouteInfoMutex.Unlock();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            skeleton_node = {
+                "id": f"class_skeleton|{hdr}|Engine",
+                "type": "class_skeleton",
+                "class_name": "Engine",
+                "file": str(hdr),
+                "member_fields": ["m_clRouteInfoMutex", "m_pclCurRoute"],
+                "skeleton": (
+                    "class Engine {\n"
+                    "  CNMutex m_clRouteInfoMutex;\n"
+                    "  CRoute* m_pclCurRoute;\n"
+                    "};\n"
+                ),
+            }
+            candidate_nodes = [
+                {
+                    "type": "function",
+                    "file": str(src),
+                    "signature": "CVArray<int> Engine::GetSteps()",
+                    "snippet": [
+                        "CVArray<int> Engine::GetSteps()",
+                        "{",
+                        "    CVArray<int> routes;",
+                        "    if (m_pclCurRoute) {",
+                        "        routes = m_pclCurRoute->GetRenderSteps();",
+                        "    }",
+                        "    return routes;",
+                        "}",
+                    ],
+                    "snippet_start_line": 2,
+                }
+            ]
+            fix_plan = {
+                "summary": "bad mutex",
+                "edits": [
+                    {
+                        "file": str(src),
+                        "function_signature": "CVArray<int> Engine::GetSteps()",
+                        "replacement_code": (
+                            "CVArray<int> Engine::GetSteps()\n"
+                            "{\n"
+                            "    CVArray<int> routes;\n"
+                            "    CVMutex::ScopedLock lock(m_clRouteDataMutex);\n"
+                            "    if (m_pclCurRoute) {\n"
+                            "        routes = m_pclCurRoute->GetRenderSteps();\n"
+                            "    }\n"
+                            "    return routes;\n"
+                            "}\n"
+                        ),
+                    }
+                ],
+            }
+            code_context = {
+                "crash_summary": {"owner_class_node_id": skeleton_node["id"]},
+                "graph": {"nodes": [skeleton_node]},
+            }
+            result = CodeFixer(llm_adapter=None).apply_fix_plan(
+                fix_plan,
+                candidate_nodes,
+                [str(root)],
+                backup_original_sources=False,
+                code_context=code_context,
+            )
+            self.assertFalse(result.success, result.to_dict())
+            err = str((result.applied or [{}])[0].get("error") or "")
+            self.assertIn("m_clRouteDataMutex", err)
+            self.assertNotIn("m_clRouteDataMutex", src.read_text(encoding="utf-8"))
+            allowed = _collect_allowed_member_names(
+                src.read_text(encoding="utf-8"), code_context
+            )
+            self.assertIn("m_clRouteInfoMutex", allowed)
+
+    def test_apply_rejects_bare_lock_unlock_when_member_lock_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "engine.cpp"
+            src.write_text(
+                "CVArray<int> Engine::GetSteps()\n"
+                "{\n"
+                "    CVArray<int> routes;\n"
+                "    if (m_pclCurRoute) {\n"
+                "        routes = m_pclCurRoute->GetRenderSteps();\n"
+                "    }\n"
+                "    return routes;\n"
+                "}\n"
+                "void Engine::Release()\n"
+                "{\n"
+                "    m_clRouteInfoMutex.Lock(-1);\n"
+                "    m_clRouteInfoMutex.Unlock();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            candidate_nodes = [
+                {
+                    "type": "function",
+                    "file": str(src),
+                    "signature": "CVArray<int> Engine::GetSteps()",
+                    "snippet": src.read_text(encoding="utf-8").splitlines()[:8],
+                    "snippet_start_line": 1,
+                }
+            ]
+            fix_plan = {
+                "summary": "bare lock",
+                "edits": [
+                    {
+                        "file": str(src),
+                        "function_signature": "CVArray<int> Engine::GetSteps()",
+                        "replacement_code": (
+                            "CVArray<int> Engine::GetSteps()\n"
+                            "{\n"
+                            "    CVArray<int> routes;\n"
+                            "    Lock();\n"
+                            "    if (m_pclCurRoute) {\n"
+                            "        routes = m_pclCurRoute->GetRenderSteps();\n"
+                            "    }\n"
+                            "    Unlock();\n"
+                            "    return routes;\n"
+                            "}\n"
+                        ),
+                    }
+                ],
+            }
+            result = CodeFixer(llm_adapter=None).apply_fix_plan(
+                fix_plan,
+                candidate_nodes,
+                [str(root)],
+                backup_original_sources=False,
+                code_context={"graph": {"nodes": []}},
+            )
+            self.assertFalse(result.success, result.to_dict())
+            err = str((result.applied or [{}])[0].get("error") or "")
+            self.assertIn("Lock()", err)
+            self.assertNotIn("\n    Lock();\n", src.read_text(encoding="utf-8"))
+
+    def test_apply_rejects_scoped_lock_on_lock_unlock_member(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "engine.cpp"
+            src.write_text(
+                "CVArray<int> Engine::GetSteps()\n"
+                "{\n"
+                "    CVArray<int> routes;\n"
+                "    if (m_pclCurRoute) {\n"
+                "        routes = m_pclCurRoute->GetRenderSteps();\n"
+                "    }\n"
+                "    return routes;\n"
+                "}\n"
+                "void Engine::Release()\n"
+                "{\n"
+                "    m_clRouteInfoMutex.Lock(-1);\n"
+                "    m_clRouteInfoMutex.Unlock();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            candidate_nodes = [
+                {
+                    "type": "function",
+                    "file": str(src),
+                    "signature": "CVArray<int> Engine::GetSteps()",
+                    "snippet": src.read_text(encoding="utf-8").splitlines()[:8],
+                    "snippet_start_line": 1,
+                }
+            ]
+            fix_plan = {
+                "summary": "wrong lock api",
+                "edits": [
+                    {
+                        "file": str(src),
+                        "function_signature": "CVArray<int> Engine::GetSteps()",
+                        "replacement_code": (
+                            "CVArray<int> Engine::GetSteps()\n"
+                            "{\n"
+                            "    CVArray<int> routes;\n"
+                            "    CVMutex::ScopedLock lock(m_clRouteInfoMutex);\n"
+                            "    if (m_pclCurRoute) {\n"
+                            "        routes = m_pclCurRoute->GetRenderSteps();\n"
+                            "    }\n"
+                            "    return routes;\n"
+                            "}\n"
+                        ),
+                    }
+                ],
+            }
+            result = CodeFixer(llm_adapter=None).apply_fix_plan(
+                fix_plan,
+                candidate_nodes,
+                [str(root)],
+                backup_original_sources=False,
+                code_context={"graph": {"nodes": []}},
+            )
+            self.assertFalse(result.success, result.to_dict())
+            err = str((result.applied or [{}])[0].get("error") or "")
+            self.assertIn("ScopedLock", err)
+            self.assertNotIn("ScopedLock", src.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

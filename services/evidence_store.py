@@ -65,14 +65,20 @@ class EvidenceContextManager:
 
     @staticmethod
     def _compress(content: str, limit: int) -> str:
-        if len(content) <= limit:
-            return content
-        marker = "\n...[evidence compressed by context budget]...\n"
-        if limit <= len(marker) + 32:
-            return content[:limit]
-        available = limit - len(marker)
-        head = max(1, int(available * 0.7))
-        return content[:head] + marker + content[-(available - head):]
+        """压缩 prompt，并保活同步成员 / 写路径等关键段（与 ContextEngine 共用逻辑）。"""
+        try:
+            from services.context_engine import ContextEngine
+
+            return ContextEngine._compress_stable_context(str(content or ""), int(limit))
+        except Exception:
+            if len(content) <= limit:
+                return content
+            marker = "\n...[evidence compressed by context budget]...\n"
+            if limit <= len(marker) + 32:
+                return content[:limit]
+            available = limit - len(marker)
+            head = max(1, int(available * 0.7))
+            return content[:head] + marker + content[-(available - head):]
 
     def select_prompt(self, prompt: str, *, max_chars: Optional[int] = None,
                       max_tokens: Optional[int] = None) -> Dict[str, Any]:

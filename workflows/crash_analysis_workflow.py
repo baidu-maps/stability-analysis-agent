@@ -9,7 +9,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from cli.phase_spinner import PhaseSpinner
 from tools.analysis_entry_display import (
@@ -2463,7 +2463,13 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     cand_key_read, key=lambda x: str((node_map.get(x) or {}).get("signature") or x)
                 )
                 chosen: List[str] = []
-                key_quota = min(key_read_floor, len(ordered_key_read), k_tip)
+                # 共享状态竞态优先保留写/删路径完整源码；key-read 占用剩余配额
+                min_write_slots = min(len(ordered_write), max(2, k_tip // 2), k_tip)
+                key_quota = min(
+                    key_read_floor,
+                    len(ordered_key_read),
+                    max(0, k_tip - min_write_slots),
+                )
                 write_quota = max(0, k_tip - key_quota)
 
                 for fid in ordered_write:
@@ -2760,12 +2766,18 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             isinstance(crash_summary, dict)
             and crash_summary.get("selected_analysis_is_crash_thread") is False
         )
+        # 供预算压缩保活：在「# 崩溃分析任务」前再贴一份短摘要（人工分析关键路径）
+        sync_keepalive_blocks: List[List[str]] = []
         if emit_class_skeleton:
+            sync_line_re = re.compile(
+                r"(?i)(mutex|rwlock|spinlock|semaphore|critical|locker|\block\b|m_pcl\w+|m_\w*Mutex|m_\w*Lock)"
+            )
             for nid, n in node_map.items():
                 if not isinstance(n, dict) or n.get("type") != "class_skeleton":
                     continue
-                skel_text = n.get("skeleton", "")
-                if not skel_text.strip():
+                skel_text = str(n.get("skeleton") or "")
+                member_fields = n.get("member_fields") if isinstance(n.get("member_fields"), list) else []
+                if not skel_text.strip() and not member_fields:
                     continue
                 cls_name = n.get("class_name", "Unknown")
                 skel_file = n.get("file", "N/A")
@@ -2774,10 +2786,87 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 lines.append("- 说明: 以下为类的精简骨架（成员变量 + 函数签名），函数体已省略。")
                 lines.append("  若修复方案需要修改成员变量声明（如 volatile → std::atomic）或其他未列出函数体的函数，")
                 lines.append("  请在修复代码中明确给出对应修改。")
-                lines.append("```cpp")
-                lines.append(skel_text)
-                lines.append("```")
+                field_names = [str(x).strip() for x in member_fields if str(x).strip()]
+                # 通用同步原语命名启发（不绑定具体业务类/字段）
+                sync_hint = re.compile(
+                    r"(?i)(mutex|rwlock|spinlock|semaphore|critical|locker|_lock$|Lock$)"
+                )
+                sync_fields = [f for f in field_names if sync_hint.search(f)]
+                if field_names:
+                    preview = ", ".join(field_names[:60])
+                    if len(field_names) > 60:
+                        preview += f", …(+{len(field_names) - 60})"
+                    lines.append(f"- 成员字段名（来自类声明，禁止臆造未列出的 m_*）：{preview}")
+                if sync_fields:
+                    lines.append(
+                        "- 疑似同步原语成员（优先复用，禁止假设新的 mutex/lock 成员名）："
+                        + ", ".join(sync_fields[:30])
+                    )
+                # 大类骨架可能被后续上下文裁剪；单独摘录同步/指针成员声明行，保证锁名可见
+                sync_decl_lines: List[str] = []
+                for ln in skel_text.splitlines():
+                    if sync_line_re.search(ln):
+                        sync_decl_lines.append(ln.rstrip())
+                if sync_decl_lines:
+                    lines.append("- 同步/共享指针相关声明摘录（来自类骨架，优先复用这些成员）：")
+                    lines.append("```cpp")
+                    lines.extend(sync_decl_lines[:40])
+                    lines.append("```")
+                usage_examples = self._collect_sync_member_usage_examples(
+                    code_context if isinstance(code_context, dict) else {},
+                    sync_fields=sync_fields,
+                    skel_file=str(skel_file or ""),
+                    max_examples=10,
+                )
+                if usage_examples:
+                    lines.append(
+                        "- 同文件已有加锁用法（风格必须一致；禁止写成无接收者的 Lock()/Unlock()）："
+                    )
+                    lines.append("```cpp")
+                    lines.extend(usage_examples)
+                    lines.append("```")
+                # 完整骨架可能很长；限制行数，避免挤掉关键同步摘录
+                if skel_text.strip():
+                    skel_lines = skel_text.splitlines()
+                    # 大类优先保留尾部成员区（mutex/指针常在 private 末段），并保留头部签名
+                    max_skel_lines = 80
+                    lines.append("```cpp")
+                    if len(skel_lines) <= max_skel_lines:
+                        lines.append(skel_text)
+                    else:
+                        head_n = 25
+                        tail_n = max_skel_lines - head_n
+                        lines.extend(skel_lines[:head_n])
+                        lines.append(
+                            f"// ... class skeleton middle omitted "
+                            f"({len(skel_lines) - head_n - tail_n} lines); "
+                            "prefer sync/shared-pointer excerpts above ..."
+                        )
+                        lines.extend(skel_lines[-tail_n:])
+                    lines.append("```")
                 lines.append("")
+                # 预算压缩保活块（短）：锁名 + 声明 + 同文件用法
+                keep: List[str] = [
+                    f"### 关键同步与共享成员（{cls_name}，压缩保活）",
+                    f"- 文件: {skel_file}",
+                ]
+                if sync_fields:
+                    keep.append(
+                        "- 疑似同步原语成员（禁止臆造新 mutex/lock）："
+                        + ", ".join(sync_fields[:30])
+                    )
+                if sync_decl_lines:
+                    keep.append("- 声明摘录：")
+                    keep.append("```cpp")
+                    keep.extend(sync_decl_lines[:24])
+                    keep.append("```")
+                if usage_examples:
+                    keep.append("- 同文件用法（复制此风格，须带成员对象接收者）：")
+                    keep.append("```cpp")
+                    keep.extend(usage_examples[:8])
+                    keep.append("```")
+                if len(keep) > 2:
+                    sync_keepalive_blocks.append(keep)
 
         code_roots: List[str] = []
         if isinstance(problem, dict):
@@ -2824,6 +2913,97 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     "当前应将其视为崩溃承载线程/现象线程，优先分析其它有业务帧线程中的跨线程影响、"
                     "异步任务、共享对象、资源释放和生命周期问题。"
                 )
+
+        for keep_block in sync_keepalive_blocks:
+            lines.extend(keep_block)
+            lines.append("")
+
+        # 写路径完整函数体保活：避免预算压缩裁掉中间「函数源码」后无法改写侧
+        # 优先：与崩溃函数共享同一 var| 的写边 > 同文件 > 其它 assign 噪音
+        crash_write_fids: Set[str] = set()
+        if shared_var_tids:
+            for e in edges_list:
+                if not isinstance(e, dict) or e.get("type") != "use_shared_var":
+                    continue
+                tid = str(e.get("to_id") or "")
+                if tid not in shared_var_tids:
+                    continue
+                if not _relation_write_like(str(e.get("relation") or "")):
+                    continue
+                crash_write_fids.add(_norm_graph_nid(str(e.get("from_id") or "")))
+        crash_file_hints: Set[str] = set()
+        for cfid in crash_fn_norm_ids:
+            for nid, n in node_map.items():
+                if not isinstance(n, dict):
+                    continue
+                if _norm_graph_nid(str(nid)) == cfid or _norm_graph_nid(str(n.get("id") or "")) == cfid:
+                    fp = str(n.get("file") or "")
+                    if fp:
+                        crash_file_hints.add(fp)
+                    break
+
+        def _write_keep_rank(fid_raw: str) -> Tuple[int, int, str]:
+            node = None
+            for nid, n in node_map.items():
+                if not isinstance(n, dict) or n.get("type") != "function":
+                    continue
+                if _norm_graph_nid(str(nid)) == fid_raw or _norm_graph_nid(str(n.get("id") or "")) == fid_raw:
+                    node = n
+                    break
+            same_crash_var = 0 if fid_raw in crash_write_fids else 1
+            same_file = 0
+            if isinstance(node, dict) and str(node.get("file") or "") in crash_file_hints:
+                same_file = 0
+            else:
+                same_file = 1
+            sig = str((node or {}).get("signature") or fid_raw)
+            return (same_crash_var, same_file, sig)
+
+        write_keep_emitted = 0
+        write_keep_budget_chars = 12000
+        write_keep_used = 0
+        write_keep_lines: List[str] = []
+        for fid_raw in sorted(write_shared_func_norm, key=_write_keep_rank):
+            if write_keep_emitted >= 6:
+                break
+            # 若已识别崩溃共享变量的写边，则只保活这些写路径，避免 PDR 等误报 assign 占满配额
+            if crash_write_fids and fid_raw not in crash_write_fids:
+                continue
+            node = None
+            for nid, n in node_map.items():
+                if not isinstance(n, dict) or n.get("type") != "function":
+                    continue
+                if _norm_graph_nid(str(nid)) == fid_raw or _norm_graph_nid(str(n.get("id") or "")) == fid_raw:
+                    node = n
+                    break
+            if not isinstance(node, dict):
+                continue
+            if _norm_graph_nid(str(node.get("id") or "")) in crash_fn_norm_ids:
+                continue
+            snippet = node.get("snippet")
+            if not (isinstance(snippet, list) and snippet):
+                continue
+            sig = str(node.get("signature") or node.get("id") or "write_path")
+            block = [
+                f"#### 写路径函数源码: {sig}",
+                f"- 文件: {node.get('file', 'N/A')}",
+                "- 代码片段:",
+                *[str(s) for s in snippet],
+                "",
+            ]
+            block_text = "\n".join(block)
+            if write_keep_used + len(block_text) > write_keep_budget_chars and write_keep_emitted > 0:
+                break
+            write_keep_lines.extend(block)
+            write_keep_used += len(block_text)
+            write_keep_emitted += 1
+        if write_keep_lines:
+            lines.append("### 写路径函数源码（压缩保活，可纳入需要修改的函数）")
+            lines.append(
+                "- 说明: 以下优先保留与崩溃点共享变量相关的 assign/delete/write 函数完整体；"
+                "与崩溃读路径同锁保护时，应一并评估是否修改。"
+            )
+            lines.extend(write_keep_lines)
 
         lines.append("# 崩溃分析任务")
         if prompt_mode == "fix":
@@ -2950,6 +3130,26 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.append(
                 "- 禁止调用源码片段中未出现的成员方法；不要编造 Cancel/Abort 等异步控制 API。"
             )
+            lines.append(
+                "- 禁止臆造类成员变量名（含任何 `m_*Mutex` / `m_*Lock` 等同步原语）；"
+                "同步保护必须优先使用上文「类骨架」/`member_fields` 或同文件源码中**已存在**的成员。"
+                "若上下文未给出可用锁/原子量，不得假设新成员已存在，应写入「无法生成完整修复代码/需人工处理」。"
+            )
+            lines.append(
+                "- 加锁/解锁 API 必须与同文件现有用法一致："
+                "若源码已使用 `成员.Lock(...)/成员.Unlock()`，必须带成员对象接收者，"
+                "禁止写成无接收者的 `Lock()`/`Unlock()`，也禁止改用该文件未出现的 `ScopedLock`/`unique_lock` 等包装；"
+                "反之亦然。禁止把其它无关对象的加锁模板套用到新臆造的成员上。"
+            )
+            lines.append(
+                "- 若根因涉及共享指针/共享状态的 TOCTOU（检查与使用之间被并发改写）："
+                "读者与写者（赋值、置空、delete/释放）应一并评估；"
+                "写路径函数体可能在「函数源码」或「写路径函数源码（压缩保活）」中给出；"
+                "只要上文已给出完整函数体，就**必须**将其列入「需要修改的函数」并与读侧同锁保护，"
+                "且修复代码中必须给出该写路径的完整可替换函数体；"
+                "禁止只输出读侧修复。若写路径体未给出，则把写路径保护列为「需人工处理」，"
+                "禁止只改读侧却声称竞态已彻底修复。"
+            )
             lines.append("- **修复代码格式**：每个修复函数必须使用独立的 ```cpp 围栏包裹；函数体必须完整，禁止用 `...`、`// ...`、`/* ... */`、`[其他代码]`、`其他逻辑保持不变`、`省略` 等任何占位内容代替代码行。")
             lines.append("- “需要修改的函数”列表中的每一项，都必须在“修复代码”中给出对应的完整函数定义（包含函数签名、完整函数体和全部原有必要逻辑），不能只给函数体片段、局部代码片段、diff 片段或伪代码。")
             lines.append(
@@ -2966,7 +3166,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 "应放到“无法生成完整修复代码/需人工处理”并说明缺少哪些上下文。"
             )
             lines.append(
-                "- 仅当上文「函数源码」中已给出该函数的完整函数体时，才允许将其列入「需要修改的函数」并输出可替换代码；"
+                "- 仅当上文「函数源码」或「写路径函数源码（压缩保活）」中已给出该函数的完整函数体时，"
+                "才允许将其列入「需要修改的函数」并输出可替换代码；"
                 "禁止修改仅出现在分析文字、类骨架或不完整片段中的函数。"
             )
             lines.append("- 禁止在修复函数中用注释表示保留原逻辑；所有未改动但仍需要保留的原代码也必须原样写出。")
@@ -3040,6 +3241,12 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     "- 如需字段读写、`RemoveAll()` 后访问、原子操作路径，请使用 `type=references` 或补充相关 `function`。"
                 )
                 lines.append("- 如需某函数的调用方，请使用 `type=callers`。")
+                lines.append(
+                    "- 读取头文件/源文件请使用 `type=read_file` 并填写 `file`；禁止 `type=file`。"
+                )
+                lines.append(
+                    "- `priority` 只能是 `low` / `normal` / `high` / `critical`；禁止 `medium`。"
+                )
                 lines.append("- 单个请求只对应一种回填形式；复合问题应拆成多个 `context_requests`。")
                 lines.append(
                     "- 每个 `context_requests[]` 必须包含 `expected_return_form`；"
@@ -3061,6 +3268,11 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 lines.append(
                     "- 只有输出 `agent_can_fetch_more=false` 时，才允许输出完整分析报告和修复或排查建议。"
                 )
+                lines.append(
+                    "- Markdown「修复代码」示例只供人阅读；若希望自动写码，须在 JSON 中声明 "
+                    '`"next_action": {"kind": "propose_fix"}`，'
+                    "并由后续改码管道生成可应用编辑（示例代码块不等于已改码）。"
+                )
             lines.append(
                 "- 当前是偏分析模式：不强制输出修复代码；"
                 "证据不足时只给分析方法、排查路径和人工确认点；"
@@ -3068,6 +3280,14 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             )
             lines.append("- 对共享状态的其它读写函数，应逐个判断其与崩溃路径的关系；不要因为函数被列出就默认需要修改。")
             lines.append("- 禁止调用源码片段中未出现的成员方法；不要编造 Cancel/Abort 等异步控制 API。")
+            lines.append(
+                "- 禁止臆造类成员变量名（含同步原语成员）；同步保护须复用上文类骨架/`member_fields` 或同文件已有成员，"
+                "不得假设新的 mutex/lock 成员已存在。"
+            )
+            lines.append(
+                "- 加锁 API 须与同文件现有风格一致；共享状态 TOCTOU 需同时评估写路径，"
+                "写路径不在完整函数源码中时不得声称已自动修复完毕。"
+            )
             lines.append("- 非静态成员函数内不得用 `if (this == nullptr)` 等形式作为 use-after-free/悬空对象 的修复。")
             lines.append("- 若输出修复代码，必须仅针对证据充分且上下文完整的函数，并保持原函数签名不变。")
         lines.append("")
@@ -3265,6 +3485,74 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
     @classmethod
     def _is_complete_function_snippet(cls, snippet: List[str]) -> bool:
         return cls._find_function_end_index(snippet) is not None
+
+    @staticmethod
+    def _collect_sync_member_usage_examples(
+        code_context: Dict[str, Any],
+        *,
+        sync_fields: Sequence[str],
+        skel_file: str = "",
+        max_examples: int = 10,
+    ) -> List[str]:
+        """从已收集的函数片段中摘录「成员.Lock/Unlock」同文件用法，供改码对齐风格。"""
+        fields = [str(f).strip() for f in (sync_fields or []) if str(f).strip()]
+        if not fields:
+            return []
+        field_alt = "|".join(re.escape(f) for f in fields[:40])
+        use_re = re.compile(
+            rf"\b(?:{field_alt})\s*\.\s*(?:Lock|Unlock|lock|unlock)\s*\("
+        )
+        skel_base = os.path.basename(str(skel_file or "").replace("\\", "/"))
+        examples: List[str] = []
+        seen: Set[str] = set()
+
+        def _add_line(raw: str) -> bool:
+            ln = str(raw or "").rstrip()
+            if not use_re.search(ln):
+                return False
+            key = ln.strip()
+            if not key or key in seen:
+                return False
+            seen.add(key)
+            examples.append(ln)
+            return len(examples) >= max_examples
+
+        graph = code_context.get("graph") if isinstance(code_context, dict) else None
+        nodes = graph.get("nodes") if isinstance(graph, dict) else None
+        if isinstance(nodes, list):
+            for node in nodes:
+                if not isinstance(node, dict) or node.get("type") != "function":
+                    continue
+                node_file = str(node.get("file") or "")
+                if skel_base:
+                    base = os.path.basename(node_file.replace("\\", "/"))
+                    stem = os.path.splitext(skel_base)[0]
+                    if stem and stem not in base and skel_base not in node_file:
+                        continue
+                snippet = node.get("snippet")
+                if not isinstance(snippet, list):
+                    continue
+                for raw in snippet:
+                    if _add_line(str(raw)):
+                        return examples
+
+        # 片段不足时：扫描头文件同 stem 的实现文件（对齐人工 grep 同文件锁用法）
+        skel_path = str(skel_file or "").strip()
+        if len(examples) < max_examples and skel_path and os.path.isfile(skel_path):
+            stem_path = os.path.splitext(skel_path)[0]
+            for ext in (".cpp", ".cc", ".cxx", ".mm", ".m"):
+                cand = stem_path + ext
+                if not os.path.isfile(cand):
+                    continue
+                try:
+                    with open(cand, "r", encoding="utf-8", errors="ignore") as fh:
+                        for raw in fh:
+                            if _add_line(raw):
+                                return examples
+                except OSError:
+                    continue
+                break
+        return examples
 
     def _prepare_prompt_function_snippet(
         self,
