@@ -3388,12 +3388,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", required=False, help="SystemConfig JSON 文件")
     p.add_argument(
         "--verification-config-json", default=None,
-        help="显式验证配置 JSON；未配置时 scope=full 会尝试自动 smoke build/test",
+        help="显式验证配置 JSON；默认不执行其中的 Crash 复现和回归脚本",
     )
-    p.add_argument(
-        "--skip-verify",
+    runtime_verification_group = p.add_mutually_exclusive_group()
+    runtime_verification_group.add_argument(
+        "--enable-runtime-verification",
         action="store_true",
-        help="跳过自动/显式 verify（仅 apply patch，不执行 build/test/reproduce）",
+        help="启用已配置的 Crash 复现和回归脚本（默认关闭；确定性修改安全检查仍会执行）",
+    )
+    runtime_verification_group.add_argument(
+        "--skip-runtime-verification",
+        action="store_true",
+        help="跳过 Crash 复现和回归脚本；确定性修改安全检查及安全同步仍会执行",
     )
     p.add_argument("--vector-db-path", default="./vector_db", help="向量数据库目录（默认: ./vector_db）")
     p.add_argument("--vector-db-max-results", type=int, default=3, help="向量检索最大返回数")
@@ -3444,6 +3450,17 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="是否基于 AI 建议回写源码（默认开启；仅在 --scope full 且 LLM 可用时生效，使用 --no-apply-ai-fixes 关闭）",
+    )
+    p.add_argument(
+        "--bypass-repair-gate",
+        dest="bypass_repair_gate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "是否跳过 04 诊断 repair_gate（默认开启跳过："
+            "probable/低置信度也可进入自动改码；"
+            "使用 --no-bypass-repair-gate 恢复 confirmed+高置信度门控）"
+        ),
     )
     p.add_argument(
         "--llm-mode",
@@ -4814,10 +4831,12 @@ def _build_run_request_record(
         "max_agent_rounds": max_agent_rounds,
         "max_context_requests_per_round": max_context_requests,
         "apply_ai_fixes": bool(getattr(args, "apply_ai_fixes", True)),
+        "bypass_repair_gate": bool(getattr(args, "bypass_repair_gate", True)),
         "backup_original_sources": bool(getattr(args, "backup_original_sources", True)),
         "engine": getattr(args, "engine", "direct"),
         "verification": verification_record,
-        "skip_verify": bool(getattr(args, "skip_verify", False)),
+        "enable_runtime_verification": bool(getattr(args, "enable_runtime_verification", False)),
+        "skip_runtime_verification": bool(getattr(args, "skip_runtime_verification", False)),
         "optimized": bool(getattr(args, "optimized", False)),
         "streaming": llm_snapshot.get("streaming"),
         "vector_db_max_results": int(getattr(args, "vector_db_max_results", 3) or 3),
@@ -5036,6 +5055,8 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
 
     if not bool(record.get("apply_ai_fixes", True)):
         argv += ["--no-apply-ai-fixes"]
+    if not bool(record.get("bypass_repair_gate", True)):
+        argv += ["--no-bypass-repair-gate"]
     if not bool(record.get("backup_original_sources", True)):
         argv += ["--no-backup-original-sources"]
     if bool(record.get("optimized", False)):
@@ -5803,7 +5824,11 @@ def collect_interactive_run_state() -> Optional[Dict[str, Any]]:
         print("")
         print("[AI 自动改码]")
         print("1) --apply-ai-fixes / --no-apply-ai-fixes：是否自动把 AI 修复写回源码")
-        print("2) --backup-original-sources / --no-backup-original-sources：改码前是否备份源码")
+        print(
+            "2) --bypass-repair-gate / --no-bypass-repair-gate："
+            "是否跳过 04 诊断门控（默认跳过；--no-bypass-repair-gate 要求 confirmed+高置信度）"
+        )
+        print("3) --backup-original-sources / --no-backup-original-sources：改码前是否备份源码")
         print("")
         print("[向量数据库运维]")
         print("1) --init-vector-db：初始化向量库（清空后写入种子）")
@@ -6363,9 +6388,21 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
     verification_config = _parse_verification_config_json(
         getattr(args, "verification_config_json", None)
     )
-    if bool(getattr(args, "skip_verify", False)):
+    runtime_verification_enabled = bool(getattr(args, "enable_runtime_verification", False)) and not bool(
+        getattr(args, "skip_runtime_verification", False)
+    )
+    if isinstance(verification_config, dict):
+        verification_config = dict(verification_config)
+        verification_config["enable_runtime_verification"] = runtime_verification_enabled
+        verification_config["run_issue_verification"] = runtime_verification_enabled and bool(
+            verification_config.get("run_issue_verification", True)
+        )
+        verification_config["run_regression_verification"] = runtime_verification_enabled and bool(
+            verification_config.get("run_regression_verification", True)
+        )
+    if bool(getattr(args, "skip_runtime_verification", False)):
         verification_config = dict(verification_config or {})
-        verification_config["skip_verify"] = True
+        verification_config["skip_runtime_verification"] = True
     tool_approval_raw = getattr(args, "tool_approval_json", None)
     if tool_approval_raw:
         approval_payload = _parse_verification_config_json(tool_approval_raw)
@@ -6380,6 +6417,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         "code_roots": code_roots,
         "scope": scope,
         "apply_ai_fixes": bool(args.apply_ai_fixes),
+        "bypass_repair_gate": bool(getattr(args, "bypass_repair_gate", True)),
         "force_disassembly": bool(getattr(args, "force_disassembly", False)),
         "force_anr_analysis": bool(getattr(args, "force_anr_analysis", False)),
         "force_memory_analysis": bool(getattr(args, "force_memory_analysis", False)),
@@ -6388,7 +6426,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         "force_timeline_analysis": bool(getattr(args, "force_timeline_analysis", False)),
         "prompt_mode": str(getattr(args, "prompt_mode", "fix") or "fix"),
         "verification": verification_config,
-        "skip_verify": bool(getattr(args, "skip_verify", False)),
+        "skip_runtime_verification": bool(getattr(args, "skip_runtime_verification", False)),
         # 0 表示让 workflow 按 prompt_mode 决定默认轮数
         "max_agent_rounds": int(getattr(args, "max_agent_rounds", 0) or 0),
         "max_context_requests_per_round": max(
@@ -6655,11 +6693,54 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
     verification_config = problem.get("verification")
     if not isinstance(verification_config, dict):
         verification_config = config.metadata.get("verification") if isinstance(config.metadata, dict) else None
+    if isinstance(verification_config, dict):
+        verification_config = dict(verification_config)
+        verification_config["enable_runtime_verification"] = runtime_verification_enabled
+        verification_config["run_issue_verification"] = runtime_verification_enabled and bool(
+            verification_config.get("run_issue_verification", True)
+        )
+        verification_config["run_regression_verification"] = runtime_verification_enabled and bool(
+            verification_config.get("run_regression_verification", True)
+        )
+        problem["verification"] = verification_config
+
+    # Interactive clients may resolve optional verification scripts after the
+    # diagnosis is available but before any source mutation. Daemon and normal
+    # non-interactive CLI calls do not install this callback.
+    verification_resolver = getattr(args, "_verification_resolution_callback", None)
+    if runtime_verification_enabled and callable(verification_resolver) and should_run_repair_pipeline(
+        apply_ai_fixes=bool(args.apply_ai_fixes),
+        result=result if isinstance(result, dict) else {},
+        scope=scope,
+        bypass_repair_gate=bool(getattr(args, "bypass_repair_gate", True)),
+    ):
+        resolved_verification = verification_resolver(
+            result if isinstance(result, dict) else {},
+            verification_config if isinstance(verification_config, dict) else {},
+        )
+        verification_config = (
+            dict(resolved_verification) if isinstance(resolved_verification, dict) else {}
+        )
+        problem["verification"] = verification_config
+        if isinstance(request_record, dict):
+            effectiveness = (
+                verification_config.get("effectiveness")
+                if isinstance(verification_config.get("effectiveness"), dict)
+                else verification_config
+            )
+            request_record["verification_resolution"] = {
+                "interactive": True,
+                "issue_configured": bool(effectiveness.get("issue")),
+                "regression_configured": bool(effectiveness.get("regression")),
+                "run_issue_verification": effectiveness.get("run_issue_verification"),
+                "run_regression_verification": effectiveness.get("run_regression_verification"),
+            }
 
     if should_run_repair_pipeline(
         apply_ai_fixes=bool(args.apply_ai_fixes),
         result=result if isinstance(result, dict) else {},
         scope=scope,
+        bypass_repair_gate=bool(getattr(args, "bypass_repair_gate", True)),
     ):
         repair_out = runtime.run_repair_and_verify(
             result=result,
@@ -6671,7 +6752,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
             backup_original_sources=bool(args.backup_original_sources),
             uaf_nullptr_guard_policy=_effective_uaf_nullptr_guard_policy,
             request_record=request_record,
-            post_fix_diagnosis=True,
+            post_fix_diagnosis=False,
         )
         result = repair_out.get("result", result)
         applied_fix_result = repair_out.get("applied_fix_result")

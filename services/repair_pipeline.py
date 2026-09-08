@@ -21,7 +21,7 @@ from services.git_worktree_manager import (
     write_workspace_artifacts,
     isolated_workspace_from_dict,
 )
-from services.repair_actions import RepairActionDeps, build_repair_action_executor, run_reanalyze_on_failure
+from services.repair_actions import RepairActionDeps, build_repair_action_executor
 from services.decide_scorer import score_repair_decision
 from services.stage_artifacts import save_decide_artifact
 from services.runtime_actions import ApprovalBinding, VERIFICATION_ACTION_TOOLS, pending_tool_action_name
@@ -46,6 +46,7 @@ class RepairPipelineResult:
     applied_fix_result: Optional[Dict[str, Any]] = None
     verification_result: Optional[Dict[str, Any]] = None
     diff_review: Optional[Dict[str, Any]] = None
+    safety_verification: Optional[Dict[str, Any]] = None
     isolated_workspace: Optional[IsolatedCodeWorkspace] = None
     apply_fix_duration_ms: Optional[int] = None
     result_updates: Dict[str, Any] = field(default_factory=dict)
@@ -103,12 +104,133 @@ def _attach_verification_candidates(
         verification_result["discovered_candidates"] = candidates
 
 
+def _simple_verification_section(config: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(config, dict):
+        return None
+    section = config.get("verification") if isinstance(config.get("verification"), dict) else config
+    if isinstance(section, dict) and isinstance(section.get("effectiveness"), dict):
+        section = section["effectiveness"]
+    if not isinstance(section, dict) or not any(key in section for key in ("issue", "regression")):
+        return None
+    return section
+
+
+def _has_legacy_runtime_verification(config: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(config, dict):
+        return False
+    return any(config.get(key) for key in (
+        "command", "checks", "provider", "profile", "reproduce", "reproduction_plan",
+    ))
+
+
+def _runtime_verification_enabled(config: Optional[Dict[str, Any]]) -> bool:
+    """Runtime scripts are opt-in; deterministic change safety checks always run."""
+    return bool(isinstance(config, dict) and config.get("enable_runtime_verification") is True)
+
+
+def _simple_verification_option(config: Dict[str, Any], key: str, default: bool) -> bool:
+    section = config.get("verification") if isinstance(config.get("verification"), dict) else config
+    if isinstance(section, dict) and isinstance(section.get("effectiveness"), dict):
+        section = section["effectiveness"]
+    if isinstance(section, dict) and key in section:
+        return bool(section[key])
+    if key in config:
+        return bool(config[key])
+    return default
+
+
+def _simple_verification_context(
+    *, deps: RepairActionDeps, workspace: str, report_dir: Path,
+    verification_config: Dict[str, Any], changed_files: Optional[List[str]] = None,
+):
+    from services.simple_verification import ReproductionScenario, VerificationContext
+
+    problem = deps.request_record if isinstance(deps.request_record, dict) else {}
+    effectiveness = _simple_verification_section(verification_config) or {}
+    raw = (
+        problem.get("reproduction")
+        or problem.get("reproduction_scenario")
+        or effectiveness.get("reproduction")
+        or verification_config.get("reproduction")
+    )
+    reproduction = None
+    if isinstance(raw, dict):
+        reproduction = ReproductionScenario(
+            description=str(raw.get("description") or ""),
+            preconditions=[str(item) for item in (raw.get("preconditions") or [])],
+            steps=[str(item) for item in (raw.get("steps") or [])],
+            expected_signature=str(raw.get("expected_signature") or ""),
+            trigger_probability=raw.get("trigger_probability"),
+            probability_unit=str(raw.get("probability_unit") or "per_attempt"),
+            probability_basis=str(raw.get("probability_basis") or ""),
+            confidence=str(raw.get("confidence") or "unknown"),
+            source=str(raw.get("source") or "task_state"),
+            confirmed=bool(raw.get("confirmed")),
+        )
+    return VerificationContext(
+        task_id=str(deps.run_id), workspace=workspace, report_dir=str(report_dir),
+        diagnosis=dict(deps.result or {}),
+        changes={"modified_files": list(changed_files or [])},
+        reproduction=reproduction,
+        metadata={"request": problem, "verification": verification_config},
+    )
+
+
+def _expected_original_files(
+    workspace: IsolatedCodeWorkspace, isolated_files: List[str],
+) -> List[str]:
+    expected: List[str] = []
+    for raw in isolated_files:
+        source = Path(raw).expanduser().resolve()
+        for original_root, isolated_root in zip(
+            workspace.original_code_roots, workspace.isolated_code_roots
+        ):
+            try:
+                relative = source.relative_to(Path(isolated_root).resolve())
+            except ValueError:
+                continue
+            expected.append(str((Path(original_root).resolve() / relative).resolve()))
+            break
+    return sorted(set(expected))
+
+
+def _sync_with_integrity_check(
+    actions: Any,
+    action_context: Dict[str, Any],
+    deps: RepairActionDeps,
+    workspace: IsolatedCodeWorkspace,
+    safety_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    from services.safety_verification import verify_sync_integrity
+
+    expected = _expected_original_files(workspace, list(deps.changed_files))
+    sync = actions.execute(
+        "sync_worktree", {**action_context, "artifact_dir": str(deps.report_dir / "artifacts")},
+    )
+    integrity = verify_sync_integrity(
+        expected_files=expected,
+        copied_files=list(sync.get("files") or []),
+    )
+    safety_report.setdefault("checks", []).append(integrity)
+    if integrity["status"] != "passed":
+        safety_report["status"] = "failed"
+        safety_report["summary"] = "代码同步完整性检查失败"
+    return {**sync, "integrity": integrity}
+
+
 def should_run_repair_pipeline(
     *,
     apply_ai_fixes: bool,
     result: Dict[str, Any],
     scope: str,
+    bypass_repair_gate: bool = True,
 ) -> bool:
+    """Decide whether to enter apply/verify after LLM analysis.
+
+    ``bypass_repair_gate`` defaults to True so probable/low-confidence 04
+    diagnoses still allow auto-fix when the caller opted into apply_ai_fixes.
+    Pass False to enforce confirmed+high-confidence only.
+    """
     if not apply_ai_fixes or result.get("status") != "success" or scope != "full":
         return False
     meta = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
@@ -125,8 +247,14 @@ def should_run_repair_pipeline(
         from tools.diagnosis.repair_gate import evaluate_repair_gate
 
         gate = evaluate_repair_gate(crash_diagnosis)
-        if not gate.allowed and termination not in {"ready_to_fix"}:
-            result.setdefault("metadata", {})["repair_gate"] = gate.to_dict()
+        gate_payload = gate.to_dict()
+        gate_payload["bypassed"] = bool(bypass_repair_gate) and not gate.allowed
+        result.setdefault("metadata", {})["repair_gate"] = gate_payload
+        if (
+            not gate.allowed
+            and not bypass_repair_gate
+            and termination not in {"ready_to_fix"}
+        ):
             return False
     return True
 
@@ -236,7 +364,7 @@ def _finalize_repair_decide(
     if runtime_state is not None and terminal not in {"verification_pending", "approval_required"}:
         runtime_state.transition(
             "decide",
-            status="completed" if score.decision == "accept" else "error",
+            status="completed" if score.decision in {"accept", "partial"} else "error",
             reason=score.decision,
         )
         runtime_state.decision = score.decision
@@ -265,7 +393,7 @@ def _continue_repair_after_apply_patch(
     isolated_workspace: Optional[IsolatedCodeWorkspace],
     unisolated_approval: Optional[Dict[str, Any]],
     report_dir: Path,
-    post_fix_diagnosis: bool = True,
+    post_fix_diagnosis: bool = False,
     trace: Any = None,
     runtime_state: Optional[RuntimeState] = None,
 ) -> RepairPipelineResult:
@@ -291,32 +419,41 @@ def _continue_repair_after_apply_patch(
             out, report_dir=report_dir, trace=trace, runtime_state=runtime_state,
         )
 
-    diff_review = actions.execute("inspect_diff", {**action_context, "artifact_dir": str(report_dir / "artifacts")})
-    out.diff_review = deps.diff_review
+    safety_report = actions.execute(
+        "inspect_diff", {**action_context, "artifact_dir": str(report_dir / "artifacts")}
+    )
+    out.safety_verification = safety_report
+    # Retained in the result object for report readers that still inspect this
+    # field; its contents are now deterministic safety evidence, not heuristics.
+    out.diff_review = safety_report
 
-    if diff_review.get("status") != "passed":
+    if safety_report.get("status") != "passed":
         rollback = actions.execute(
             "rollback",
             {**action_context, "artifact_dir": str(report_dir / "artifacts")},
             approval=workspace_action_approval,
         )
         out.applied_fix_result = deps.applied_fix_result
-        out.applied_fix_result["skipped_reason"] = "diff review rejected"
-        out.applied_fix_result["error"] = "; ".join(diff_review.get("issues") or [])
+        out.applied_fix_result["skipped_reason"] = "safety verification failed"
+        failed_checks = [
+            str(item.get("name")) for item in (safety_report.get("checks") or [])
+            if isinstance(item, dict) and item.get("status") != "passed"
+        ]
+        out.applied_fix_result["error"] = "safety checks failed: " + ", ".join(failed_checks)
         out.verification_result = {
-            "status": "skipped",
-            "provider": "diff_review",
-            "mode": "gate",
-            "error": "修复 diff 未通过门禁，已拒绝后续验证",
-            "diff_review": out.diff_review,
+            "status": "safety_check_failed",
+            "safety_verification": safety_report,
+            "effectiveness_verification": {"enabled": False, "status": "skipped"},
+            "error": "代码修改完整性检查失败",
             "rollback": rollback,
         }
         out.result_updates = {
             "status": "error",
-            "completion_reason": "diff_review_failed",
+            "completion_reason": "safety_check_failed",
             "review_required": True,
             "applied_ai_fixes": out.applied_fix_result,
             "diff_review": out.diff_review,
+            "safety_verification": safety_report,
             "verification": out.verification_result,
         }
         if unisolated_approval is not None:
@@ -333,36 +470,149 @@ def _continue_repair_after_apply_patch(
         or (code_roots[0] if code_roots else "")
     )
     problem = deps.request_record if isinstance(deps.request_record, dict) else {}
+    if (
+        not _runtime_verification_enabled(verification_config)
+        or _simple_verification_section(verification_config) is None
+        or bool((verification_config or {}).get("skip_runtime_verification"))
+    ):
+        sync = None
+        if isolated_workspace is not None:
+            sync = _sync_with_integrity_check(
+                actions, action_context, deps, isolated_workspace, safety_report,
+            )
+            write_workspace_artifacts(isolated_workspace, report_dir)
+        safety_success = safety_report.get("status") == "passed"
+        out.verification_result = {
+            "status": "repair_applied" if safety_success else "safety_check_failed",
+            "safety_verification": safety_report,
+            "effectiveness_verification": {
+                "enabled": False,
+                "status": "skipped",
+                "issue_verification": {"configured": False, "status": "skipped"},
+                "regression_verification": {"configured": False, "status": "skipped"},
+            },
+        }
+        if sync is not None:
+            out.verification_result["worktree_sync"] = sync
+        out.result_updates = {
+            "status": "success" if safety_success else "error",
+            "completion_reason": "repair_applied" if safety_success else "safety_check_failed",
+            "applied_ai_fixes": out.applied_fix_result, "diff_review": out.diff_review,
+            "safety_verification": safety_report,
+            "verification": out.verification_result,
+        }
+        if unisolated_approval is not None:
+            out.result_updates["unisolated_approval"] = unisolated_approval
+        _write_json_object(report_dir / "09_verification.json", out.verification_result)
+        return _finalize_repair_decide(out, report_dir=report_dir, trace=trace, runtime_state=runtime_state)
     effective_verification = build_verification_config_with_reproduce_priority(
         verification_config,
         workspace=workspace_path,
         code_roots=code_roots,
         problem=problem,
     )
-    if effective_verification.get("skip_verify"):
-        out.verification_result = {
-            "status": "skipped",
-            "provider": "none",
-            "mode": "auto",
-            "checks": [],
-            "duration_ms": 0,
-            "error": "verify skipped by --skip-verify",
-        }
-        out.result_updates = {
+    deps.verification_config = effective_verification
+    # New platform-neutral verification scripts are preferred when configured.
+    # Legacy provider/profile execution remains available for old callers until
+    # their configuration is migrated.
+    simple_section = _simple_verification_section(effective_verification)
+    if simple_section is not None:
+        from services.simple_verification import EffectivenessVerificationRunner, write_verification_report
+
+        runner = EffectivenessVerificationRunner.from_mapping(effective_verification)
+        status_updates: Dict[str, Any] = {}
+        max_edit_rounds = resolve_max_repair_edit_rounds(problem)
+        edit_round = 0
+        while True:
+            simple_context = _simple_verification_context(
+                deps=deps, workspace=workspace_path, report_dir=report_dir,
+                verification_config=effective_verification,
+                changed_files=list(deps.changed_files),
+            )
+            effectiveness_report = runner.run(
+                simple_context,
+                run_issue=_simple_verification_option(effective_verification, "run_issue_verification", True),
+                run_regression=_simple_verification_option(effective_verification, "run_regression_verification", True),
+                issue_baseline=out.baseline_result,
+            )
+            effectiveness_status = str(effectiveness_report.get("status") or "inconclusive")
+            simple_report = {
+                "status": "repair_applied" if effectiveness_status == "skipped" else effectiveness_status,
+                "safety_verification": safety_report,
+                "effectiveness_verification": effectiveness_report,
+            }
+            out.verification_result = simple_report
+            if trace is not None:
+                trace.emit(
+                    "verification.simple.completed", kind="verification", name="simple_verification",
+                    status=str(simple_report.get("status") or "inconclusive"), result=simple_report,
+                )
+
+            issue = effectiveness_report.get("issue_verification") or {}
+            regression = effectiveness_report.get("regression_verification") or {}
+            actionable = (
+                issue.get("status") == "failed" and issue.get("reproduced") is True
+            ) or regression.get("status") == "failed"
+            if actionable and edit_round < max_edit_rounds:
+                failure_class = "reproduce_failure" if issue.get("status") == "failed" else "test_failure"
+                edit_out = run_repair_edit_round(
+                    deps=deps, round_index=edit_round,
+                    verification_result=simple_report, failure_class=failure_class,
+                    report_dir=report_dir, trace=trace,
+                )
+                edit_round += 1
+                status_updates.setdefault("repair_edit_rounds", []).append(edit_out.to_dict())
+                if edit_out.success and isinstance(edit_out.applied_fix_result, dict):
+                    out.applied_fix_result = edit_out.applied_fix_result
+                    deps.applied_fix_result = edit_out.applied_fix_result
+                    deps.changed_files = [
+                        str(item.get("file")) for item in (edit_out.applied_fix_result.get("applied") or [])
+                        if isinstance(item, dict) and item.get("status") == "applied" and item.get("file")
+                    ]
+                    action_context["changed_files"] = list(deps.changed_files)
+                    safety_report = actions.execute(
+                        "inspect_diff",
+                        {**action_context, "artifact_dir": str(report_dir / "artifacts")},
+                    )
+                    out.safety_verification = safety_report
+                    out.diff_review = safety_report
+                    if safety_report.get("status") != "passed":
+                        simple_report = {
+                            "status": "safety_check_failed",
+                            "safety_verification": safety_report,
+                            "effectiveness_verification": effectiveness_report,
+                        }
+                        out.verification_result = simple_report
+                        break
+                    continue
+            break
+
+        status_updates.update({
+            "verification": simple_report,
             "applied_ai_fixes": out.applied_fix_result,
             "diff_review": out.diff_review,
-            "verification": out.verification_result,
-            "status": "success",
-            "completion_reason": "verify_skipped",
+            "safety_verification": safety_report,
+        })
+        verification_status = str(simple_report.get("status") or "inconclusive")
+        successful = verification_status in {
+            "repair_applied", "verified", "issue_verified", "regression_verified", "inconclusive",
         }
-        if unisolated_approval is not None:
-            out.result_updates["unisolated_approval"] = unisolated_approval
+        status_updates["status"] = "success" if successful else "error"
+        status_updates["completion_reason"] = verification_status
+        if successful and isolated_workspace is not None:
+            sync = _sync_with_integrity_check(
+                actions, action_context, deps, isolated_workspace, safety_report,
+            )
+            simple_report["worktree_sync"] = sync
+            if safety_report.get("status") != "passed":
+                simple_report["status"] = "safety_check_failed"
+                status_updates["status"] = "error"
+                status_updates["completion_reason"] = "safety_check_failed"
+        write_verification_report(simple_report, report_dir)
+        out.result_updates = status_updates
         if isolated_workspace is not None:
             write_workspace_artifacts(isolated_workspace, report_dir)
-        return _finalize_repair_decide(
-            out, report_dir=report_dir, trace=trace, runtime_state=runtime_state,
-        )
-    deps.verification_config = effective_verification
+        return _finalize_repair_decide(out, report_dir=report_dir, trace=trace, runtime_state=runtime_state)
     max_edit_rounds = resolve_max_repair_edit_rounds(problem)
     edit_round = 0
     status_updates: Dict[str, Any] = {
@@ -451,8 +701,6 @@ def _continue_repair_after_apply_patch(
             out.applied_fix_result["skipped_reason"] = (
                 "验证失败后已回滚" if rollback.get("files") else "验证失败但没有可用备份，无法回滚"
             )
-            reanalyze = run_reanalyze_on_failure(deps, actions)
-            out.verification_result["post_fix_diagnosis"] = reanalyze
             status_updates["status"] = "error"
             status_updates["error"] = out.verification_result.get("error") or "验证失败"
             status_updates["completion_reason"] = "verification_failed"
@@ -461,9 +709,6 @@ def _continue_repair_after_apply_patch(
                 if failure_class in {"test_failure", "reproduce_failure"}
                 else "edit_feedback"
             )
-            if reanalyze.get("status") not in {"passed", "skipped"}:
-                status_updates["error"] = "验证失败且复诊未成功"
-                status_updates["completion_reason"] = "post_fix_diagnosis_failed"
             break
 
         if verify_status == "unavailable" and out.verification_result.get("provider") != "none":
@@ -475,18 +720,11 @@ def _continue_repair_after_apply_patch(
         break
 
     if out.verification_result.get("status") == "passed":
-        if post_fix_diagnosis:
-            diagnosis = actions.execute(
-                "post_fix_diagnosis", {**action_context, "artifact_dir": str(report_dir / "artifacts")},
-            )
-            out.verification_result["post_fix_diagnosis"] = diagnosis
-            if diagnosis.get("status") not in {"passed", "skipped"}:
-                status_updates["status"] = "error"
-                status_updates["error"] = "验证通过，但修复后复诊未成功"
-                status_updates["completion_reason"] = "post_fix_diagnosis_failed"
         if status_updates.get("status") not in {"error", "review_required"}:
             if isolated_workspace is not None:
-                sync = actions.execute("sync_worktree", {**action_context, "artifact_dir": str(report_dir / "artifacts")})
+                sync = _sync_with_integrity_check(
+                    actions, action_context, deps, isolated_workspace, safety_report,
+                )
                 out.verification_result["worktree_sync"] = sync
             status_updates["status"] = "success"
             status_updates["completion_reason"] = "verification_passed"
@@ -513,7 +751,7 @@ def run_repair_pipeline(
     uaf_nullptr_guard_policy: Optional[Callable[..., Any]] = None,
     trace: Any = None,
     request_record: Optional[Dict[str, Any]] = None,
-    post_fix_diagnosis: bool = True,
+    post_fix_diagnosis: bool = False,
     apply_fix_fn: Optional[Callable[..., Dict[str, Any]]] = None,
     tool_executor: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
     runtime_state: Optional[RuntimeState] = None,
@@ -654,25 +892,37 @@ def run_repair_pipeline(
         action_context["unisolated_approval"] = unisolated_approval
     workspace_action_approval = unisolated_approval or deps.approval
 
-    # A baseline is opt-in: only an explicit profile request can execute a
-    # pre-fix command. This prevents the agent from inventing a verification
-    # command when no external runtime is configured.
-    if isinstance(verification_config, dict) and verification_config.get("pre_fix_baseline"):
-        baseline = actions.execute(
-            "verify", {**action_context, "verification": verification_config,
-                        "changed_files": [], "artifact_dir": str(report_dir / "artifacts")},
-            approval=deps.approval,
+    # The current-issue script is a Harness observation, so establish its
+    # baseline before changing code. Missing scripts and inconclusive/runtime
+    # errors are evidence gaps, not repair gates.
+    runtime_verification_enabled = _runtime_verification_enabled(verification_config)
+    simple_section = (
+        _simple_verification_section(verification_config)
+        if runtime_verification_enabled
+        and not bool((verification_config or {}).get("skip_runtime_verification"))
+        else None
+    )
+    if simple_section is not None:
+        from services.simple_verification import EffectivenessVerificationRunner
+
+        workspace_path = str(
+            isolated_workspace.root if isolated_workspace is not None
+            else (fix_code_roots[0] if fix_code_roots else "")
         )
-        out.baseline_result = baseline
-        if baseline.get("status") in {"pending", "verification_pending"}:
-            out.result_updates = {"status": "verification_pending",
-                                  "completion_reason": "pre_fix_baseline_pending",
-                                  "baseline": baseline}
-            return out
-        if baseline.get("status") not in {"passed", "failed", "timeout", "not_triggered", "unavailable"}:
-            out.result_updates = {"status": "error", "completion_reason": "pre_fix_baseline_invalid",
-                                  "baseline": baseline}
-            return out
+        simple_context = _simple_verification_context(
+            deps=deps, workspace=workspace_path, report_dir=report_dir,
+            verification_config=verification_config, changed_files=[],
+        )
+        if _simple_verification_option(verification_config, "run_issue_verification", True):
+            out.baseline_result = EffectivenessVerificationRunner.from_mapping(
+                verification_config
+            ).run_issue_baseline(simple_context)
+        if out.baseline_result is not None and trace is not None:
+            trace.emit(
+                "verification.issue.before_fix", kind="verification", name="issue_reproduction",
+                status=str(out.baseline_result.get("status") or "inconclusive"),
+                result=out.baseline_result,
+            )
 
     apply_fix_started = time.perf_counter()
     try:
@@ -976,30 +1226,15 @@ def resume_verification_from_report(
     elif out.verification_result.get("status") in {"failed", "timeout"}:
         rollback = actions.execute("rollback", {"artifact_dir": str(report_dir / "artifacts")}, approval=replay_approval)
         out.verification_result["rollback"] = {"attempted": True, **rollback}
-        diagnosis = run_reanalyze_on_failure(deps, actions)
-        out.verification_result["post_fix_diagnosis"] = diagnosis
         out.result_updates.update(
             status="error", completion_reason="verification_failed",
             error=out.verification_result.get("error") or "验证失败",
         )
-        if diagnosis.get("status") not in {"passed", "skipped"}:
-            out.result_updates.update(
-                completion_reason="post_fix_diagnosis_failed",
-                error="验证失败且复诊未成功",
-            )
     elif out.verification_result.get("status") == "passed":
-        diagnosis = actions.execute("post_fix_diagnosis", {"artifact_dir": str(report_dir / "artifacts")})
-        out.verification_result["post_fix_diagnosis"] = diagnosis
-        if diagnosis.get("status") not in {"passed", "skipped"}:
-            out.result_updates.update(
-                status="error", completion_reason="post_fix_diagnosis_failed",
-                error="验证通过，但修复后复诊未成功",
-            )
-        else:
-            if out.isolated_workspace is not None:
-                sync = actions.execute("sync_worktree", {"artifact_dir": str(report_dir / "artifacts")})
-                out.verification_result["worktree_sync"] = sync
-            out.result_updates.update(status="success", completion_reason="verification_passed")
+        if out.isolated_workspace is not None:
+            sync = actions.execute("sync_worktree", {"artifact_dir": str(report_dir / "artifacts")})
+            out.verification_result["worktree_sync"] = sync
+        out.result_updates.update(status="success", completion_reason="verification_passed")
     terminal_status = str(out.result_updates.get("status") or "")
     if terminal_status not in {"verification_pending", "approval_required"}:
         replay_state.transition(

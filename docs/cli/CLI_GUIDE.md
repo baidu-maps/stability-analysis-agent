@@ -102,7 +102,9 @@ python3 cli/main.py \
 
 修复闭环方面：
 
-- 未配置 `--verification-config-json` 时，`scope=full` 会尝试从 workspace 自动选择 smoke build/test（可用 `--skip-verify` 关闭）。
+- `scope=full` 默认只执行确定性的代码修改完整性检查：补丁成功、工作区边界、修改清单和同步清单一致。不执行启发式源码审查或旧日志复诊。
+- 只有同时传入 `--enable-runtime-verification` 和 `--verification-config-json` 时，才执行其中已配置的 Crash 复现/回归脚本；`--skip-runtime-verification` 可显式跳过这两类运行时脚本。两者都不影响确定性修改安全检查。
+- 未启用运行时验证时，成功状态为 `repair_applied`，只表示修改可靠落盘，不表示 Crash 已修复。
 - verify 失败时，编译错误会触发 bounded `repair_edit_loop`（默认最多 2 轮）并在 worktree 内修订 patch；测试/reproduce 失败则在重试用尽后 rollback。
 - 模型可通过 `next_action.kind=propose_fix` 提前结束探索并进入改码（仍受 04a `repair_gate` 约束）。
 

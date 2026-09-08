@@ -63,6 +63,23 @@ from services.evaluation import EvaluationResult, evaluate_case, evaluate_report
 from services.diff_review import DiffReview, review_changed_files
 from services.verification import verification_observation
 from services.verification_profile import VerificationProfile, VerificationCheck, normalize_verification_config
+from services.simple_verification import (
+    EffectivenessVerificationRunner,
+    IssueVerificationScript,
+    RegressionVerificationScript,
+    ReproductionScenario,
+    VerificationContext,
+    VerificationResult,
+    VerificationRunner,
+    VerificationStatus,
+)
+from services.safety_verification import (
+    CORE_SAFETY_CHECKS,
+    SafetyCheckResult,
+    SafetyContext,
+    SafetyVerificationRunner,
+    verify_sync_integrity,
+)
 from services.verification_baseline import compare_verification_runs
 from services.verification_plan import (
     VerificationClaim, VerificationPlan, VerificationCapability, ReproductionPlan,
@@ -157,6 +174,11 @@ __all__ = [
     "RepositoryEvidenceService",
     "verification_observation",
     "VerificationProfile", "VerificationCheck", "normalize_verification_config",
+    "IssueVerificationScript", "RegressionVerificationScript", "ReproductionScenario",
+    "VerificationContext", "VerificationResult", "VerificationRunner",
+    "EffectivenessVerificationRunner", "VerificationStatus",
+    "CORE_SAFETY_CHECKS", "SafetyCheckResult", "SafetyContext",
+    "SafetyVerificationRunner", "verify_sync_integrity",
     "compare_verification_runs",
     "VerificationClaim", "VerificationPlan", "VerificationCapability", "ReproductionPlan",
     "build_verification_plan", "build_reproduction_plan", "capabilities_from_profile",

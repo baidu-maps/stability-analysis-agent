@@ -38,8 +38,14 @@ def judge_run(
     termination = str(session.get("termination_reason") or value.get("termination_reason") or "")
     structured = metadata.get("structured_analysis") if isinstance(metadata.get("structured_analysis"), dict) else {}
     diagnosis = value.get("crash_diagnosis") if isinstance(value.get("crash_diagnosis"), dict) else {}
-    diff_review = value.get("diff_review") if isinstance(value.get("diff_review"), dict) else metadata.get("diff_review")
-    diff_review = diff_review if isinstance(diff_review, dict) else {}
+    safety = (
+        value.get("safety_verification")
+        if isinstance(value.get("safety_verification"), dict)
+        else verification.get("safety_verification")
+    )
+    if not isinstance(safety, dict):
+        safety = value.get("diff_review") if isinstance(value.get("diff_review"), dict) else metadata.get("diff_review")
+    safety = safety if isinstance(safety, dict) else {}
     provider = str(verification.get("provider") or "").lower()
     kind = str(verification.get("kind") or verification.get("mode") or "").lower()
     l4_provider = verification_level != "L4" or kind == "integration" or provider in {"device_runner", "integration"}
@@ -53,11 +59,14 @@ def judge_run(
         "analysis_completed": termination not in {"invalid_schema", "llm_error", "llm_budget_exhausted"},
         "structured_output": bool(structured) or not value.get("analysis"),
         "diagnosis_evidence": bool(diagnosis),
-        "diff_authorized": str(diff_review.get("status") or "") == "passed" if repair_attempted else True,
+        "diff_authorized": str(safety.get("status") or "") == "passed" if repair_attempted else True,
         "verification_passed": (
-            status in {"passed", "compile_verified", "native_verified", "integration_verified", "strongly_supported"}
-            and levels.get(verification_level, 0) >= levels.get(minimum_level, 1)
-            and l4_provider
+            status == "verified"
+            or (
+                status in {"passed", "compile_verified", "native_verified", "integration_verified", "strongly_supported"}
+                and levels.get(verification_level, 0) >= levels.get(minimum_level, 1)
+                and l4_provider
+            )
         ) if repair_attempted else True,
     }
     questions: List[str] = []
@@ -74,14 +83,22 @@ def judge_run(
     if not gates["diff_authorized"]:
         questions.append("Are all changed files and functions within the authorized repair scope?")
         reasons.append("unauthorized_diff")
-    if not gates["verification_passed"] and status not in {"not_configured", "configured_but_unavailable", "not_triggered", "inconclusive", "unavailable", "skipped", "pending"}:
+    if not gates["verification_passed"] and status not in {
+        "repair_applied", "issue_verified", "regression_verified", "not_configured",
+        "configured_but_unavailable", "not_triggered", "inconclusive", "unavailable",
+        "skipped", "pending",
+    }:
         questions.append("Which executable check proves the proposed repair works?")
         reasons.append(f"verification:{status}")
 
     if all(gates.values()):
         verdict = "accept"
         confidence = "high" if repair_attempted and verification_level in {"L2", "L3", "L4"} else "medium"
-    elif repair_attempted and status in {"pending", "unavailable", "skipped", "not_configured", "configured_but_unavailable", "not_triggered", "harness_invalid", "inconclusive", ""}:
+    elif repair_attempted and status in {
+        "repair_applied", "issue_verified", "regression_verified", "pending", "unavailable",
+        "skipped", "not_configured", "configured_but_unavailable", "not_triggered",
+        "harness_invalid", "inconclusive", "",
+    }:
         verdict = "pending"
         confidence = "low"
     elif same_plan_crash:

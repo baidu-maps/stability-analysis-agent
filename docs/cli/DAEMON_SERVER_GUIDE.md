@@ -122,6 +122,11 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
   "library_dir": "/path/to/lib",
   "code_roots": ["/path/to/src"],
   "config": null,
+  "verification": null,
+  "enable_runtime_verification": false,
+  "skip_runtime_verification": false,
+  "run_issue_verification": null,
+  "run_regression_verification": null,
   "output_format": "markdown",
   "engine": "direct",
   "scope": "full",
@@ -131,6 +136,7 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
   "max_context_requests_per_round": null,
   "streaming": null,
   "apply_ai_fixes": true,
+  "bypass_repair_gate": true,
   "backup_original_sources": true,
   "force_disassembly": false,
   "force_anr_analysis": false,
@@ -166,6 +172,9 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
 - `prompt_mode`：`fix`（默认）/ `analysis`，控制 `06_ai_prompt.md` / LLM 输入偏补丁输出还是偏证据分析；不控制是否自动应用修复（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--prompt-mode-取值)）
 - `agent_loop`：`null`（省略或传 `null` 时随 `prompt_mode`：`analysis`→`context_loop`，其它→`single`）/ `single` / `context_loop`，控制是否允许模型请求补充函数源码后继续多轮分析；独立于 `engine`（详见 [CLI 参考](./CLI_COMMANDS_REFERENCE.md#--agent-loop-取值)）
 - `apply_ai_fixes` / `backup_original_sources`：默认 `true`；为 `false` 时分别传 `--no-apply-ai-fixes` / `--no-backup-original-sources`
+- `bypass_repair_gate`：默认 `true`（跳过 04 诊断 repair_gate，probable/低置信度也可改码）；为 `false` 时传 `--no-bypass-repair-gate`，恢复 confirmed+高置信度门控
+- `enable_runtime_verification`：默认 `false`。只有为 `true` 时才加载并执行 `verification.effectiveness` 中本地已配置的 Crash 复现和回归脚本；`skip_runtime_verification=true` 可显式跳过两类运行时脚本，两者不能同时为 `true`；`run_issue_verification` / `run_regression_verification` 可进一步关闭其中一类。无论是否开启，改码任务都会执行不可关闭的确定性工作区和修改清单检查；不再自动执行启发式源码审查或旧日志复诊。
+- HTTP 请求不得在 `verification.effectiveness.issue.class` 或 `regression.class` 中提交 Python 类路径；脚本类必须由 daemon 本机系统配置提供，请求只负责通过上述布尔字段选择是否执行。
 - `external_agent_evaluation`：默认 `false`；仅传 `true` 时生成 `external_agent_evaluation/` 对比任务文件，不会调用外部 Agent。该字段必须是 JSON boolean，字符串 `"true"` 会返回 400。
 - daemon 对 `scope=full` 且 `apply_ai_fixes=true` 的请求自动创建 detached Git worktree，CLI 只修改该 run 的隔离目录，不会直接回写请求中的源码目录。`code_roots` 必须位于 Git 仓库内，且对应范围不能有未提交修改；非 Git 或 dirty code root 会使 run 以 `workspace_error` 结束。
 - worktree 默认保留在系统临时目录的 `stability-analysis-agent/worktrees/<run_id>/` 下，便于检查和继续处理；可通过 `STABILITY_AGENT_WORKTREE_DIR` 指定管理根目录。

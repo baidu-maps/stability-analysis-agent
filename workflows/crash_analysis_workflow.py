@@ -716,7 +716,30 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             # === 追加结构化报告格式要求（确定性事实已在 04a 诊断段）===
             try:
                 from prompts.report_schema import get_report_instruction
-                report_instruction = get_report_instruction(mode="full")
+                verification = problem.get("verification") if isinstance(problem, dict) else None
+                verification_section = (
+                    verification.get("verification")
+                    if isinstance(verification, dict) and isinstance(verification.get("verification"), dict)
+                    else verification
+                )
+                effectiveness = (
+                    verification_section.get("effectiveness")
+                    if isinstance(verification_section, dict)
+                    and isinstance(verification_section.get("effectiveness"), dict)
+                    else verification_section
+                )
+                issue_script_configured = bool(
+                    isinstance(verification, dict)
+                    and verification.get("enable_runtime_verification") is True
+                    and isinstance(effectiveness, dict)
+                    and effectiveness.get("issue")
+                )
+                generate_reproduction = not issue_script_configured
+                if isinstance(effectiveness, dict) and effectiveness.get("generate_reproduction_by_llm") is False:
+                    generate_reproduction = False
+                report_instruction = get_report_instruction(
+                    mode="full", include_reproduction=generate_reproduction,
+                )
                 if report_instruction:
                     analysis_prompt += "\n\n" + report_instruction
             except Exception as ri_exc:

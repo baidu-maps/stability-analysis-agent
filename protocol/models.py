@@ -64,6 +64,13 @@ class RunRequest:
     config: Optional[str] = None  # 配置文件路径
     # 显式验证配置；候选发现不会自动填充或执行此字段
     verification: Optional[Dict[str, Any]] = None
+    # 简化验证协议：只控制本地已配置的两个验证脚本。
+    reproduction: Optional[Dict[str, Any]] = None
+    generate_reproduction_by_llm: Optional[bool] = None
+    enable_runtime_verification: bool = False
+    skip_runtime_verification: bool = False
+    run_issue_verification: Optional[bool] = None
+    run_regression_verification: Optional[bool] = None
     engine: EngineType = "direct"
 
     output_format: OutputFormat = "markdown"
@@ -79,6 +86,8 @@ class RunRequest:
     streaming: Optional[bool] = None
 
     apply_ai_fixes: bool = True
+    # 默认跳过 04 诊断 repair_gate；传 false / --no-bypass-repair-gate 恢复严格门控
+    bypass_repair_gate: bool = True
     backup_original_sources: bool = True
 
     force_disassembly: bool = False

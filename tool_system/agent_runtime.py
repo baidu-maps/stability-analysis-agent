@@ -261,7 +261,7 @@ class AgentRuntime:
         backup_original_sources: bool = True,
         uaf_nullptr_guard_policy: Any = None,
         request_record: Optional[Dict[str, Any]] = None,
-        post_fix_diagnosis: bool = True,
+        post_fix_diagnosis: bool = False,
     ) -> Dict[str, Any]:
         """Run act/verify stages after workflow analysis completes."""
         from services.repair_pipeline import run_repair_pipeline

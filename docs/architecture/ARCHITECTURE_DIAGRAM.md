@@ -69,7 +69,9 @@ graph TB
 - **AgentRuntime**：统一 observe/analyze/act/verify/decide 生命周期（LangGraph 仅作 LLM backend）
 - **Analyzers**：解析器、地址解析、代码上下文
 - **RAG / EvidenceStore**：向量检索与 LLM 上下文证据账本
-- **DecideScorer**：patch / diff / verify / post_fix_diagnosis 四维聚合判定
+- **SafetyVerificationRunner**：确定性校验补丁、工作区、修改清单与同步清单
+- **EffectivenessVerificationRunner**：独立调度 Crash 复现和回归测试脚本
+- **DecideScorer**：区分 `repair_applied`、部分运行证据与完整 `verified`
 - **Report**：报告生成
 
 ### 数据层

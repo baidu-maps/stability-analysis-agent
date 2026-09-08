@@ -57,6 +57,22 @@ class BuildCliCmdTests(unittest.TestCase):
         self.assertIn("--no-apply-ai-fixes", cmd)
         self.assertIn("--no-backup-original-sources", cmd)
 
+    def test_no_bypass_repair_gate(self) -> None:
+        """HTTP false maps to --no-bypass-repair-gate; default true omits the flag."""
+        req = run_request_from_dict(
+            {
+                "crash_log": "/tmp/a.crash",
+                "bypass_repair_gate": False,
+            }
+        )
+        cmd, _ = _build_cli_cmd(req)
+        self.assertIn("--no-bypass-repair-gate", cmd)
+
+        default_req = run_request_from_dict({"crash_log": "/tmp/a.crash"})
+        default_cmd, _ = _build_cli_cmd(default_req)
+        self.assertNotIn("--no-bypass-repair-gate", default_cmd)
+        self.assertNotIn("--bypass-repair-gate", default_cmd)
+
     def test_force_and_llm_flags(self) -> None:
         req = run_request_from_dict(
             {
@@ -110,6 +126,44 @@ class BuildCliCmdTests(unittest.TestCase):
         cmd, _ = _build_cli_cmd(req)
         self.assertIn("--no-interactive", cmd)
         self.assertIn("--no-save-to-vector-db", cmd)
+
+    def test_runtime_verification_is_disabled_by_default(self) -> None:
+        req = run_request_from_dict({"crash_log": "/tmp/a.crash"})
+        cmd, _ = _build_cli_cmd(req)
+        self.assertNotIn("--enable-runtime-verification", cmd)
+        self.assertNotIn("--skip-runtime-verification", cmd)
+        parsed = build_parser().parse_args(_argv_from_cmd(cmd))
+        self.assertFalse(parsed.enable_runtime_verification)
+        self.assertFalse(parsed.skip_runtime_verification)
+
+    def test_http_runtime_verification_requires_explicit_opt_in(self) -> None:
+        req = run_request_from_dict(
+            {
+                "crash_log": "/tmp/a.crash",
+                "enable_runtime_verification": True,
+                "verification": {
+                    "effectiveness": {"issue": {"class": "local_scripts:Issue"}}
+                },
+            }
+        )
+        cmd, _ = _build_cli_cmd(req)
+        self.assertIn("--enable-runtime-verification", cmd)
+        self.assertTrue(req.enable_runtime_verification)
+
+    def test_http_runtime_verification_false_is_preserved(self) -> None:
+        req = run_request_from_dict(
+            {"crash_log": "/tmp/a.crash", "enable_runtime_verification": False}
+        )
+        self.assertFalse(req.enable_runtime_verification)
+
+
+    def test_http_skip_runtime_verification_maps_to_explicit_cli_flag(self) -> None:
+        req = run_request_from_dict(
+            {"crash_log": "/tmp/a.crash", "skip_runtime_verification": True}
+        )
+        cmd, _ = _build_cli_cmd(req)
+        self.assertIn("--skip-runtime-verification", cmd)
+        self.assertNotIn("--enable-runtime-verification", cmd)
 
     def test_content_uses_stdin(self) -> None:
         req = run_request_from_dict({"crash_log_content": "SIGSEGV\n"})

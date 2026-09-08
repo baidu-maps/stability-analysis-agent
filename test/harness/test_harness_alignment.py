@@ -87,6 +87,16 @@ class HarnessAlignmentTests(unittest.TestCase):
         self.assertNotEqual(score.decision, "accept")
         self.assertFalse(score.verification_passed)
 
+    def test_safety_checked_repair_is_partial_without_runtime_evidence(self):
+        score = score_repair_decision(
+            applied_ai_fixes={"success": True, "applied": [{"status": "applied"}]},
+            diff_review={"status": "passed"},
+            verification={"status": "repair_applied"},
+            run_status="success",
+        )
+        self.assertEqual(score.decision, "partial")
+        self.assertTrue(score.verification_passed)
+
     def test_streaming_tool_is_audited_and_internal_handles_are_hidden(self):
         store = ObservationStore()
 

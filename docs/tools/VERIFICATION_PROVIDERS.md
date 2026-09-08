@@ -147,9 +147,8 @@ build 目录等仍需要项目配置明确指定。
 验证命令返回失败或超时时，CLI 默认使用 `CodeFixer` 生成的原始源码备份回滚已应用修改。
 Daemon 在 `POST /runs/{id}/verification` 失败/超时分支同样尝试回滚。
 
-验证通过后，CLI 与 daemon 均可运行 **post-fix 复诊**（`parse_stack_only` 子流程，不再次改码）。
-结果写入 `09_verification.json` 的 `post_fix_diagnosis` 字段；复诊失败会将 run 标记为 error
-（daemon）或 `post_fix_diagnosis_failed`（CLI metadata）。
+修复后不再自动对原始 Crash 日志执行 `parse_stack_only` 复诊。原始日志对应旧二进制，
+重新解析不能证明修改后的程序已经修复，只会增加耗时和环境误报。
 `unavailable` 不会触发回滚；也可以将 `rollback_on_verification_failure` 设为 `false`。
 
 ## 隔离修复 workspace

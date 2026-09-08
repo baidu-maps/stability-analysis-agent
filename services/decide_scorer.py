@@ -59,7 +59,10 @@ def _verification_passed(verification: Optional[Dict[str, Any]]) -> tuple[bool, 
     ver = verification if isinstance(verification, dict) else {}
     status = str(ver.get("status") or "")
     reasons: List[str] = []
-    if status in {"passed", "skipped", ""}:
+    if status in {
+        "passed", "repair_applied", "issue_verified", "regression_verified",
+        "verified", "inconclusive", "skipped", "",
+    }:
         return True, {"status": status or "skipped"}, reasons
     if status == "pending":
         reasons.append("verification_pending")
@@ -180,6 +183,10 @@ def score_repair_decision(
                 dimensions={"mode": "analyze_only"},
             )
 
+    verification_status = str(verify_dim.get("status") or "")
+    partial_evidence = verification_status in {
+        "repair_applied", "issue_verified", "regression_verified", "inconclusive",
+    }
     if pipeline_skipped:
         decision: DecisionLiteral = "partial"
     elif status in {"verification_pending", "approval_required"} or str(verify_dim.get("status") or "") == "pending":
@@ -187,7 +194,7 @@ def score_repair_decision(
     elif status in {"error", "failed"} or not (patch_ok and diff_ok and verify_ok and diag_ok):
         decision = "reject"
     elif status in {"success", "done", ""}:
-        decision = "accept"
+        decision = "partial" if partial_evidence else "accept"
     else:
         decision = "reject"
 

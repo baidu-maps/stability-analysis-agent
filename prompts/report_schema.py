@@ -58,7 +58,18 @@ STRUCTURED_REPORT_INSTRUCTION = """\
 ### 6.2 防御性措施（架构级）
 (长期改进建议)
 
-## 7. 需补充材料
+## 7. Crash 复现场景
+
+- **场景描述**: (根据根因描述最可能触发本问题的通用场景)
+- **前置条件**: (列表)
+- **复现步骤**: (列表；仅描述操作，不生成或执行脚本)
+- **预期 Crash 特征**: (与本次日志可比对的信号、异常或栈特征)
+- **单次触发概率**: (证据不足时必须写 unknown，禁止根据单份日志伪造精确比例)
+- **概率单位**: per_attempt
+- **估计可信度**: 高 / 中 / 低
+- **估计依据**: (明确区分日志事实与推测)
+
+## 8. 需补充材料
 
 - [ ] 是否需要符号文件（当前是否已符号化）
 - [ ] 是否需要完整源码
@@ -78,7 +89,9 @@ REPORT_STRUCTURE_HINT = """\
 """
 
 
-def get_report_instruction(mode: str = "full", deterministic_facts: str = "") -> str:
+def get_report_instruction(
+    mode: str = "full", deterministic_facts: str = "", *, include_reproduction: bool = True,
+) -> str:
     """获取报告格式指令。
 
     Args:
@@ -94,7 +107,13 @@ def get_report_instruction(mode: str = "full", deterministic_facts: str = "") ->
         parts.append(deterministic_facts)
 
     if mode == "full":
-        parts.append(STRUCTURED_REPORT_INSTRUCTION)
+        instruction = STRUCTURED_REPORT_INSTRUCTION
+        if not include_reproduction:
+            start = instruction.find("## 7. Crash 复现场景")
+            end = instruction.find("## 8. 需补充材料")
+            if start >= 0 and end > start:
+                instruction = instruction[:start] + "## 7. 需补充材料\n" + instruction[end + len("## 8. 需补充材料\n"):]
+        parts.append(instruction)
     else:
         parts.append(REPORT_STRUCTURE_HINT)
 

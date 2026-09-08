@@ -57,6 +57,49 @@ class PrepareHttpRunBodyTests(unittest.TestCase):
             "invalid_external_agent_evaluation",
         )
 
+    def test_runtime_verification_switch_rejects_string_boolean(self) -> None:
+        with self.assertRaises(DaemonHttpError) as ctx:
+            _prepare_http_run_body(
+                {
+                    "crash_log_content": "tombstone",
+                    "enable_runtime_verification": "false",
+                }
+            )
+        self.assertEqual(ctx.exception.status, int(HTTPStatus.BAD_REQUEST))
+        self.assertEqual(ctx.exception.payload["error"], "invalid_boolean")
+        self.assertEqual(ctx.exception.payload["field"], "enable_runtime_verification")
+
+    def test_runtime_verification_flags_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(DaemonHttpError) as ctx:
+            _prepare_http_run_body(
+                {
+                    "crash_log_content": "tombstone",
+                    "enable_runtime_verification": True,
+                    "skip_runtime_verification": True,
+                }
+            )
+        self.assertEqual(
+            ctx.exception.payload["error"],
+            "conflicting_runtime_verification_flags",
+        )
+
+    def test_http_cannot_submit_verification_script_class(self) -> None:
+        with self.assertRaises(DaemonHttpError) as ctx:
+            _prepare_http_run_body(
+                {
+                    "crash_log_content": "tombstone",
+                    "verification": {
+                        "effectiveness": {
+                            "issue": {"class": "untrusted.module:IssueScript"},
+                        }
+                    },
+                }
+            )
+        self.assertEqual(
+            ctx.exception.payload["error"],
+            "dynamic_verification_class_forbidden",
+        )
+
     def test_external_agent_evaluation_changes_run_fingerprint(self) -> None:
         base = {"crash_log_content": "tombstone"}
         self.assertNotEqual(

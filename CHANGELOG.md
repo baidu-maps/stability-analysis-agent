@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.3.7] - 2026-09-08
+
+### Added
+
+- **`--bypass-repair-gate` / HTTP `bypass_repair_gate`**：默认 `true`，跳过 04 诊断 repair_gate，使 probable/低置信度在 `apply_ai_fixes=true` 时也可进入自动改码；`--no-bypass-repair-gate` / `false` 恢复 confirmed+高置信度门控。
+- **简化运行时验证协议**：`enable_runtime_verification` / `skip_runtime_verification` / `run_issue_verification` / `run_regression_verification` 与本地 issue/regression 脚本执行器（`services/simple_verification.py`）；默认不跑复现/回归脚本。
+- **改码安全检查**：`services/safety_verification.py` 校验补丁落盘与同步完整性（与运行时验证开关独立）。
+
+### Changed
+
+- 改码管道与 harness/decide 判定、CLI/Daemon 参数透传对齐上述开关；相关文档与单测同步。
+
+### Documentation
+
+- README / PyPI 发布说明中的最新版本号更新为 1.3.7。
+- Daemon / CLI 参考补充 `bypass_repair_gate` 与运行时验证字段。
+
 ## [1.3.6] - 2026-09-04
 
 ### Added
@@ -18,8 +35,6 @@ All notable changes to this project are documented in this file.
 ### Documentation
 
 - [CONTEXT_LOOP_CONTRACT.md](docs/architecture/CONTEXT_LOOP_CONTRACT.md), [HARNESS_MIGRATION.md](docs/cli/HARNESS_MIGRATION.md)
-
-## [Unreleased]
 
 ## [1.3.5] - 2026-08-24
 

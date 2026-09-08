@@ -12,7 +12,7 @@ entry points; LangGraph is an LLM backend and not a second state graph.
 Every run uses the same stages:
 
 ```text
-observe -> analyze -> plan -> act -> diff_review -> verify -> rollback/sync_worktree -> post_fix_diagnosis -> decide
+observe -> analyze -> plan -> act -> safety_verify -> effectiveness_verify -> rollback/sync_worktree -> decide
 ```
 
 The crash workflow completes toolchain **prepare** inside `execute_workflow_prepare`,
@@ -23,8 +23,7 @@ replay still hydrates from `artifacts/stage_analyze_result.json`.
 
 Post-fix actions run through `services/repair_pipeline.py` and
 `services/repair_actions.py` (`RuntimeActionExecutor` handlers:
-`apply_patch`, `inspect_diff`, `verify`, `rollback`, `sync_worktree`,
-`post_fix_diagnosis`) via `AgentRuntime.run_repair_and_verify()` for
+`apply_patch`, `inspect_diff`, `verify`, `rollback`, `sync_worktree`) via `AgentRuntime.run_repair_and_verify()` for
 `act/verify/decide`.
 
 Runtime state is available in result metadata as `runtime_state`. Full event
@@ -32,23 +31,30 @@ streams are written to `00_runtime_trace.json` in report directories.
 
 ## Verification
 
-Verification is opt-in. Discovery only reports candidates and never executes
-them. A configured provider exposes four operations:
+Verification has two independent parts. `SafetyVerificationRunner` always runs
+for code-writing tasks and checks only deterministic integrity facts: the patch
+produced a Git change, every changed path is inside the requested workspace,
+the declared and actual change sets match, and synchronization copied exactly
+the expected files. It performs no heuristic source review and makes no claim
+that the Crash is fixed.
+
+`EffectivenessVerificationRunner` is opt-in and runs only the configured Crash
+reproduction and regression scripts. Discovery only reports candidates and
+never executes them. A configured legacy provider exposes four operations:
 
 - `discover`: read-only candidate discovery
 - `validate`: command/capability validation and approval request
 - `execute`: explicit execution after approval
 - `summarize`: stable result projection
 
-When no provider is configured, a successful fix moves the run to
-`verification_pending`. The daemon resumes it only after the user submits an
-explicit command. Verification results include the command fingerprint and
-approval record.
+When effectiveness verification is disabled, a safety-checked and synchronized
+fix ends as `repair_applied`. Only both runtime checks passing produces
+`verified`; partial or unavailable runtime evidence remains `partial` or
+`inconclusive`.
 
 Verification failure triggers rollback when backups exist (CLI and daemon).
-Verification failure may run **reanalyze only** (`parse_stack_only` via
-`reanalyze_diagnosis`; no automatic re-apply). Verification success may run
-`post_fix_diagnosis` (`parse_stack_only` re-run).
+The original Crash log is not re-diagnosed after source edits because that does
+not provide runtime evidence for the modified program.
 
 ## Tool policy and approval
 
@@ -118,9 +124,8 @@ Shared routing for snippet and similar calls: `services/tool_invoke.py`
 
 ## Decide stage
 
-After repair verify/post_fix_diagnosis, `services/decide_scorer.py`
-aggregates four dimensions (patch valid, diff review, verification,
-diagnosis stable) into `accept` / `reject` / `pending` / `partial`.
+After safety and effectiveness verification, `services/decide_scorer.py`
+distinguishes a safely applied patch from partial and complete runtime evidence.
 Runtime and offline evaluation share the same scorer. The sidecar artifact
 is `10_decide.json` (via `services/stage_artifacts.save_decide_artifact`).
 
@@ -130,7 +135,8 @@ when set on the problem or environment.
 ## Safety rules
 
 - Candidate commands are never executed implicitly.
-- Worktree synchronization occurs only after verification passes.
+- Worktree synchronization occurs after safety verification, and after runtime
+  verification when the latter is enabled.
 - Verification failure remains a failure and may trigger rollback.
 - An invalid engine is rejected; it is never silently mapped to another
   backend.

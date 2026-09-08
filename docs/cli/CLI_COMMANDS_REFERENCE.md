@@ -122,6 +122,7 @@ LLM 配置模板见 **`configs/agent_config.local.example.json`**。实际密钥
 | 参数 | 默认 | 作用 |
 |------|------|------|
 | `--apply-ai-fixes` / `--no-apply-ai-fixes` | **开启** | 是否在首轮 AI 分析后，再经一次结构化调用，将候选函数**回写到 `--code-roots` 内源码**。关闭后只分析、不改文件。 |
+| `--bypass-repair-gate` / `--no-bypass-repair-gate` | **开启（跳过门控）** | 是否跳过 04 诊断 `repair_gate`。默认跳过，使 `probable`/低置信度也可进入自动改码；加 `--no-bypass-repair-gate` 时恢复「仅 `confirmed` 且置信度 ≥ 0.85」门控。HTTP 字段：`bypass_repair_gate`（默认 `true`）。 |
 | `--backup-original-sources` / `--no-backup-original-sources` | **开启** | 回写前是否在当次 **`reports/<run>/original_sources/`** 下保存**改前**源码副本。若工程已由 Git 管理、习惯用 `git checkout` 撤销，可加 **`--no-backup-original-sources`** 省略磁盘备份。 |
 
 **说明**：

@@ -6,10 +6,27 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
-from services.diff_review import review_changed_files
 from services.git_worktree_manager import WorktreeIsolationError, cleanup_isolated_workspace
 from services.repair_pipeline import run_repair_pipeline, unisolated_workspace_fingerprint
 from services.verification import make_approval
+from services.simple_verification import IssueVerificationScript, VerificationResult, VerificationStatus
+
+
+class PhaseReproduction(IssueVerificationScript):
+    def __init__(self):
+        self.phases = []
+
+    def run(self, context):
+        phase = context.metadata.get("verification_phase")
+        self.phases.append(phase)
+        return VerificationResult(
+            VerificationStatus.PASSED, phase, reproduced=phase == "before_fix",
+        )
+
+
+class MustNotRunReproduction(IssueVerificationScript):
+    def run(self, context):
+        raise AssertionError("runtime verification must remain disabled")
 
 
 class RepairRuntimeContractTests(unittest.TestCase):
@@ -75,38 +92,7 @@ class RepairRuntimeContractTests(unittest.TestCase):
             prepare.assert_not_called()
             self.assertEqual(result.result_updates["unisolated_approval"]["status"], "consumed")
 
-    def test_diff_review_rejects_dangerous_dependency_api_and_guard_removal(self):
-        path = "/tmp/api.h"
-        old = "public:\n  void lock();\n  void checkError();\n"
-        new = "#include <cstdlib>\npublic:\n  void changed();\n  system(\"x\");\n"
-        review = review_changed_files(
-            [path], [path],
-            changed_contents={path: new}, original_contents={path: old},
-            diff_text="-  void lock();\n-  void checkError();\n+  void changed();\n+  system(\"x\");",
-        )
-        joined = "\n".join(review.issues)
-        self.assertEqual(review.status, "failed")
-        self.assertIn("dangerous API", joined)
-        self.assertIn("new dependency", joined)
-        self.assertIn("lock/error-check removal", joined)
-        self.assertIn("public API/ABI", joined)
-
-    def test_diff_review_enforces_file_diff_and_function_limits(self):
-        review = review_changed_files(
-            ["/tmp/a.cpp", "/tmp/b.cpp"],
-            ["/tmp/a.cpp", "/tmp/b.cpp"],
-            max_files=1,
-            max_diff_lines=1,
-            diff_text="+one\n+two\n",
-            changed_functions=["Other::f"],
-            allowed_functions=["Target::f"],
-        )
-        joined = "\n".join(review.issues)
-        self.assertIn("changed file count exceeds", joined)
-        self.assertIn("diff line count exceeds", joined)
-        self.assertIn("unrelated", joined)
-
-    def test_real_worktree_fix_stays_isolated_until_verification(self):
+    def test_real_worktree_fix_syncs_after_safety_verification_without_scripts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "src.cpp"
@@ -123,26 +109,179 @@ class RepairRuntimeContractTests(unittest.TestCase):
                 return {"success": True, "applied": [{"file": str(isolated_file)}]}
 
             report_dir = root / "report"
-            result = run_repair_pipeline(
-                result={
-                    "status": "success",
-                    "analysis": "done",
-                    "code_context": {"graph": {"nodes": [{
-                        "file": str(source), "signature": "target()", "snippet": ["int target()"]
-                    }]}},
-                },
-                code_roots=[str(root)], report_dir=report_dir, run_id="real-worktree",
-                verification_config=None, llm_adapter=object(), apply_fix_fn=apply_fix,
-                post_fix_diagnosis=False,
-            )
+            with patch(
+                "services.repair_actions.run_post_fix_diagnosis",
+                side_effect=AssertionError("old log diagnosis must not run"),
+            ):
+                result = run_repair_pipeline(
+                    result={
+                        "status": "success",
+                        "analysis": "done",
+                        "code_context": {"graph": {"nodes": [{
+                            "file": str(source), "signature": "target()", "snippet": ["int target()"]
+                        }]}},
+                    },
+                    code_roots=[str(root)], report_dir=report_dir, run_id="real-worktree",
+                    verification_config=None, llm_adapter=object(), apply_fix_fn=apply_fix,
+                    post_fix_diagnosis=True,
+                )
             try:
-                self.assertEqual(result.verification_result["status"], "pending", result.verification_result)
-                self.assertEqual(result.result_updates["completion_reason"], "verification_pending")
-                self.assertEqual(source.read_text(encoding="utf-8"), "int target() { return 0; }\n")
+                self.assertEqual(result.verification_result["status"], "repair_applied", result.verification_result)
+                self.assertEqual(result.result_updates["completion_reason"], "repair_applied")
+                self.assertEqual(result.verification_result["safety_verification"]["status"], "passed")
+                self.assertEqual(source.read_text(encoding="utf-8"), "int target() { return 1; }\n")
                 self.assertIsNotNone(result.isolated_workspace)
                 isolated_file = Path(result.isolated_workspace.isolated_code_roots[0]) / "src.cpp"
                 self.assertEqual(isolated_file.read_text(encoding="utf-8"), "int target() { return 1; }\n")
                 self.assertTrue((report_dir / "09_ai_fix_workspace.json").is_file())
+            finally:
+                if result.isolated_workspace is not None:
+                    cleanup_isolated_workspace(result.isolated_workspace, force=True)
+
+    def test_configured_runtime_script_is_not_loaded_or_run_without_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "src.cpp"
+            source.write_text("int target() { return 0; }\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
+            subprocess.run(["git", "add", "src.cpp"], cwd=str(root), check=True)
+            subprocess.run(["git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                            "commit", "-qm", "initial"], cwd=str(root), check=True)
+
+            def apply_fix(**kwargs):
+                isolated_file = Path(kwargs["code_roots"][0]) / "src.cpp"
+                isolated_file.write_text("int target() { return 1; }\n", encoding="utf-8")
+                return {"success": True, "applied": [{"file": str(isolated_file)}]}
+
+            result = run_repair_pipeline(
+                result={"status": "success", "analysis": "done", "code_context": {}},
+                code_roots=[str(root)], report_dir=root / "report", run_id="runtime-disabled",
+                verification_config={
+                    "verification": {
+                        "effectiveness": {"issue": MustNotRunReproduction()},
+                    }
+                },
+                llm_adapter=object(), apply_fix_fn=apply_fix, post_fix_diagnosis=False,
+            )
+            try:
+                self.assertIsNone(result.baseline_result)
+                self.assertEqual(result.verification_result["status"], "repair_applied")
+                self.assertEqual(
+                    result.verification_result["effectiveness_verification"]["status"], "skipped"
+                )
+            finally:
+                if result.isolated_workspace is not None:
+                    cleanup_isolated_workspace(result.isolated_workspace, force=True)
+
+    def test_skip_verify_skips_runtime_script_but_syncs_safe_patch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "src.cpp"
+            source.write_text("int target() { return 0; }\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
+            subprocess.run(["git", "add", "src.cpp"], cwd=str(root), check=True)
+            subprocess.run(["git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                            "commit", "-qm", "initial"], cwd=str(root), check=True)
+
+            def apply_fix(**kwargs):
+                isolated_file = Path(kwargs["code_roots"][0]) / "src.cpp"
+                isolated_file.write_text("int target() { return 1; }\n", encoding="utf-8")
+                return {"success": True, "applied": [{"file": str(isolated_file)}]}
+
+            result = run_repair_pipeline(
+                result={"status": "success", "analysis": "done", "code_context": {}},
+                code_roots=[str(root)], report_dir=root / "report", run_id="runtime-skipped",
+                verification_config={
+                    "enable_runtime_verification": True,
+                    "skip_runtime_verification": True,
+                    "verification": {
+                        "effectiveness": {"issue": MustNotRunReproduction()},
+                    },
+                },
+                llm_adapter=object(), apply_fix_fn=apply_fix, post_fix_diagnosis=False,
+            )
+            try:
+                self.assertIsNone(result.baseline_result)
+                self.assertEqual(result.verification_result["status"], "repair_applied")
+                self.assertEqual(source.read_text(encoding="utf-8"), "int target() { return 1; }\n")
+                self.assertEqual(
+                    result.verification_result["worktree_sync"]["integrity"]["status"], "passed"
+                )
+            finally:
+                if result.isolated_workspace is not None:
+                    cleanup_isolated_workspace(result.isolated_workspace, force=True)
+
+    def test_undeclared_worktree_change_fails_safety_and_is_not_synced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first.cpp"
+            second = root / "second.cpp"
+            first.write_text("int first() { return 0; }\n", encoding="utf-8")
+            second.write_text("int second() { return 0; }\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
+            subprocess.run(["git", "add", "first.cpp", "second.cpp"], cwd=str(root), check=True)
+            subprocess.run(["git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                            "commit", "-qm", "initial"], cwd=str(root), check=True)
+
+            def apply_fix(**kwargs):
+                isolated_root = Path(kwargs["code_roots"][0])
+                isolated_first = isolated_root / "first.cpp"
+                isolated_first.write_text("int first() { return 1; }\n", encoding="utf-8")
+                (isolated_root / "second.cpp").write_text(
+                    "int second() { return 1; }\n", encoding="utf-8"
+                )
+                return {"success": True, "applied": [{"file": str(isolated_first)}]}
+
+            result = run_repair_pipeline(
+                result={"status": "success", "analysis": "done", "code_context": {}},
+                code_roots=[str(root)], report_dir=root / "report", run_id="unsafe-manifest",
+                verification_config=None, llm_adapter=object(), apply_fix_fn=apply_fix,
+            )
+            try:
+                self.assertEqual(result.verification_result["status"], "safety_check_failed")
+                self.assertEqual(first.read_text(encoding="utf-8"), "int first() { return 0; }\n")
+                self.assertEqual(second.read_text(encoding="utf-8"), "int second() { return 0; }\n")
+            finally:
+                if result.isolated_workspace is not None:
+                    cleanup_isolated_workspace(result.isolated_workspace, force=True)
+
+    def test_issue_reproduction_runs_before_and_after_patch_inside_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "src.cpp"
+            source.write_text("int target() { return 0; }\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
+            subprocess.run(["git", "add", "src.cpp"], cwd=str(root), check=True)
+            subprocess.run(["git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                            "commit", "-qm", "initial"], cwd=str(root), check=True)
+
+            def apply_fix(**kwargs):
+                isolated_file = Path(kwargs["code_roots"][0]) / "src.cpp"
+                isolated_file.write_text("int target() { return 1; }\n", encoding="utf-8")
+                return {"success": True, "applied": [{"file": str(isolated_file)}]}
+
+            script = PhaseReproduction()
+            result = run_repair_pipeline(
+                result={"status": "success", "analysis": "done", "code_context": {}},
+                code_roots=[str(root)], report_dir=root / "report", run_id=f"simple-{root.name}",
+                verification_config={
+                    "enable_runtime_verification": True,
+                    "verification": {
+                        "safety": {},
+                        "effectiveness": {"issue": script},
+                    },
+                },
+                llm_adapter=object(), apply_fix_fn=apply_fix, post_fix_diagnosis=False,
+            )
+            try:
+                self.assertIsNotNone(result.baseline_result, result.result_updates)
+                self.assertEqual(result.baseline_result["summary"], "before_fix")
+                self.assertEqual(
+                    result.verification_result["effectiveness_verification"]["issue_verification"]["summary"],
+                    "after_fix",
+                )
+                self.assertEqual(result.result_updates["completion_reason"], "issue_verified")
+                self.assertEqual(source.read_text(encoding="utf-8"), "int target() { return 1; }\n")
             finally:
                 if result.isolated_workspace is not None:
                     cleanup_isolated_workspace(result.isolated_workspace, force=True)

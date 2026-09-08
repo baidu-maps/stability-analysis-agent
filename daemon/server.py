@@ -83,6 +83,54 @@ def _prepare_http_run_body(body: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(body or {})
     if "apply_ai_fixes" not in payload:
         payload["apply_ai_fixes"] = False
+    for field_name in (
+        "enable_runtime_verification",
+        "skip_runtime_verification",
+        "run_issue_verification",
+        "run_regression_verification",
+        "generate_reproduction_by_llm",
+        "bypass_repair_gate",
+    ):
+        if field_name in payload and payload[field_name] is not None and not isinstance(payload[field_name], bool):
+            raise DaemonHttpError(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": "invalid_boolean",
+                    "field": field_name,
+                    "message": f"{field_name} 必须是 boolean",
+                },
+            )
+    if payload.get("enable_runtime_verification") is True and payload.get("skip_runtime_verification") is True:
+        raise DaemonHttpError(
+            HTTPStatus.BAD_REQUEST,
+            {
+                "error": "conflicting_runtime_verification_flags",
+                "message": "enable_runtime_verification 与 skip_runtime_verification 不能同时为 true",
+            },
+        )
+    verification = payload.get("verification")
+    if isinstance(verification, dict):
+        section = (
+            verification.get("verification")
+            if isinstance(verification.get("verification"), dict)
+            else verification
+        )
+        effectiveness = (
+            section.get("effectiveness")
+            if isinstance(section, dict) and isinstance(section.get("effectiveness"), dict)
+            else section
+        )
+        for script_kind in ("issue", "regression"):
+            script = effectiveness.get(script_kind) if isinstance(effectiveness, dict) else None
+            if isinstance(script, dict) and script.get("class"):
+                raise DaemonHttpError(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "error": "dynamic_verification_class_forbidden",
+                        "field": f"verification.{script_kind}.class",
+                        "message": "HTTP 请求不能提交验证脚本类路径；只能执行 daemon 本地配置的脚本",
+                    },
+                )
     if "external_agent_evaluation" in payload and not isinstance(
         payload["external_agent_evaluation"], bool
     ):
@@ -874,6 +922,7 @@ def _run_fingerprint(body: Dict[str, Any]) -> str:
         "platform": body.get("platform"),
         "sdk_version": body.get("sdk_version"),
         "apply_ai_fixes": body.get("apply_ai_fixes"),
+        "bypass_repair_gate": body.get("bypass_repair_gate"),
         "output_format": body.get("output_format"),
         "external_agent_evaluation": body.get("external_agent_evaluation", False),
     }
@@ -1048,6 +1097,12 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
 
     if bool(getattr(req, "apply_ai_fixes", True)) != bool(getattr(defaults, "apply_ai_fixes", True)):
         cmd += ["--apply-ai-fixes" if req.apply_ai_fixes else "--no-apply-ai-fixes"]
+    if bool(getattr(req, "bypass_repair_gate", True)) != bool(
+        getattr(defaults, "bypass_repair_gate", True)
+    ):
+        cmd += [
+            "--bypass-repair-gate" if req.bypass_repair_gate else "--no-bypass-repair-gate"
+        ]
     if bool(getattr(req, "backup_original_sources", True)) != bool(
         getattr(defaults, "backup_original_sources", True)
     ):
@@ -1186,8 +1241,21 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
         if module_text:
             cmd += ["--plugin-module", module_text]
 
-    if isinstance(getattr(req, "verification", None), dict):
-        cmd += ["--verification-config-json", json.dumps(req.verification, ensure_ascii=False)]
+    verification = dict(req.verification) if isinstance(getattr(req, "verification", None), dict) else {}
+    if getattr(req, "reproduction", None) is not None:
+        verification["reproduction"] = req.reproduction
+    if getattr(req, "generate_reproduction_by_llm", None) is not None:
+        verification["generate_reproduction_by_llm"] = bool(req.generate_reproduction_by_llm)
+    if getattr(req, "run_issue_verification", None) is not None:
+        verification["run_issue_verification"] = bool(req.run_issue_verification)
+    if getattr(req, "run_regression_verification", None) is not None:
+        verification["run_regression_verification"] = bool(req.run_regression_verification)
+    if bool(getattr(req, "enable_runtime_verification", False)):
+        cmd += ["--enable-runtime-verification"]
+    if bool(getattr(req, "skip_runtime_verification", False)):
+        cmd += ["--skip-runtime-verification"]
+    if verification:
+        cmd += ["--verification-config-json", json.dumps(verification, ensure_ascii=False)]
     cmd += ["--no-interactive", "--no-save-to-vector-db"]
 
     return cmd, stdin_text

@@ -3,12 +3,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-import difflib
 import fnmatch
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from services.code_fixer import CodeFixer, extract_candidate_nodes, rollback_applied_edits
-from services.diff_review import review_changed_files
+from services.code_fixer import CodeFixer, rollback_applied_edits
 from services.agent_schema import VerificationDecision
 from services.git_worktree_manager import (
     IsolatedCodeWorkspace,
@@ -169,73 +167,31 @@ def _apply_patch_handler(deps: RepairActionDeps, payload: Dict[str, Any]) -> Dic
 
 
 def _inspect_diff_handler(deps: RepairActionDeps, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Run deterministic change-integrity checks.
+
+    The runtime action name remains ``inspect_diff`` for trace compatibility,
+    but heuristic source review is intentionally not part of this gate.
+    """
+    from services.safety_verification import SafetyContext, SafetyVerificationRunner
+
     applied = deps.applied_fix_result or {}
     declared_changed = list(payload.get("changed_files") or deps.changed_files)
-    review_config = deps.verification_config if isinstance(deps.verification_config, dict) else {}
     if deps.isolated_workspace is not None:
         actual = collect_workspace_diff(deps.isolated_workspace)
         changed = list(actual.get("changed_files") or [])
-        diff_text = str(actual.get("diff_text") or "")
-        changed_contents = dict(actual.get("changed_contents") or {})
-        original_contents = dict(actual.get("original_contents") or {})
-        workspace = str(deps.isolated_workspace.root)
+        workspace_roots = list(deps.isolated_workspace.isolated_code_roots)
     else:
         changed = list(declared_changed)
-        changed_contents = {}
-        original_contents = {}
-        diff_parts: List[str] = []
-        for item in (applied.get("applied") or []):
-            if not isinstance(item, dict) or not item.get("file"):
-                continue
-            path = str(Path(str(item["file"])).expanduser().resolve())
-            try:
-                changed_contents[path] = Path(path).read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                changed_contents[path] = ""
-            backup = Path(str(item.get("backup_path") or ""))
-            if backup.is_file():
-                old = backup.read_text(encoding="utf-8", errors="replace")
-                original_contents[path] = old
-                diff_parts.extend(difflib.unified_diff(
-                    old.splitlines(), changed_contents[path].splitlines(),
-                    fromfile=path, tofile=path, lineterm="",
-                ))
-        diff_text = "\n".join(diff_parts)
-        workspace = str(Path(deps.code_roots[0]).resolve()) if deps.code_roots else ""
-    candidates = extract_candidate_nodes(
-        deps.result.get("code_context") if isinstance(deps.result.get("code_context"), dict) else {}
+        workspace_roots = list(deps.code_roots)
+    report = SafetyVerificationRunner.from_mapping(deps.verification_config).run(
+        SafetyContext(
+            applied_result=applied,
+            declared_changed_files=declared_changed,
+            actual_changed_files=changed,
+            workspace_roots=workspace_roots,
+        )
     )
-    candidate_files = [str(item.get("file")) for item in candidates if item.get("file")]
-    allowed_files = review_config.get("allowed_files") or review_config.get("allowed_changed_files") or candidate_files
-    if deps.isolated_workspace is not None:
-        allowed_files = [map_original_path(deps.isolated_workspace, str(path)) for path in allowed_files]
-    changed_functions = [
-        str(item.get("function_signature") or "")
-        for item in (applied.get("applied") or [])
-        if isinstance(item, dict) and item.get("function_signature")
-    ]
-    allowed_functions = [
-        str(item.get("signature") or item.get("function_signature") or "")
-        for item in candidates
-        if item.get("signature") or item.get("function_signature")
-    ]
-    review = review_changed_files(
-        changed,
-        allowed_files,
-        diff_text=diff_text,
-        max_files=review_config.get("max_changed_files", 8),
-        max_diff_lines=review_config.get("max_diff_lines", 800),
-        changed_contents=changed_contents,
-        original_contents=original_contents,
-        workspace=workspace,
-        max_function_lines=review_config.get("max_function_lines", 400),
-        declared_files=declared_changed,
-        changed_functions=changed_functions,
-        allowed_functions=allowed_functions,
-        allow_dependency_changes=bool(review_config.get("allow_dependency_changes", False)),
-        allow_public_api_changes=bool(review_config.get("allow_public_api_changes", False)),
-    )
-    deps.diff_review = review.to_dict()
+    deps.diff_review = report
     return deps.diff_review
 
 
@@ -627,11 +583,25 @@ def _sync_worktree_handler(deps: RepairActionDeps, payload: Dict[str, Any]) -> D
 
 def _post_fix_diagnosis_handler(deps: RepairActionDeps, payload: Dict[str, Any]) -> Dict[str, Any]:
     record = deps.request_record if isinstance(deps.request_record, dict) else {}
+    crash_input = record.get("crash_input") if isinstance(record.get("crash_input"), dict) else {}
+    paths = record.get("paths") if isinstance(record.get("paths"), dict) else {}
+    crash_source = str(crash_input.get("source") or "")
+    crash_content = str(
+        record.get("crash_log_content")
+        or (crash_input.get("content") if crash_source in {"content", "stdin"} else "")
+        or ""
+    )
+    crash_path = str(
+        record.get("crash_log")
+        or crash_input.get("resolved_path")
+        or crash_input.get("original_path")
+        or ""
+    )
     diagnosis = run_post_fix_diagnosis(
-        crash_log=record.get("crash_log"),
-        crash_log_content=record.get("crash_log_content"),
-        library_dir=record.get("library_dir"),
-        code_roots=list(deps.code_roots or record.get("code_roots") or []),
+        crash_log=crash_path,
+        crash_log_content=crash_content,
+        library_dir=str(record.get("library_dir") or paths.get("library_dir") or ""),
+        code_roots=list(deps.code_roots or record.get("code_roots") or paths.get("code_roots") or []),
     )
     return diagnosis
 
