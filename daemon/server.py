@@ -79,7 +79,11 @@ def set_deny_local_path_fields(enabled: bool) -> None:
 
 
 def _prepare_http_run_body(body: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize and guard a POST /runs JSON object."""
+    """Normalize and guard a POST /runs JSON object.
+
+    Missing ``apply_ai_fixes`` defaults to **False** on the HTTP path (digital-employee /
+    remote-safe). CLI ``--apply-ai-fixes`` defaults to True. See GET /health ``defaults``.
+    """
     payload = dict(body or {})
     if "apply_ai_fixes" not in payload:
         payload["apply_ai_fixes"] = False
@@ -913,6 +917,18 @@ def _health_package_info() -> Dict[str, Any]:
             extra = {}
         if isinstance(extra, dict):
             payload.update(extra)
+    # HTTP intentionally defaults apply_ai_fixes=false (digital-employee safe path).
+    # CLI argparse defaults to true; callers must not assume they match.
+    cli_apply_default = True
+    try:
+        cli_apply_default = bool(getattr(_cli_analysis_defaults(), "apply_ai_fixes", True))
+    except Exception:
+        cli_apply_default = True
+    payload["defaults"] = {
+        "http_apply_ai_fixes": False,
+        "cli_apply_ai_fixes": cli_apply_default,
+        "http_bypass_repair_gate": True,
+    }
     return payload
 
 
@@ -998,6 +1014,166 @@ def _load_run_summary(run: "RunState") -> Optional[Dict[str, Any]]:
     except (OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _stage_status_from_summary(summary: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Map ``stages[].name -> status`` from 00_run_summary.json."""
+    rows = summary.get("stages") if isinstance(summary, dict) else None
+    if not isinstance(rows, list):
+        return {}
+    out: Dict[str, str] = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        status = str(item.get("status") or "").strip()
+        if name and status:
+            out[name] = status
+    return out
+
+
+def _stage_errors_from_summary(summary: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Normalize ``errors[]`` from 00_run_summary.json to ``[{stage, message}]``."""
+    rows = summary.get("errors") if isinstance(summary, dict) else None
+    if not isinstance(rows, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        stage = str(item.get("stage") or "").strip()
+        message = str(item.get("message") or item.get("error") or "").strip()
+        if not stage and not message:
+            continue
+        out.append({"stage": stage or "unknown", "message": message or "unknown error"})
+    return out
+
+
+def _fix_notes_from_applied(applied: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Extract skipped / rolled_back edit notes from 08_apply_ai_fixes.json."""
+    rows = applied.get("applied") if isinstance(applied, dict) else None
+    if not isinstance(rows, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        if status not in {"skipped", "rolled_back", "failed"}:
+            continue
+        file_name = str(item.get("file") or "").strip()
+        short = Path(file_name).name if file_name else ""
+        function = str(
+            item.get("function_signature") or item.get("function") or item.get("name") or ""
+        ).strip()
+        error = str(item.get("error") or item.get("reason") or item.get("skipped_reason") or "").strip()
+        out.append(
+            {
+                "file": short or file_name,
+                "function": function,
+                "status": status,
+                "error": error,
+            }
+        )
+    return out
+
+
+def _compose_failure_detail(
+    *,
+    completion_reason: Optional[str],
+    stage_errors: List[Dict[str, str]],
+    fix_notes: List[Dict[str, str]],
+    applied: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Build a Chinese one-liner for digital employees (prefer over raw progress)."""
+    reason = str(completion_reason or "").strip()
+    parts: List[str] = []
+    if reason == "safety_check_failed":
+        parts.append("改码阶段被服务端安全校验拒绝，已回滚全部改动")
+    elif reason.startswith("skipped_"):
+        parts.append(f"分析提前终止（completion_reason={reason}）")
+    elif reason:
+        parts.append(f"任务未正常完成（completion_reason={reason}）")
+
+    for item in stage_errors:
+        stage = str(item.get("stage") or "").strip() or "unknown"
+        message = str(item.get("message") or "").strip()
+        if message:
+            parts.append(f"阶段 {stage}: {message}")
+
+    apply_error = ""
+    if isinstance(applied, dict):
+        apply_error = str(
+            applied.get("error") or applied.get("skipped_reason") or ""
+        ).strip()
+        if apply_error and not any(apply_error in part for part in parts):
+            parts.append(f"改码: {apply_error}")
+
+    for note in fix_notes:
+        label = str(note.get("file") or note.get("function") or "").strip() or "edit"
+        status = str(note.get("status") or "").strip() or "skipped"
+        error = str(note.get("error") or "").strip()
+        if error:
+            parts.append(f"{label} → {status}：{error}")
+        else:
+            parts.append(f"{label} → {status}")
+
+    if not parts:
+        return None
+    # Keep digital-employee bubbles readable.
+    text = "；".join(parts)
+    if len(text) > 1200:
+        return text[:1197] + "..."
+    return text
+
+
+def _report_failure_fields(run: "RunState") -> Dict[str, Any]:
+    """Collect completion_reason / stage_* / fix_notes / failure_detail from report dir."""
+    summary = _load_run_summary(run)
+    applied = _load_report_applied_fixes(run)
+    stage_status = _stage_status_from_summary(summary)
+    stage_errors = _stage_errors_from_summary(summary)
+    fix_notes = _fix_notes_from_applied(applied)
+    reason = str(run.completion_reason or "").strip()
+    if not reason and isinstance(summary, dict):
+        reason = str(summary.get("completion_reason") or "").strip()
+    failure_detail = _compose_failure_detail(
+        completion_reason=reason or None,
+        stage_errors=stage_errors,
+        fix_notes=fix_notes,
+        applied=applied,
+    )
+    return {
+        "completion_reason": reason or None,
+        "failure_detail": failure_detail,
+        "stage_status": stage_status,
+        "stage_errors": stage_errors,
+        "fix_notes": fix_notes,
+    }
+
+
+def _attach_report_failure_fields(run: "RunState", payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge report-derived failure fields into /status and /result payloads."""
+    fields = _report_failure_fields(run)
+    reason = fields.get("completion_reason")
+    if reason and not run.completion_reason:
+        run.completion_reason = str(reason)
+    payload["completion_reason"] = run.completion_reason or reason
+    payload["failure_detail"] = fields.get("failure_detail")
+    payload["stage_status"] = fields.get("stage_status") or {}
+    payload["stage_errors"] = fields.get("stage_errors") or []
+    payload["fix_notes"] = fields.get("fix_notes") or []
+    detail = str(fields.get("failure_detail") or "").strip()
+    # Prefer concrete report reason over the last progress line for callers.
+    if detail and run.status in {"error", "canceled"}:
+        progress = str(run.last_progress or "").strip()
+        if progress and progress not in detail:
+            rewritten = f"{detail}（{progress}）"
+        else:
+            rewritten = detail
+        payload["error"] = rewritten
+        run.error = rewritten
+    return payload
 
 
 _CLI_ANALYSIS_DEFAULTS = None
@@ -1422,6 +1598,11 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
             run.completion_reason = reason
         report_summary = _load_run_summary(run)
         if isinstance(report_summary, dict):
+            if not run.completion_reason:
+                saved_reason = str(report_summary.get("completion_reason") or "").strip()
+                if saved_reason:
+                    run.completion_reason = saved_reason
+                    reason = saved_reason
             saved_runtime = report_summary.get("runtime_state")
             if isinstance(saved_runtime, dict):
                 _adopt_runtime_payload(run, saved_runtime)
@@ -1442,6 +1623,12 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
             status = "error"
         _set_transport_status(run, status)
         result_error = _summarize_cli_outcome(run, output_text, exit_code)
+        # Prefer report-derived Chinese detail when CLI only left a progress line.
+        report_fields = _report_failure_fields(run)
+        detail = str(report_fields.get("failure_detail") or "").strip()
+        if detail and status in {"error", "canceled"}:
+            progress = str(run.last_progress or "").strip()
+            result_error = f"{detail}（{progress}）" if progress and progress not in detail else detail
         run.error = result_error
         run.result = RunResult(
             run_id=run.run_id,
@@ -1523,7 +1710,12 @@ def _wait_cli_process(process: subprocess.Popen, run: RunState) -> int:
             return -15
 
 
-_REPORT_MARKS = ("# 崩溃分析结果", "# Crash Analysis Result", "# Crash analysis")
+_REPORT_MARKS = (
+    "# 崩溃分析结果",
+    "# 堆栈地址解析结果",
+    "# Crash Analysis Result",
+    "# Crash analysis",
+)
 _STAGE_RE = re.compile(r"\[阶段\s*(\d+)\s*/\s*(\d+)\]")
 _COMPLETION_REASON_RE = re.compile(
     r'completion_reason["\s:=]+([A-Za-z0-9_]+)',
@@ -1577,13 +1769,11 @@ def _load_report_verification(run: RunState) -> Optional[Dict[str, Any]]:
 
 
 def _load_report_applied_fixes(run: RunState) -> Optional[Dict[str, Any]]:
-    if not run.report_dir:
+    report_dir = _resolve_report_dir(run.report_dir)
+    if report_dir is None:
         return None
-    path = Path(run.report_dir).expanduser()
-    if not path.is_absolute():
-        path = PROJECT_ROOT / path
     try:
-        payload = json.loads((path / "08_apply_ai_fixes.json").read_text(encoding="utf-8"))
+        payload = json.loads((report_dir / "08_apply_ai_fixes.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return payload if isinstance(payload, dict) else None
@@ -1856,7 +2046,7 @@ def _run_public_dict(run: RunState) -> Dict[str, Any]:
                 payload["evaluation"] = evaluate_report_dir(report_dir).to_dict()
             except Exception:
                 pass
-    return payload
+    return _attach_report_failure_fields(run, payload)
 
 
 def _result_public_dict(run: RunState) -> Dict[str, Any]:
@@ -1868,7 +2058,7 @@ def _result_public_dict(run: RunState) -> Dict[str, Any]:
     payload["completion_reason"] = run.completion_reason
     payload["verification"] = run.pending_verification
     payload["links"] = _run_links(run.run_id)
-    return payload
+    return _attach_report_failure_fields(run, payload)
 
 
 def _respond_status(handler: BaseHTTPRequestHandler, run_id: str) -> None:

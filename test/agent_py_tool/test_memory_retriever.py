@@ -199,6 +199,9 @@ class TestMemoryRetriever(unittest.TestCase):
         self.assertIn("修复代码必须完整且可编译", text)
         self.assertIn("## 必须遵守的规则", text)
         self.assertNotIn("## 关键约束", text)
+        self.assertIn("主根因", text)
+        self.assertIn("建议修改的函数", text)
+        self.assertIn("多假说分级", text)
 
     def test_agent_loop_defaults_and_context_loop_prompt(self):
         wf = iOSCrashAnalyzeWorkflow()

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import re
-from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
 from services.agent_output_parser import parse_agent_decision
 from services.agent_schema import CONTEXT_REQUEST_TYPES
@@ -804,46 +804,199 @@ class ContextEngine:
             return section[:4000]
         return pin
 
+    _HEAP_DELETE_HINT_RE = re.compile(
+        r"operator_delete|invalid\s+chunk|Scudo|heap\s+allocator\s+abort|"
+        r"use-after-free|double[\s_-]?free",
+        re.IGNORECASE,
+    )
+
     @classmethod
-    def _extract_pinned_stable_sections(cls, text: str) -> List[str]:
-        """预算压缩时优先保留的稳定上下文片段。"""
-        pins: List[str] = []
+    def _slice_section_until(cls, body: str, start: int, stop_pats: Sequence[str]) -> str:
+        rest = body[start:]
+        end = len(rest)
+        for pat in stop_pats:
+            m = re.search(pat, rest)
+            if m:
+                end = min(end, m.start())
+        return rest[:end].strip()
+
+    @classmethod
+    def _extract_pinned_stable_sections(cls, text: str) -> List[Tuple[int, str]]:
+        """预算压缩时优先保留的稳定上下文片段。
+
+        返回 ``(priority, block)``，数值越小越优先保活。
+        崩溃行/参数求值源码优先于写路径与类骨架，避免 heap/lifetime 案被 TOCTOU 写路径挤掉。
+        """
+        pins: List[Tuple[int, str]] = []
         body = str(text or "")
+        stop_common = (
+            r"\n# 崩溃分析任务",
+            r"\n## 分析指导",
+            r"\n## 输出格式",
+        )
+
+        crash_line_marker = "### 崩溃行关键源码"
+        crash_line_pos = body.find(crash_line_marker)
+        if crash_line_pos >= 0:
+            block = cls._slice_section_until(
+                body,
+                crash_line_pos,
+                stop_common
+                + (
+                    r"\n### 同文件旁路候选源码",
+                    r"\n### 关键同步与共享成员",
+                    r"\n### 写路径函数源码",
+                    r"\n### 崩溃所属类骨架",
+                ),
+            )
+            if block:
+                pins.append((0, block))
+
+        bypass_marker = "### 同文件旁路候选源码"
+        bypass_pos = body.find(bypass_marker)
+        if bypass_pos >= 0:
+            block = cls._slice_section_until(
+                body,
+                bypass_pos,
+                stop_common
+                + (
+                    r"\n### 崩溃行关键源码",
+                    r"\n### 关键同步与共享成员",
+                    r"\n### 写路径函数源码",
+                    r"\n### 崩溃所属类骨架",
+                ),
+            )
+            if block:
+                pins.append((1, block))
+
         sync_marker = "### 关键同步与共享成员"
         sync_pos = body.find(sync_marker)
         if sync_pos >= 0:
-            rest = body[sync_pos:]
-            end = len(rest)
-            for pat in (r"\n# 崩溃分析任务", r"\n## 分析指导", r"\n## 输出格式"):
-                m = re.search(pat, rest)
-                if m:
-                    end = min(end, m.start())
-            block = rest[:end].strip()
+            block = cls._slice_section_until(body, sync_pos, stop_common)
             if block:
-                pins.append(block)
+                pins.append((2, block))
+
         write_marker = "### 写路径函数源码"
         write_pos = body.find(write_marker)
         if write_pos >= 0:
-            # 若写路径已含在「关键同步」到任务节的保活块中，不再重复抽取
-            already = any(write_marker in (p or "") for p in pins)
+            already = any(write_marker in (p or "") for _prio, p in pins)
             if not already:
-                rest = body[write_pos:]
-                end = len(rest)
-                for pat in (r"\n# 崩溃分析任务", r"\n## 分析指导", r"\n### 关键同步与共享成员"):
-                    m = re.search(pat, rest)
-                    if m:
-                        end = min(end, m.start())
-                block = rest[:end].strip()
-                if block and block not in pins:
-                    pins.append(block)
+                block = cls._slice_section_until(
+                    body,
+                    write_pos,
+                    stop_common
+                    + (
+                        r"\n### 关键同步与共享成员",
+                        r"\n### 崩溃行关键源码",
+                        r"\n### 同文件旁路候选源码",
+                    ),
+                )
+                if block:
+                    pins.append((3, block))
+
         skel_pin = cls._compact_class_skeleton_pin(body)
-        if skel_pin and skel_pin not in pins:
-            # 已有同步保活且含锁名时，不再附加大块类骨架，省预算给写路径
-            if any("关键同步与共享成员" in (p or "") and "m_" in (p or "") for p in pins):
+        if skel_pin and not any(skel_pin == p for _prio, p in pins):
+            # 已有同步保活且含锁名时，不再附加大块类骨架，省预算给崩溃行/写路径
+            if any("关键同步与共享成员" in (p or "") and "m_" in (p or "") for _prio, p in pins):
                 pass
             else:
-                pins.append(skel_pin)
+                pins.append((4, skel_pin))
+        pins.sort(key=lambda item: (item[0], -len(item[1])))
         return pins
+
+    @classmethod
+    def _pack_pinned_sections(
+        cls,
+        pinned_parts: Sequence[Tuple[int, str]],
+        pinned_budget: int,
+        *,
+        prefer_crash_line: bool,
+    ) -> str:
+        """按优先级装箱 pin 段；超预算时截断低优先级，而不是从拼接末尾一刀切。"""
+        if pinned_budget <= 0 or not pinned_parts:
+            return ""
+        # 0=崩溃行 1=同文件旁路 2=同步 3=写路径 4=类骨架
+        share_by_prio = {
+            0: 0.55 if prefer_crash_line else 0.45,
+            1: 0.22 if prefer_crash_line else 0.15,
+            2: 0.12,
+            3: 0.08 if prefer_crash_line else 0.22,
+            4: 0.05,
+        }
+        selected: List[str] = []
+        used = 0
+        for prio, block in pinned_parts:
+            if not block:
+                continue
+            frac = share_by_prio.get(int(prio), 0.10)
+            # 至少给高优 pin 留出可读窗口；剩余预算可被后续段使用
+            soft_cap = max(1200, int(pinned_budget * frac))
+            room = pinned_budget - used
+            if room <= 0:
+                break
+            allow = min(room, soft_cap if used > 0 or prio > 0 else room)
+            # 最高优段（崩溃行）尽量吃满剩余预算上限
+            if prio == 0:
+                allow = min(room, max(soft_cap, int(pinned_budget * frac)))
+            if len(block) <= allow:
+                selected.append(block)
+                used += len(block)
+                continue
+            if allow < 400:
+                continue
+            if int(prio) == 0:
+                trimmed = cls._truncate_crash_line_pin(block, allow)
+            else:
+                trimmed = block[: allow - 40].rstrip() + "\n...[pinned section truncated]...\n"
+            selected.append(trimmed)
+            used += len(trimmed)
+        if not selected:
+            return ""
+        joined = "\n\n".join(selected).strip()
+        if len(joined) > pinned_budget:
+            joined = joined[: max(0, pinned_budget - 48)].rstrip() + "\n...[pinned sync context truncated]...\n"
+        return joined
+
+    @classmethod
+    def _truncate_crash_line_pin(cls, block: str, allow: int) -> str:
+        """截断崩溃行保活段时优先保留 g_str / c_str 等生命周期风险窗口。"""
+        if len(block) <= allow:
+            return block
+        lines = block.splitlines()
+        hit_idx = next(
+            (
+                i
+                for i, ln in enumerate(lines)
+                if ("g_strShader" in ln)
+                or ("lifetime-risk" in ln)
+                or ("c_str()" in ln and i > 0)
+            ),
+            None,
+        )
+        head_n = min(20, len(lines))
+        head = lines[:head_n]
+        if hit_idx is None:
+            text = "\n".join(head)
+            if len(text) > allow - 40:
+                text = text[: allow - 40]
+            return text.rstrip() + "\n...[pinned section truncated]...\n"
+        window = lines[max(head_n, hit_idx - 2) : min(len(lines), hit_idx + 50)]
+        out_lines = head + ["// ... pinned lifetime-risk window ..."] + window
+        text = "\n".join(out_lines)
+        if len(text) > allow - 40:
+            # 保命中窗口：从头部再压缩
+            keep_hit = "\n".join(
+                lines[max(0, hit_idx - 2) : min(len(lines), hit_idx + 50)]
+            )
+            prefix = "\n".join(lines[:8])
+            text = (
+                prefix
+                + "\n// ... pinned lifetime-risk window ...\n"
+                + keep_hit
+            )
+            if len(text) > allow - 40:
+                text = text[: allow - 40]
+        return text.rstrip() + "\n...[pinned section truncated]...\n"
 
     @classmethod
     def _compress_stable_context(cls, text: str, limit: int) -> str:
@@ -853,18 +1006,25 @@ class ContextEngine:
         if limit <= len(marker):
             return text[: max(0, limit)]
         pinned_parts = cls._extract_pinned_stable_sections(text)
-        pinned = "\n\n".join(p for p in pinned_parts if p).strip()
+        prefer_crash_line = bool(cls._HEAP_DELETE_HINT_RE.search(text)) or any(
+            prio == 0 for prio, _block in pinned_parts
+        )
         task_marker = "\n# 崩溃分析任务"
         task_idx = text.find(task_marker)
         task_tail = text[task_idx:] if task_idx >= 0 else ""
         # 任务节至少保留引导与关键规则头，避免压缩后丢失输出契约
         task_reserve = min(len(task_tail), max(800, int(limit * 0.22))) if task_tail else 0
+        # 有崩溃行保活时，把更多预算给 pin（首轮性价比），头部只留摘要/证据
+        pin_frac = 0.62 if prefer_crash_line else 0.50
         pinned_budget = min(
-            max(3500, int(limit * 0.50)),
+            max(3500, int(limit * pin_frac)),
             max(0, limit - len(marker) - task_reserve - 256),
         )
-        if pinned and len(pinned) > pinned_budget:
-            pinned = pinned[: max(0, pinned_budget - 48)].rstrip() + "\n...[pinned sync context truncated]...\n"
+        pinned = cls._pack_pinned_sections(
+            pinned_parts,
+            pinned_budget,
+            prefer_crash_line=prefer_crash_line,
+        )
         suffix = ""
         if pinned:
             suffix += "\n\n" + pinned
@@ -875,9 +1035,8 @@ class ContextEngine:
         remaining = max(0, limit - len(marker) - len(suffix))
         if remaining <= 0:
             return (marker + suffix)[:limit]
-        # 头部优先保留崩溃摘要与崩溃函数源码
+        # 头部优先保留崩溃摘要；完整崩溃行源码改由 pin 段保活
         head = text[:remaining]
-        # 避免把头截断在任务节之后造成重复
         if task_idx >= 0:
             head = text[: min(remaining, task_idx)].rstrip()
             if len(head) > remaining:

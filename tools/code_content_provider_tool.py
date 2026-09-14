@@ -256,7 +256,9 @@ class GraphEdge:
     """崩溃相关代码图中的边，描述节点之间的关系"""
     from_id: str
     to_id: str
-    type: str  # "calls_direct" | "calls_stack_order" | "calls_stack_verified" | "calls_to_crash_site" | "use_shared_var"
+    # calls_direct | calls_stack_order | calls_stack_verified | calls_to_crash_site
+    # | use_shared_var | arg_eval（崩溃点实参求值调用）| feeds_arg_of（返回值喂入另一调用）
+    type: str
     thread_id: Optional[str] = None
     is_crash_thread: Optional[bool] = None
     is_main_thread: Optional[bool] = None
@@ -1939,8 +1941,18 @@ class CodeContentProvider:
             "noexcept",
             "LOG",
             "CVLog",
+            "diag2_d",
+            "diag2_i",
+            "diag2_e",
+            "diag2_w",
+            "V_GetTickCount",
+            "V_GetMsTickCount",
         }
     )
+
+    # 崩溃行被调展开上限；跨文件 arg_eval 另计，避免全仓扫爆。
+    _MAX_CRASH_LINE_CALLEES = 16
+    _MAX_ARG_EVAL_CROSS_FILE = 6
 
     def _callee_names_from_crash_snippet(
         self,
@@ -1948,27 +1960,124 @@ class CodeContentProvider:
         snippet: Optional[List[str]],
         crash_function_name: str,
     ) -> List[str]:
-        """从崩溃行/短函数体提取同文件被调函数名（LTO 下越界常发生在 callee）。"""
+        """从崩溃行/短函数体提取被调函数名（含参数位调用；兼容旧调用方）。"""
+        return [
+            name
+            for name, _kind in self._classify_callees_from_crash_snippet(
+                crash_line, snippet, crash_function_name
+            )
+        ]
+
+    def _classify_callees_from_crash_snippet(
+        self,
+        crash_line: str,
+        snippet: Optional[List[str]],
+        crash_function_name: str,
+        *,
+        max_names: int = 12,
+    ) -> List[Tuple[str, str]]:
+        """
+        从崩溃行/短函数体提取被调函数，并区分：
+        - statement：语句级调用（如 initWithShaderSources(...)）
+        - arg_eval：作为另一调用实参求值（如 initWith(GetShaderValue(...))）
+        """
         simple = self._extract_function_name_from_resolved(crash_function_name) or ""
         texts = [str(crash_line or "")]
         if snippet:
             texts.extend(str(line) for line in snippet[:220])
         blob = "\n".join(texts)
-        names: List[str] = []
-        seen = set()
-        for match in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", blob):
-            name = match.group(1)
-            if name in self._CRASH_LINE_CALLEE_SKIP:
+        return self._classify_call_names_in_blob(blob, simple, max_names=max_names)
+
+    def _classify_call_names_in_blob(
+        self,
+        blob: str,
+        crash_simple_name: str,
+        *,
+        max_names: int = 12,
+    ) -> List[Tuple[str, str]]:
+        """按嵌套括号深度区分 statement / arg_eval 调用名。"""
+        text = str(blob or "")
+        if not text:
+            return []
+        simple = str(crash_simple_name or "").strip()
+        call_re = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+        out: List[Tuple[str, str]] = []
+        seen: Set[str] = set()
+        # call_frames: 每个未闭合函数调用在「打开该调用的 '(' 之前」的 paren_depth
+        call_frames: List[int] = []
+        paren_depth = 0
+        i = 0
+        n = len(text)
+        while i < n:
+            match = call_re.match(text, i)
+            if match:
+                name = match.group(1)
+                kind = "arg_eval" if call_frames else "statement"
+                if (
+                    name not in self._CRASH_LINE_CALLEE_SKIP
+                    and name != simple
+                    and not name.startswith("operator")
+                    and name not in seen
+                ):
+                    seen.add(name)
+                    out.append((name, kind))
+                    if len(out) >= max_names:
+                        # 仍继续跟踪括号，避免后续分类错乱；但不再收集名字
+                        pass
+                call_frames.append(paren_depth)
+                paren_depth += 1
+                i = match.end()
                 continue
-            if name == simple or name.startswith("operator"):
-                continue
-            if name in seen:
-                continue
-            seen.add(name)
-            names.append(name)
-            if len(names) >= 12:
+            ch = text[i]
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")":
+                paren_depth = max(0, paren_depth - 1)
+                while call_frames and call_frames[-1] >= paren_depth:
+                    call_frames.pop()
+            i += 1
+            if len(out) >= max_names and not call_frames:
                 break
-        return names
+        return out
+
+    def _snippet_from_function_body(self, body: Optional[str]) -> Optional[List[str]]:
+        if not body:
+            return None
+        snippet = [ln.rstrip() for ln in body.splitlines() if ln is not None]
+        while snippet and not snippet[-1].strip():
+            snippet.pop()
+        return snippet or None
+
+    @staticmethod
+    def _truncate_arg_eval_snippet(snippet: List[str], *, keep_head: int = 40, keep_hit: int = 80) -> List[str]:
+        """截断巨型 arg_eval 被调体，优先保留全局 buffer / c_str 返回等生命周期风险片段。"""
+        if len(snippet) <= 160:
+            return snippet
+        hit_re = re.compile(
+            r"g_strShader|c_str\s*\(|return\s+\(const\s+char\s*\*\)\s*g_|"
+            r"static\s+std::string|thread_local",
+            re.I,
+        )
+        head = list(snippet[:keep_head])
+        hits: List[str] = []
+        for i, line in enumerate(snippet):
+            if i < keep_head:
+                continue
+            if hit_re.search(line):
+                start = max(keep_head, i - 2)
+                end = min(len(snippet), i + 3)
+                for j in range(start, end):
+                    if snippet[j] not in hits and snippet[j] not in head:
+                        hits.append(snippet[j])
+                if len(hits) >= keep_hit:
+                    break
+        out = head
+        if hits:
+            out = out + ["// ... arg_eval lifetime-risk hits ..."] + hits
+        out.append(
+            f"// ... truncated arg_eval callee body: kept {len(out)}/{len(snippet)} lines ..."
+        )
+        return out
 
     def _extract_same_file_callee_by_name(
         self,
@@ -1976,6 +2085,8 @@ class CodeContentProvider:
         local: str,
         lines: List[str],
         skip_names: Set[str],
+        *,
+        chain_origin: str = "crash_line_callee",
     ) -> Optional[CallChainFunction]:
         """按函数名在同文件提取完整函数体，作为崩溃行 callee。"""
         if not name or name in skip_names:
@@ -1986,19 +2097,100 @@ class CodeContentProvider:
         body = self._extract_full_function_code(
             lines, def_idx, target_function_name=name
         )
-        if not body:
-            return None
-        snippet = [ln.rstrip() for ln in body.splitlines() if ln is not None]
-        while snippet and not snippet[-1].strip():
-            snippet.pop()
+        snippet = self._snippet_from_function_body(body)
         if not snippet:
             return None
+        if chain_origin == "arg_eval_callee":
+            snippet = self._truncate_arg_eval_snippet(snippet)
         return CallChainFunction(
             name=name,
             file=local,
             snippet=snippet,
-            chain_origin="crash_line_callee",
+            chain_origin=chain_origin,
         )
+
+    def _extract_cross_file_callee_by_name(
+        self,
+        name: str,
+        code_roots: List[str],
+        skip_names: Set[str],
+        *,
+        chain_origin: str = "arg_eval_callee",
+        file_lines_cache: Optional[Dict[str, List[str]]] = None,
+    ) -> Optional[CallChainFunction]:
+        """在 code_roots 内按符号名跨文件定位函数定义并提取函数体。"""
+        if not name or name in skip_names or not code_roots:
+            return None
+        loc = self._find_function_definition_location(name, code_roots)
+        if not loc:
+            return None
+        path, line_no = loc
+        path = str(path or "").strip()
+        if not path or not os.path.isfile(path):
+            return None
+        cache = file_lines_cache if file_lines_cache is not None else {}
+        lines = self._read_file_lines_cached(path, cache) or []
+        if not lines:
+            return None
+        try:
+            anchor = max(0, int(line_no) - 1)
+        except (TypeError, ValueError):
+            anchor = 0
+        def_idx = self._find_function_definition_line_by_name(lines, name, anchor)
+        if def_idx is None:
+            def_idx = anchor if 0 <= anchor < len(lines) else None
+        if def_idx is None:
+            return None
+        body = self._extract_full_function_code(
+            lines, def_idx, target_function_name=name
+        )
+        snippet = self._snippet_from_function_body(body)
+        if not snippet:
+            return None
+        # 巨型自由函数（如 GetShaderValue 大 switch）截断，避免撑爆 prompt；
+        # 优先保留全局 buffer / c_str 返回等生命周期风险片段。
+        if chain_origin == "arg_eval_callee":
+            snippet = self._truncate_arg_eval_snippet(snippet)
+        return CallChainFunction(
+            name=name,
+            file=path,
+            snippet=snippet,
+            chain_origin=chain_origin,
+        )
+
+    def _extract_callee_by_name(
+        self,
+        name: str,
+        local: str,
+        local_lines: List[str],
+        code_roots: List[str],
+        skip_names: Set[str],
+        *,
+        chain_origin: str,
+        allow_cross_file: bool,
+        cross_file_budget: List[int],
+        file_lines_cache: Optional[Dict[str, List[str]]] = None,
+    ) -> Optional[CallChainFunction]:
+        """同文件优先；失败且允许时再跨文件解析。"""
+        item = self._extract_same_file_callee_by_name(
+            name, local, local_lines, skip_names, chain_origin=chain_origin
+        )
+        if item is not None:
+            return item
+        if not allow_cross_file:
+            return None
+        if cross_file_budget and cross_file_budget[0] <= 0:
+            return None
+        item = self._extract_cross_file_callee_by_name(
+            name,
+            code_roots,
+            skip_names,
+            chain_origin=chain_origin,
+            file_lines_cache=file_lines_cache,
+        )
+        if item is not None and cross_file_budget:
+            cross_file_budget[0] -= 1
+        return item
 
     def _find_crash_line_callee_functions(
         self,
@@ -2006,25 +2198,33 @@ class CodeContentProvider:
         source_file: str,
         code_roots: List[str],
     ) -> List[CallChainFunction]:
-        """将崩溃行上的同文件被调函数展开进调用链，避免只给 compile() 外壳。"""
+        """
+        将崩溃行上的被调函数展开进调用链（含参数位嵌套调用）。
+
+        - statement callee：同文件优先，可再跨文件
+        - arg_eval callee：同文件优先，否则跨文件（覆盖 GetShaderValue 等自由函数）
+        - 对 statement callee 再同文件嵌套一层（compile → initWith → getAttributeInfo）
+        """
         local = str(source_file or "").strip()
         if not local or not os.path.isfile(local):
             mapped = self._find_source_file(local, code_roots) if local else None
             local = str(mapped or "")
         if not local or not os.path.isfile(local):
             return []
-        names = self._callee_names_from_crash_snippet(
+        classified = self._classify_callees_from_crash_snippet(
             getattr(crash_func, "crash_line", "") or "",
             getattr(crash_func, "snippet", None),
             getattr(crash_func, "name", "") or "",
         )
-        if not names:
+        if not classified:
             return []
-        lines = self._read_file_lines_cached(local, {}) or []
+        file_lines_cache: Dict[str, List[str]] = {}
+        lines = self._read_file_lines_cached(local, file_lines_cache) or []
         if not lines:
             try:
                 with open(local, "r", encoding="utf-8", errors="ignore") as handle:
                     lines = [ln.rstrip("\n\r") for ln in handle.readlines()]
+                file_lines_cache[local] = lines
             except OSError:
                 return []
         crash_simple = self._extract_function_name_from_resolved(
@@ -2033,32 +2233,66 @@ class CodeContentProvider:
         skip_names = {crash_simple} if crash_simple else set()
         out: List[CallChainFunction] = []
         seen: Set[str] = set()
-        for name in names:
-            item = self._extract_same_file_callee_by_name(name, local, lines, skip_names)
-            if item is None or item.name in seen:
-                continue
-            seen.add(item.name)
-            out.append(item)
-        # 再展开一层：compile() → initWithShaderSources() → getAttributeInfo()
-        nested_names: List[str] = []
-        for item in list(out):
-            nested_names.extend(
-                self._callee_names_from_crash_snippet("", item.snippet, item.name)
-            )
-        for name in nested_names:
+        cross_budget = [int(self._MAX_ARG_EVAL_CROSS_FILE)]
+        statement_items: List[CallChainFunction] = []
+
+        for name, kind in classified:
             if name in seen or name in skip_names:
                 continue
-            item = self._extract_same_file_callee_by_name(name, local, lines, skip_names)
+            origin = "arg_eval_callee" if kind == "arg_eval" else "crash_line_callee"
+            item = self._extract_callee_by_name(
+                name,
+                local,
+                lines,
+                code_roots,
+                skip_names,
+                chain_origin=origin,
+                allow_cross_file=True,
+                cross_file_budget=cross_budget,
+                file_lines_cache=file_lines_cache,
+            )
             if item is None or item.name in seen:
                 continue
             seen.add(item.name)
             out.append(item)
-            if len(out) >= 16:
+            if kind != "arg_eval":
+                statement_items.append(item)
+            if len(out) >= self._MAX_CRASH_LINE_CALLEES:
                 break
+
+        # 再展开一层同文件嵌套：compile() → initWithShaderSources() → getAttributeInfo()
+        if len(out) < self._MAX_CRASH_LINE_CALLEES:
+            nested_names: List[str] = []
+            for item in statement_items:
+                nested_names.extend(
+                    name
+                    for name, _kind in self._classify_callees_from_crash_snippet(
+                        "", item.snippet, item.name
+                    )
+                )
+            for name in nested_names:
+                if name in seen or name in skip_names:
+                    continue
+                item = self._extract_same_file_callee_by_name(
+                    name,
+                    local,
+                    lines,
+                    skip_names,
+                    chain_origin="crash_line_callee",
+                )
+                if item is None or item.name in seen:
+                    continue
+                seen.add(item.name)
+                out.append(item)
+                if len(out) >= self._MAX_CRASH_LINE_CALLEES:
+                    break
         if out:
             logger.info(
                 "崩溃行被调函数展开: %s",
-                ", ".join(item.name for item in out),
+                ", ".join(
+                    f"{item.name}({item.chain_origin or 'crash_line_callee'})"
+                    for item in out
+                ),
             )
         return out
 
@@ -7642,6 +7876,7 @@ class CodeContentProvider:
         sibling_member_func_in_same_class: List[RelatedFunction],
         thread_context: List[ThreadContext],
         os_type: str,
+        crash_line_callee_funs: Optional[List[CallChainFunction]] = None,
     ) -> CrashGraph:
         """
         基于已提取的函数/变量/线程信息，构建图结构视图：
@@ -7749,7 +7984,7 @@ class CodeContentProvider:
             snippet: Optional[List[str]],
             origin: Optional[str] = None,
         ):
-            """确保函数节点存在；crash_line_callee 写入 role 供 05 装箱识别。"""
+            """确保函数节点存在；crash_line_callee / arg_eval_callee 写入 role 供提示词装箱识别。"""
             norm_sig = _normalize_signature(signature, name)
             nid = func_node_id(name, file, norm_sig)
             ss: Optional[int] = None
@@ -7761,7 +7996,11 @@ class CodeContentProvider:
                 snippet, ss, se = self._refine_function_snippet_bounds(
                     file, snippet, norm_sig or signature, ss, se
                 )
-            role = "crash_line_callee" if origin == "crash_line_callee" else None
+            role = None
+            if origin == "crash_line_callee":
+                role = "crash_line_callee"
+            elif origin == "arg_eval_callee":
+                role = "arg_eval_callee"
             if nid not in nodes:
                 nodes[nid] = GraphNode(
                     id=nid,
@@ -7829,6 +8068,10 @@ class CodeContentProvider:
                 path_index += 1
         else:
             for f in effective_direct_callers:
+                # 崩溃行被调 / 参数求值被调不应当作上游 caller（边方向相反）。
+                origin = getattr(f, "chain_origin", None)
+                if origin in ("crash_line_callee", "arg_eval_callee"):
+                    continue
                 sig = f.snippet[0].strip() if f.snippet else None
                 if not _is_plausible_function_signature(sig):
                     sig = str(f.name or sig or "").strip() or None
@@ -7926,6 +8169,48 @@ class CodeContentProvider:
                         )
                     )
                     path_index += 1
+
+        # 2b. 崩溃行被调 / 参数求值被调：crash_site → callee
+        for f in list(crash_line_callee_funs or []):
+            origin = getattr(f, "chain_origin", None) or "crash_line_callee"
+            if origin not in ("crash_line_callee", "arg_eval_callee"):
+                origin = "crash_line_callee"
+            sig = f.snippet[0].strip() if f.snippet else None
+            if not _is_plausible_function_signature(sig):
+                # snippet 首行常带函数体 '{'，回退为 name()
+                raw_name = str(f.name or "").strip()
+                sig = f"{raw_name}()" if raw_name and not raw_name.endswith(")") else (raw_name or None)
+            if not _is_plausible_function_signature(sig):
+                continue
+            nid = ensure_func_node(f.name, f.file, sig, f.snippet, origin)
+            edge_type = "arg_eval" if origin == "arg_eval_callee" else "calls_direct"
+            edges.append(GraphEdge(from_id=cf_id, to_id=nid, type=edge_type))
+            if origin == "arg_eval_callee":
+                # 标记返回值喂入崩溃点调用表达式（便于下游解释生命周期）
+                edges.append(
+                    GraphEdge(
+                        from_id=nid,
+                        to_id=cf_id,
+                        type="feeds_arg_of",
+                        relation="arg_eval",
+                    )
+                )
+            pk = (cf_id, nid, edge_type)
+            if pk not in seen_path_keys:
+                seen_path_keys.add(pk)
+                call_chain_from_code.append(
+                    ExecutionPath(
+                        id=f"path_{path_index}",
+                        thread_id="unknown",
+                        nodes=[cf_id, nid],
+                        description=(
+                            "arg_eval"
+                            if origin == "arg_eval_callee"
+                            else "crash_line_callee"
+                        ),
+                    )
+                )
+                path_index += 1
 
         # 变量相关函数：函数节点 + 变量节点 + use_shared_var 边
         var_nodes: Dict[str, GraphNode] = {}
@@ -9481,8 +9766,15 @@ class CodeContentProvider:
                 if n.get("type") == "variable":
                     n.pop("snippet", None)
                 if n.get("type") == "function":
-                    n.pop("role", None)
-                    n.pop("name", None)
+                    # 保留崩溃行被调 / 参数求值被调角色，供提示词 must 装箱；
+                    # 其余函数节点仍去掉 role/name 以降低 JSON 体积。
+                    keep_role = str(n.get("role") or "") in {
+                        "crash_line_callee",
+                        "arg_eval_callee",
+                    }
+                    if not keep_role:
+                        n.pop("role", None)
+                        n.pop("name", None)
             except AttributeError:
                 continue
 
@@ -9570,6 +9862,9 @@ class CodeContentProvider:
         callees = [n for n in getattr(self, "_crash_line_callee_names", []) or [] if n]
         if callees:
             diagnostics["crash_line_callees"] = callees
+        arg_eval = [n for n in getattr(self, "_arg_eval_callee_names", []) or [] if n]
+        if arg_eval:
+            diagnostics["arg_eval_callees"] = arg_eval
         if result_dict.get("extraction_warnings"):
             diagnostics["extraction_warnings"] = result_dict.pop("extraction_warnings")
         result_dict["diagnostics"] = diagnostics
@@ -9800,6 +10095,7 @@ class CodeContentProvider:
             # 记录当前代码根目录（绝对路径），供后续图构建/查找函数定义时使用
             self.current_code_roots = list(code_roots_abs_strs)
             self._crash_line_callee_names: List[str] = []
+            self._arg_eval_callee_names: List[str] = []
             self.current_code_root = code_roots_abs_strs[0]
             self._ensure_ctags_index(code_roots_abs_strs)
 
@@ -10355,6 +10651,7 @@ class CodeContentProvider:
             # 2b. add2line 堆栈帧对应的工程内源文件（静态「直接调用者 / 共享变量」先扫这些，再全仓补充）
             stack_priority_files: List[str] = []
             direct_call_crash_fun: List[CallChainFunction] = []
+            crash_line_callee_funs: List[CallChainFunction] = []
             pre_call_fun_in_same_parent_fun: List[CallChainFunction] = []
             shared_vars: List[str] = []
             use_same_var_related_fun: List[VariableFunction] = []
@@ -10505,16 +10802,25 @@ class CodeContentProvider:
                         logger.info(
                             f"直接调用崩溃函数的静态候选已截断为最多 {self.max_direct_callers} 个（防止输出膨胀）"
                         )
+                    crash_line_callee_funs = []
                     callee_funs = self._find_crash_line_callee_functions(
                         crash_func,
                         crash_local_source or resolved_file,
                         code_roots_abs_strs,
                     )
                     if callee_funs:
-                        self._crash_line_callee_names = [str(item.name or "") for item in callee_funs]
-                        direct_call_crash_fun = self._merge_call_chain_function_lists(
-                            callee_funs, direct_call_crash_fun
-                        )
+                        crash_line_callee_funs = list(callee_funs)
+                        self._arg_eval_callee_names = [
+                            str(item.name or "")
+                            for item in callee_funs
+                            if item.chain_origin == "arg_eval_callee" and str(item.name or "").strip()
+                        ]
+                        # 诊断字段：全部崩溃行被调（含 arg_eval）
+                        self._crash_line_callee_names = [
+                            str(item.name or "")
+                            for item in callee_funs
+                            if str(item.name or "").strip()
+                        ]
 
                     # 等待共享变量结果
                     shared_vars, use_same_var_related_fun = _future_shared_var.result()
@@ -10795,6 +11101,7 @@ class CodeContentProvider:
                         sibling_member_func_in_same_class=sibling_member_func_in_same_class,
                         thread_context=thread_context,
                         os_type=os_type,
+                        crash_line_callee_funs=crash_line_callee_funs,
                     )
                 except _CodeContextPhaseTimeout:
                     raise

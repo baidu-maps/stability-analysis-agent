@@ -17,6 +17,7 @@ from services.code_fixer import (
     _extract_include_directive_edits,
     _extract_function_block_from_code,
     _extract_replacement_from_analysis,
+    _extract_required_function_names_from_analysis,
     _replacement_signature_compatible,
     _ensure_owner_class_methods_in_targets,
     _select_required_targets,
@@ -981,6 +982,92 @@ VINLINE VVoid VDelete(TYPE* pObjects)
             err = str((result.applied or [{}])[0].get("error") or "")
             self.assertIn("ScopedLock", err)
             self.assertNotIn("ScopedLock", src.read_text(encoding="utf-8"))
+
+    def test_extractor_skips_class_skeleton_and_keeps_following_functions(self):
+        """class 骨架 + 后续完整 Class::method 围栏时仍应提取 edits（3525 回归）。"""
+        analysis_text = """
+## 6. 修复建议
+### 6.1 直接修复（代码级）
+在类中添加互斥锁：
+
+```cpp
+class WalkMapOperator : public WalkSafeCallbackObj
+{
+private:
+    mutable std::mutex m_pBaseMapControlMutex; // 新增互斥锁
+    // ... 其他成员 ...
+};
+```
+
+修改GetMapStatus()函数：
+```cpp
+CMapStatus WalkMapOperator::GetMapStatus()
+{
+    std::lock_guard<std::mutex> lock(m_pBaseMapControlMutex);
+    if (m_pBaseMapControl == nullptr) {
+        return CMapStatus();
+    }
+    return m_pBaseMapControl->GetMapStatus();
+}
+```
+
+修改析构函数：
+```cpp
+WalkMapOperator::~WalkMapOperator()
+{
+    std::lock_guard<std::mutex> lock(m_pBaseMapControlMutex);
+    m_pBaseMapControl = nullptr;
+}
+```
+"""
+        code_context = {
+            "graph": {
+                "nodes": [
+                    {
+                        "type": "function",
+                        "file": "/tmp/walk_map_operator.cpp",
+                        "signature": "CMapStatus WalkMapOperator::GetMapStatus()",
+                        "snippet": [
+                            "CMapStatus WalkMapOperator::GetMapStatus()",
+                            "{",
+                            "    return m_pBaseMapControl->GetMapStatus();",
+                            "}",
+                        ],
+                    },
+                    {
+                        "type": "function",
+                        "file": "/tmp/walk_map_operator.cpp",
+                        "signature": "WalkMapOperator::~WalkMapOperator()",
+                        "snippet": [
+                            "WalkMapOperator::~WalkMapOperator()",
+                            "{",
+                            "    m_pBaseMapControl = nullptr;",
+                            "}",
+                        ],
+                    },
+                ]
+            }
+        }
+        names = _extract_required_function_names_from_analysis(analysis_text)
+        self.assertTrue(
+            any("GetMapStatus" in n for n in names),
+            names,
+        )
+        self.assertTrue(
+            any("~WalkMapOperator" in n or "析构" in n for n in names)
+            or any("~" in n for n in names),
+            names,
+        )
+
+        out = FixCodeExtractorTool().execute(
+            {"analysis_text": analysis_text, "code_context": code_context}
+        )
+        self.assertTrue(out.get("success"), out)
+        edits = out.get("fix_plan", {}).get("edits", [])
+        self.assertGreaterEqual(len(edits), 2, edits)
+        joined = "\n".join(str(e.get("replacement_code") or "") for e in edits)
+        self.assertIn("GetMapStatus", joined)
+        self.assertIn("~WalkMapOperator", joined)
 
 
 if __name__ == "__main__":

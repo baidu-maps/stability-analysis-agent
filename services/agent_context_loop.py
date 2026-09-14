@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from services.context_engine import ContextEngine, ContextTurn
+from services.fix_format_completeness import should_revise_for_fix_format
 from services.toctou_write_completeness import (
     build_write_path_revision_feedback,
     should_revise_for_incomplete_write_fixes,
@@ -78,10 +79,51 @@ def run_agent_context_loop(
     last_prompt_used = stable_prompt
     last_response: Any = None
     write_path_revision_used = False
+    fix_format_revision_used = False
+
+    def _schedule_revision(
+        round_index: int,
+        turn_obj: ContextTurn,
+        *,
+        kind: str,
+        source: str,
+        feedback: str,
+        trace_event: str,
+        extra_trace: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """将反馈写入 evidence_delta 并续一轮。"""
+        nonlocal next_prompt, force_final_reason
+        context_engine.add_turn(turn_obj)
+        hooks.on_round_complete(round_index, turn_obj.to_dict())
+        evidence_delta = [
+            {
+                "kind": kind,
+                "content": feedback,
+                "source": source,
+                "round": round_index + 1,
+            }
+        ]
+        force_final_reason = None
+        next_prompt = context_engine.build_prompt(
+            stable_prompt,
+            evidence_delta=evidence_delta,
+            is_final_round=(round_index + 1 >= max_rounds - 1),
+            early_final_reason=("max_rounds" if round_index + 1 >= max_rounds - 1 else None),
+        )
+        if trace is not None:
+            payload = {
+                "kind": "agent",
+                "name": "context_loop",
+                "status": "continue",
+                "round_index": round_index,
+            }
+            if extra_trace:
+                payload.update(extra_trace)
+            trace.emit(trace_event, **payload)
 
     def _try_write_path_revision(round_index: int, analysis_text: str, turn_obj: ContextTurn) -> bool:
         """写路径保活已在 prompt 且分析认定竞态，但缺写侧完整补丁时，强制续一轮。"""
-        nonlocal next_prompt, write_path_revision_used, force_final_reason
+        nonlocal write_path_revision_used
         if write_path_revision_used or config.agent_loop_mode != "context_loop":
             return False
         if round_index >= max_rounds - 1:
@@ -93,36 +135,49 @@ def run_agent_context_loop(
         if not missing:
             return False
         write_path_revision_used = True
-        context_engine.add_turn(turn_obj)
-        hooks.on_round_complete(round_index, turn_obj.to_dict())
-        feedback = build_write_path_revision_feedback(missing)
-        evidence_delta = [
-            {
-                "kind": "write_path_revision",
-                "content": feedback,
-                "source": "toctou_write_completeness",
-                "round": round_index + 1,
-            }
-        ]
-        # 下一轮仍允许补上下文，但优先要求补齐写路径修复代码
-        force_final_reason = None
-        next_prompt = context_engine.build_prompt(
-            stable_prompt,
-            evidence_delta=evidence_delta,
-            is_final_round=(round_index + 1 >= max_rounds - 1),
-            early_final_reason=("max_rounds" if round_index + 1 >= max_rounds - 1 else None),
+        _schedule_revision(
+            round_index,
+            turn_obj,
+            kind="write_path_revision",
+            source="toctou_write_completeness",
+            feedback=build_write_path_revision_feedback(missing),
+            trace_event="agent.write_path_revision",
+            extra_trace={
+                "missing_count": len(missing),
+                "missing_signatures": list(missing)[:8],
+            },
         )
-        if trace is not None:
-            trace.emit(
-                "agent.write_path_revision",
-                kind="agent",
-                name="context_loop",
-                status="continue",
-                round_index=round_index,
-                missing_count=len(missing),
-                missing_signatures=list(missing)[:8],
-            )
         return True
+
+    def _try_fix_format_revision(round_index: int, analysis_text: str, turn_obj: ContextTurn) -> bool:
+        """修复代码含 class 骨架或臆造锁时，强制续一轮纠正格式。"""
+        nonlocal fix_format_revision_used
+        if fix_format_revision_used or config.agent_loop_mode != "context_loop":
+            return False
+        if round_index >= max_rounds - 1:
+            return False
+        feedback = should_revise_for_fix_format(
+            prompt=str(last_prompt_used or stable_prompt),
+            analysis=analysis_text,
+        )
+        if not feedback:
+            return False
+        fix_format_revision_used = True
+        _schedule_revision(
+            round_index,
+            turn_obj,
+            kind="fix_format_revision",
+            source="fix_format_completeness",
+            feedback=feedback,
+            trace_event="agent.fix_format_revision",
+        )
+        return True
+
+    def _try_post_final_revisions(round_index: int, analysis_text: str, turn_obj: ContextTurn) -> bool:
+        """终局前依次尝试写路径完整性与修复格式续轮。"""
+        if _try_write_path_revision(round_index, analysis_text, turn_obj):
+            return True
+        return _try_fix_format_revision(round_index, analysis_text, turn_obj)
 
     for round_index in range(max_rounds):
         if trace is not None:
@@ -214,7 +269,7 @@ def run_agent_context_loop(
                 )
 
         if force_final_reason is not None:
-            if _try_write_path_revision(round_index, previous_analysis, turn):
+            if _try_post_final_revisions(round_index, previous_analysis, turn):
                 continue
             context_engine.add_turn(turn)
             finish_reason = force_final_reason
@@ -236,14 +291,14 @@ def run_agent_context_loop(
         next_action = dict(parsed.get("next_action") or {})
         next_kind = str(next_action.get("kind") or "").strip().lower()
         if config.agent_loop_mode == "context_loop" and next_kind == "propose_fix" and not is_last_slot:
-            if _try_write_path_revision(round_index, previous_analysis, turn):
+            if _try_post_final_revisions(round_index, previous_analysis, turn):
                 continue
             context_engine.add_turn(turn)
             context_engine.finish("ready_to_fix")
             hooks.on_round_complete(round_index, turn.to_dict())
             break
         if config.agent_loop_mode == "context_loop" and next_kind in {"final", "insufficient_evidence"}:
-            if next_kind == "final" and _try_write_path_revision(round_index, previous_analysis, turn):
+            if next_kind == "final" and _try_post_final_revisions(round_index, previous_analysis, turn):
                 continue
             context_engine.add_turn(turn)
             termination = "insufficient_evidence" if next_kind == "insufficient_evidence" else "model_final"
@@ -260,7 +315,7 @@ def run_agent_context_loop(
         requested_more = bool(parsed.get("requested_more"))
         if parsed.get("degraded") and not parsed.get("has_control_contract") and not requests:
             # 控制契约解析失败时仍优先补齐写侧，避免 TOCTOU 只交读侧就强制终局。
-            if _try_write_path_revision(round_index, previous_analysis, turn):
+            if _try_post_final_revisions(round_index, previous_analysis, turn):
                 continue
             context_engine.add_turn(turn)
             hooks.on_round_complete(round_index, turn.to_dict())
@@ -275,7 +330,7 @@ def run_agent_context_loop(
             )
             continue
         if not requested_more:
-            if _try_write_path_revision(round_index, previous_analysis, turn):
+            if _try_post_final_revisions(round_index, previous_analysis, turn):
                 continue
             context_engine.add_turn(turn)
             context_engine.finish("model_final", degraded=bool(parsed.get("degraded")))
@@ -283,7 +338,7 @@ def run_agent_context_loop(
             break
 
         if not requests:
-            if _try_write_path_revision(round_index, previous_analysis, turn):
+            if _try_post_final_revisions(round_index, previous_analysis, turn):
                 continue
             context_engine.add_turn(turn)
             hooks.on_round_complete(round_index, turn.to_dict())

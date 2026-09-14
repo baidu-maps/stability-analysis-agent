@@ -678,8 +678,12 @@ class TestBuildPromptFinalTip(unittest.TestCase):
         self.assertNotIn("**可选提供**", text)
         self.assertNotIn("无需修改但与根因相关", text)
         self.assertNotIn("#### 无需修改但关键相关的函数", text)
-        self.assertIn("「需要修改的函数」与「修复代码」必须一一对应", text)
+        self.assertIn("「需要修改的函数（必改）」与「修复代码」必须一一对应", text)
         self.assertIn("**禁止**单独列出「无需修改的函数」章节", text)
+        self.assertIn("建议修改的函数", text)
+        self.assertIn("主根因", text)
+        self.assertIn("多假说分级", text)
+        self.assertIn("带 `// ...` /「其他成员」占位的 class/struct 骨架", text)
 
 
 class TestCodeContentProviderV2(unittest.TestCase):

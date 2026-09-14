@@ -78,11 +78,12 @@ class FixResult:
 
 
 def _extract_simple_function_name(signature: str) -> str:
-    s = str(signature or "").strip()
+    """从签名提取函数短名（忽略返回类型与模板参数中的嵌套括号）。"""
+    s = _normalize_signature_whitespace(signature)
     if not s:
         return ""
-    paren_idx = s.find("(")
-    head = s[:paren_idx].strip() if paren_idx > 0 else s
+    open_idx = _parameter_list_open_index(s)
+    head = s[:open_idx].strip() if open_idx >= 0 else s
     head = _strip_template_args(head)
     if "::" in head:
         head = head.split("::")[-1].strip()
@@ -109,8 +110,36 @@ def _strip_template_args(text: str) -> str:
     return "".join(out)
 
 
+def _normalize_signature_whitespace(signature: str) -> str:
+    """把签名里的空格/Tab/换行折叠成单空格，便于跨格式比对。"""
+    return re.sub(r"\s+", " ", str(signature or "").strip())
+
+
+def _parameter_list_open_index(signature: str) -> int:
+    """返回函数形参列表起始 ``(`` 的下标；跳过 ``<>`` 与嵌套括号内的 ``(``。"""
+    angle = 0
+    paren = 0
+    for i, ch in enumerate(str(signature or "")):
+        if ch == "<":
+            angle += 1
+            continue
+        if ch == ">" and angle > 0:
+            angle -= 1
+            continue
+        if angle > 0:
+            continue
+        if ch == "(":
+            if paren == 0:
+                return i
+            paren += 1
+            continue
+        if ch == ")":
+            paren = max(0, paren - 1)
+    return -1
+
+
 def _normalize_signature_key(signature: str) -> str:
-    s = re.sub(r"\s+", " ", str(signature or "").strip())
+    s = _normalize_signature_whitespace(signature)
     s = re.sub(r"<[^<>]*(?:<[^<>]*>[^<>]*)*>", "", s)
     return s.rstrip("{").rstrip()
 
@@ -194,42 +223,38 @@ def sanitize_replacement_code(replacement_code: str, signature: str = "") -> str
 
 
 def _extracted_block_matches_signature(block: str, signature: str) -> bool:
-    """校验从源码提取的函数块：必须以目标签名开头，且不能夹带其它顶层成员定义。"""
+    """校验从源码提取的函数块：签名头（可多行）对应目标，且不夹带其它顶层成员定义。"""
     block = str(block or "").strip()
     signature = str(signature or "").strip()
     if not block or not signature:
         return False
-    func_name = _extract_simple_function_name(signature)
-    owner = ""
-    m_owner = re.search(
-        r"([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)::\s*([~]?[A-Za-z_]\w*)\s*[\(<]",
-        signature,
-    )
-    if m_owner:
-        owner = m_owner.group(1)
-        func_name = m_owner.group(2) or func_name
+    owner, func_name = _extract_owner_and_name(signature)
     if not func_name:
         return False
-    non_empty = [
-        ln
-        for ln in block.splitlines()
-        if ln.strip() and not ln.strip().startswith("//")
-    ]
-    if not non_empty:
+    header = _extract_block_signature(block)
+    if not header:
         return False
-    first = non_empty[0].strip()
-    target_head = f"{owner}::{func_name}" if owner else func_name
-    if owner:
-        if target_head not in first:
+    header_owner, header_name = _extract_owner_and_name(header)
+    if header_name and header_name != func_name:
+        return False
+    if owner and header_owner:
+        o_tail = owner.split("::")[-1]
+        h_tail = header_owner.split("::")[-1]
+        if owner != header_owner and o_tail != h_tail:
+            return False
+    elif owner:
+        # 目标带 Class::，块签名因 NAMESPACE 宏 / 模板特化写成短名时，只要求函数名一致。
+        if not header_name or header_name != func_name:
             return False
     elif not re.search(
-        rf"(?:^|\s){re.escape(func_name)}\s*(?:<[^>]*>)?\s*\(",
-        first,
+        rf"(?:^|[\s:*&]){re.escape(func_name)}\s*(?:<[^>]*>)?\s*\(",
+        header,
     ):
         return False
     if owner:
+        owner_tail = owner.split("::")[-1]
         extra_defs = re.findall(
-            rf"(?:^|\n)\s*(?:[\w:\<\>\*&~\s]+\s+)?{re.escape(owner)}\s*::\s*"
+            rf"(?:^|\n)\s*(?:[\w:\<\>\*&~\s]+\s+)?(?:[\w:]*::)?{re.escape(owner_tail)}\s*::\s*"
             rf"(?!{re.escape(func_name)}\b)([~]?[A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(",
             block,
             flags=re.M,
@@ -240,14 +265,24 @@ def _extracted_block_matches_signature(block: str, signature: str) -> bool:
 
 
 def _extract_owner_and_name(signature: str) -> Tuple[str, str]:
-    """从签名提取 (类名, 函数名)；无类作用域时类名为空。"""
-    text = str(signature or "")
+    """从签名提取 (类名, 函数名)；定位真实形参列表，避免被返回类型/参数里的 ``std::`` / ``(`` 误导。"""
+    text = _normalize_signature_whitespace(signature)
+    if not text:
+        return "", ""
+    open_idx = _parameter_list_open_index(text)
+    head = text[:open_idx].rstrip() if open_idx >= 0 else text
+    head = _strip_template_args(head).rstrip()
     m_owner = re.search(
-        r"([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)::\s*([~]?[A-Za-z_]\w*)\s*[\(<]",
-        text,
+        r"([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)::\s*([~]?[A-Za-z_]\w*)\s*$",
+        head,
     )
     if m_owner:
         return m_owner.group(1), m_owner.group(2)
+    m_name = re.search(r"([~]?[A-Za-z_]\w*)\s*$", head)
+    if m_name:
+        name = m_name.group(1)
+        if name not in {"if", "for", "while", "switch", "catch", "return"}:
+            return "", name
     return "", _extract_simple_function_name(text)
 
 
@@ -327,14 +362,155 @@ def is_forbidden_patch(signature: str, replacement_code: str, uaf_nullptr_guard_
 
 
 def _source_newline_style(source: str) -> str:
-    return "\r\n" if "\r\n" in str(source or "") else "\n"
+    """根据文本中是否含 CRLF 判定换行风格。"""
+    text = str(source or "")
+    crlf = text.count("\r\n")
+    # 单独的 \r 较少见；用占比避免偶发 \r\n 误判
+    lf_only = text.count("\n") - crlf
+    if crlf > 0 and crlf >= lf_only:
+        return "\r\n"
+    return "\n"
 
 
 def _convert_newlines(text: str, style: str) -> str:
+    """将文本统一为指定换行风格。"""
     normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     if style == "\r\n":
         return normalized.replace("\n", "\r\n")
     return normalized
+
+
+def _read_text_raw(path: Path, *, encoding: str = "utf-8") -> str:
+    """读取文本并保留原始换行（禁用 universal newlines）。"""
+    with path.open("r", encoding=encoding, newline="") as handle:
+        return handle.read()
+
+
+def _write_text_raw(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """写入文本；newline='' 避免把 ``\\n`` 再转换成 os.linesep。"""
+    with path.open("w", encoding=encoding, newline="") as handle:
+        handle.write(text)
+
+
+def _try_read_source_raw(path: Path) -> Tuple[str, str]:
+    """读取源码，返回 ``(text, encoding)``；优先 utf-8，再 gbk。"""
+    try:
+        return _read_text_raw(path, encoding="utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        return _read_text_raw(path, encoding="gbk"), "gbk"
+
+
+def _detect_indent_unit(block: str) -> Tuple[str, int]:
+    """从代码块推断缩进：``('tab', 4)`` 或 ``('space', width)``。"""
+    tab_lines = 0
+    space_widths: List[int] = []
+    for line in str(block or "").splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("\t"):
+            tab_lines += 1
+            continue
+        match = re.match(r"^( +)\S", line)
+        if match:
+            space_widths.append(len(match.group(1)))
+    if tab_lines > 0 and tab_lines >= len(space_widths):
+        return "tab", 4
+    if space_widths:
+        from functools import reduce
+        from math import gcd
+
+        width = reduce(gcd, space_widths)
+        if width <= 0:
+            width = 4
+        elif width % 4 == 0:
+            width = 4
+        elif width % 2 == 0:
+            width = 2
+        else:
+            width = 4
+        return "space", width
+    return "space", 4
+
+
+def _count_indent_columns(leading_ws: str, *, tab_width: int = 4) -> int:
+    """把前导空白折算成列宽（Tab 按 tab_width 计）。"""
+    cols = 0
+    width = max(1, int(tab_width or 4))
+    for char in str(leading_ws or ""):
+        if char == "\t":
+            cols += width
+        elif char == " ":
+            cols += 1
+        else:
+            break
+    return cols
+
+
+def _adapt_replacement_indent(replacement: str, old_block: str) -> str:
+    """将 LLM 补丁的前导缩进对齐到原函数块的 Tab/空格风格。"""
+    old = str(old_block or "")
+    text = str(replacement or "")
+    if not text or not old:
+        return text
+    style, width = _detect_indent_unit(old)
+    repl_style, repl_width = _detect_indent_unit(text)
+    if style == repl_style and (style == "tab" or width == repl_width):
+        return text
+    measure_tab = repl_width if repl_style == "space" else 4
+    out_lines: List[str] = []
+    for line in text.splitlines():
+        match = re.match(r"^([ \t]*)(.*)$", line)
+        if not match:
+            out_lines.append(line)
+            continue
+        leading, rest = match.group(1), match.group(2)
+        if rest == "":
+            out_lines.append("")
+            continue
+        cols = _count_indent_columns(leading, tab_width=measure_tab)
+        if style == "tab":
+            tw = measure_tab
+            out_lines.append(("\t" * (cols // tw)) + (" " * (cols % tw)) + rest)
+        else:
+            out_lines.append((" " * cols) + rest)
+    result = "\n".join(out_lines)
+    if text.endswith("\n") or text.endswith("\r\n"):
+        result += "\n"
+    return result
+
+
+def _ensure_newline_before_replacement(prefix: str, replacement: str) -> str:
+    """避免 ``*/`` 后紧贴函数签名，把行尾注释与代码挤成一行。"""
+    text = str(replacement or "")
+    head = str(prefix or "")
+    if not text or not head:
+        return text
+    trimmed = head.rstrip(" \t")
+    if not trimmed.endswith("*/"):
+        return text
+    if trimmed.endswith("\n") or trimmed.endswith("\r"):
+        return text
+    stripped = text.lstrip(" \t")
+    if stripped.startswith(("\n", "\r", "/*", "//")):
+        return text
+    return "\n" + stripped
+
+
+def _align_leading_newline(old_block: str, replacement: str) -> str:
+    """若 old_block 含前导换行而 replacement 没有，补上以免粘连上一行。"""
+    old = str(old_block or "")
+    repl = str(replacement or "")
+    if not old or not repl:
+        return repl
+    if not (old.startswith("\n") or old.startswith("\r")):
+        return repl
+    if repl.startswith("\n") or repl.startswith("\r"):
+        return repl
+    if old.startswith("\r\n"):
+        return "\r\n" + repl
+    if old.startswith("\r"):
+        return "\r" + repl
+    return "\n" + repl
 
 
 def _normalize_code_for_equivalence(text: str) -> str:
@@ -378,6 +554,7 @@ def _extract_current_function_block(
         snippet = out.get("snippet") if isinstance(out, dict) else None
         if bool(out.get("is_complete_function")) and isinstance(snippet, list) and snippet:
             block = "\n".join(str(x) for x in snippet).strip("\n")
+            block = _convert_newlines(block, _source_newline_style(original_source))
             if (
                 block
                 and block in original_source
@@ -927,7 +1104,15 @@ def graph_auto_fix_allowed(code_context: Dict[str, Any]) -> Tuple[bool, str]:
     return False, "仅栈序关联或证据不足，已禁止自动改码"
 
 
+def _append_unique_name(names: List[str], raw: str) -> None:
+    """向名单追加去空白后的函数名（就地去重）。"""
+    name = str(raw or "").strip()
+    if name and name not in names:
+        names.append(name)
+
+
 def _extract_required_function_names_from_analysis(analysis_text: str) -> List[str]:
+    """从「需要修改的函数」或非正式修复段落解析目标函数名。"""
     names: List[str] = []
     in_section = False
     for raw_line in (analysis_text or "").splitlines():
@@ -945,7 +1130,7 @@ def _extract_required_function_names_from_analysis(analysis_text: str) -> List[s
         # 1. `FuncName()` (backtick)
         m = re.match(r"^(?:[-*]|\d+[.)]\s*)\s*(?:\*{0,2})\s*`([^`]+)`", line)
         if m:
-            names.append(m.group(1).strip())
+            _append_unique_name(names, m.group(1))
             continue
         # 2. **FuncName()** (bold markdown)
         m2 = re.match(r"^(?:[-*]|\d+[.)]\s*)\s*\*\*([^*]+)\*\*", line)
@@ -958,12 +1143,49 @@ def _extract_required_function_names_from_analysis(analysis_text: str) -> List[s
                 paren_end = name_candidate.find(")")
                 if paren_end >= 0:
                     name_candidate = name_candidate[: paren_end + 1]
-                names.append(name_candidate.strip())
-    dedup: List[str] = []
-    for n in names:
-        if n and n not in dedup:
-            dedup.append(n)
-    return dedup
+                _append_unique_name(names, name_candidate)
+    if names:
+        return names
+
+    # 非正式输出（如「### 6.1 直接修复」）：从叙述与独立函数围栏补名单
+    try:
+        from services.toctou_write_completeness import _extract_fix_oriented_text
+
+        fix_text = _extract_fix_oriented_text(analysis_text) or str(analysis_text or "")
+    except Exception:
+        fix_text = str(analysis_text or "")
+
+    informal_pat = re.compile(
+        r"修改\s*`?([A-Za-z_]\w*(?:::[~A-Za-z_]\w*)?)\s*\([^)`\n]*\)`?(?:\s*函数)?"
+    )
+    for m in informal_pat.finditer(fix_text):
+        _append_unique_name(names, m.group(1) + "()")
+
+    # 「修改析构函数」后紧跟的 ```cpp 围栏签名
+    dtor_cue = re.compile(
+        r"修改\s*(?:其)?析构函数[^\n]*\n+```(?:cpp|c\+\+|c|cc|cxx)?\s*\n"
+        r"([^\n]*~[A-Za-z_]\w*(?:::~?[A-Za-z_]\w*)?\s*\([^)]*\))",
+        re.IGNORECASE,
+    )
+    for m in dtor_cue.finditer(fix_text):
+        _append_unique_name(names, m.group(1).strip())
+
+    # 独立 Class::method / Class::~Class 完整函数围栏（跳过 class/struct 骨架）
+    for block in _extract_code_blocks(fix_text):
+        if re.search(r"^\s*(?:class|struct)\s+\w+", block, re.MULTILINE):
+            continue
+        for m in re.finditer(
+            r"(?:^|\n)\s*(?:[\w:*&<>,\s]+?\s+)?"
+            r"((?:~?\w+::)?[~]?\w+)\s*\([^;{]*\)\s*(?:const\s*)?\{",
+            block,
+        ):
+            leaf = m.group(1)
+            if leaf in ("if", "else", "for", "while", "switch", "do", "catch", "try"):
+                continue
+            if "::" not in leaf and not leaf.startswith("~"):
+                continue
+            _append_unique_name(names, leaf + "()")
+    return names
 
 
 def _find_candidate_node_for_edit(
@@ -1009,18 +1231,36 @@ def _build_candidate_node_from_current_source(
             },
             tool_executor=tool_executor,
         )
+        snippet = out.get("snippet") if isinstance(out, dict) else None
+        if isinstance(snippet, list) and snippet:
+            return {
+                "type": "function",
+                "file": str(file_path),
+                "signature": signature,
+                "snippet": [str(x) for x in snippet],
+                "snippet_start_line": out.get("snippet_start_line"),
+                "snippet_end_line": out.get("snippet_end_line"),
+            }
+    except Exception:
+        pass
+    # 无 registry / snippet 工具时，直接从源码定位函数块（单测与精简部署常用）。
+    try:
+        original, _enc = _try_read_source_raw(file_path)
     except Exception:
         return None
-    snippet = out.get("snippet") if isinstance(out, dict) else None
-    if not (isinstance(snippet, list) and snippet):
+    _, block = CodeFixer.replace_function_block(original, signature, "")
+    if not block or not _extracted_block_matches_signature(block, signature):
         return None
+    lines = str(block).splitlines()
+    idx = original.find(block)
+    start_line = original.count("\n", 0, idx) + 1 if idx >= 0 else 1
     return {
         "type": "function",
         "file": str(file_path),
         "signature": signature,
-        "snippet": [str(x) for x in snippet],
-        "snippet_start_line": out.get("snippet_start_line"),
-        "snippet_end_line": out.get("snippet_end_line"),
+        "snippet": lines,
+        "snippet_start_line": start_line,
+        "snippet_end_line": start_line + max(0, len(lines) - 1),
     }
 
 
@@ -1489,25 +1729,51 @@ def _find_template_prefix_start(code_text: str, line_start: int) -> Optional[int
 
 
 def _extract_block_signature(block: str) -> str:
-    """从函数代码块提取函数签名文本（到 '{' 之前）。"""
+    """从函数代码块提取函数签名文本（到形参列表结束及尾部限定符，空白已规范化）。"""
     text = str(block or "").strip()
     if not text:
         return ""
+    open_idx = _parameter_list_open_index(text)
+    if open_idx >= 0:
+        depth = 0
+        close_idx = -1
+        angle = 0
+        for i in range(open_idx, len(text)):
+            ch = text[i]
+            if ch == "<":
+                angle += 1
+                continue
+            if ch == ">" and angle > 0:
+                angle -= 1
+                continue
+            if angle > 0:
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    close_idx = i
+                    break
+        if close_idx >= 0:
+            after = text[close_idx + 1 :]
+            # 只保留 const/noexcept 等尾缀；不把 ctor-initializer / 函数体算进签名。
+            qual_match = re.match(
+                r"^((?:\s*(?:const|volatile|noexcept\s*(?:\([^)]*\))?|override|final|&&|&))*)",
+                after,
+            )
+            qual = qual_match.group(1) if qual_match else ""
+            return _normalize_signature_whitespace(text[: close_idx + 1] + qual)
     brace = text.find("{")
     if brace < 0:
         return ""
-    sig = text[:brace].strip()
-    sig = re.sub(r"\s+", " ", sig)
-    return sig
+    return _normalize_signature_whitespace(text[:brace])
 
 
 def _extract_signature_function_name(signature: str) -> str:
-    text = str(signature or "")
-    matches = re.findall(r"([~]?[A-Za-z_]\w*)\s*\(", text)
-    for name in reversed(matches):
-        if name not in {"if", "for", "while", "switch", "catch"}:
-            return name
-    return ""
+    """提取声明中的函数名（忽略参数类型里的嵌套 ``name(``）。"""
+    _, name = _extract_owner_and_name(signature)
+    return name
 
 
 def _target_is_destructor(signature: str) -> bool:
@@ -1515,25 +1781,31 @@ def _target_is_destructor(signature: str) -> bool:
 
 
 def _replacement_signature_compatible(target_signature: str, replacement_code: str) -> bool:
-    """确认 replacement 是目标函数的完整定义，且没有改写函数签名。"""
+    """确认 replacement 是目标函数的完整定义，类名/函数名一致。
+
+    只约束身份（类 + 函数名），不要求签名字符串逐字相同：多行参数列表、Tab/空格、
+    ``T*`` vs ``T *``、换行折行等格式差异一律视为兼容。参数类型被改写时不在此拦截
+    （避免模型排版导致误拒）；跨类同名仍拒绝。
+    """
     block_sig = _extract_block_signature(replacement_code)
     if not block_sig:
         return False
     stripped = block_sig.strip()
     if ";" in stripped or stripped.startswith("//") or stripped.startswith("/*"):
         return False
-    target_name = _extract_signature_function_name(target_signature)
+    target_norm = _normalize_signature_whitespace(target_signature)
+    target_name = _extract_signature_function_name(target_norm)
     block_name = _extract_signature_function_name(block_sig)
     if target_name and block_name and target_name != block_name:
         return False
-    target_owner, _ = _extract_owner_and_name(target_signature)
+    target_owner, _ = _extract_owner_and_name(target_norm)
     block_owner, _ = _extract_owner_and_name(block_sig)
     if target_owner and block_owner:
         t_tail = target_owner.split("::")[-1]
         b_tail = block_owner.split("::")[-1]
         if target_owner != block_owner and t_tail != b_tail:
             return False
-    if _target_is_destructor(target_signature):
+    if _target_is_destructor(target_norm):
         # 析构函数没有返回类型；`VBool Class::~Class()` 或 `VBool ~Class()` 都不可直接替换。
         if re.match(r"^\s*(?:[\w:<>,*&]+\s+)+[A-Za-z_]\w*::~[A-Za-z_]\w*\s*\(", block_sig):
             return False
@@ -1909,10 +2181,10 @@ class CodeFixer:
             # 扫描所有代码块中的函数
             targets = []
             for code in blocks:
-                # 如果代码块包含 class/struct 定义，说明 LLM 输出了整个类，
-                # fast-path 无法从类中精确提取单个函数替换，放弃快速路径
+                # class/struct 骨架（常含 // ... 占位）不能整块替换；跳过该围栏，
+                # 继续扫描后续独立的 Class::method 完整函数围栏。
                 if re.search(r"^\s*(?:class|struct)\s+\w+", code, re.MULTILINE):
-                    return None
+                    continue
                 # 尝试找到完整的函数定义
                 func_pattern = re.compile(
                     r"(?:[\w:*&<>,\s]+?\s+)?(~?\w+(?:::\w+)*)\s*\([^)]*\)"
@@ -2234,15 +2506,11 @@ class CodeFixer:
                     continue
                 file_encoding = "utf-8"
                 try:
-                    original = file_path.read_text(encoding="utf-8")
-                except UnicodeDecodeError:
-                    try:
-                        original = file_path.read_text(encoding="gbk")
-                        file_encoding = "gbk"
-                    except (UnicodeDecodeError, LookupError):
-                        record["error"] = "目标文件编码无法识别（非 UTF-8/GBK）"
-                        applied.append(record)
-                        continue
+                    original, file_encoding = _try_read_source_raw(file_path)
+                except (UnicodeDecodeError, LookupError, OSError):
+                    record["error"] = "目标文件编码无法识别（非 UTF-8/GBK）"
+                    applied.append(record)
+                    continue
                 include_pat = re.compile(r"^\s*" + re.escape(include_line) + r"\s*$", re.MULTILINE)
                 if include_pat.search(original):
                     record["error"] = "include 已存在，无需修改"
@@ -2255,11 +2523,14 @@ class CodeFixer:
                     if re.match(r"^\s*#\s*include\b", line):
                         insert_at = idx + 1
                 lines.insert(insert_at, include_line)
-                new_source = _convert_newlines("\n".join(lines) + (eol if original.endswith(("\n", "\r\n")) else ""), eol)
+                new_source = _convert_newlines(
+                    "\n".join(lines) + (eol if original.endswith(("\n", "\r\n")) else ""),
+                    eol,
+                )
                 try:
-                    file_path.write_text(new_source, encoding=file_encoding)
+                    _write_text_raw(file_path, new_source, encoding=file_encoding)
                 except (UnicodeEncodeError, UnicodeDecodeError):
-                    file_path.write_text(new_source, encoding="utf-8")
+                    _write_text_raw(file_path, new_source, encoding="utf-8")
                 if report_dir is not None and backup_original_sources:
                     backup_root = report_dir / "original_sources"
                     containing_root = _find_containing_code_root(file_path, code_roots)
@@ -2267,7 +2538,7 @@ class CodeFixer:
                         backup_path = backup_root / file_path.relative_to(containing_root)
                         backup_path.parent.mkdir(parents=True, exist_ok=True)
                         if not backup_path.exists():
-                            backup_path.write_text(original, encoding="utf-8")
+                            _write_text_raw(backup_path, original, encoding="utf-8")
                         record["backup_path"] = str(backup_path)
                 record["status"] = "applied"
                 record["replaced_preview"] = include_line
@@ -2306,15 +2577,11 @@ class CodeFixer:
                     continue
                 file_encoding = "utf-8"
                 try:
-                    original = file_path.read_text(encoding="utf-8")
-                except UnicodeDecodeError:
-                    try:
-                        original = file_path.read_text(encoding="gbk")
-                        file_encoding = "gbk"
-                    except (UnicodeDecodeError, LookupError):
-                        record["error"] = "目标文件编码无法识别（非 UTF-8/GBK）"
-                        applied.append(record)
-                        continue
+                    original, file_encoding = _try_read_source_raw(file_path)
+                except (UnicodeDecodeError, LookupError, OSError):
+                    record["error"] = "目标文件编码无法识别（非 UTF-8/GBK）"
+                    applied.append(record)
+                    continue
                 if old_text not in original:
                     record["error"] = "old_text 未能在文件中精确匹配"
                     record["match_feedback"] = _match_feedback(original, old_text, file_path=str(file_path))
@@ -2326,9 +2593,9 @@ class CodeFixer:
                     eol,
                 )
                 try:
-                    file_path.write_text(new_source, encoding=file_encoding)
+                    _write_text_raw(file_path, new_source, encoding=file_encoding)
                 except (UnicodeEncodeError, UnicodeDecodeError):
-                    file_path.write_text(new_source, encoding="utf-8")
+                    _write_text_raw(file_path, new_source, encoding="utf-8")
                 if report_dir is not None and backup_original_sources:
                     backup_root = report_dir / "original_sources"
                     containing_root = _find_containing_code_root(file_path, code_roots)
@@ -2336,7 +2603,7 @@ class CodeFixer:
                         backup_path = backup_root / file_path.relative_to(containing_root)
                         backup_path.parent.mkdir(parents=True, exist_ok=True)
                         if not backup_path.exists():
-                            backup_path.write_text(original, encoding="utf-8")
+                            _write_text_raw(backup_path, original, encoding="utf-8")
                         record["backup_path"] = str(backup_path)
                 record["status"] = "applied"
                 record["replaced_preview"] = new_text
@@ -2397,17 +2664,16 @@ class CodeFixer:
                 continue
             file_encoding = "utf-8"
             try:
-                original = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                # 尝试 GBK 等常见中文编码
-                try:
-                    original = file_path.read_text(encoding="gbk")
-                    file_encoding = "gbk"
-                except (UnicodeDecodeError, LookupError):
-                    record["error"] = "目标文件编码无法识别（非 UTF-8/GBK）"
-                    applied.append(record)
-                    continue
+                original, file_encoding = _try_read_source_raw(file_path)
+            except (UnicodeDecodeError, LookupError, OSError):
+                record["error"] = "目标文件编码无法识别（非 UTF-8/GBK）"
+                applied.append(record)
+                continue
             snippet_text = "\n".join(node["snippet"])
+            # 与原文换行对齐，避免 CRLF 文件中 snippet 用 LF 拼出后匹配失败
+            eol_probe = _source_newline_style(original)
+            if eol_probe == "\r\n" and snippet_text:
+                snippet_text = _convert_newlines(snippet_text, "\r\n")
             new_text_content = original
             old_block: Optional[str] = _extract_current_function_block(
                 file_path, signature, node, original, tool_executor=tool_executor,
@@ -2487,6 +2753,14 @@ class CodeFixer:
                 continue
             # 仅拦截「同名转发 + 整函数入口判空」；其余质量由提示词与人工 review 控制。
             eol = _source_newline_style(original)
+            replacement_code = _adapt_replacement_indent(replacement_code, old_block or "")
+            replacement_code = _align_leading_newline(old_block or "", replacement_code)
+            replace_at = original.find(old_block or "")
+            if replace_at >= 0:
+                replacement_code = _ensure_newline_before_replacement(
+                    original[:replace_at],
+                    replacement_code,
+                )
             replacement_code = _convert_newlines(replacement_code, eol)
             new_text_content = _convert_newlines(
                 original.replace(old_block, replacement_code, 1),
@@ -2495,10 +2769,10 @@ class CodeFixer:
             logger.info("[CodeFixer] 写入文件: %s (diff=%+d bytes, encoding=%s)",
                         file_path, len(new_text_content) - len(original), file_encoding)
             try:
-                file_path.write_text(new_text_content, encoding=file_encoding)
+                _write_text_raw(file_path, new_text_content, encoding=file_encoding)
             except (UnicodeEncodeError, UnicodeDecodeError):
                 # replacement_code 含原编码无法表示的字符，升级为 UTF-8 写入
-                file_path.write_text(new_text_content, encoding="utf-8")
+                _write_text_raw(file_path, new_text_content, encoding="utf-8")
                 file_encoding = "utf-8"
             if report_dir is not None and backup_original_sources:
                 backup_root = report_dir / "original_sources"
@@ -2510,7 +2784,7 @@ class CodeFixer:
                 backup_path = backup_root / file_path.relative_to(containing_root)
                 backup_path.parent.mkdir(parents=True, exist_ok=True)
                 if not backup_path.exists():
-                    backup_path.write_text(original, encoding=file_encoding)
+                    _write_text_raw(backup_path, original, encoding=file_encoding)
                 record["backup_path"] = str(backup_path)
             record["status"] = "applied"
             record["replaced_preview"] = replacement_code
@@ -2657,4 +2931,5 @@ class CodeFixer:
                 else:
                     return source, None
         old_block = source[sig_index : end_index + 1]
-        return source[:sig_index] + replacement_code + source[end_index + 1 :], old_block
+        patched = _ensure_newline_before_replacement(source[:sig_index], replacement_code)
+        return source[:sig_index] + patched + source[end_index + 1 :], old_block

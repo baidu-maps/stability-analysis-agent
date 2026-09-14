@@ -160,7 +160,7 @@ LLM 配置模板见 **`configs/agent_config.local.example.json`**。实际密钥
 | `external_agent_evaluation/` | 显式开启且已生成解析后堆栈 | 供 Codex、Cursor 等外部通用编程 Agent 使用的隔离对比任务文件；默认不生成 |
 | `round_0/07_ai_gen_res.md` | `full` 且 LLM 成功 | 模型输出 |
 | `08_apply_ai_fixes.json` | 改码执行时 | 自动改码结果 |
-| `final_output.md` | 通常 `full` | 人类可读汇总 |
+| `final_output.md` | `full` / `parse_stack_only` | 人类可读汇总；`parse_stack_only` 为符号化三列表格（原日志行号 / 地址 / addr2line） |
 
 多轮 `context_loop` 时另有 `round_N/`、`05b_pre_round_add_res.json`、`06b_next_round_ai_request.json`、`agent_rounds_summary.json`。报告读取遵循当前 artifact 协议，不转换旧报告命名。
 

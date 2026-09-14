@@ -143,6 +143,35 @@ class TestCodeFixerClassGuard(unittest.TestCase):
         self.assertFalse(_extracted_block_matches_signature(wrong, target))
         self.assertTrue(_extracted_block_matches_signature(right, target))
 
+    def test_multiline_tab_signature_is_compatible(self) -> None:
+        """多行参数列表 + Tab 缩进不应导致签名校验误拒。"""
+        target = "VBool CVLayer::Draw(\n\tVVoid* pArg,\n\tVBool bForce)"
+        replacement = (
+            "VBool\n"
+            "CVLayer::Draw(\n"
+            "\tVVoid * pArg,\n"
+            "\tVBool bForce)\n"
+            "{\n"
+            "\treturn V_TRUE;\n"
+            "}\n"
+        )
+        self.assertTrue(_replacement_signature_compatible(target, replacement))
+        self.assertTrue(_extracted_block_matches_signature(replacement, target))
+
+    def test_std_return_type_and_nested_param_parens(self) -> None:
+        """返回类型含 std:: / 参数含嵌套 () 时仍应识别真实函数名。"""
+        target = "Foo::bar()"
+        replacement = (
+            "std::vector<int> Foo::bar(std::function<void(int)> cb)\n"
+            "{\n"
+            "    return {};\n"
+            "}\n"
+        )
+        self.assertTrue(_replacement_signature_compatible(target, replacement))
+        self.assertTrue(
+            signatures_match("std::vector<int> Foo::bar()", "Foo::bar()")
+        )
+
     def test_skip_edit_without_complete_prompt_body(self) -> None:
         ctx = {
             "diagnostics": {

@@ -299,6 +299,8 @@ def inject_extra_code_context(base_prompt: str, extra_context_markdown: str) -> 
         return text
     section = f"## 其它代码上下文\n\n{extra}\n"
     for marker in (
+        "### 崩溃行关键源码",
+        "### 同文件旁路候选源码",
         "### 关键同步与共享成员",
         "### 写路径函数源码",
         "### 崩溃所属类骨架",

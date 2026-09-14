@@ -4190,7 +4190,7 @@ def _artifact_manifest(report_dir: Path, *, scope: str) -> Dict[str, Any]:
                 "05_memory_context.json",
             ]
         )
-    if scope == "full":
+    if scope in {"full", "parse_stack_only"}:
         expected.append("final_output.md")
     for rel in expected:
         manifest.setdefault(rel, {"status": "not_written", "size_bytes": None})
@@ -4700,7 +4700,26 @@ def _write_cli_report(
             except Exception as exc:
                 logger.warning("failed to write external agent evaluation task: %s", exc)
         if write_readme_output:
-            final_output_text = analysis_text if analysis_text is not None else rendered_output
+            if scope == "parse_stack_only":
+                from services.stack_resolve_report import build_parse_stack_only_markdown
+
+                parse_payload = result.get("parse_result") if isinstance(result.get("parse_result"), dict) else {}
+                crash_info = (
+                    parse_payload.get("crash_info")
+                    if isinstance(parse_payload.get("crash_info"), dict)
+                    else {}
+                )
+                resolved = (
+                    result.get("resolved_stack")
+                    if isinstance(result.get("resolved_stack"), dict)
+                    else {}
+                )
+                final_output_text = build_parse_stack_only_markdown(
+                    resolved,
+                    crash_info=crash_info,
+                )
+            else:
+                final_output_text = analysis_text if analysis_text is not None else rendered_output
             (report_dir / "final_output.md").write_text(str(final_output_text), encoding="utf-8")
         if isinstance(request_record, dict):
             started_at = str(
@@ -5386,7 +5405,9 @@ def _primary_artifact_for_scope(scope: str, report_dir: Path) -> Optional[Path]:
     if scope_norm == "parse_log_only":
         p = report_dir / "01_crash_log_parser.json"
     elif scope_norm == "parse_stack_only":
-        p = report_dir / "04a_crash_diagnosis.json"
+        p = report_dir / "final_output.md"
+        if not p.exists():
+            p = report_dir / "04a_crash_diagnosis.json"
         if not p.exists():
             p = report_dir / "03_add2line_resolver.json"
     elif scope_norm == "gen_prompt_only":
@@ -5505,7 +5526,9 @@ def _print_tty_markdown_brief_summary(
         if scope_norm == "parse_log_only":
             print("【产物】崩溃日志解析结果：")
         elif scope_norm == "parse_stack_only":
-            if (report_dir / "04a_crash_diagnosis.json").exists():
+            if (report_dir / "final_output.md").exists():
+                label = "堆栈地址解析报告"
+            elif (report_dir / "04a_crash_diagnosis.json").exists():
                 label = "崩溃诊断结果（04a）"
             else:
                 label = (
@@ -6994,12 +7017,28 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         else:
             output = f"# 错误\n\n{result.get('error')}"
 
+    if (
+        scope == "parse_stack_only"
+        and result.get("status") == "success"
+        and str(getattr(args, "output_format", "markdown") or "markdown") == "markdown"
+    ):
+        from services.stack_resolve_report import build_parse_stack_only_markdown
+
+        parse_payload = result.get("parse_result") if isinstance(result.get("parse_result"), dict) else {}
+        crash_info = (
+            parse_payload.get("crash_info") if isinstance(parse_payload.get("crash_info"), dict) else {}
+        )
+        resolved = (
+            result.get("resolved_stack") if isinstance(result.get("resolved_stack"), dict) else {}
+        )
+        output = build_parse_stack_only_markdown(resolved, crash_info=crash_info)
+
     report_dir = _write_cli_report(
         report_dir,
         result,
         output,
         applied_fix_result,
-        write_readme_output=(scope == "full"),
+        write_readme_output=(scope in {"full", "parse_stack_only"}),
         scope=scope,
         request_record=request_record,
         run_started_at=_analysis_started_at,

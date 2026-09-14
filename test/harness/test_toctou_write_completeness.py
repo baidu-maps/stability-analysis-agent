@@ -129,6 +129,7 @@ class ToctouWriteCompletenessTests(unittest.TestCase):
 
         stable = (
             "前置上下文\n"
+            "疑似同步原语成员（禁止臆造新 mutex/lock）：m_clRouteInfoMutex\n"
             "### 写路径函数源码（压缩保活，可纳入需要修改的函数）\n"
             "#### 写路径函数源码: VVoid Foo::HandleRemoveRouteMessage()\n"
             "- 代码片段:\n"

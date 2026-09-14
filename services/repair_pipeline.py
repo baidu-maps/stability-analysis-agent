@@ -21,7 +21,11 @@ from services.git_worktree_manager import (
     write_workspace_artifacts,
     isolated_workspace_from_dict,
 )
-from services.repair_actions import RepairActionDeps, build_repair_action_executor
+from services.repair_actions import (
+    RepairActionDeps,
+    build_repair_action_executor,
+    changed_files_from_applied_result,
+)
 from services.decide_scorer import score_repair_decision
 from services.stage_artifacts import save_decide_artifact
 from services.runtime_actions import ApprovalBinding, VERIFICATION_ACTION_TOOLS, pending_tool_action_name
@@ -565,10 +569,7 @@ def _continue_repair_after_apply_patch(
                 if edit_out.success and isinstance(edit_out.applied_fix_result, dict):
                     out.applied_fix_result = edit_out.applied_fix_result
                     deps.applied_fix_result = edit_out.applied_fix_result
-                    deps.changed_files = [
-                        str(item.get("file")) for item in (edit_out.applied_fix_result.get("applied") or [])
-                        if isinstance(item, dict) and item.get("status") == "applied" and item.get("file")
-                    ]
+                    deps.changed_files = changed_files_from_applied_result(edit_out.applied_fix_result)
                     action_context["changed_files"] = list(deps.changed_files)
                     safety_report = actions.execute(
                         "inspect_diff",
@@ -673,11 +674,7 @@ def _continue_repair_after_apply_patch(
                 if edit_out.success and isinstance(edit_out.applied_fix_result, dict):
                     out.applied_fix_result = edit_out.applied_fix_result
                     deps.applied_fix_result = edit_out.applied_fix_result
-                    deps.changed_files = [
-                        str(item.get("file"))
-                        for item in (edit_out.applied_fix_result.get("applied") or [])
-                        if isinstance(item, dict) and item.get("status") == "applied" and item.get("file")
-                    ]
+                    deps.changed_files = changed_files_from_applied_result(edit_out.applied_fix_result)
                     action_context["changed_files"] = list(deps.changed_files)
                     status_updates["applied_ai_fixes"] = out.applied_fix_result
                     action_state = getattr(actions, "state", None)
@@ -1154,11 +1151,7 @@ def resume_verification_from_report(
         run_id=replay_run_id,
         verification_config=verification_config,
         applied_fix_result=out.applied_fix_result,
-        changed_files=[
-            str(item.get("file"))
-            for item in (out.applied_fix_result or {}).get("applied", [])
-            if isinstance(item, dict) and item.get("file")
-        ],
+        changed_files=changed_files_from_applied_result(out.applied_fix_result),
         approval=replay_approval,
         isolated_workspace=out.isolated_workspace,
         request_record=request_record,

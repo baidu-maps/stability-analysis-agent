@@ -339,6 +339,101 @@ class AgentContextLoopTests(unittest.TestCase):
         self.assertGreaterEqual(sync_at, 0)
         self.assertLess(sync_at, task_at)
 
+    def test_compress_stable_context_pins_crash_line_over_write_path(self):
+        """heap/delete 场景：崩溃行 arg_eval 保活应优先于大块写路径。"""
+        head = (
+            "## 崩溃摘要\n"
+            "- 错误类型: SIGABRT\n"
+            "- signal: heap allocator abort / operator_delete\n"
+            + ("evidence pad line\n" * 300)
+        )
+        crash_line_keep = (
+            "### 崩溃行关键源码（压缩保活，优先分析崩溃行实参求值与被调）\n"
+            "- 说明: 优先保留参数求值被调\n"
+            "#### 函数源码: const char* GetShaderValue(int a, int b)\n"
+            "- 来源标签: 参数求值被调, 崩溃行被调\n"
+            "- 代码片段:\n"
+            "const char* GetShaderValue(int a, int b) {\n"
+            "  g_strShaderVert = str1 + str2;\n"
+            "  return g_strShaderVert.c_str();\n"
+            "}\n"
+        )
+        write_keep = (
+            "### 写路径函数源码（压缩保活，可纳入需要修改的函数）\n"
+            "#### 写路径函数源码: void GLRenderShader::getAttributeInfo()\n"
+            "- 代码片段:\n"
+            + ("  m_vecAttrDesc[nAttrLoc + i] = desc;\n" * 200)
+        )
+        tail = "# 崩溃分析任务\n输出契约\n"
+        text = head + crash_line_keep + write_keep + tail
+        compressed = ContextEngine._compress_stable_context(text, 4500)
+        self.assertLessEqual(len(compressed), 4500)
+        self.assertIn("stable context compressed by budget", compressed)
+        self.assertIn("GetShaderValue", compressed)
+        self.assertIn("g_strShaderVert", compressed)
+        self.assertIn("崩溃行关键源码", compressed)
+        self.assertIn("# 崩溃分析任务", compressed)
+        # 写路径可被挤掉或截断，但不能反过来挤掉 GetShaderValue
+        crash_at = compressed.find("GetShaderValue")
+        task_at = compressed.find("# 崩溃分析任务")
+        self.assertGreaterEqual(crash_at, 0)
+        self.assertLess(crash_at, task_at)
+
+    def test_compress_stable_context_pins_bypass_after_crash_line(self):
+        head = (
+            "## 崩溃摘要\n"
+            "- signal: heap allocator abort / operator_delete\n"
+            + ("pad\n" * 200)
+        )
+        crash_line = (
+            "### 崩溃行关键源码（压缩保活）\n"
+            "#### 函数源码: const char* GetShaderValue()\n"
+            "- 来源标签: 参数求值被调\n"
+            "g_strShaderVert = x; return g_strShaderVert.c_str();\n"
+        )
+        bypass = (
+            "### 同文件旁路候选源码（压缩保活，次于崩溃行；供旁路/次要假设）\n"
+            "#### 函数源码: void GLRenderShader::getAttributeInfo()\n"
+            "m_vecAttrDesc[nAttrLoc + 3] = desc;\n"
+        )
+        write_keep = (
+            "### 写路径函数源码（压缩保活）\n"
+            "#### 写路径函数源码: void noise()\n"
+            + ("noise line\n" * 80)
+        )
+        tail = "# 崩溃分析任务\n规则\n"
+        text = head + crash_line + bypass + write_keep + tail
+        compressed = ContextEngine._compress_stable_context(text, 5000)
+        self.assertIn("GetShaderValue", compressed)
+        self.assertIn("g_strShaderVert", compressed)
+        self.assertIn("getAttributeInfo", compressed)
+        self.assertIn("m_vecAttrDesc", compressed)
+        self.assertLess(
+            compressed.find("GetShaderValue"),
+            compressed.find("getAttributeInfo"),
+        )
+
+    def test_truncate_crash_line_pin_keeps_lifetime_hits(self):
+        head = (
+            "### 崩溃行关键源码（压缩保活）\n"
+            "#### 函数源码: const char* GetShaderValue()\n"
+            "- 来源标签: 参数求值被调\n"
+            "- 代码片段:\n"
+            "const char* GetShaderValue() {\n"
+        )
+        mid = "".join(f'  case {i}: return "s{i}";\n' for i in range(400))
+        hit = (
+            '  g_strShaderVert = "anim";\n'
+            "  return g_strShaderVert.c_str();\n"
+            "}\n"
+        )
+        block = head + mid + hit
+        out = ContextEngine._truncate_crash_line_pin(block, 2500)
+        self.assertLessEqual(len(out), 2500)
+        self.assertIn("GetShaderValue", out)
+        self.assertIn("g_strShaderVert", out)
+        self.assertIn("c_str()", out)
+
     def test_context_engine_ledger_records_rejected_and_duplicate_attempts(self):
         registry = ContextResolverRegistry([
             CallableContextResolver(

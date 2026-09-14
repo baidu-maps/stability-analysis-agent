@@ -4,6 +4,68 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-14
+
+### Added
+
+- `parse_stack_only`：生成可读的 `final_output.md`（三列表格：原日志行号 / 原始堆栈地址 / addr2line 解析结果），与 `full` 一样落盘人类可读报告。
+- 新增 `services/stack_resolve_report.py` 及单测，供 CLI / 报告产物复用。
+
+### Changed
+
+- Daemon `/result` 报告截取标题增加 `# 堆栈地址解析结果`，与全流程 `# 崩溃分析结果` 对齐。
+- CLI 产物清单与主产物路径：`parse_stack_only` 优先指向 `final_output.md`。
+
+### Documentation
+
+- CLI 命令参考中 `final_output.md` 适用范围更新为 `full` / `parse_stack_only`。
+- README / PyPI 发布说明中的最新版本号更新为 1.4.0。
+
+## [1.3.11] - 2026-09-10
+
+### Added
+
+- 代码上下文：崩溃行实参求值被调（`arg_eval`）展开与跨文件被调解析，优先保留全局 buffer / `c_str` 等生命周期风险片段。
+- Daemon `/status`、`/result`：从报告目录聚合 `completion_reason` / `stage_*` / `fix_notes` / `failure_detail`，便于数字员工可读失败原因。
+
+### Fixed
+
+- 自动改码：函数签名匹配更稳健（模板/`std::`/多行签名/NAMESPACE 宏短名），降低错抽或整段放弃。
+- Context 预算压缩：崩溃行 / 同步 / 写路径等 pin 段按优先级装箱，避免高价值上下文被末尾一刀切裁掉。
+- 修复管道：`changed_files` 与 applied 结果对齐；相关单测补充。
+
+### Documentation
+
+- README / PyPI 发布说明中的最新版本号更新为 1.3.11。
+
+## [1.3.10] - 2026-09-09
+
+### Fixed
+
+- 自动改码提取：`class`/`struct` 骨架围栏不再整段放弃 fast-path；跳过骨架后继续提取后续完整
+  `Class::method` / 析构函数围栏（修复「先类声明再函数」导致 0 edits）。
+- 「需要修改的函数」解析：兼容「### 6.1 直接修复」等非正式段落（`修改Xxx()`、析构叙述、独立函数围栏签名）。
+- Context-loop：修复代码含带占位的 class 骨架或臆造 `m_*Mutex`/`m_*Lock` 时强制续一轮纠正格式；
+  无可用锁时应写入「需人工处理」，禁止把臆造锁当作可自动应用补丁。
+
+### Changed
+
+- Prompt（fix 模式）：明确禁止「修复代码」输出 class/struct 骨架；新增成员一律进「需人工处理」。
+
+### Documentation
+
+- README / PyPI 发布说明中的最新版本号更新为 1.3.10。
+
+## [1.3.9] - 2026-09-09
+
+### Fixed
+
+- 自动改码写回：用 `newline=''` 读写以保留原文 CRLF/LF；替换函数时把 LLM 缩进对齐到原函数 Tab/空格风格；避免 `*/` 与函数签名挤到同一行。
+
+### Documentation
+
+- README / PyPI 发布说明中的最新版本号更新为 1.3.9。
+
 ## [1.3.8] - 2026-09-09
 
 ### Fixed

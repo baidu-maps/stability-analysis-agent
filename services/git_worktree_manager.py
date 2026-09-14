@@ -8,7 +8,6 @@ import os
 import re
 import subprocess
 import shutil
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -176,10 +175,16 @@ def revision_for_code_roots(code_roots: Sequence[str], *, include_diff: bool = F
 
 
 def default_worktree_root() -> Path:
+    """Root for per-run isolated fix worktrees.
+
+    Prefer ``STABILITY_AGENT_WORKTREE_DIR``. Otherwise use the agent cache
+    (``~/.cache/stability-analysis-agent/worktrees``) instead of ``/tmp``, so
+    production disks and ``bd-sa-gc`` can manage the same tree.
+    """
     configured = str(os.environ.get("STABILITY_AGENT_WORKTREE_DIR") or "").strip()
     if configured:
         return Path(configured).expanduser().resolve()
-    return Path(tempfile.gettempdir()) / "stability-analysis-agent" / "worktrees"
+    return Path.home() / ".cache" / "stability-analysis-agent" / "worktrees"
 
 
 def _run_git(repository: Path, args: Sequence[str]) -> str:

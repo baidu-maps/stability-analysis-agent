@@ -20,6 +20,7 @@ _MUST_TAGS = frozenset(
     {
         "崩溃函数",
         "崩溃行被调",
+        "参数求值被调",
         "栈序保留",
         "调用崩溃点",
         "线程投递对照",
@@ -368,7 +369,7 @@ def _selection_tier(
 
     if nfid in stack_norm:
         return 0
-    if "崩溃函数" in tag_set or "崩溃行被调" in tag_set:
+    if "崩溃函数" in tag_set or "崩溃行被调" in tag_set or "参数求值被调" in tag_set:
         return 1
     if _record_is_weak_only(tag_set, nfid, root_cause_norm):
         return 99

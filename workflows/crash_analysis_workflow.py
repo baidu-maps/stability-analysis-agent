@@ -2595,6 +2595,9 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 tags.add("崩溃函数")
             if str(node.get("role") or "") == "crash_line_callee":
                 tags.add("崩溃行被调")
+            if str(node.get("role") or "") == "arg_eval_callee":
+                tags.add("参数求值被调")
+                tags.add("崩溃行被调")  # 兼容既有 must 保活逻辑
             if nfid in primary_path_norm_ids:
                 tags.add("调用链")
             if nfid in caller_to_crash_norm:
@@ -2624,7 +2627,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
 
             if "栈序保留" in tags:
                 rec["priority"] = 0
-            elif "崩溃函数" in tags or "崩溃行被调" in tags:
+            elif "崩溃函数" in tags or "崩溃行被调" in tags or "参数求值被调" in tags:
                 rec["priority"] = 1
             elif "线程投递对照" in tags:
                 rec["priority"] = 2
@@ -2718,10 +2721,32 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             src_callees = diagnostics.get("crash_line_callees")
             if isinstance(src_callees, list) and src_callees:
                 meta["crash_line_callees"] = [str(x) for x in src_callees if str(x).strip()]
+            src_arg_eval = diagnostics.get("arg_eval_callees")
+            if isinstance(src_arg_eval, list) and src_arg_eval:
+                meta["arg_eval_callees"] = [str(x) for x in src_arg_eval if str(x).strip()]
             diagnostics["prompt_context_meta"] = meta
 
         complete_prompt_sigs: List[str] = []
         incomplete_prompt_sigs: List[str] = []
+        # 供预算压缩保活：崩溃函数 / 崩溃行被调 / 参数求值被调
+        crash_line_keep_items: List[Tuple[int, str, List[str]]] = []
+        # 同文件旁路候选（如 getAttributeInfo）：次于崩溃行，供多假说分级
+        bypass_keep_items: List[Tuple[int, str, List[str]]] = []
+        _CRASH_LINE_KEEP_TAGS = frozenset({"崩溃函数", "崩溃行被调", "参数求值被调"})
+        _BYPASS_NAME_RE = re.compile(
+            r"getAttributeInfo|getUniformInfo|operator\s*\[|resize\s*\(|push_back\s*\(",
+            re.I,
+        )
+        crash_files_for_bypass: Set[str] = set()
+        for cfid in crash_fn_norm_ids:
+            for nid, n in node_map.items():
+                if not isinstance(n, dict):
+                    continue
+                if _norm_graph_nid(str(nid)) == cfid or _norm_graph_nid(str(n.get("id") or "")) == cfid:
+                    fp = str(n.get("file") or "")
+                    if fp:
+                        crash_files_for_bypass.add(fp)
+                    break
         if not included_records:
             lines.append("- N/A")
             lines.append("")
@@ -2745,13 +2770,52 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     complete_prompt_sigs.append(sig)
                 else:
                     incomplete_prompt_sigs.append(sig)
-                lines.append(f"#### 函数源码: {sig}")
-                lines.append(f"- 文件: {node.get('file', 'N/A')}")
+                tags_raw = rec.get("tags") or set()
+                tag_set = set(tags_raw) if not isinstance(tags_raw, set) else tags_raw
+                keep_tags = [
+                    t
+                    for t in (
+                        "参数求值被调",
+                        "崩溃函数",
+                        "崩溃行被调",
+                        "栈序保留",
+                        "共享变量写",
+                    )
+                    if t in tag_set
+                ]
+                block_lines = [f"#### 函数源码: {sig}", f"- 文件: {node.get('file', 'N/A')}"]
+                if keep_tags:
+                    block_lines.append(f"- 来源标签: {', '.join(keep_tags)}")
                 if not is_complete_snippet:
-                    lines.append(f"- 片段说明: {incomplete_reason}")
-                lines.append("- 代码片段:")
-                lines.extend([str(s) for s in snippet])
-                lines.append("")
+                    block_lines.append(f"- 片段说明: {incomplete_reason}")
+                block_lines.append("- 代码片段:")
+                block_lines.extend([str(s) for s in snippet])
+                block_lines.append("")
+                lines.extend(block_lines)
+                # 崩溃行相关：另存一份保活，供 context_loop 24KB 压缩优先保留
+                if tag_set & _CRASH_LINE_KEEP_TAGS:
+                    if "参数求值被调" in tag_set:
+                        keep_rank = 0
+                    elif "崩溃函数" in tag_set:
+                        keep_rank = 1
+                    else:
+                        keep_rank = 2
+                    crash_line_keep_items.append((keep_rank, sig, list(block_lines)))
+                else:
+                    # 同文件旁路：容器/属性绑定等独立缺陷候选
+                    nfile = str(node.get("file") or "")
+                    sn_text = "\n".join(str(s) for s in snippet)
+                    is_bypass = bool(
+                        (nfile and nfile in crash_files_for_bypass)
+                        and (
+                            _BYPASS_NAME_RE.search(sig)
+                            or _BYPASS_NAME_RE.search(sn_text)
+                            or "共享变量写" in tag_set
+                        )
+                    )
+                    if is_bypass:
+                        bypass_rank = 0 if _BYPASS_NAME_RE.search(sig) else 1
+                        bypass_keep_items.append((bypass_rank, sig, list(block_lines)))
 
         if isinstance(code_context, dict):
             diagnostics = code_context.get("diagnostics")
@@ -2760,6 +2824,14 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 if isinstance(meta, dict):
                     meta["included_complete_signatures"] = list(complete_prompt_sigs)
                     meta["included_incomplete_signatures"] = list(incomplete_prompt_sigs)
+                    if crash_line_keep_items:
+                        meta["crash_line_keepalive_signatures"] = [
+                            sig for _rank, sig, _block in sorted(crash_line_keep_items, key=lambda x: (x[0], x[1]))
+                        ]
+                    if bypass_keep_items:
+                        meta["bypass_keepalive_signatures"] = [
+                            sig for _rank, sig, _block in sorted(bypass_keep_items, key=lambda x: (x[0], x[1]))
+                        ]
 
         # 输出类骨架（强归因且已写入 graph 时才有）：完整类结构供结构性修复参考
         emit_class_skeleton = not (
@@ -2918,6 +2990,102 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.extend(keep_block)
             lines.append("")
 
+        # 崩溃行关键源码保活：context_loop 预算压缩时优先于写路径保留
+        # （operator_delete / 参数求值生命周期案依赖此段，避免只剩 getAttributeInfo 写路径）
+        crash_line_keep_lines: List[str] = []
+        crash_line_keep_used = 0
+        crash_line_keep_budget = 14000
+        crash_line_keep_emitted = 0
+
+        def _truncate_keep_block(block: List[str], allow: int) -> List[str]:
+            """首个保活块过大时，优先保留含生命周期风险命中的尾部窗口。"""
+            text = "\n".join(block)
+            if len(text) <= allow:
+                return block
+            hit_idx = next(
+                (
+                    i
+                    for i, ln in enumerate(block)
+                    if ("g_strShader" in ln)
+                    or ("c_str()" in ln)
+                    or ("lifetime-risk" in ln)
+                    or ("truncated arg_eval" in ln)
+                ),
+                None,
+            )
+            if hit_idx is None:
+                cut = text[: max(0, allow - 60)].rstrip()
+                return cut.splitlines() + ["...[crash-line keepalive truncated]..."]
+            # 头（签名/标签）+ 命中窗口
+            head_n = min(12, len(block))
+            head = block[:head_n]
+            window = block[max(head_n, hit_idx - 2) : min(len(block), hit_idx + 40)]
+            out = head + ["// ... keepalive lifetime-risk window ..."] + window
+            out_text = "\n".join(out)
+            if len(out_text) > allow:
+                out_text = out_text[: max(0, allow - 60)].rstrip() + "\n...[crash-line keepalive truncated]..."
+                return out_text.splitlines()
+            if not any("truncated" in ln for ln in out):
+                out.append("...[crash-line keepalive truncated]...")
+            return out
+
+        for _rank, _sig, block in sorted(crash_line_keep_items, key=lambda x: (x[0], x[1])):
+            if crash_line_keep_emitted >= 8:
+                break
+            room = crash_line_keep_budget - crash_line_keep_used
+            if room < 400:
+                break
+            block_text = "\n".join(block)
+            if len(block_text) > room:
+                if crash_line_keep_emitted > 0 and room < 1200:
+                    break
+                block = _truncate_keep_block(block, room)
+                block_text = "\n".join(block)
+                if len(block_text) > room:
+                    continue
+            crash_line_keep_lines.extend(block)
+            crash_line_keep_used += len(block_text)
+            crash_line_keep_emitted += 1
+        if crash_line_keep_lines:
+            lines.append("### 崩溃行关键源码（压缩保活，优先分析崩溃行实参求值与被调）")
+            lines.append(
+                "- 说明: 以下优先保留崩溃函数、崩溃行直接被调与参数求值被调的函数体；"
+                "分析 heap/allocator abort 或 operator_delete 时，请先评估这些片段中的指针/字符串生命周期。"
+            )
+            lines.extend(crash_line_keep_lines)
+
+        # 同文件旁路候选保活：次于崩溃行；供主根因之外的独立缺陷（如 getAttributeInfo 越界）
+        bypass_keep_lines: List[str] = []
+        bypass_keep_used = 0
+        bypass_keep_budget = 8000
+        bypass_keep_emitted = 0
+        crash_line_sigs = {sig for _r, sig, _b in crash_line_keep_items}
+        for _rank, sig, block in sorted(bypass_keep_items, key=lambda x: (x[0], x[1])):
+            if sig in crash_line_sigs:
+                continue
+            if bypass_keep_emitted >= 3:
+                break
+            room = bypass_keep_budget - bypass_keep_used
+            if room < 400:
+                break
+            block_text = "\n".join(block)
+            if len(block_text) > room:
+                if bypass_keep_emitted > 0:
+                    break
+                cut = block_text[: max(0, room - 60)].rstrip()
+                block = cut.splitlines() + ["...[bypass keepalive truncated]..."]
+                block_text = "\n".join(block)
+            bypass_keep_lines.extend(block)
+            bypass_keep_used += len(block_text)
+            bypass_keep_emitted += 1
+        if bypass_keep_lines:
+            lines.append("### 同文件旁路候选源码（压缩保活，次于崩溃行；供旁路/次要假设）")
+            lines.append(
+                "- 说明: 与崩溃同文件、可能含独立缺陷（如属性/容器越界）的函数体；"
+                "评估时若不能解释本次检测点+栈，请列入「建议修改」而非唯一主根因。"
+            )
+            lines.extend(bypass_keep_lines)
+
         # 写路径完整函数体保活：避免预算压缩裁掉中间「函数源码」后无法改写侧
         # 优先：与崩溃函数共享同一 var| 的写边 > 同文件 > 其它 assign 噪音
         crash_write_fids: Set[str] = set()
@@ -3040,7 +3208,9 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         lines.append(
             "- 若存在 Abort message / Scudo / jemalloc / invalid chunk："
             "这是堆分配器在释放时检出损坏，不要当成普通业务 assert；"
-            "优先检查崩溃函数及其同文件被调函数中的 vector/new/delete 越界或 double-free。"
+            "优先检查：① 崩溃行参数求值被调的指针/字符串生命周期与全局 buffer；"
+            "② 崩溃函数及其同文件被调中的 vector/new/delete 越界或 double-free。"
+            "二者可能并存：栈更贴合的作**主根因**，同文件独立缺陷作**旁路候选**，禁止只报告其中一个就忽略另一个可见缺陷。"
         )
         lines.append(
             "- 不要根据被错误符号化的 libc 符号编造崩溃点；"
@@ -3052,17 +3222,26 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         lines.append(
             "- 修复代码必须带完整类名签名（`Class::method`），禁止把其它类的同名函数体写入当前文件。"
         )
+        lines.append(
+            "- **多假说分级（必须）**：禁止只给一个假说就收工。"
+            "若上文源码中存在多个机制都可能解释或加重本次故障，须并列并分级："
+            "主根因（解释检测点+栈，必须给出可应用修复）与旁路/次要假设"
+            "（同文件或同调用链上的独立缺陷；标明与本次崩溃关系："
+            "`直接` / `可能加重` / `无关但建议修`，以及证据等级）。"
+            "禁止把旁路缺陷写成唯一根因而忽略栈更贴合的主因；"
+            "也禁止为了「多改」而臆造未给出源码的函数。"
+        )
         lines.append("")
         lines.append("**通用分析步骤**：")
         lines.append("1. 明确崩溃点的直接原因（例如空指针、越界访问、使用已释放内存等）。")
-        lines.append("2. 结合调用链和共享数据流，分析导致该直接原因的上游逻辑。")
-        lines.append("3. 找出与崩溃点高度相关的函数或模块，判断是否存在设计或实现层面的缺陷。")
+        lines.append("2. 结合调用链和共享数据流，分析导致该直接原因的上游逻辑；同时扫描同文件/崩溃行被调中的其它独立缺陷。")
+        lines.append("3. 将假设分为「主根因」与「旁路候选」，并写明证据与和本次 abort 的关系。")
         if prompt_mode == "fix":
-            lines.append("4. 给出同时解决“症状”和“根因”的修复方案，而不仅仅是在崩溃点周围简单包裹保护代码。")
+            lines.append("4. 主根因必须给出同时解决“症状”和“根因”的修复；旁路候选有完整源码时可给建议修复，但不得替代主根因。")
             lines.append("5. 思考修复改动是否会影响其它调用方或线程，并在方案中说明。")
         else:
-            lines.append("4. 判断当前证据是否足够支持确定根因；不足时说明缺失信息与下一步排查方向。")
-            lines.append("5. 若提出修复方向，应说明它解决的证据链问题；若证据不足，不要为了改而改。")
+            lines.append("4. 判断当前证据是否足够支持确定主根因；不足时说明缺失信息与下一步排查方向。")
+            lines.append("5. 若提出修复方向，应说明它解决的证据链问题；旁路候选可单列；证据不足不要为了改而改。")
         lines.append("")
         lines.append("## 输出要求")
         if prompt_mode == "fix":
@@ -3070,11 +3249,16 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.append(
                 "1. **证据清单（使用分项序号）**：每条须引用上文函数源码中的 file:line 或片段内可见语句。"
             )
-            lines.append("2. 崩溃原因分析（直接原因和根本原因）。")
-            lines.append("3. 需要修改的函数列表（仅列出需要改动的函数）。")
             lines.append(
-                "4. 修复代码（仅包含「需要修改的函数」列表中的函数；每个函数给出最终完整可编译代码，"
-                "不得包含未列入该列表的函数，也不得重复粘贴无需改动的原函数）。"
+                "2. 崩溃原因分析：直接原因、**主根因**，以及 0–N 个**旁路/次要假设**（若上文无可并列缺陷，写「无」并简述已排除项）。"
+            )
+            lines.append(
+                "3. 需要修改的函数列表（仅列出需要改动的函数）：拆成"
+                "「必改（解释本次崩溃）」与可选的「建议修改（独立缺陷，不保证止住本次 abort）」。"
+            )
+            lines.append(
+                "4. 修复代码：必须覆盖全部「必改」项（每个给出最终完整可编译代码）；"
+                "「建议修改」仅在上文已有完整函数体且你选择一并修复时附加，否则放入「需人工处理」。"
             )
             lines.append("以上输出内容须满足下文「必须遵守的规则」。")
             if isinstance(evidence_summary, dict) and evidence_summary.get("auto_fix_allowed") is False:
@@ -3088,7 +3272,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.append("## 输出格式")
             lines.append("### 结论（崩溃定位与根因）")
             lines.append("- 直接原因：[具体原因]")
-            lines.append("- 根本原因：[根本原因]")
+            lines.append("- 主根因：[解释本次检测点+栈的根本原因]")
+            lines.append("- 旁路/次要假设：[无 / 列表；每项含：机制、与本次崩溃关系(直接/可能加重/无关但建议修)、证据等级]")
             lines.append("- 位置：[文件:行号]")
             lines.append("")
             lines.append("#### 关键证据（引用堆栈/代码）")
@@ -3096,17 +3281,22 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.append("- 证据2：[栈帧/文件:行号/代码语句]")
             lines.append("")
             lines.append("### 修复方案")
-            lines.append("#### 需要修改的函数（仅列出需要改动的函数）")
-            lines.append("- [函数名1] - [修改原因]")
-            lines.append("- [函数名2] - [修改原因]")
+            lines.append("#### 需要修改的函数（必改，解释本次崩溃）")
+            lines.append("- `[函数签名1]` - [修改原因；对应主根因]")
+            lines.append("- `[函数签名2]` - [修改原因]")
+            lines.append("")
+            lines.append("#### 建议修改的函数（独立缺陷；不保证止住本次 abort；可选）")
+            lines.append("- `[函数签名Y]` - [缺陷说明；与本次崩溃关系: …；证据等级: …]")
+            lines.append("- （若无）写：无")
             lines.append("")
             lines.append("#### 无法生成完整修复代码/需人工处理（可选）")
             lines.append("- [函数名Y] - [缺少哪些上下文，为什么不能输出完整可替换函数]")
             lines.append("")
-            lines.append("#### 修复代码（仅包含“需要修改的函数”）")
+            lines.append("#### 修复代码（仅包含“需要修改的函数（必改）”）")
             lines.append(
-                "（修复代码块中的函数必须与上一节「需要修改的函数」列表完全一致；"
-                "只粘贴列表中每一项的最终完整可编译代码，禁止粘贴未列入列表的函数或原样复制的无关函数）"
+                "（修复代码块中的函数必须与「需要修改的函数（必改）」列表完全一致；"
+                "只粘贴必改列表中每一项的最终完整可编译代码。"
+                "建议修改项若一并给出完整补丁，请另起小节「建议修复代码」并标明不保证止住本次 abort。）"
             )
             lines.append("")
             lines.append("## 必须遵守的规则")
@@ -3114,16 +3304,20 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.append("- 修复代码必须完整且可编译；")
             lines.append("- 修复代码必须相对提供的原源码包含实质逻辑变化；禁止仅调整格式、缩进、空行或只添加解释性注释作为修复。")
             lines.append(
-                "- **「需要修改的函数」与「修复代码」必须一一对应**：列表有几项，修复代码块中就只包含几项完整函数；"
+                "- **「需要修改的函数（必改）」与「修复代码」必须一一对应**：必改列表有几项，修复代码块中就只包含几项完整函数；"
                 "禁止多写、少写，或同一函数在列表与代码块中含义矛盾。"
             )
             lines.append(
-                "- **禁止**单独列出「无需修改的函数」章节；不需要改的函数不得出现在「需要修改的函数」或修复代码中；"
-                "若需在分析中说明某相关函数为何不改，仅在根因分析文字中简要带过，不要粘贴其源码。"
+                "- **禁止**单独列出「无需修改的函数」章节；不需要改的函数不得出现在「需要修改的函数（必改）」或修复代码中；"
+                "旁路独立缺陷请写入「建议修改的函数」或根因分析文字，不要用「无需修改」章节。"
+            )
+            lines.append(
+                "- 「建议修改的函数」不得替代主根因必改项；"
+                "不得把仅有旁路证据的函数唯一写入「需要修改的函数（必改）」。"
             )
             lines.append(
                 "- 对共享状态的其它读写函数，逐个判断其与崩溃路径的关系；"
-                "仅当确需修改时才纳入「需要修改的函数」与修复代码。"
+                "解释本次崩溃所必需的改动进「必改」；独立缺陷进「建议修改」。"
             )
             lines.append("- 允许标注“不确定/需要补充信息”，但必须说明缺失的具体证据；禁止把未经证实的猜测写成结论。")
             lines.append("- 若删除或改写 `Base::method(...)`/继承链关键调用，必须在结论中明确给出语义等价性或替代路径依据。")
@@ -3145,13 +3339,18 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 "- 若根因涉及共享指针/共享状态的 TOCTOU（检查与使用之间被并发改写）："
                 "读者与写者（赋值、置空、delete/释放）应一并评估；"
                 "写路径函数体可能在「函数源码」或「写路径函数源码（压缩保活）」中给出；"
-                "只要上文已给出完整函数体，就**必须**将其列入「需要修改的函数」并与读侧同锁保护，"
+                "只要上文已给出完整函数体，就**必须**将其列入「需要修改的函数（必改）」并与读侧同锁保护，"
                 "且修复代码中必须给出该写路径的完整可替换函数体；"
                 "禁止只输出读侧修复。若写路径体未给出，则把写路径保护列为「需人工处理」，"
                 "禁止只改读侧却声称竞态已彻底修复。"
             )
             lines.append("- **修复代码格式**：每个修复函数必须使用独立的 ```cpp 围栏包裹；函数体必须完整，禁止用 `...`、`// ...`、`/* ... */`、`[其他代码]`、`其他逻辑保持不变`、`省略` 等任何占位内容代替代码行。")
-            lines.append("- “需要修改的函数”列表中的每一项，都必须在“修复代码”中给出对应的完整函数定义（包含函数签名、完整函数体和全部原有必要逻辑），不能只给函数体片段、局部代码片段、diff 片段或伪代码。")
+            lines.append(
+                "- **禁止**在「修复代码」中输出带 `// ...` /「其他成员」占位的 class/struct 骨架或整类声明块；"
+                "不得用类声明代替可替换函数。新增成员（含 mutex/lock）一律写入「无法生成完整修复代码/需人工处理」，"
+                "「修复代码」仅允许完整的 `Class::method` / 析构函数定义围栏。"
+            )
+            lines.append("- “需要修改的函数（必改）”列表中的每一项，都必须在“修复代码”中给出对应的完整函数定义（包含函数签名、完整函数体和全部原有必要逻辑），不能只给函数体片段、局部代码片段、diff 片段或伪代码。")
             lines.append(
                 "- 修复代码必须保持原函数签名不变：不得修改返回类型、函数名、类作用域、参数列表、const/static/virtual 等限定；"
                 "构造函数和析构函数绝对不能添加返回类型（例如禁止写成 `VBool Class::~Class()`）。"
@@ -3162,12 +3361,12 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             )
             lines.append("- 如果确实需要调整函数签名或类接口，不能输出自动替换代码；应放到“无法生成完整修复代码/需人工处理”并说明需要人工同步修改声明、定义和所有调用点。")
             lines.append(
-                "- 如果当前上下文不足以输出某个函数的完整可替换代码，必须不要把该函数列入“需要修改的函数”；"
-                "应放到“无法生成完整修复代码/需人工处理”并说明缺少哪些上下文。"
+                "- 如果当前上下文不足以输出某个函数的完整可替换代码，必须不要把该函数列入“需要修改的函数（必改）”；"
+                "应放到“无法生成完整修复代码/需人工处理”或「建议修改的函数」并说明缺少哪些上下文。"
             )
             lines.append(
-                "- 仅当上文「函数源码」或「写路径函数源码（压缩保活）」中已给出该函数的完整函数体时，"
-                "才允许将其列入「需要修改的函数」并输出可替换代码；"
+                "- 仅当上文「函数源码」「崩溃行关键源码」「同文件旁路候选源码」或「写路径函数源码（压缩保活）」中已给出该函数的完整函数体时，"
+                "才允许将其列入「需要修改的函数（必改）」或「建议修改的函数」并输出可替换代码；"
                 "禁止修改仅出现在分析文字、类骨架或不完整片段中的函数。"
             )
             lines.append("- 禁止在修复函数中用注释表示保留原逻辑；所有未改动但仍需要保留的原代码也必须原样写出。")
@@ -3195,7 +3394,10 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.append("### 结论（崩溃定位与置信度）")
             lines.append("- 置信度：[高/中/低]")
             lines.append("- 直接原因：[已证实的直接原因；若不足请说明]")
-            lines.append("- 可能根因：[根因或推断路径；不确定处必须标注]")
+            lines.append("- 主根因：[解释本次检测点+栈；不确定处必须标注]")
+            lines.append(
+                "- 旁路/次要假设：[无 / 列表；每项含机制、与本次崩溃关系(直接/可能加重/无关但建议修)、证据等级]"
+            )
             lines.append("- 位置：[文件:行号/栈帧/日志字段]")
             lines.append("")
             lines.append("#### 关键证据（引用日志/堆栈/代码）")
@@ -3203,12 +3405,15 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.append("- 证据2：[栈帧/文件:行号/代码语句/日志字段]")
             lines.append("")
             lines.append("### 相关代码分析")
-            lines.append("- [函数或模块]：[为什么相关、支持或反驳什么结论]")
+            lines.append("- [函数或模块]：[为什么相关、支持或反驳什么结论；主因还是旁路]")
             lines.append("")
             lines.append("### 修复或排查建议")
             lines.append(
-                "- 若证据足够：[最小修复方向、风险点和验证方式；"
+                "- 主根因：[最小修复方向、风险点和验证方式；"
                 "若上下文完整且确需修改，可给出完整可替换的 C/C++ 修复代码块]"
+            )
+            lines.append(
+                "- 旁路候选：[建议修 / 需补充上下文；标明不保证止住本次 abort]"
             )
             lines.append(
                 "- 若证据不足：[缺失信息、建议补充的日志/断点/复现路径/人工确认点；"
@@ -3566,6 +3771,17 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         snippet = self._sanitize_prompt_function_snippet(sig, raw_snippet)
         has_signature = self._find_signature_index_in_snippet(sig, snippet) is not None
         has_omission = self._snippet_has_omission_marker(snippet)
+        role = str(node.get("role") or "").strip()
+        # 巨型参数求值被调已在 CCP 侧按生命周期风险截断；禁止回源撑爆 prompt / 保活段
+        if role == "arg_eval_callee":
+            if snippet:
+                return (
+                    snippet,
+                    bool(has_signature and not has_omission and self._is_complete_function_snippet(snippet)),
+                    ""
+                    if (has_signature and not has_omission)
+                    else "参数求值被调体已截断保活（保留生命周期风险命中）",
+                )
         if has_signature and not has_omission and self._is_complete_function_snippet(snippet):
             return snippet, True, ""
 

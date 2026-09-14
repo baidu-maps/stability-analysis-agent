@@ -93,6 +93,22 @@ def _run_tool(deps: RepairActionDeps, name: str, payload: Dict[str, Any]) -> Dic
     return gateway.execute(name, tool, data)
 
 
+def changed_files_from_applied_result(applied: Optional[Dict[str, Any]]) -> List[str]:
+    """Return files that were actually written (status == applied).
+
+    Skipped / failed entries must not enter ``declared_changed_files``; otherwise
+    ``change_manifest`` treats them as missing and rolls back valid patches.
+    """
+    rows = (applied or {}).get("applied") if isinstance(applied, dict) else None
+    if not isinstance(rows, list):
+        return []
+    return [
+        str(item.get("file"))
+        for item in rows
+        if isinstance(item, dict) and item.get("status") == "applied" and item.get("file")
+    ]
+
+
 def _apply_patch_handler(deps: RepairActionDeps, payload: Dict[str, Any]) -> Dict[str, Any]:
     from services.repair_context_bundle import build_repair_context_bundle
     # Make the evidence package available to both the fast path and the LLM
@@ -121,10 +137,7 @@ def _apply_patch_handler(deps: RepairActionDeps, payload: Dict[str, Any]) -> Dic
         if not isinstance(applied, dict):
             raise TypeError("apply_fix_fn must return an object")
         deps.applied_fix_result = applied
-        deps.changed_files = [
-            str(item.get("file")) for item in applied.get("applied", [])
-            if isinstance(item, dict) and item.get("file")
-        ]
+        deps.changed_files = changed_files_from_applied_result(applied)
         session = deps.result.get("context_session") if isinstance(deps.result.get("context_session"), dict) else None
         if session is not None:
             from services.evidence_graph import append_graph_observation
@@ -158,11 +171,7 @@ def _apply_patch_handler(deps: RepairActionDeps, payload: Dict[str, Any]) -> Dic
             relation="changes", hypothesis_ids=[str(x.get("id")) for x in (session.get("hypotheses") or []) if isinstance(x, dict)],
         )
     deps.applied_fix_result = applied
-    deps.changed_files = [
-        str(item.get("file"))
-        for item in (applied.get("applied") or [])
-        if isinstance(item, dict) and item.get("file")
-    ]
+    deps.changed_files = changed_files_from_applied_result(applied)
     return applied
 
 
