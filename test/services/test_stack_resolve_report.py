@@ -54,7 +54,7 @@ class StackResolveReportTests(unittest.TestCase):
             },
             crash_info={"signal": "SIGSEGV", "crash_reason": "null deref"},
         )
-        self.assertIn("# 堆栈地址解析结果", md)
+        self.assertIn("## 堆栈地址解析结果", md)
         self.assertIn("| 原日志行号 | 原始堆栈地址 | 解析结果（addr2line） |", md)
         self.assertIn("| 31 |", md)
         self.assertIn("`000000000071802c`", md)

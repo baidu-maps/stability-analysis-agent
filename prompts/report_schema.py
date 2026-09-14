@@ -10,10 +10,12 @@ from typing import Optional
 
 
 # 完整的结构化报告模板（在 full 模式下追加到 prompt 末尾）
+# 章节用 ###/####，避免 ## 在 Markdown 预览中相对正文字号过大。
 STRUCTURED_REPORT_INSTRUCTION = """\
 请严格按照以下固定结构输出分析报告（不要改变章节顺序或遗漏章节）：
+标题层级要求：一级章节用 ``###``，二级小节用 ``####``；不要使用 ``#`` 或 ``##``。
 
-## 1. 故障基本信息
+### 1. 故障基本信息
 
 | 字段 | 值 |
 |------|---|
@@ -23,13 +25,13 @@ STRUCTURED_REPORT_INSTRUCTION = """\
 | 平台 | (iOS / Android / macOS / Linux / HarmonyOS) |
 | 崩溃模块 | (崩溃发生的 .so/.dylib/.framework 名) |
 
-## 2. 三级根因定位
+### 2. 三级根因定位
 
 | 一级根因(大类) | 二级根因(机制) | 三级根因(具体原因) |
 |----------------|----------------|---------------------|
 | (如: 空指针解引用) | (如: 对象生命周期错误) | (如: 异步回调持有裸指针，owner已析构) |
 
-## 3. 证据链
+### 3. 证据链
 
 列出支撑根因判断的所有证据，每条引用原始日志片段：
 
@@ -38,27 +40,27 @@ STRUCTURED_REPORT_INSTRUCTION = """\
 
 2. **[证据类型]**: ...
 
-## 4. 置信度与证据等级
+### 4. 置信度与证据等级
 
 - **整体置信度**: 高 / 中 / 低（必须使用中文，禁止输出 HIGH/MEDIUM/LOW）
 - **证据等级**: (直接用中文描述证据强弱与缺口，例如「指令与寄存器联合证据充分」或「证据链不完整，缺少……」；禁止输出 Tier 1/2/3 等编号前缀)
 - **评估理由**: (为何给出此置信度)
 
-## 5. 责任归属
+### 5. 责任归属
 
 - **责任方**: 应用代码 / 三方SDK / 系统框架
 - **责任模块**: (具体 .so / .framework / 包名)
 - **归属依据**: (通过什么证据判定责任方)
 
-## 6. 修复建议
+### 6. 修复建议
 
-### 6.1 直接修复（代码级）
+#### 6.1 直接修复（代码级）
 (具体代码修改建议)
 
-### 6.2 防御性措施（架构级）
+#### 6.2 预防性措施（架构级）
 (长期改进建议)
 
-## 7. Crash 复现场景
+### 7. Crash 复现场景
 
 - **场景描述**: (根据根因描述最可能触发本问题的通用场景)
 - **前置条件**: (列表)
@@ -69,7 +71,7 @@ STRUCTURED_REPORT_INSTRUCTION = """\
 - **估计可信度**: 高 / 中 / 低
 - **估计依据**: (明确区分日志事实与推测)
 
-## 8. 需补充材料
+### 8. 需补充材料
 
 - [ ] 是否需要符号文件（当前是否已符号化）
 - [ ] 是否需要完整源码
@@ -109,10 +111,14 @@ def get_report_instruction(
     if mode == "full":
         instruction = STRUCTURED_REPORT_INSTRUCTION
         if not include_reproduction:
-            start = instruction.find("## 7. Crash 复现场景")
-            end = instruction.find("## 8. 需补充材料")
+            start = instruction.find("### 7. Crash 复现场景")
+            end = instruction.find("### 8. 需补充材料")
             if start >= 0 and end > start:
-                instruction = instruction[:start] + "## 7. 需补充材料\n" + instruction[end + len("## 8. 需补充材料\n"):]
+                instruction = (
+                    instruction[:start]
+                    + "### 7. 需补充材料\n"
+                    + instruction[end + len("### 8. 需补充材料\n"):]
+                )
         parts.append(instruction)
     else:
         parts.append(REPORT_STRUCTURE_HINT)

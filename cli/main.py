@@ -6828,9 +6828,9 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
             parse_result = result.get("parse_result", {}) or {}
             crash_info = parse_result.get("crash_info", {}) or {}
             lines = [
-                "# 崩溃分析结果",
+                "## 崩溃分析结果",
                 "",
-                "## 崩溃信息",
+                "### 崩溃信息",
                 f"- **错误类型**: {crash_info.get('signal', 'N/A')}",
                 f"- **崩溃原因**: {crash_info.get('crash_reason', 'N/A')}",
                 f"- **崩溃地址**: {crash_info.get('crash_address', 'N/A')}",
@@ -6841,7 +6841,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
             resolved = result.get("resolved_stack", {}) or {}
             resolved_threads = resolved.get("resolved_threads") or []
             if resolved_threads:
-                lines.append("## 解析后的堆栈（按线程）")
+                lines.append("### 解析后的堆栈（按线程）")
                 sc = resolved.get("success_count")
                 tc = resolved.get("total_count")
                 ftot = resolved.get("frame_count_total")
@@ -6862,7 +6862,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
                         tag += "+main"
                     elif is_main is False:
                         tag += "+bg"
-                    hdr = f"### [{tag}]"
+                    hdr = f"#### [{tag}]"
                     if tid is not None:
                         hdr += f" {tid}"
                     if tname:
@@ -6941,7 +6941,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
                                 else crash_summary.get("selected_analysis_is_crash_thread")
                             )
                             if selected_is_crash is False:
-                                lines.append("## 业务排查入口（非确定崩溃点）")
+                                lines.append("### 业务排查入口（非确定崩溃点）")
                                 entry_func = (
                                     entry_location.get("function")
                                     or crash_summary.get("analysis_entry_function")
@@ -6979,7 +6979,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
                                     lines.append(f"- 说明: {note}")
                                 lines.append("")
                             else:
-                                lines.append("## 崩溃点源码定位（回退）")
+                                lines.append("### 崩溃点源码定位（回退）")
                                 line_no = (
                                     crash_location.get("line")
                                     or crash_summary.get("crash_line_number")
@@ -7002,11 +7002,11 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
                                 lines.append(f"- {entry_func} ({loc})")
                                 lines.append("")
             if result.get("analysis"):
-                lines.append("## AI 分析")
+                lines.append("### AI 分析")
                 lines.append(str(result.get("analysis")))
             if applied_fix_result is not None:
                 lines.append("")
-                lines.append("## AI 自动改码结果")
+                lines.append("### AI 自动改码结果")
                 if applied_fix_result.get("success"):
                     for item in applied_fix_result.get("applied", []):
                         if item.get("status") == "applied":
@@ -7015,7 +7015,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
                     lines.append(f"- 未应用修改: {applied_fix_result.get('error', '未知原因')}")
             output = "\n".join(lines)
         else:
-            output = f"# 错误\n\n{result.get('error')}"
+            output = f"## 错误\n\n{result.get('error')}"
 
     if (
         scope == "parse_stack_only"

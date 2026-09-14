@@ -840,6 +840,26 @@ def _json_response(
     handler.wfile.write(data)
 
 
+def _value_error_payload(exc: BaseException) -> Dict[str, Any]:
+    """Map request/protocol ``ValueError`` to a stable JSON error body for HTTP 400.
+
+    ``run_request_from_dict`` and engine resolution raise ``ValueError`` for bad client
+    input. Callers must convert these to 400 instead of re-raising: an uncaught exception
+    in ``Handler.do_*`` skips the response body and clients see hang / HTTP 000.
+    """
+    message = str(exc)
+    if "engine must be one of" in message:
+        return {"error": "invalid_engine", "message": message}
+    if message.startswith("removed protocol fields:"):
+        return {"error": "removed_protocol_fields", "message": message}
+    return {"error": "invalid_request", "message": message}
+
+
+def _json_response_for_value_error(handler: BaseHTTPRequestHandler, exc: BaseException) -> None:
+    """Reply HTTP 400 for a protocol/request validation ``ValueError``."""
+    _json_response(handler, HTTPStatus.BAD_REQUEST, _value_error_payload(exc))
+
+
 DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024
 
 
@@ -1710,9 +1730,14 @@ def _wait_cli_process(process: subprocess.Popen, run: RunState) -> int:
             return -15
 
 
+# Prefer "## …" before "# …" so find("# …") does not match inside "## …".
 _REPORT_MARKS = (
+    "## 崩溃分析结果",
+    "## 堆栈地址解析结果",
     "# 崩溃分析结果",
     "# 堆栈地址解析结果",
+    "## Crash Analysis Result",
+    "## Crash analysis",
     "# Crash Analysis Result",
     "# Crash analysis",
 )
@@ -2897,10 +2922,7 @@ class Handler(BaseHTTPRequestHandler):
                 active = executor.executor.list_active() if hasattr(executor, "executor") else executor.list_active()
                 _json_response(self, HTTPStatus.OK, active)
             except ValueError as exc:
-                if "engine must be one of" in str(exc):
-                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid_engine", "message": str(exc)})
-                else:
-                    raise
+                _json_response_for_value_error(self, exc)
             except Exception as e:
                 _json_response(self, HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
             return
@@ -3067,10 +3089,7 @@ class Handler(BaseHTTPRequestHandler):
                     headers={"Retry-After": "5"},
                 )
             except ValueError as exc:
-                if "engine must be one of" in str(exc):
-                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid_engine", "message": str(exc)})
-                else:
-                    raise
+                _json_response_for_value_error(self, exc)
             except DaemonHttpError as exc:
                 _json_response(self, int(exc.status), exc.payload)
             except Exception as e:
@@ -3148,10 +3167,7 @@ class Handler(BaseHTTPRequestHandler):
                 }, engine=body.get("engine"))
                 _json_response(self, HTTPStatus.OK, result)
             except ValueError as exc:
-                if "engine must be one of" in str(exc):
-                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid_engine", "message": str(exc)})
-                else:
-                    raise
+                _json_response_for_value_error(self, exc)
             except DaemonHttpError as exc:
                 _json_response(self, int(exc.status), exc.payload)
             except Exception as e:
@@ -3172,10 +3188,7 @@ class Handler(BaseHTTPRequestHandler):
                 }, engine=body.get("engine"))
                 _json_response(self, HTTPStatus.OK, result)
             except ValueError as exc:
-                if "engine must be one of" in str(exc):
-                    _json_response(self, HTTPStatus.BAD_REQUEST, {"error": "invalid_engine", "message": str(exc)})
-                else:
-                    raise
+                _json_response_for_value_error(self, exc)
             except DaemonHttpError as exc:
                 _json_response(self, int(exc.status), exc.payload)
             except Exception as e:

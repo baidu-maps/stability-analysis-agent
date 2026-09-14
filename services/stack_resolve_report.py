@@ -108,15 +108,16 @@ def build_parse_stack_only_markdown(
     2. 原始堆栈地址（``address``）
     3. addr2line 解析结果（函数 + file:line）
     """
+    # 标题用 ##/###，避免 #/## 在预览里相对正文字号过大。
     lines: List[str] = [
-        "# 堆栈地址解析结果",
+        "## 堆栈地址解析结果",
         "",
     ]
     info = crash_info if isinstance(crash_info, dict) else {}
     if info:
         lines.extend(
             [
-                "## 崩溃信息",
+                "### 崩溃信息",
                 f"- **错误类型**: {info.get('signal', 'N/A')}",
                 f"- **崩溃原因**: {info.get('crash_reason', 'N/A')}",
                 f"- **崩溃地址**: {info.get('crash_address', 'N/A')}",
@@ -139,13 +140,13 @@ def build_parse_stack_only_markdown(
     if tool_name:
         meta_bits.append(f"工具 `{tool_name}`")
     if meta_bits:
-        lines.append("## 解析摘要")
+        lines.append("### 解析摘要")
         lines.append("- " + "；".join(meta_bits))
         lines.append("")
 
     lines.extend(
         [
-            "## 符号化堆栈",
+            "### 符号化堆栈",
             "",
             "| 原日志行号 | 原始堆栈地址 | 解析结果（addr2line） |",
             "| ---: | --- | --- |",

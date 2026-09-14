@@ -429,6 +429,27 @@ class DaemonRunLifecycleTests(unittest.TestCase):
             else:
                 os.environ["STABILITY_AGENT_DAEMON_MAX_BODY_BYTES"] = old
 
+    def test_post_runs_removed_protocol_fields_return_400(self) -> None:
+        """Removed protocol keys must 400 quickly (not hang / HTTP 000)."""
+        status, payload = self._request(
+            "POST",
+            "/runs",
+            {"crash_log": "/tmp/demo.crash", "skip_ai": True, "code_root": "/tmp/code"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload.get("error"), "removed_protocol_fields")
+        self.assertIn("skip_ai", payload.get("message", ""))
+        self.assertIn("code_root", payload.get("message", ""))
+
+    def test_value_error_payload_maps_engine_and_generic(self) -> None:
+        """Stable error codes for engine vs other validation ValueErrors."""
+        engine = server._value_error_payload(ValueError("engine must be one of: direct, langchain, langgraph"))
+        self.assertEqual(engine["error"], "invalid_engine")
+        removed = server._value_error_payload(ValueError("removed protocol fields: skip_ai"))
+        self.assertEqual(removed["error"], "removed_protocol_fields")
+        other = server._value_error_payload(ValueError("unexpected client input"))
+        self.assertEqual(other["error"], "invalid_request")
+
 
 if __name__ == "__main__":
     unittest.main()

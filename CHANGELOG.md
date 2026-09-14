@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-09-14
+
+### Fixed
+
+- Daemon：请求/协议类 ``ValueError``（含已移除字段如 ``skip_ai`` / ``code_root``、非法 ``engine``）统一映射为 HTTP **400** JSON，避免 Handler 未捕获导致客户端挂起 / HTTP 000。
+- 报告标题层级：``final_output.md`` / 结构化分析报告改为 ``##``/``###``/``####``，避免 Markdown 预览中相对正文字号过大；Daemon 截取报告时同时识别新旧标题标记。
+
+### Changed
+
+- Prompt 结构化报告模板章节降级为 ``###``/``####``，并明确禁止使用 ``#``/``##`` 作为章节标题。
+
+### Documentation
+
+- README / PyPI 发布说明中的最新版本号更新为 1.4.1。
+
 ## [1.4.0] - 2026-09-14
 
 ### Added
