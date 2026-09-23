@@ -10,8 +10,8 @@ class EngineHarnessTests(unittest.TestCase):
         config = {"provider": "openai", "model": "test", "api_key": "x", "base_url": "http://127.0.0.1"}
         with patch.object(LLMAdapterFactory, "create", side_effect=lambda value: value) as factory:
             for engine in ("direct", "langchain", "langgraph"):
-                adapter = LLMAdapterFactory.create({**config, "engine": engine})
-                self.assertEqual(adapter["engine"], engine)
+                adapter = LLMAdapterFactory.create({**config, "demo": engine})
+                self.assertEqual(adapter["demo"], engine)
         self.assertEqual(factory.call_count, 3)
 
     def test_unknown_engine_is_rejected_without_fallback(self):
@@ -41,7 +41,7 @@ class EngineHarnessTests(unittest.TestCase):
     def test_offline_replay_is_network_free_for_every_engine(self):
         for engine in ("direct", "langchain", "langgraph"):
             adapter = LLMAdapterFactory.create({
-                "engine": engine,
+                "demo": engine,
                 "provider": "offline_replay",
                 "responses": [{"content": engine, "usage": {"input_tokens": 2, "output_tokens": 1}}],
             })

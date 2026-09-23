@@ -14,9 +14,17 @@ def analyze_artifact_path(report_dir: Path) -> Path:
 
 
 def save_analyze_artifact(report_dir: Path, payload: Dict[str, Any]) -> Path:
+    """Persist an analyze-stage artifact with an additive structured envelope."""
     path = analyze_artifact_path(report_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    value = dict(payload or {})
+    value.setdefault("schema_version", 3)
+    value.setdefault("artifact_type", "stage_result")
+    value.setdefault("stage", "analyze")
+    metadata = value.get("metadata") if isinstance(value.get("metadata"), dict) else {}
+    if "evidence_contract" not in value and isinstance(metadata.get("evidence_contract"), dict):
+        value["evidence_contract"] = metadata["evidence_contract"]
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path
 
 
@@ -108,6 +116,7 @@ def hydrate_problem_from_artifact(problem: Dict[str, Any], artifact: Dict[str, A
     for key in (
         "parse_result", "resolved_stack", "code_context", "crash_diagnosis",
         "analysis", "final_tip", "agent_rounds", "memory_maps", "status",
+        "evidence_contract", "source_identity", "verification",
     ):
         if key in artifact and artifact.get(key) is not None:
             out[f"_hydrated_{key}"] = artifact.get(key)

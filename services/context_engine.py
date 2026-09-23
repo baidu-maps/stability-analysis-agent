@@ -809,6 +809,14 @@ class ContextEngine:
         r"use-after-free|double[\s_-]?free",
         re.IGNORECASE,
     )
+    # 容器拷贝竞态：展开成员写路径须在预算压缩时单独保活，不能被同步段吞掉或挤掉。
+    # 注意：不要用「写路径函数源码」标题本身作触发条件，以免 heap/lifetime 案误抬写路径。
+    _CONTAINER_COPY_RACE_HINT_RE = re.compile(
+        r"箭头展开容器成员|已定位展开成员的写|container_copy_write|"
+        r"expanded_container_member|"
+        r"(?:Array|Vector|List)\s*::\s*Copy|std\s*::\s*vector|operator\s*=.*容器|容器拷贝",
+        re.IGNORECASE,
+    )
 
     @classmethod
     def _slice_section_until(cls, body: str, start: int, stop_pats: Sequence[str]) -> str:
@@ -825,14 +833,23 @@ class ContextEngine:
         """预算压缩时优先保留的稳定上下文片段。
 
         返回 ``(priority, block)``，数值越小越优先保活。
-        崩溃行/参数求值源码优先于写路径与类骨架，避免 heap/lifetime 案被 TOCTOU 写路径挤掉。
+        默认：崩溃行/参数求值源码优先于写路径，避免 heap/lifetime 案被 TOCTOU 写路径挤掉。
+        若证据指向容器拷贝竞态（展开成员写路径），则抬高写路径 pin，避免被同步段吞并或挤掉。
         """
         pins: List[Tuple[int, str]] = []
         body = str(text or "")
+        prefer_write_path = bool(cls._CONTAINER_COPY_RACE_HINT_RE.search(body))
         stop_common = (
             r"\n# 崩溃分析任务",
             r"\n## 分析指导",
             r"\n## 输出格式",
+        )
+        stop_peers = (
+            r"\n### 同文件旁路候选源码",
+            r"\n### 关键同步与共享成员",
+            r"\n### 写路径函数源码",
+            r"\n### 崩溃行关键源码",
+            r"\n### 崩溃所属类骨架",
         )
 
         crash_line_marker = "### 崩溃行关键源码"
@@ -841,16 +858,11 @@ class ContextEngine:
             block = cls._slice_section_until(
                 body,
                 crash_line_pos,
-                stop_common
-                + (
-                    r"\n### 同文件旁路候选源码",
-                    r"\n### 关键同步与共享成员",
-                    r"\n### 写路径函数源码",
-                    r"\n### 崩溃所属类骨架",
-                ),
+                stop_common + stop_peers,
             )
             if block:
-                pins.append((0, block))
+                # 容器拷贝竞态时写路径与崩溃行同档；heap 案仍让崩溃行独占最高优。
+                pins.append((1 if prefer_write_path else 0, block))
 
         bypass_marker = "### 同文件旁路候选源码"
         bypass_pos = body.find(bypass_marker)
@@ -858,23 +870,22 @@ class ContextEngine:
             block = cls._slice_section_until(
                 body,
                 bypass_pos,
-                stop_common
-                + (
-                    r"\n### 崩溃行关键源码",
-                    r"\n### 关键同步与共享成员",
-                    r"\n### 写路径函数源码",
-                    r"\n### 崩溃所属类骨架",
-                ),
+                stop_common + stop_peers,
             )
             if block:
-                pins.append((1, block))
+                pins.append((2, block))
 
         sync_marker = "### 关键同步与共享成员"
         sync_pos = body.find(sync_marker)
         if sync_pos >= 0:
-            block = cls._slice_section_until(body, sync_pos, stop_common)
+            # 必须在写路径标题处截断，禁止把「写路径函数源码」吞进同步 pin。
+            block = cls._slice_section_until(
+                body,
+                sync_pos,
+                stop_common + stop_peers,
+            )
             if block:
-                pins.append((2, block))
+                pins.append((3, block))
 
         write_marker = "### 写路径函数源码"
         write_pos = body.find(write_marker)
@@ -884,15 +895,11 @@ class ContextEngine:
                 block = cls._slice_section_until(
                     body,
                     write_pos,
-                    stop_common
-                    + (
-                        r"\n### 关键同步与共享成员",
-                        r"\n### 崩溃行关键源码",
-                        r"\n### 同文件旁路候选源码",
-                    ),
+                    stop_common + stop_peers,
                 )
                 if block:
-                    pins.append((3, block))
+                    # 容器拷贝竞态：写路径提到最高优先（0）；否则保持次于崩溃行/旁路。
+                    pins.append((0 if prefer_write_path else 4, block))
 
         skel_pin = cls._compact_class_skeleton_pin(body)
         if skel_pin and not any(skel_pin == p for _prio, p in pins):
@@ -900,7 +907,7 @@ class ContextEngine:
             if any("关键同步与共享成员" in (p or "") and "m_" in (p or "") for _prio, p in pins):
                 pass
             else:
-                pins.append((4, skel_pin))
+                pins.append((5, skel_pin))
         pins.sort(key=lambda item: (item[0], -len(item[1])))
         return pins
 
@@ -911,18 +918,39 @@ class ContextEngine:
         pinned_budget: int,
         *,
         prefer_crash_line: bool,
+        prefer_write_path: bool = False,
     ) -> str:
         """按优先级装箱 pin 段；超预算时截断低优先级，而不是从拼接末尾一刀切。"""
         if pinned_budget <= 0 or not pinned_parts:
             return ""
-        # 0=崩溃行 1=同文件旁路 2=同步 3=写路径 4=类骨架
-        share_by_prio = {
-            0: 0.55 if prefer_crash_line else 0.45,
-            1: 0.22 if prefer_crash_line else 0.15,
-            2: 0.12,
-            3: 0.08 if prefer_crash_line else 0.22,
-            4: 0.05,
-        }
+        # priority 语义见 _extract_pinned_stable_sections；share 按场景倾斜预算。
+        if prefer_write_path:
+            share_by_prio = {
+                0: 0.42,  # 写路径（容器拷贝竞态）
+                1: 0.28,  # 崩溃行
+                2: 0.12,  # 旁路
+                3: 0.12,  # 同步
+                4: 0.05,
+                5: 0.03,
+            }
+        elif prefer_crash_line:
+            share_by_prio = {
+                0: 0.55,  # 崩溃行
+                1: 0.08,
+                2: 0.22,  # 旁路
+                3: 0.10,  # 同步
+                4: 0.08,  # 写路径
+                5: 0.05,
+            }
+        else:
+            share_by_prio = {
+                0: 0.45,
+                1: 0.10,
+                2: 0.15,
+                3: 0.12,
+                4: 0.22,  # 写路径
+                5: 0.05,
+            }
         selected: List[str] = []
         used = 0
         for prio, block in pinned_parts:
@@ -935,7 +963,7 @@ class ContextEngine:
             if room <= 0:
                 break
             allow = min(room, soft_cap if used > 0 or prio > 0 else room)
-            # 最高优段（崩溃行）尽量吃满剩余预算上限
+            # 最高优段尽量吃满本档预算
             if prio == 0:
                 allow = min(room, max(soft_cap, int(pinned_budget * frac)))
             if len(block) <= allow:
@@ -944,7 +972,7 @@ class ContextEngine:
                 continue
             if allow < 400:
                 continue
-            if int(prio) == 0:
+            if int(prio) == 0 and "崩溃行关键源码" in block:
                 trimmed = cls._truncate_crash_line_pin(block, allow)
             else:
                 trimmed = block[: allow - 40].rstrip() + "\n...[pinned section truncated]...\n"
@@ -1006,16 +1034,28 @@ class ContextEngine:
         if limit <= len(marker):
             return text[: max(0, limit)]
         pinned_parts = cls._extract_pinned_stable_sections(text)
-        prefer_crash_line = bool(cls._HEAP_DELETE_HINT_RE.search(text)) or any(
-            prio == 0 for prio, _block in pinned_parts
+        prefer_write_path = bool(cls._CONTAINER_COPY_RACE_HINT_RE.search(text)) or any(
+            prio == 0 and "写路径函数源码" in (block or "") for prio, block in pinned_parts
+        )
+        prefer_crash_line = (
+            (not prefer_write_path)
+            and (
+                bool(cls._HEAP_DELETE_HINT_RE.search(text))
+                or any(prio == 0 for prio, _block in pinned_parts)
+            )
         )
         task_marker = "\n# 崩溃分析任务"
         task_idx = text.find(task_marker)
         task_tail = text[task_idx:] if task_idx >= 0 else ""
         # 任务节至少保留引导与关键规则头，避免压缩后丢失输出契约
         task_reserve = min(len(task_tail), max(800, int(limit * 0.22))) if task_tail else 0
-        # 有崩溃行保活时，把更多预算给 pin（首轮性价比），头部只留摘要/证据
-        pin_frac = 0.62 if prefer_crash_line else 0.50
+        # 容器拷贝竞态把更多预算给写路径 pin；heap 案把预算给崩溃行 pin
+        if prefer_write_path:
+            pin_frac = 0.66
+        elif prefer_crash_line:
+            pin_frac = 0.62
+        else:
+            pin_frac = 0.50
         pinned_budget = min(
             max(3500, int(limit * pin_frac)),
             max(0, limit - len(marker) - task_reserve - 256),
@@ -1024,6 +1064,7 @@ class ContextEngine:
             pinned_parts,
             pinned_budget,
             prefer_crash_line=prefer_crash_line,
+            prefer_write_path=prefer_write_path,
         )
         suffix = ""
         if pinned:

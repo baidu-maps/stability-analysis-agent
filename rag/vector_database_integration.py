@@ -104,6 +104,14 @@ class StabilityMemorySystem:
             "confidence_score": float(pattern.get("confidence_score", 0.0)),
             "validation_state": pattern.get("validation_state", "draft"),
             "source_type": pattern.get("source_type", "internal_case"),
+            "pack_id": str(pattern.get("pack_id") or ""),
+            "doc_path": str(pattern.get("doc_path") or ""),
+            "kb_layer": str(pattern.get("kb_layer") or ""),
+            "provenance": str(pattern.get("provenance") or ""),
+            "codebase_id": str(pattern.get("codebase_id") or ""),
+            "engine_version": str(pattern.get("engine_version") or ""),
+            "source_commit": str(pattern.get("source_commit") or ""),
+            "root_cause_confidence": float(pattern.get("root_cause_confidence") or 0.0),
         }
         return self.pattern_index.add_pattern(
             pattern_id=pattern["pattern_id"],
@@ -152,6 +160,14 @@ class StabilityMemorySystem:
                     "crash_category": meta.get("crash_category"),
                     "evidence_requirements": meta.get("evidence_requirements"),
                     "source_type": meta.get("source_type"),
+                    "pack_id": (h.get("metadata") or {}).get("pack_id", ""),
+                    "doc_path": (h.get("metadata") or {}).get("doc_path", ""),
+                    "kb_layer": (h.get("metadata") or {}).get("kb_layer", ""),
+                    "provenance": (h.get("metadata") or {}).get("provenance", ""),
+                    "codebase_id": (h.get("metadata") or {}).get("codebase_id", ""),
+                    "engine_version": (h.get("metadata") or {}).get("engine_version", ""),
+                    "source_commit": (h.get("metadata") or {}).get("source_commit", ""),
+                    "root_cause_confidence": (h.get("metadata") or {}).get("root_cause_confidence", 0.0),
                 }
             )
         out.sort(key=lambda x: x.get("score", 0.0), reverse=True)

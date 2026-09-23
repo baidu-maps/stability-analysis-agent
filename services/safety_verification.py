@@ -14,6 +14,7 @@ CORE_SAFETY_CHECKS = (
     "patch_applied",
     "workspace_boundary",
     "change_manifest",
+    "diff_hygiene",
 )
 
 
@@ -34,14 +35,19 @@ def _inside(path: str, roots: Sequence[str]) -> bool:
 
 @dataclass(frozen=True)
 class SafetyContext:
+    """Inputs for deterministic patch-safety checks."""
+
     applied_result: Mapping[str, Any]
     declared_changed_files: Sequence[str]
     actual_changed_files: Sequence[str]
     workspace_roots: Sequence[str]
+    diff_text: str = ""
 
 
 @dataclass(frozen=True)
 class SafetyCheckResult:
+    """One deterministic safety-check outcome."""
+
     name: str
     status: str
     summary: str
@@ -91,7 +97,7 @@ class SafetyVerificationRunner:
                     "所有修改均位于指定工作区" if not outside else "存在工作区之外的修改",
                     {"workspace_roots": roots, "outside_files": outside},
                 )
-            else:
+            elif name == "change_manifest":
                 missing = sorted(set(declared) - set(actual))
                 undeclared = sorted(set(actual) - set(declared))
                 passed = not missing and not undeclared
@@ -99,6 +105,20 @@ class SafetyVerificationRunner:
                     name, "passed" if passed else "failed",
                     "补丁记录与实际 Git 修改完全一致" if passed else "补丁记录与实际 Git 修改不一致",
                     {"missing_files": missing, "undeclared_files": undeclared},
+                )
+            else:
+                trailing = [
+                    line
+                    for line in str(context.diff_text or "").splitlines()
+                    if line.startswith("+")
+                    and not line.startswith("+++")
+                    and line[1:].endswith((" ", "\t"))
+                ]
+                result = SafetyCheckResult(
+                    name,
+                    "passed" if not trailing else "failed",
+                    "新增行无尾随空白" if not trailing else "新增行包含尾随空白",
+                    {"trailing_whitespace_lines": trailing[:20]},
                 )
             results.append(result)
         status = "passed" if all(item.status == "passed" for item in results) else "failed"

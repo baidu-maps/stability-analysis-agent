@@ -17,12 +17,12 @@ class TestCodeIndexService(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "src")
             os.makedirs(src)
-            path = os.path.join(src, "VMapControl.cpp")
+            path = os.path.join(src, "DemoMapControl.cpp")
             with open(path, "w", encoding="utf-8") as f:
                 f.write("void foo() {}\n")
             service = CodeIndexService(tmp)
             self.assertTrue(service.wait_ready(timeout=5.0))
-            hits = service.lookup("VMapControl.cpp")
+            hits = service.lookup("DemoMapControl.cpp")
             self.assertIn(os.path.abspath(path), [os.path.abspath(p) for p in hits])
 
     def test_multi_root_cache(self):
@@ -41,7 +41,7 @@ class TestCtagsFunctionIndex(unittest.TestCase):
         sample = "\n".join(
             [
                 "!_TAG_FILE_FORMAT\t2\t/extended format/",
-                "ReleaseAllLayers\t/tmp/VMapControl.cpp\t/^VVoid CVMapControl::ReleaseAllLayers()/;\"\tf\tline:774",
+                "ReleaseAllLayers\t/tmp/DemoMapControl.cpp\t/^void DemoMapControl::ReleaseAllLayers()/;\"\tf\tline:774",
                 "main\t/tmp/main.cpp\t/^int main()/;\"\tf\tline:10",
             ]
         )
@@ -54,10 +54,10 @@ class TestCtagsFunctionIndex(unittest.TestCase):
 
     def test_parse_bsd_ctags_format(self):
         with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as tmp:
-            tmp.write("VVoid CVMapControl::ReleaseAllLayers() {}\n")
+            tmp.write("void DemoMapControl::ReleaseAllLayers() {}\n")
             tmp_path = tmp.name
         try:
-            sample = f"ReleaseAllLayers\t{tmp_path}\t/^VVoid CVMapControl::ReleaseAllLayers()/"
+            sample = f"ReleaseAllLayers\t{tmp_path}\t/^void DemoMapControl::ReleaseAllLayers()/"
             index = CtagsFunctionIndex([])
             index._parse_tags_stream([sample])
             index._ready = True

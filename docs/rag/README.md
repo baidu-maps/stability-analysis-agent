@@ -8,6 +8,15 @@
 - 向量兜底（`PatternIndex` / ChromaDB）
 - 元数据推理（`MetadataStore` / SQLite）
 
+代码库 Knowledge Pack 通过 `knowledge_plane` 使用同一 `PatternIndex`，不会创建第二套
+向量库。可用以下命令幂等建立 Pack chunk 索引：
+
+```bash
+python3 -m knowledge_plane.ingest \
+  --vector-db-path ./vector_db \
+  --pack-dir /path/to/knowledge_packs
+```
+
 对应实现位于 `rag/` 目录（代码实现，不包含数据库文件）。
 
 ## 目录与职责

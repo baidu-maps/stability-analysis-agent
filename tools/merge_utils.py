@@ -311,12 +311,20 @@ def _resolve_crash_location(
                         location["source"] = "from_log_deduce"
                 break
 
-    # analysis_entry fallback
+    # analysis_entry fallback：入口文件可回退到 location.file，但行号不得跨文件混用。
     if not location.get("analysis_entry_file"):
         location["analysis_entry_file"] = location.get("file")
     if not location.get("analysis_entry_function"):
         location["analysis_entry_function"] = location.get("function")
+    entry_file = str(location.get("analysis_entry_file") or "")
+    loc_file = str(location.get("file") or "")
+    entry_base = entry_file.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    loc_base = loc_file.replace("\\", "/").rsplit("/", 1)[-1].lower()
     if not location.get("analysis_entry_line"):
-        location["analysis_entry_line"] = location.get("line")
+        # 仅当入口文件与定位文件同基名时，才把 line 当作入口行号。
+        if entry_base and loc_base and entry_base == loc_base:
+            location["analysis_entry_line"] = location.get("line")
+        else:
+            location["analysis_entry_line"] = None
 
     return location

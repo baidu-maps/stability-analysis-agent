@@ -37,7 +37,7 @@ class TestCliReplayAndStreaming(unittest.TestCase):
                 "crash_log": "/tmp/demo.crash",
                 "crash_log_source": "file",
                 "scope": "full",
-                "engine": "direct",
+                "demo": "direct",
                 "prompt_mode": "analysis",
                 "output_format": "markdown",
             }
@@ -152,7 +152,7 @@ class TestCliReplayAndStreaming(unittest.TestCase):
             },
             "effective_parameters": {
                 "scope": "full",
-                "engine": "direct",
+                "demo": "direct",
                 "output_format": "markdown",
                 "prompt_mode": "analysis",
                 "agent_loop": "context_loop",
@@ -234,7 +234,7 @@ class TestCliReplayAndStreaming(unittest.TestCase):
             "crash_log_source": "stdin",
             "crash_log_content": "crash log content",
             "scope": "gen_prompt_only",
-            "engine": "direct",
+            "demo": "direct",
             "output_format": "markdown",
         }
         argv, cleanup_paths = _build_replay_argv_from_record(record)
@@ -251,7 +251,7 @@ class TestCliReplayAndStreaming(unittest.TestCase):
             "crash_log_source": "content",
             "crash_log_content": "crash log content",
             "scope": "full",
-            "engine": "direct",
+            "demo": "direct",
             "output_format": "markdown",
         }
         argv, cleanup_paths = _build_replay_argv_from_record(record)
@@ -268,7 +268,7 @@ class TestCliReplayAndStreaming(unittest.TestCase):
             "crash_log_source": "dir",
             "crash_log_dir": "/tmp/logs",
             "scope": "full",
-            "engine": "direct",
+            "demo": "direct",
             "output_format": "markdown",
         }
         argv, cleanup_paths = _build_replay_argv_from_record(record)
@@ -282,7 +282,7 @@ class TestCliReplayAndStreaming(unittest.TestCase):
             {
                 "crash_log_source": "file",
                 "crash_log_file": "/tmp/demo.crash",
-                "engine": "direct",
+                "demo": "direct",
                 "scope": "parse_log_only",
                 "code_roots": [],
             }
@@ -297,7 +297,7 @@ class TestCliReplayAndStreaming(unittest.TestCase):
             {
                 "crash_log_source": "content",
                 "crash_log_content": "line1\nline2",
-                "engine": "direct",
+                "demo": "direct",
                 "scope": "full",
                 "code_roots": [],
             }

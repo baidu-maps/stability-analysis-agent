@@ -140,5 +140,45 @@ class TestExtensions(unittest.TestCase):
                 os.environ.pop("STABILITY_AGENT_USER_EXT_DIR", None)
 
 
+class TestReportDirname(unittest.TestCase):
+    def test_default_dirname_is_timestamp_and_crash_stem(self) -> None:
+        from types import SimpleNamespace
+
+        from cli.main import _build_report_dirname, _crash_stem_from_args
+
+        args = SimpleNamespace(
+            crash_log=None,
+            crash_log_file="/tmp/logs/cppcrash-com.okii.xtcwatch-20020214.crash",
+            crash_log_content=None,
+            crash_log_dir=None,
+            scope="parse_stack_only",
+            engine="direct",
+        )
+        name = _build_report_dirname(args)
+        self.assertRegex(name, r"^\d{8}_\d{6}_cppcrash-com\.okii\.xtcwatch-20020214$")
+        self.assertNotIn("analysis_", name)
+        self.assertNotIn("parse_stack_only", name)
+        self.assertNotIn("direct", name)
+        self.assertEqual(
+            _crash_stem_from_args(args),
+            "cppcrash-com.okii.xtcwatch-20020214",
+        )
+
+    def test_crash_stem_truncates_long_names(self) -> None:
+        from types import SimpleNamespace
+
+        from cli.main import _REPORT_CRASH_STEM_MAX, _crash_stem_from_args
+
+        long_stem = "a" * (_REPORT_CRASH_STEM_MAX + 40)
+        args = SimpleNamespace(
+            crash_log=None,
+            crash_log_file=f"/tmp/{long_stem}.crash",
+            crash_log_content=None,
+            crash_log_dir=None,
+        )
+        stem = _crash_stem_from_args(args)
+        self.assertLessEqual(len(stem), _REPORT_CRASH_STEM_MAX)
+
+
 if __name__ == "__main__":
     unittest.main()

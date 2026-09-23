@@ -22,7 +22,7 @@ from tools.resolve_stack_errors import (
 
 HARMONY_PC = (
     "#00 pc 00000000001d8250 /system/lib/ld-musl-aarch64.so.1\n"
-    "#02 pc 0000000000255f20 /data/storage/el1/bundle/libs/arm64/libapp_BaiduVIlib.so\n"
+    "#02 pc 0000000000255f20 /data/storage/el1/bundle/libs/arm64/libapp_DemoUtil.so\n"
 )
 
 DOC = {
@@ -53,7 +53,7 @@ DOC = {
             "frames": [
                 {
                     "address": "0x255f20",
-                    "module": "libapp_BaiduVIlib.so",
+                    "module": "libapp_DemoUtil.so",
                     "library_type": "app",
                 }
             ],
@@ -65,7 +65,7 @@ DOC = {
 class TestAdd2lineMultiThread(unittest.TestCase):
     def test_resolved_threads_structure(self):
         lib_dir = tempfile.mkdtemp(prefix="add2line_mt_")
-        lib_path = os.path.join(lib_dir, "libapp_BaiduVIlib.so")
+        lib_path = os.path.join(lib_dir, "libapp_DemoUtil.so")
         with open(lib_path, "wb"):
             pass
         try:
@@ -78,13 +78,13 @@ class TestAdd2lineMultiThread(unittest.TestCase):
                 for t in threads
                 for f in (t.get("frames") or [])
             }
-            self.assertIn("libapp_BaiduVIlib.so", mods)
+            self.assertIn("libapp_DemoUtil.so", mods)
             self.assertNotIn("libace_compatible.z.so", mods)
             self.assertNotIn("libmmi-client.z.so", mods)
             self.assertNotIn("resolved_frames", out)
             flat = flatten_resolved_frames_from_stack(out)
             flat_mods = {f.get("module") for f in flat}
-            self.assertIn("libapp_BaiduVIlib.so", flat_mods)
+            self.assertIn("libapp_DemoUtil.so", flat_mods)
             self.assertTrue(resolved_stack_has_usable_resolution(out))
             self.assertIsNotNone(out.get("frame_count_total"))
         finally:
@@ -118,7 +118,7 @@ class TestAdd2lineMultiThread(unittest.TestCase):
             },
         }
         lib_dir = tempfile.mkdtemp(prefix="add2line_hy_")
-        with open(os.path.join(lib_dir, "libapp_BaiduVIlib.so"), "wb"):
+        with open(os.path.join(lib_dir, "libapp_DemoUtil.so"), "wb"):
             pass
         try:
             sample = "crashDiagnosis: " + json.dumps(doc, ensure_ascii=False)

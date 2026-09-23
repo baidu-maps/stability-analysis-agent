@@ -101,12 +101,11 @@ def build_parse_stack_only_markdown(
     crash_info: Optional[Dict[str, Any]] = None,
     max_frames: int = 200,
 ) -> str:
-    """生成堆栈地址解析报告 Markdown（三列表格）。
+    """生成堆栈地址解析报告 Markdown（两列表格）。
 
     列含义：
-    1. 原日志行号（``raw_log_line``）
-    2. 原始堆栈地址（``address``）
-    3. addr2line 解析结果（函数 + file:line）
+    1. 原始堆栈地址（``address``）
+    2. addr2line 解析结果（函数 + file:line）
     """
     # 标题用 ##/###，避免 #/## 在预览里相对正文字号过大。
     lines: List[str] = [
@@ -148,13 +147,13 @@ def build_parse_stack_only_markdown(
         [
             "### 符号化堆栈",
             "",
-            "| 原日志行号 | 原始堆栈地址 | 解析结果（addr2line） |",
-            "| ---: | --- | --- |",
+            "| 原始堆栈地址 | 解析结果（addr2line） |",
+            "| --- | --- |",
         ]
     )
 
     if not pairs:
-        lines.append("| — | — | （无可用符号化帧） |")
+        lines.append("| — | （无可用符号化帧） |")
         lines.append("")
         return "\n".join(lines)
 
@@ -163,7 +162,7 @@ def build_parse_stack_only_markdown(
     for thread, frame in pairs:
         if shown >= max(1, int(max_frames or 200)):
             rest = len(pairs) - shown
-            lines.append(f"| — | — | … 还有 {rest} 帧未列出 |")
+            lines.append(f"| — | … 还有 {rest} 帧未列出 |")
             break
         thread_key = (
             f"{thread.get('tid')}|{thread.get('name')}|{thread.get('is_crash_thread')}"
@@ -187,14 +186,12 @@ def build_parse_stack_only_markdown(
                 header += f" `{tid}`"
             if name:
                 header += f" ({name})"
-            # 线程分隔行：三列合并语义用首列说明
-            lines.append(f"| {_cell(header)} |  |  |")
+            # 线程分隔行：两列合并语义用首列说明
+            lines.append(f"| {_cell(header)} |  |")
 
-        raw_line = frame.get("raw_log_line")
         address = str(frame.get("address") or "").strip() or "—"
         detail = format_addr2line_detail(frame)
         lines.append(
-            f"| {_cell(raw_line if raw_line is not None else '—')} "
             f"| `{_cell(address)}` "
             f"| {_cell(detail)} |"
         )

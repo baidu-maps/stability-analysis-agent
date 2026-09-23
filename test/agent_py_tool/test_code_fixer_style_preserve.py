@@ -42,9 +42,9 @@ class CodeFixerStylePreserveTests(unittest.TestCase):
 
     def test_adapt_spaces_to_tabs(self) -> None:
         """原函数用 Tab 缩进时，LLM 的 4 空格应折成 Tab。"""
-        old = "VVoid Foo::Bar()\n{\n\tint x = 1;\n\tif (x) {\n\t\tx++;\n\t}\n}\n"
+        old = "void Foo::Bar()\n{\n\tint x = 1;\n\tif (x) {\n\t\tx++;\n\t}\n}\n"
         repl = (
-            "VVoid Foo::Bar()\n"
+            "void Foo::Bar()\n"
             "{\n"
             "    int x = 1;\n"
             "    if (x) {\n"
@@ -60,28 +60,28 @@ class CodeFixerStylePreserveTests(unittest.TestCase):
     def test_ensure_newline_after_block_comment(self) -> None:
         """`*/` 后紧接签名时应插入换行。"""
         prefix = "\t/** 参见类定义*/"
-        repl = "VVoid CNaviEngineControl::HandleRemoveRouteMessage()\n{\n}\n"
+        repl = "void DemoEngineControl::HandleClearItem()\n{\n}\n"
         out = _ensure_newline_before_replacement(prefix, repl)
-        self.assertTrue(out.startswith("\nVVoid"))
+        self.assertTrue(out.startswith("\nvoid"))
         glued = prefix + out
-        self.assertIn("*/\nVVoid", glued)
-        self.assertNotIn("*/VVoid", glued)
+        self.assertIn("*/\nvoid", glued)
+        self.assertNotIn("*/void", glued)
 
     def test_align_leading_newline_prevents_comment_glue(self) -> None:
         """old_block 含前导换行而补丁没有时，补上换行。"""
-        old = "\nVVoid Foo::Bar()\n{\n}\n"
-        repl = "VVoid Foo::Bar()\n{\n\treturn;\n}\n"
+        old = "\nvoid Foo::Bar()\n{\n}\n"
+        repl = "void Foo::Bar()\n{\n\treturn;\n}\n"
         out = _align_leading_newline(old, repl)
-        self.assertTrue(out.startswith("\nVVoid"))
+        self.assertTrue(out.startswith("\nvoid"))
 
     def test_replace_function_block_keeps_comment_on_own_line(self) -> None:
         """替换时不把上一行 `*/` 与新签名挤到同一行。"""
         source = (
             "class C {\n"
             "/** 参见类定义*/\n"
-            "VVoid C::HandleRemoveRouteMessage()\n"
+            "void C::HandleClearItem()\n"
             "{\n"
-            "\tm_pclCurRoute = V_NULL;\n"
+            "\tm_pCurrentItem = nullptr;\n"
             "}\n"
             "};\n"
         )
@@ -89,35 +89,35 @@ class CodeFixerStylePreserveTests(unittest.TestCase):
         # 把注释与签名写在同一逻辑位置前的 prefix 上。
         mashed_source = (
             "class C {\n"
-            "/** 参见类定义*/VVoid C::HandleRemoveRouteMessage()\n"
+            "/** 参见类定义*/void C::HandleClearItem()\n"
             "{\n"
-            "\tm_pclCurRoute = V_NULL;\n"
+            "\tm_pCurrentItem = nullptr;\n"
             "}\n"
             "};\n"
         )
         replacement = (
-            "VVoid C::HandleRemoveRouteMessage()\n"
+            "void C::HandleClearItem()\n"
             "{\n"
             "\tm_clRouteInfoMutex.Lock(V_INFINITY_WAIT);\n"
-            "\tm_pclCurRoute = V_NULL;\n"
+            "\tm_pCurrentItem = nullptr;\n"
             "\tm_clRouteInfoMutex.Unlock();\n"
             "}\n"
         )
         new_src, old = CodeFixer.replace_function_block(
             mashed_source,
-            "VVoid C::HandleRemoveRouteMessage()",
+            "void C::HandleClearItem()",
             replacement,
         )
         self.assertIsNotNone(old)
-        self.assertIn("*/\nVVoid C::HandleRemoveRouteMessage()", new_src)
-        self.assertNotIn("*/VVoid", new_src)
+        self.assertIn("*/\nvoid C::HandleClearItem()", new_src)
+        self.assertNotIn("*/void", new_src)
         # 正常分行源也仍可替换
         new2, _ = CodeFixer.replace_function_block(
             source,
-            "VVoid C::HandleRemoveRouteMessage()",
+            "void C::HandleClearItem()",
             replacement,
         )
-        self.assertIn("HandleRemoveRouteMessage", new2)
+        self.assertIn("HandleClearItem", new2)
         self.assertIn("m_clRouteInfoMutex", new2)
 
     def test_read_text_raw_roundtrip_bytes(self) -> None:

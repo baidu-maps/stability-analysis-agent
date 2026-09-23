@@ -24,17 +24,17 @@ from tools.code_content_provider_tool import CodeContentProvider
 class TestStackSymbolUtils(unittest.TestCase):
     def test_sanitize_rtf_trailing_backslash(self):
         self.assertEqual(
-            sanitize_stack_symbol("walk_navi::CRoute::GetLegSize\\"),
-            "walk_navi::CRoute::GetLegSize",
+            sanitize_stack_symbol("demo_ns::DemoRoute::GetSegmentCount\\"),
+            "demo_ns::DemoRoute::GetSegmentCount",
         )
         self.assertEqual(sanitize_stack_symbol("_pthread_start}"), "_pthread_start")
 
     def test_is_cpp_native_symbol_without_parens(self):
         self.assertTrue(
-            is_cpp_native_stack_symbol("walk_navi::CRoute::GetLegSize")
+            is_cpp_native_stack_symbol("demo_ns::DemoRoute::GetSegmentCount")
         )
         self.assertTrue(
-            is_cpp_native_stack_symbol("walk_navi::CRoute::GetLegSize\\")
+            is_cpp_native_stack_symbol("demo_ns::DemoRoute::GetSegmentCount\\")
         )
         self.assertFalse(is_cpp_native_stack_symbol("-[Foo bar:]"))
         self.assertTrue(is_objc_stack_symbol("-[Foo bar:]"))
@@ -49,7 +49,7 @@ class TestStackSymbolUtils(unittest.TestCase):
             should_keep_frame_for_cpp_stack_output(
                 {
                     "address": "0x2",
-                    "resolved_function": "_baidu_vi::MTLVertexBuffer::createPrivateBuffer",
+                    "resolved_function": "demo_util::DemoVertexBuffer::createPrivateBuffer",
                 }
             )
         )
@@ -62,23 +62,23 @@ class TestStackSymbolUtils(unittest.TestCase):
     def test_extract_cpp_qualified_parts_without_parens(self):
         p = CodeContentProvider()
         self.assertEqual(
-            p._extract_cpp_qualified_parts("walk_navi::CRoute::GetLegSize"),
-            ("walk_navi::CRoute", "GetLegSize"),
+            p._extract_cpp_qualified_parts("demo_ns::DemoRoute::GetSegmentCount"),
+            ("demo_ns::DemoRoute", "GetSegmentCount"),
         )
 
     def test_looks_like_cpp_qualified_stack(self):
         sample = """
         Thread 0 Crashed:
-        0 10ae3b7c8 walk_navi::CRoute::GetLegSize + 0
-        1 10b170ecc walk_navi::CPanoramaRouteDataFactory::HandleDataFail + 0
+        0 10ae3b7c8 demo_ns::DemoRoute::GetSegmentCount + 0
+        1 10b170ecc demo_ns::DemoRouteDataFactory::HandleDataFail + 0
         """
         self.assertTrue(looks_like_cpp_qualified_stack(sample))
 
     def test_rtf_to_plain_text(self):
-        rtf = r"{\rtf1\ansi walk_navi::CRoute::GetLegSize\par null pointer dereference\par}"
+        rtf = r"{\rtf1\ansi demo_ns::DemoRoute::GetSegmentCount\par null pointer dereference\par}"
         self.assertTrue(looks_like_rtf(rtf))
         plain = rtf_to_plain_text(rtf)
-        self.assertIn("walk_navi::CRoute::GetLegSize", plain)
+        self.assertIn("demo_ns::DemoRoute::GetSegmentCount", plain)
         self.assertIn("null pointer dereference", plain)
 
 
@@ -92,8 +92,8 @@ class TestTopmostLocatableCrashFrame(unittest.TestCase):
             root = Path(td) / "src"
             root.mkdir()
             (root / "buf.mm").write_text(
-                "namespace _baidu_vi {\n"
-                "void MTLVertexBuffer::createPrivateBuffer() {}\n"
+                "namespace demo_util {\n"
+                "void DemoVertexBuffer::createPrivateBuffer() {}\n"
                 "}\n",
                 encoding="utf-8",
             )
@@ -104,13 +104,13 @@ class TestTopmostLocatableCrashFrame(unittest.TestCase):
                 },
                 {
                     "address": "0x2",
-                    "resolved_function": "_baidu_vi::MTLVertexBuffer::createPrivateBuffer",
+                    "resolved_function": "demo_util::DemoVertexBuffer::createPrivateBuffer",
                 },
             ]
             p = CodeContentProvider(code_parser_backend="regex")
             picked = p._select_topmost_locatable_crash_frame(frames, [str(root)])
             self.assertIsNotNone(picked)
-            self.assertIn("MTLVertexBuffer", picked.get("resolved_function", ""))
+            self.assertIn("DemoVertexBuffer", picked.get("resolved_function", ""))
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
@@ -120,7 +120,7 @@ class TestTopmostLocatableCrashFrame(unittest.TestCase):
         with patch("tools.code_content_provider_tool.os.walk", side_effect=AssertionError("unexpected walk")):
             self.assertIsNone(
                 p._find_cpp_qualified_definition_location(
-                    "_baidu_vi::MissingClass::missingMethod()", ["/tmp/nonexistent"]
+                    "demo_util::MissingClass::missingMethod()", ["/tmp/nonexistent"]
                 )
             )
 
@@ -147,9 +147,9 @@ class TestSymbolOnlyPassthrough(unittest.TestCase):
             root = Path(td) / "src"
             root.mkdir()
             (root / "route.cpp").write_text(
-                "namespace walk_navi {\n"
-                "int CRoute::GetLegSize() { return 0; }\n"
-                "void CPanoramaRouteDataFactory::HandleDataFail() {}\n"
+                "namespace demo_ns {\n"
+                "int DemoRoute::GetSegmentCount() { return 0; }\n"
+                "void DemoRouteDataFactory::HandleDataFail() {}\n"
                 "}\n",
                 encoding="utf-8",
             )
@@ -158,7 +158,7 @@ class TestSymbolOnlyPassthrough(unittest.TestCase):
                     "resolved_frames": [
                         {
                             "address": "10ae3b7c8",
-                            "resolved_function": "walk_navi::CRoute::GetLegSize\\",
+                            "resolved_function": "demo_ns::DemoRoute::GetSegmentCount\\",
                             "resolved_file": None,
                             "resolved_line": None,
                         }
@@ -172,8 +172,12 @@ class TestSymbolOnlyPassthrough(unittest.TestCase):
             p = CodeContentProvider(code_parser_backend="regex")
             out = json.loads(p.code_content_provider(add2line, str(root)))
             self.assertNotIn("error", out, out.get("error"))
-            self.assertIn("crash_summary", out)
-            self.assertIn("route.cpp", out["crash_summary"].get("node_id", ""))
+            graph = out.get("graph") or {}
+            nodes = graph.get("nodes") or []
+            self.assertTrue(nodes, msg=f"expected graph nodes, got {out.keys()}")
+            joined = json.dumps(nodes, ensure_ascii=False)
+            self.assertIn("route.cpp", joined)
+            self.assertIn("GetSegmentCount", joined)
         finally:
             shutil.rmtree(td, ignore_errors=True)
 

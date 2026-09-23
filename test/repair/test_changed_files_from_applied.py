@@ -35,7 +35,7 @@ class ChangedFilesFromAppliedTests(unittest.TestCase):
 
     def test_apply_patch_declared_list_ignores_skipped_edits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            applied_file = str(Path(tmp) / "walk_naviengine_control.cpp")
+            applied_file = str(Path(tmp) / "demo_engine_control.cpp")
             skipped_file = str(Path(tmp) / "walk_guidance_control.cpp")
 
             def _apply_fix_fn(**_kwargs):
@@ -45,13 +45,13 @@ class ChangedFilesFromAppliedTests(unittest.TestCase):
                         {
                             "file": applied_file,
                             "status": "applied",
-                            "function_signature": "CVArray<RenderStep> CNaviEngineControl::GetRenderSteps()",
+                            "function_signature": "DemoArray<RenderStep> DemoEngineControl::GetDrawSteps()",
                         },
                         {
                             "file": skipped_file,
                             "status": "skipped",
                             "error": "replacement_code 的类名/函数名与目标签名不一致，已拒绝写入",
-                            "function_signature": "CVArray<RenderStep> CNaviGuidanceControl::GetRenderSteps()",
+                            "function_signature": "DemoArray<RenderStep> DemoGuidanceControl::GetDrawSteps()",
                         },
                     ],
                 }

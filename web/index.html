@@ -29,6 +29,21 @@
           <span>源码 code_roots（每行一个）</span>
           <textarea id="wsCodeRoots" rows="3"></textarea>
         </label>
+        <label class="field">
+          <span>Knowledge Pack 目录（每行一个）</span>
+          <textarea id="knowledgePackDirs" rows="2"></textarea>
+        </label>
+        <label class="field">
+          <span>Knowledge Pack ID（留空自动路由）</span>
+          <input id="knowledgePackId" type="text" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span><input id="domainKnowledgeEnabled" type="checkbox" checked /> 启用代码库领域知识</span>
+        </label>
+        <label class="field">
+          <span>知识命中数 / 字符预算</span>
+          <input id="knowledgeBudget" type="text" value="4 / 4500" autocomplete="off" />
+        </label>
         <button type="button" id="btnSaveWorkspace" class="btn ghost block">保存工作区</button>
       </section>
 

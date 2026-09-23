@@ -19,13 +19,13 @@ class TestSnippetExtractorTool(unittest.TestCase):
             fp = Path(td) / "templ.h"
             fp.write_text(
                 "template< class TYPE >\n"
-                "VINLINE VVoid VDelete(TYPE* pObjects)\n"
+                "inline void DemoDelete(TYPE* pObjects)\n"
                 "{\n"
-                "    if (pObjects == V_NULL)\n"
+                "    if (pObjects == nullptr)\n"
                 "    {\n"
                 "        return;\n"
                 "    }\n"
-                "    VDestructElements< TYPE >(pObjects, 1);\n"
+                "    DemoDestructElements< TYPE >(pObjects, 1);\n"
                 "}\n",
                 encoding="utf-8",
             )
@@ -34,7 +34,7 @@ class TestSnippetExtractorTool(unittest.TestCase):
                 {
                     "file_path": str(fp),
                     "line_number": 5,
-                    "function_name": "void _baidu_vi::VDelete<_baidu_framework::CVMapControl>(_baidu_framework::CVMapControl*)",
+                    "function_name": "void demo_util::DemoDelete<demo_fw::DemoMapControl>(demo_fw::DemoMapControl*)",
                     "max_code_length": 0,
                 }
             )
@@ -43,11 +43,11 @@ class TestSnippetExtractorTool(unittest.TestCase):
             self.assertTrue(out.get("is_complete_function"), out.get("incomplete_reason"))
             snippet = out.get("snippet") or []
             self.assertEqual(snippet[0], "template< class TYPE >")
-            self.assertIn("VDelete(TYPE* pObjects)", "\n".join(snippet))
+            self.assertIn("DemoDelete(TYPE* pObjects)", "\n".join(snippet))
 
     def test_extract_get_leg_size_full_function(self):
         target_file = Path(
-            "/Users/liuhong_cd/baidu/mapclient/mapsdk-vector/engine-dev/src/app/walk/guidance/route_plan/src/walk_routeplan_result.cpp"
+            "/tmp/demo-app/src/app/walk/guidance/route_plan/src/demo_route_result.cpp"
         )
         if not target_file.exists():
             self.skipTest(f"external source not found: {target_file}")
@@ -57,7 +57,7 @@ class TestSnippetExtractorTool(unittest.TestCase):
             {
                 "file_path": str(target_file),
                 "line_number": 2155,
-                "function_name": "GetLegSize",
+                "function_name": "GetSegmentCount",
             }
         )
 
@@ -67,7 +67,7 @@ class TestSnippetExtractorTool(unittest.TestCase):
         self.assertTrue(out.get("is_complete_function"), out.get("incomplete_reason"))
         snippet = out.get("snippet") or []
         self.assertGreaterEqual(len(snippet), 3)
-        self.assertIn("GetLegSize", snippet[0])
+        self.assertIn("GetSegmentCount", snippet[0])
         snippet_text = "\n".join(snippet)
         self.assertIn("return m_clLegs.GetSize();", snippet_text)
         self.assertNotIn("GetPassTime", snippet_text)
@@ -78,9 +78,9 @@ class TestPromptSnippetCompletion(unittest.TestCase):
     def test_workflow_extracts_template_instantiation_simple_name(self):
         workflow = iOSCrashAnalyzeWorkflow()
         name = workflow._extract_simple_name_from_signature(
-            "void _baidu_vi::VDelete<_baidu_framework::CVMapControl>(_baidu_framework::CVMapControl*)"
+            "void demo_util::DemoDelete<demo_fw::DemoMapControl>(demo_fw::DemoMapControl*)"
         )
-        self.assertEqual(name, "VDelete")
+        self.assertEqual(name, "DemoDelete")
 
     def test_workflow_reextracts_incomplete_prompt_snippet(self):
         with tempfile.TemporaryDirectory() as td:

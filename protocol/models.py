@@ -62,6 +62,13 @@ class RunRequest:
     library_dir: Optional[str] = None
     code_roots: Optional[List[str]] = None  # 多根，顺序 = 查找优先级
     config: Optional[str] = None  # 配置文件路径
+    # Additive source/release identity contract. Omitted fields preserve legacy behavior.
+    source_identity: Optional[Dict[str, Any]] = None
+    source_origin: Optional[str] = None
+    commit_policy: Optional[str] = None
+    base_commit: Optional[str] = None
+    identity_confidence: Optional[str] = None
+    block_reason: Optional[str] = None
     # 显式验证配置；候选发现不会自动填充或执行此字段
     verification: Optional[Dict[str, Any]] = None
     # 简化验证协议：只控制本地已配置的两个验证脚本。
@@ -108,6 +115,11 @@ class RunRequest:
     vector_db_max_results: Optional[int] = None
     vector_db_record_usage: bool = False
     rule_confidence_threshold: Optional[float] = None
+    knowledge_pack_dirs: Optional[List[str]] = None
+    knowledge_pack_id: Optional[str] = None
+    knowledge_max_hits: Optional[int] = None
+    knowledge_max_chars: Optional[int] = None
+    domain_knowledge: bool = True
     use_ctags_index: bool = False
     plugin_modules: Optional[List[str]] = None
     max_sibling_member_functions: Optional[int] = None

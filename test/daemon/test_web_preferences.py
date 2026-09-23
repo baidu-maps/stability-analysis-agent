@@ -75,6 +75,26 @@ class WebPreferencesTests(unittest.TestCase):
                 else:
                     os.environ["STABILITY_AGENT_WEB_PREFS_FILE"] = old
 
+    def test_domain_knowledge_switch_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            prefs_file = Path(tmp) / "web_preferences.json"
+            import os
+
+            old = os.environ.get("STABILITY_AGENT_WEB_PREFS_FILE")
+            os.environ["STABILITY_AGENT_WEB_PREFS_FILE"] = str(prefs_file)
+            try:
+                saved = save_web_preferences(
+                    {"knowledge_plane": {"enabled": False, "pack_id": "demo-app"}}
+                )
+                self.assertFalse(saved["knowledge_plane"]["enabled"])
+                self.assertEqual(saved["knowledge_plane"]["pack_id"], "demo-app")
+                self.assertFalse(load_web_preferences()["knowledge_plane"]["enabled"])
+            finally:
+                if old is None:
+                    os.environ.pop("STABILITY_AGENT_WEB_PREFS_FILE", None)
+                else:
+                    os.environ["STABILITY_AGENT_WEB_PREFS_FILE"] = old
+
 
 if __name__ == "__main__":
     unittest.main()

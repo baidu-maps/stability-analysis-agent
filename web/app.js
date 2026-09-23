@@ -33,6 +33,7 @@
   let eventSource = null;
   let workspace = { library_dir: "", code_roots: [] };
   let vectorDbPrefs = { mode: "local", local_path: "" };
+  let knowledgePrefs = { pack_dirs: [], pack_id: "", max_hits: 4, max_chars: 4500, enabled: true };
   let lastReportPath = "";
   let lastTracePayload = null;
 
@@ -140,6 +141,11 @@
       backup_original_sources: true,
       output_format: "markdown",
       engine: $("engineSelect").value,
+      knowledge_pack_dirs: (knowledgePrefs.pack_dirs || []).filter(Boolean),
+      knowledge_pack_id: knowledgePrefs.pack_id || null,
+      knowledge_max_hits: Number(knowledgePrefs.max_hits || 4),
+      knowledge_max_chars: Number(knowledgePrefs.max_chars || 4500),
+      domain_knowledge: knowledgePrefs.enabled !== false,
     };
     return body;
   }
@@ -213,8 +219,13 @@
       if (!res.ok) return;
       workspace = data.workspace || workspace;
       vectorDbPrefs = data.vector_db || vectorDbPrefs;
+      knowledgePrefs = data.knowledge_plane || knowledgePrefs;
       $("wsLibraryDir").value = workspace.library_dir || "";
       $("wsCodeRoots").value = (workspace.code_roots || []).join("\n");
+      $("knowledgePackDirs").value = (knowledgePrefs.pack_dirs || []).join("\n");
+      $("knowledgePackId").value = knowledgePrefs.pack_id || "";
+      $("domainKnowledgeEnabled").checked = knowledgePrefs.enabled !== false;
+      $("knowledgeBudget").value = `${knowledgePrefs.max_hits || 4} / ${knowledgePrefs.max_chars || 4500}`;
       const savedEngine = localStorage.getItem(STORAGE_ENGINE_KEY) || "direct";
       $("engineSelect").value = ["direct", "langchain", "langgraph"].includes(savedEngine) ? savedEngine : "direct";
       const mode = vectorDbPrefs.mode || "local";
@@ -230,6 +241,7 @@
   }
 
   async function saveWorkspace() {
+    const budget = $("knowledgeBudget").value.split("/").map((x) => Number(x.trim()));
     const payload = {
       workspace: {
         library_dir: $("wsLibraryDir").value.trim(),
@@ -237,6 +249,13 @@
           .value.split("\n")
           .map((x) => x.trim())
           .filter(Boolean),
+      },
+      knowledge_plane: {
+        pack_dirs: $("knowledgePackDirs").value.split("\n").map((x) => x.trim()).filter(Boolean),
+        pack_id: $("knowledgePackId").value.trim(),
+        max_hits: budget[0] || 4,
+        max_chars: budget[1] || 4500,
+        enabled: $("domainKnowledgeEnabled").checked,
       },
     };
     try {
@@ -248,6 +267,7 @@
       const data = await res.json();
       if (res.ok) {
         workspace = data.workspace || payload.workspace;
+        knowledgePrefs = data.knowledge_plane || payload.knowledge_plane;
         $("skillOpMsg").textContent = "工作区已保存";
       }
     } catch (err) {

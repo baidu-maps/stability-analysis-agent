@@ -162,39 +162,39 @@ class TestCodeLocationTrace(unittest.TestCase):
             self.assertIn("location_trace", out)
 
     def test_same_method_name_on_caller_class_stays_separate_node(self):
-        """栈上 WalkMapControl::UpdateFoo 不得折叠成崩溃点 NaviMapRender::UpdateFoo。"""
+        """栈上 DemoMapControl::UpdateFoo 不得折叠成崩溃点 DemoMapRender::UpdateFoo。"""
         with tempfile.TemporaryDirectory() as tmp:
             src_dir = Path(tmp) / "proj" / "src"
             src_dir.mkdir(parents=True)
             (src_dir / "navi_map_render.cpp").write_text(
-                "class NaviMapRender {\n"
+                "class DemoMapRender {\n"
                 "public:\n"
-                "  void UpdateMapRenderCustomDrawOption() {\n"
+                "  void UpdateCustomDrawOption() {\n"
                 "    m_config->x = 1;\n"
                 "  }\n"
                 "};\n"
-                "void NaviMapRender::OnCreate() {\n"
+                "void DemoMapRender::OnCreate() {\n"
                 "    m_config = 0;\n"
                 "}\n",
                 encoding="utf-8",
             )
             (src_dir / "walk_map_control.cpp").write_text(
-                "class WalkMapControl {\n"
+                "class DemoMapControl {\n"
                 "public:\n"
-                "  void UpdateMapRenderCustomDrawOption() {\n"
+                "  void UpdateCustomDrawOption() {\n"
                 "    if (!m_render) return;\n"
-                "    m_render->UpdateMapRenderCustomDrawOption();\n"
+                "    m_render->UpdateCustomDrawOption();\n"
                 "  }\n"
                 "};\n"
-                "void WalkMapControl::OnInit() {\n"
+                "void DemoMapControl::OnInit() {\n"
                 "    m_render = 0;\n"
                 "}\n"
-                "void WalkMapControl::Init() {\n"
-                "    if (Hop(WalkMapControl::Init)) return;\n"
+                "void DemoMapControl::Init() {\n"
+                "    if (Hop(DemoMapControl::Init)) return;\n"
                 "    OnInit();\n"
                 "}\n"
-                "void WalkMapControl::SetOverlookMode() {\n"
-                "    if (Hop(WalkMapControl::SetOverlookMode)) return;\n"
+                "void DemoMapControl::SetOverlookMode() {\n"
+                "    if (Hop(DemoMapControl::SetOverlookMode)) return;\n"
                 "    m_render->SetOverlookMode();\n"
                 "}\n",
                 encoding="utf-8",
@@ -217,8 +217,8 @@ class TestCodeLocationTrace(unittest.TestCase):
                             {
                                 "address": "0x1000",
                                 "resolved_function": (
-                                    "walk_navi::NaviMapRender::UpdateMapRenderCustomDrawOption("
-                                    "walk_navi::NE_MapRenderCustomDrawOption&)"
+                                    "demo_ns::DemoMapRender::UpdateCustomDrawOption("
+                                    "demo_ns::DemoDrawOption&)"
                                 ),
                                 "resolved_file": "proj/src/navi_map_render.cpp",
                                 "resolved_line": 4,
@@ -226,8 +226,8 @@ class TestCodeLocationTrace(unittest.TestCase):
                             {
                                 "address": "0x2000",
                                 "resolved_function": (
-                                    "walk_navi::WalkMapControl::UpdateMapRenderCustomDrawOption("
-                                    "walk_navi::NE_MapRenderCustomDrawOption&)"
+                                    "demo_ns::DemoMapControl::UpdateCustomDrawOption("
+                                    "demo_ns::DemoDrawOption&)"
                                 ),
                                 "resolved_file": "proj/src/walk_map_control.cpp",
                                 "resolved_line": 5,

@@ -174,12 +174,31 @@ def revision_for_code_roots(code_roots: Sequence[str], *, include_diff: bool = F
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+def head_commits_for_code_roots(code_roots: Sequence[str]) -> List[str]:
+    """Return unique Git HEAD commits for the repositories containing code roots."""
+    repositories: Dict[str, Path] = {}
+    for raw in code_roots:
+        if not str(raw).strip():
+            continue
+        try:
+            repository = _repository_for(Path(raw).expanduser().resolve())
+        except WorktreeIsolationError:
+            continue
+        repositories[str(repository)] = repository
+    return sorted(
+        {
+            _run_git(repository, ["rev-parse", "HEAD"])
+            for repository in repositories.values()
+        }
+    )
+
+
 def default_worktree_root() -> Path:
     """Root for per-run isolated fix worktrees.
 
     Prefer ``STABILITY_AGENT_WORKTREE_DIR``. Otherwise use the agent cache
     (``~/.cache/stability-analysis-agent/worktrees``) instead of ``/tmp``, so
-    production disks and ``bd-sa-gc`` can manage the same tree.
+    production disks and external cleanup tooling can manage the same tree.
     """
     configured = str(os.environ.get("STABILITY_AGENT_WORKTREE_DIR") or "").strip()
     if configured:

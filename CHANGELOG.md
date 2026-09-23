@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-21
+
+### Added
+
+- 新增 `knowledge_plane/`：Codebase Knowledge Pack 加载、路由、轻量检索与 ingest；与既有 RAG 规则/案例统一写入 `05_memory_context.json` / `memory_context`。
+- 新增 `rag/retrieval_fusion.py`：规则、Pack、历史案例统一排序、去重与字符预算裁剪。
+- CLI / Daemon / Web：Knowledge Pack 相关参数与偏好（`--knowledge-pack-dir` / `--knowledge-pack` / `--knowledge-max-hits` / `--knowledge-max-chars` / `--domain-knowledge`）。
+- 新增 `tools/lifecycle_code_search_tool.py`，旁路落盘 `04b3_lifecycle_evidence.json`。
+- 新增 `services/evidence_contract.py` 与协议侧 `source_identity` 字段，修复管道对源码身份不安全时门禁阻断。
+- 修复管道支持可选 `syntax_build` 验证结果归一化；改码/定位/上下文引擎与 TOCTOU 写侧门禁增强。
+
+### Changed
+
+- Wheel 打包纳入 `knowledge_plane` 子包。
+- 架构 / RAG / CLI 命令参考文档补充 Knowledge Pack 与融合检索说明。
+
+### Documentation
+
+- README / PyPI 发布说明中的最新版本号更新为 1.5.0。
+
 ## [1.4.1] - 2026-09-14
 
 ### Fixed

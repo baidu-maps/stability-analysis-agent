@@ -77,6 +77,7 @@ def collect_memory_context(
     vector_db_max_results: int = 3,
     vector_db_readonly: bool = True,
     crash_log_content: str = "",
+    include_domain_knowledge: bool = True,
 ) -> Dict[str, Any]:
     """
     增强检索流程：故障模式匹配→证据分级→选择性知识加载→渲染增强。
@@ -166,7 +167,24 @@ def collect_memory_context(
         except Exception as e:
             logger.debug("Module knowledge routing skipped: %s", e)
 
-        # === 原有规则检索逻辑 ===
+        if not include_domain_knowledge:
+            domain_exclusion = {
+                "source_type": {"$ne": "knowledge_pack_chunk"}
+            }
+            vector_filter = (
+                {"$and": [vector_filter, domain_exclusion]}
+                if vector_filter
+                else domain_exclusion
+            )
+            decision_trace.append(
+                {
+                    "stage": "domain_knowledge",
+                    "result": "disabled",
+                    "excluded_source_type": "knowledge_pack_chunk",
+                }
+            )
+
+        # 规则与向量均参与统一融合；规则命中不再短路历史案例/Pack 向量召回。
         if high_conf_hits:
             decision_trace.append(
                 {
@@ -175,26 +193,26 @@ def collect_memory_context(
                     "rule_ids": [h.get("rule_id") for h in high_conf_hits if h.get("rule_id")],
                 }
             )
-        else:
-            query_text, _signature = build_pattern_query(parse_result, resolved_stack, code_context)
-            # 使用模块路由过滤（如果可用）
-            pattern_hits = analyzer.retrieve_patterns(
-                query_text,
-                n_results=int(vector_db_max_results),
-                record_usage=not vector_db_readonly,
-            )
-            vector_used = bool(pattern_hits)
-            pattern_ids = [p.get("pattern_id") for p in pattern_hits if p.get("pattern_id")]
-            for pid in pattern_ids:
-                evidence_map[pid] = analyzer.get_evidence(pid)
-            strategy_hits = analyzer.get_fix_strategies(pattern_ids)
-            decision_trace.append(
-                {
-                    "stage": "vector",
-                    "result": "hit" if pattern_hits else "miss",
-                    "pattern_ids": pattern_ids,
-                }
-            )
+        query_text, _signature = build_pattern_query(parse_result, resolved_stack, code_context)
+        pattern_hits = analyzer.retrieve_patterns(
+            query_text,
+            n_results=int(vector_db_max_results),
+            filters=vector_filter,
+            record_usage=not vector_db_readonly,
+        )
+        vector_used = bool(pattern_hits)
+        pattern_ids = [p.get("pattern_id") for p in pattern_hits if p.get("pattern_id")]
+        for pid in pattern_ids:
+            evidence_map[pid] = analyzer.get_evidence(pid)
+        strategy_hits = analyzer.get_fix_strategies(pattern_ids)
+        decision_trace.append(
+            {
+                "stage": "vector",
+                "result": "hit" if pattern_hits else "miss",
+                "pattern_ids": pattern_ids,
+                "filter": vector_filter,
+            }
+        )
 
         # === 新增：证据分级 ===
         evidence_grade_context = ""
@@ -244,12 +262,38 @@ def collect_memory_context(
         except Exception as e:
             logger.debug("Stack layer classification skipped: %s", e)
 
-        # === 渲染增强的 memory_context ===
-        memory_context = render_memory_context(
-            rule_hits, pattern_hits, evidence_map, strategy_hits,
-            fault_mode_context=fault_mode_context,
-            evidence_grade_context=evidence_grade_context,
-            stack_layers_context=stack_layers_context,
+        # === 统一融合参考知识，确定性诊断上下文保持独立、优先展示 ===
+        from rag.retrieval_fusion import fuse_retrieval_hits
+
+        fusion = fuse_retrieval_hits(
+            rule_hits=rule_hits,
+            pack_hits=[],
+            vector_hits=pattern_hits,
+        )
+        diagnostic_context = "\n\n".join(
+            item
+            for item in (
+                fault_mode_context,
+                evidence_grade_context,
+                stack_layers_context,
+            )
+            if item
+        )
+        strategy_context = ""
+        if strategy_hits:
+            strategy_context = "可参考修复策略:\n" + "\n".join(
+                f"- {item.get('fix_intent') or item.get('strategy_id')}"
+                for item in strategy_hits[:3]
+            )
+        reference_context = str(fusion.get("context") or "")
+        memory_context = "\n\n".join(
+            item
+            for item in (
+                diagnostic_context,
+                "融合知识参考:\n" + reference_context if reference_context else "",
+                strategy_context,
+            )
+            if item
         )
         base.update(
             {
@@ -264,6 +308,9 @@ def collect_memory_context(
                 "evidence_grade": evidence_grade_raw,
                 "stack_layers": stack_layers_raw,
                 "knowledge_domains": knowledge_domains,
+                "diagnostic_context": diagnostic_context,
+                "strategy_context": strategy_context,
+                "retrieval_fusion": fusion,
                 "user_message": (
                     "已从向量库只读检索规则/经验参考"
                     if memory_context and vector_db_readonly

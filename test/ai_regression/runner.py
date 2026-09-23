@@ -256,7 +256,7 @@ class AIRegressionRunner:
         value_options = {
             "--prompt-mode": "prompt_mode",
             "--agent-loop": "agent_loop",
-            "--engine": "engine",
+            "--engine": "demo",
             "--llm-mode": "llm_mode",
             "--llm-profile": "llm_profile",
             "--max-agent-rounds": "max_agent_rounds",

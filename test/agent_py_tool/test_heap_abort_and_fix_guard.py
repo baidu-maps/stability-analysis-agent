@@ -113,7 +113,7 @@ class TestSystemLibMatch(unittest.TestCase):
     def test_libc_is_system(self) -> None:
         self.assertTrue(is_system_native_module("libc.so"))
         self.assertTrue(is_system_native_module("/apex/com.android.runtime/lib64/bionic/libc.so"))
-        self.assertFalse(is_system_native_module("libBaiduMapSDK_map_for_navi_v9_0_0.so"))
+        self.assertFalse(is_system_native_module("libDemoMapSDK_core_v9_0_0.so"))
 
     def test_short_name_does_not_match_libcrypto(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -145,12 +145,12 @@ class TestCodeFixerClassGuard(unittest.TestCase):
 
     def test_multiline_tab_signature_is_compatible(self) -> None:
         """多行参数列表 + Tab 缩进不应导致签名校验误拒。"""
-        target = "VBool CVLayer::Draw(\n\tVVoid* pArg,\n\tVBool bForce)"
+        target = "bool DemoLayer::Draw(\n\tvoid* pArg,\n\tbool bForce)"
         replacement = (
-            "VBool\n"
-            "CVLayer::Draw(\n"
-            "\tVVoid * pArg,\n"
-            "\tVBool bForce)\n"
+            "bool\n"
+            "DemoLayer::Draw(\n"
+            "\tvoid * pArg,\n"
+            "\tbool bForce)\n"
             "{\n"
             "\treturn V_TRUE;\n"
             "}\n"
@@ -246,42 +246,42 @@ class TestSameNameMethodNotCollapsed(unittest.TestCase):
     """同名成员函数不得被当成崩溃点自身。"""
 
     def test_stack_symbol_aliases_requires_same_class(self) -> None:
-        crash_sig = "VVoid NaviMapRender::UpdateMapRenderCustomDrawOption(NE_MapRenderCustomDrawOption &option)"
+        crash_sig = "void DemoMapRender::UpdateCustomDrawOption(DemoDrawOption &option)"
         self.assertTrue(
             stack_symbol_aliases_crash_function(
-                "walk_navi::NaviMapRender::UpdateMapRenderCustomDrawOption(walk_navi::NE_MapRenderCustomDrawOption&)",
-                "UpdateMapRenderCustomDrawOption",
+                "demo_ns::DemoMapRender::UpdateCustomDrawOption(demo_ns::DemoDrawOption&)",
+                "UpdateCustomDrawOption",
                 crash_sig,
             )
         )
         self.assertFalse(
             stack_symbol_aliases_crash_function(
-                "walk_navi::WalkMapControl::UpdateMapRenderCustomDrawOption(walk_navi::NE_MapRenderCustomDrawOption&)",
-                "UpdateMapRenderCustomDrawOption",
+                "demo_ns::DemoMapControl::UpdateCustomDrawOption(demo_ns::DemoDrawOption&)",
+                "UpdateCustomDrawOption",
                 crash_sig,
             )
         )
         self.assertFalse(
             stack_symbol_aliases_crash_function(
-                "walk_navi::WalkMapControl::UpdateMapRenderCustomDrawOption(walk_navi::NE_MapRenderCustomDrawOption&)",
-                "UpdateMapRenderCustomDrawOption",
-                "void UpdateMapRenderCustomDrawOption()",
+                "demo_ns::DemoMapControl::UpdateCustomDrawOption(demo_ns::DemoDrawOption&)",
+                "UpdateCustomDrawOption",
+                "void UpdateCustomDrawOption()",
             )
         )
 
     def test_caller_scan_keeps_same_named_trampoline(self) -> None:
         self.assertFalse(
             caller_is_same_cpp_method(
-                "WalkMapControl::UpdateMapRenderCustomDrawOption",
-                "UpdateMapRenderCustomDrawOption",
-                "walk_navi::NaviMapRender::UpdateMapRenderCustomDrawOption(walk_navi::NE_MapRenderCustomDrawOption&)",
+                "DemoMapControl::UpdateCustomDrawOption",
+                "UpdateCustomDrawOption",
+                "demo_ns::DemoMapRender::UpdateCustomDrawOption(demo_ns::DemoDrawOption&)",
             )
         )
         self.assertTrue(
             caller_is_same_cpp_method(
-                "NaviMapRender::UpdateMapRenderCustomDrawOption",
-                "UpdateMapRenderCustomDrawOption",
-                "walk_navi::NaviMapRender::UpdateMapRenderCustomDrawOption(walk_navi::NE_MapRenderCustomDrawOption&)",
+                "DemoMapRender::UpdateCustomDrawOption",
+                "UpdateCustomDrawOption",
+                "demo_ns::DemoMapRender::UpdateCustomDrawOption(demo_ns::DemoDrawOption&)",
             )
         )
 
@@ -292,48 +292,48 @@ class TestSameNameMethodNotCollapsed(unittest.TestCase):
             crash_file = src / "navi.cpp"
             caller_file = src / "control.cpp"
             crash_file.write_text(
-                "void NaviMapRender::UpdateMapRenderCustomDrawOption() {\n"
+                "void DemoMapRender::UpdateCustomDrawOption() {\n"
                 "  m_config->x = 1;\n"
                 "}\n",
                 encoding="utf-8",
             )
             caller_file.write_text(
-                "void WalkMapControl::UpdateMapRenderCustomDrawOption() {\n"
+                "void DemoMapControl::UpdateCustomDrawOption() {\n"
                 "  if (!m_render) return;\n"
-                "  m_render->UpdateMapRenderCustomDrawOption();\n"
+                "  m_render->UpdateCustomDrawOption();\n"
                 "}\n",
                 encoding="utf-8",
             )
             svc = CodeLocatorService(LocatorConfig())
             callers = svc.find_callers(
-                "walk_navi::NaviMapRender::UpdateMapRenderCustomDrawOption()",
+                "demo_ns::DemoMapRender::UpdateCustomDrawOption()",
                 [tmp],
                 max_search_files=32,
                 stack_priority_files=[str(crash_file), str(caller_file)],
             )
             names = [c.name for c in callers]
-            self.assertTrue(any("WalkMapControl" in n for n in names), names)
+            self.assertTrue(any("DemoMapControl" in n for n in names), names)
 
     def test_stack_has_same_named_trampoline(self) -> None:
         self.assertTrue(
             stack_has_same_named_trampoline(
                 [
-                    "walk_navi::NaviMapRender::UpdateMapRenderCustomDrawOption()",
-                    "walk_navi::WalkMapControl::UpdateMapRenderCustomDrawOption()",
+                    "demo_ns::DemoMapRender::UpdateCustomDrawOption()",
+                    "demo_ns::DemoMapControl::UpdateCustomDrawOption()",
                 ]
             )
         )
         self.assertFalse(
             stack_has_same_named_trampoline(
                 [
-                    "walk_navi::NaviMapRender::UpdateMapRenderCustomDrawOption()",
-                    "walk_navi::WalkMapControl::Init()",
+                    "demo_ns::DemoMapRender::UpdateCustomDrawOption()",
+                    "demo_ns::DemoMapControl::Init()",
                 ]
             )
         )
         self.assertFalse(
             stack_has_same_named_trampoline(
-                ["walk_navi::NaviMapRender::UpdateMapRenderCustomDrawOption()"]
+                ["demo_ns::DemoMapRender::UpdateCustomDrawOption()"]
             )
         )
 
@@ -342,12 +342,12 @@ class TestNullGuardOnlyPatchRejectsEntryReturn(unittest.TestCase):
     """同名转发存在时拒绝崩溃点整函数入口判空；按分支判空仍允许。"""
 
     _OLD = (
-        "void NaviMapRender::UpdateMapRenderCustomDrawOption() {\n"
+        "void DemoMapRender::UpdateCustomDrawOption() {\n"
         "    m_config->x = 1;\n"
         "}\n"
     )
     _ENTRY_GUARD = (
-        "void NaviMapRender::UpdateMapRenderCustomDrawOption() {\n"
+        "void DemoMapRender::UpdateCustomDrawOption() {\n"
         "    if (!m_config) {\n"
         "        return;\n"
         "    }\n"
@@ -355,7 +355,7 @@ class TestNullGuardOnlyPatchRejectsEntryReturn(unittest.TestCase):
         "}\n"
     )
     _BRANCH_GUARD = (
-        "void NaviMapRender::UpdateMapRenderCustomDrawOption() {\n"
+        "void DemoMapRender::UpdateCustomDrawOption() {\n"
         "    if (car_bundle) {\n"
         "        foo();\n"
         "    } else if (m_config) {\n"
@@ -368,8 +368,8 @@ class TestNullGuardOnlyPatchRejectsEntryReturn(unittest.TestCase):
             "call_chain_from_add2line": [
                 {
                     "call_order_from_add2line": [
-                        "walk_navi::NaviMapRender::UpdateMapRenderCustomDrawOption()",
-                        "walk_navi::WalkMapControl::UpdateMapRenderCustomDrawOption()",
+                        "demo_ns::DemoMapRender::UpdateCustomDrawOption()",
+                        "demo_ns::DemoMapControl::UpdateCustomDrawOption()",
                     ]
                 }
             ]
@@ -411,7 +411,7 @@ class TestLifecycleContrastHelpers(unittest.TestCase):
         self.assertEqual(deref_members_from_text("m_config->x = 1;"), ["m_config"])
         self.assertEqual(
             forwarding_members(
-                "void WalkMapControl::Update() {\n    m_render->Update();\n}\n",
+                "void DemoMapControl::Update() {\n    m_render->Update();\n}\n",
                 "Update",
             ),
             ["m_render"],
@@ -421,32 +421,32 @@ class TestLifecycleContrastHelpers(unittest.TestCase):
         self.assertFalse(member_is_assigned("void Update() { m_render->Foo(); }", "m_render"))
         hop = (
             "void Init() {\n"
-            "    if (Post(WalkMapControl::Init, arg)) return;\n"
+            "    if (Post(DemoMapControl::Init, arg)) return;\n"
             "    OnInit();\n"
             "}\n"
         )
-        self.assertTrue(has_self_repost_prologue(hop, "WalkMapControl"))
+        self.assertTrue(has_self_repost_prologue(hop, "DemoMapControl"))
         self.assertFalse(
-            has_self_repost_prologue("void Update() { if (!m_render) return; }", "WalkMapControl")
+            has_self_repost_prologue("void Update() { if (!m_render) return; }", "DemoMapControl")
         )
         picked = pick_lifecycle_contrast(
             caller_has_repost=False,
-            assign_names=["WalkMapControl::OnInit"],
-            callers_of_assign=["WalkMapControl::Init"],
-            hop_exemplars=["WalkMapControl::SetOverlookMode"],
-            crash_writers=["NaviMapRender::OnCreate"],
-            names_with_repost=["WalkMapControl::Init"],
+            assign_names=["DemoMapControl::OnInit"],
+            callers_of_assign=["DemoMapControl::Init"],
+            hop_exemplars=["DemoMapControl::SetOverlookMode"],
+            crash_writers=["DemoMapRender::OnCreate"],
+            names_with_repost=["DemoMapControl::Init"],
             cap=3,
         )
         self.assertEqual(
             picked,
             [
-                "WalkMapControl::OnInit",
-                "WalkMapControl::Init",
-                "NaviMapRender::OnCreate",
+                "DemoMapControl::OnInit",
+                "DemoMapControl::Init",
+                "DemoMapRender::OnCreate",
             ],
         )
-        self.assertNotIn("WalkMapControl::SetOverlookMode", picked)
+        self.assertNotIn("DemoMapControl::SetOverlookMode", picked)
 
 
 class TestStackCallerThreadAffinitySiblings(unittest.TestCase):
@@ -460,49 +460,49 @@ class TestStackCallerThreadAffinitySiblings(unittest.TestCase):
             src.mkdir()
             navi = src / "navi.cpp"
             navi.write_text(
-                "void NaviMapRender::OnCreate() {\n"
+                "void DemoMapRender::OnCreate() {\n"
                 "    m_config = 0;\n"
                 "}\n"
-                "void NaviMapRender::UpdateMapRenderCustomDrawOption() {\n"
+                "void DemoMapRender::UpdateCustomDrawOption() {\n"
                 "    m_config->x = 1;\n"
                 "}\n",
                 encoding="utf-8",
             )
             cpp = src / "walk_map_control.cpp"
             cpp.write_text(
-                "void WalkMapControl::OnInit() {\n"
+                "void DemoMapControl::OnInit() {\n"
                 "    m_render = 0;\n"
                 "}\n"
-                "void WalkMapControl::Init() {\n"
-                "    if (Hop(WalkMapControl::Init)) return;\n"
+                "void DemoMapControl::Init() {\n"
+                "    if (Hop(DemoMapControl::Init)) return;\n"
                 "    OnInit();\n"
                 "}\n"
-                "void WalkMapControl::SetOverlookMode() {\n"
-                "    if (Hop(WalkMapControl::SetOverlookMode)) return;\n"
+                "void DemoMapControl::SetOverlookMode() {\n"
+                "    if (Hop(DemoMapControl::SetOverlookMode)) return;\n"
                 "    m_render->SetOverlookMode();\n"
                 "}\n"
-                "void WalkMapControl::UpdateMapRenderCustomDrawOption() {\n"
+                "void DemoMapControl::UpdateCustomDrawOption() {\n"
                 "    if (!m_render) return;\n"
-                "    m_render->UpdateMapRenderCustomDrawOption();\n"
+                "    m_render->UpdateCustomDrawOption();\n"
                 "}\n",
                 encoding="utf-8",
             )
             crash = CrashFunction(
-                name="UpdateMapRenderCustomDrawOption",
-                signature="void NaviMapRender::UpdateMapRenderCustomDrawOption()",
-                snippet=["void NaviMapRender::UpdateMapRenderCustomDrawOption() {"],
+                name="UpdateCustomDrawOption",
+                signature="void DemoMapRender::UpdateCustomDrawOption()",
+                snippet=["void DemoMapRender::UpdateCustomDrawOption() {"],
                 crash_line="m_config->x = 1;",
             )
             frames = [
                 {
                     "resolved_function": (
-                        "walk_navi::NaviMapRender::UpdateMapRenderCustomDrawOption()"
+                        "demo_ns::DemoMapRender::UpdateCustomDrawOption()"
                     ),
                     "resolved_file": str(navi),
                 },
                 {
                     "resolved_function": (
-                        "walk_navi::WalkMapControl::UpdateMapRenderCustomDrawOption()"
+                        "demo_ns::DemoMapControl::UpdateCustomDrawOption()"
                     ),
                     "resolved_file": str(cpp),
                 },
@@ -516,9 +516,9 @@ class TestStackCallerThreadAffinitySiblings(unittest.TestCase):
                 max_total=3,
             )
             names = [h.name for h in hits]
-            self.assertIn("WalkMapControl::OnInit", names)
-            self.assertIn("WalkMapControl::Init", names)
-            self.assertIn("NaviMapRender::OnCreate", names)
+            self.assertIn("DemoMapControl::OnInit", names)
+            self.assertIn("DemoMapControl::Init", names)
+            self.assertIn("DemoMapRender::OnCreate", names)
             self.assertFalse(any("SetOverlookMode" in n for n in names), names)
             self.assertTrue(all(h.relation_type == "thread_affinity" for h in hits))
 
@@ -540,24 +540,24 @@ class TestStackCallerThreadAffinitySiblings(unittest.TestCase):
                 "    if (Hop(FooControl::OtherApi)) return;\n"
                 "    m_render->OtherApi();\n"
                 "}\n"
-                "void FooControl::UpdateMapRenderCustomDrawOption() {\n"
-                "    m_render->UpdateMapRenderCustomDrawOption();\n"
+                "void FooControl::UpdateCustomDrawOption() {\n"
+                "    m_render->UpdateCustomDrawOption();\n"
                 "}\n",
                 encoding="utf-8",
             )
             crash = CrashFunction(
-                name="UpdateMapRenderCustomDrawOption",
-                signature="void NaviMapRender::UpdateMapRenderCustomDrawOption()",
+                name="UpdateCustomDrawOption",
+                signature="void DemoMapRender::UpdateCustomDrawOption()",
                 snippet=[],
                 crash_line="m_config->x = 1;",
             )
             frames = [
                 {
-                    "resolved_function": "NaviMapRender::UpdateMapRenderCustomDrawOption()",
+                    "resolved_function": "DemoMapRender::UpdateCustomDrawOption()",
                     "resolved_file": "navi.cpp",
                 },
                 {
-                    "resolved_function": "FooControl::UpdateMapRenderCustomDrawOption()",
+                    "resolved_function": "FooControl::UpdateCustomDrawOption()",
                     "resolved_file": str(cpp),
                 },
             ]

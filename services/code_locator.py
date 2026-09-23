@@ -1093,22 +1093,16 @@ class SymbolLocator:
             for token in ("/demo/", "/test/", "/apptest/", "/unittest/", "/systemtest/")
         ):
             score -= 120
-        if any(token in path for token in ("/support/", "/huiwei")):
+        if "/support/" in path:
             score -= 150
-        if any(token in path for token in ("/engine-dev/", "/src/app/", "/src/")):
+        if any(token in path for token in ("/src/app/", "/src/")):
             score += 80
-        if "/engine-dev/inc/" in path or "/inc/vi/" in path or "/inc/app/" in path:
+        if "/inc/" in path or "/include/" in path:
             score += 40
         if path.endswith(".cpp") or path.endswith(".cc") or path.endswith(".cxx"):
             score += 60
         elif path.endswith(".h") or path.endswith(".hpp") or path.endswith(".hh"):
             score -= 40
-        if path.endswith("baselayer.cpp") or path.endswith("vbaselayer.cpp"):
-            score += 40
-        if path.endswith("vtempl.h"):
-            score += 80
-        if "/inc/vi/vos/" in path or "/engine-dev/inc/" in path:
-            score += 30
         return score
 
     @staticmethod
@@ -1529,29 +1523,38 @@ class SymbolLocator:
         if not lines or line_number < 1:
             return None
         target_idx = line_number - 1
-        # Search backward for function definition
-        search_start = max(0, target_idx - 50)
+        # 大函数（如 DemoRoute::Build）体内写点可能距函数头数百行；50 行窗口会丢写路径。
+        search_start = max(0, target_idx - 800)
         pattern = re.compile(
             r"(?:[\w:<>,~*&\s]+?\s+)?"  # return type
             r"((?:[\w:]+::)*~?[\w]+)\s*\("  # function name with optional class prefix
         )
+        # 自下而上维护相对花括号深度，优先返回 depth==0 的包围函数定义。
+        depth = 0
+        fallback_name: Optional[str] = None
         for i in range(target_idx, search_start - 1, -1):
             if i >= len(lines):
                 continue
-            line = lines[i].strip()
-            if not line or line.startswith("//") or line.startswith("/*") or line.startswith("*"):
-                continue
-            if is_control_flow_source_line(line):
-                continue
-            m = pattern.search(strip_leading_close_braces(line))
-            if m and self.is_function_definition_line(line):
-                name = m.group(1)
-                if not keep_class_qualifier and "::" in name:
-                    parts = name.split("::")
-                    name = parts[-1] if parts[-1] else name
-                if is_plausible_function_name(name.split("::")[-1] if name else name):
-                    return name
-        return None
+            raw = lines[i]
+            line = raw.strip()
+            # 先识别函数头，再按本行括号更新深度（函数头常在 `{` 上一行）。
+            if line and not line.startswith("//") and not line.startswith("/*") and not line.startswith("*"):
+                if not is_control_flow_source_line(line):
+                    m = pattern.search(strip_leading_close_braces(line))
+                    if m and self.is_function_definition_line(line):
+                        name = m.group(1)
+                        if not keep_class_qualifier and "::" in name:
+                            parts = name.split("::")
+                            name = parts[-1] if parts[-1] else name
+                        if is_plausible_function_name(name.split("::")[-1] if name else name):
+                            if depth == 0:
+                                return name
+                            if fallback_name is None:
+                                fallback_name = name
+            depth += raw.count("}") - raw.count("{")
+            if depth < 0:
+                depth = 0
+        return fallback_name
 
     def extract_simple_function_name(self, full_function_name: str) -> str:
         """Extract simple function name from qualified name: Class::fn(...) -> fn"""
@@ -1572,7 +1575,7 @@ class SymbolLocator:
         parts = s.split()
         if parts:
             s = parts[-1]
-        # 析构函数保留前导 ~，避免 ~CBaseLayer 被降格为 CBaseLayer 后误命中构造函数。
+        # 析构函数保留前导 ~，避免 ~DemoLayer 被降格为 DemoLayer 后误命中构造函数。
         if s.startswith("~"):
             return "~" + s[1:].lstrip("*&")
         return s.lstrip("*&~")
@@ -2286,7 +2289,9 @@ class VariableLocator:
             relation = self.determine_variable_relation(line, var)
             if store_only and self._relation_strength(relation) < 2:
                 return
-            func_name = self._symbol.extract_function_name_at_line(lines, line_no)
+            func_name = self._symbol.extract_function_name_at_line(
+                lines, line_no, keep_class_qualifier=True
+            )
             if not func_name:
                 return
             from tools.function_snippet_utils import is_plausible_function_code_head
@@ -2367,15 +2372,19 @@ class VariableLocator:
                         )
 
         def _rg_store_site_files(seed_files: List[str]) -> List[str]:
-            """用 rg 在 seed 目录附近找赋值/释放点所在文件（变量名来自 shared_vars，非硬编码）。"""
+            """用 rg 在 seed 目录附近找赋值/释放/容器修改点所在文件。"""
             if not bare_vars:
                 return list(seed_files or [])
-            # 身份赋值 / 置空 / delete|free；避免匹配 ==
+            # 身份赋值 / 置空 / delete|free / 容器就地修改；避免匹配 ==
+            mutators = "|".join(self._CONTAINER_MUTATOR_METHODS)
             parts = []
             for bv in bare_vars:
                 eb = re.escape(bv)
                 parts.append(rf"{eb}\s*=")
                 parts.append(rf"(?:->|\.)\s*{eb}\s*=")
+                parts.append(rf"{eb}\s*\.\s*(?:{mutators})\s*\(")
+                parts.append(rf"(?:->|\.)\s*{eb}\s*\.\s*(?:{mutators})\s*\(")
+                parts.append(rf"{eb}\s*->\s*(?:{mutators})\s*\(")
                 parts.append(rf"delete\s*(?:\[\s*\])?\s*{eb}\b")
                 parts.append(rf"free\s*\(\s*{eb}\s*\)")
             pattern = "|".join(parts)
@@ -2617,11 +2626,27 @@ class VariableLocator:
                 return True
         return False
 
+    # 容器就地修改 API：无赋值号，但会改变被 Copy 的源容器内容。
+    _CONTAINER_MUTATOR_METHODS = (
+        "Add",
+        "Append",
+        "Clear",
+        "Copy",
+        "InsertAt",
+        "Remove",
+        "RemoveAll",
+        "RemoveAt",
+        "SetAt",
+        "SetAtGrow",
+        "SetSize",
+        "Swap",
+    )
+
     def determine_variable_relation(self, line: str, variable_name: str) -> str:
         """Classify variable relation: read / write / assign / delete.
 
         - ``assign``: 改指针/对象身份（``m_x =`` / ``p->m_x =``）
-        - ``write``: 经指针改字段（``m_x->field =``）
+        - ``write``: 经指针改字段（``m_x->field =``）或容器就地修改（``m_x.Add(...)``）
         - ``delete``: delete/free
         - ``read``: 其它使用
         """
@@ -2637,6 +2662,18 @@ class VariableLocator:
         if re.search(rf"\b{re.escape(bare)}\s*->\s*\w+\s*=(?!=)", stripped):
             return "write"
         if re.search(rf"\b{re.escape(bare)}\s*\.\s*\w+\s*=(?!=)", stripped):
+            return "write"
+        # 容器就地修改：m_renderSteps.Add(...) / ptr->m_renderSteps.RemoveAll()
+        mutators = "|".join(self._CONTAINER_MUTATOR_METHODS)
+        if re.search(
+            rf"(?:(?:->|\.)\s*)?\b{re.escape(bare)}\s*\.\s*(?:{mutators})\s*\(",
+            stripped,
+        ):
+            return "write"
+        if re.search(
+            rf"\b{re.escape(bare)}\s*->\s*(?:{mutators})\s*\(",
+            stripped,
+        ):
             return "write"
         # 身份赋值：obj->m_x = / m_x =
         if re.search(rf"(?:->|\.)\s*{re.escape(bare)}\s*=(?!=)", stripped):

@@ -23,6 +23,7 @@ from .code_content_provider_tool import (
     CodeContentProviderWithPrompts,
 )
 from .symbol_callsite_finder_tool import SymbolCallsiteFinderTool
+from .lifecycle_code_search_tool import LifecycleCodeSearchTool
 from .snippet_extractor_tool import SnippetExtractorTool
 from .fix_code_extractor_tool import FixCodeExtractorTool
 from .fix_code_applier_tool import FixCodeApplierTool
@@ -51,6 +52,7 @@ __all__ = [
     "CodeContentProvider",
     "CodeContentProviderWithPrompts",
     "SymbolCallsiteFinderTool",
+    "LifecycleCodeSearchTool",
     "SnippetExtractorTool",
     "FixCodeExtractorTool",
     "FixCodeApplierTool",
@@ -100,6 +102,14 @@ def register_all_tools(registry=None):
     registry.register(
         "symbol_callsite_finder",
         SymbolCallsiteFinderTool(),
+        priority=Priority.BUILTIN,
+        force_override=False,
+        is_tool=True,
+        module="tools",
+    )
+    registry.register(
+        "lifecycle_code_search",
+        LifecycleCodeSearchTool(),
         priority=Priority.BUILTIN,
         force_override=False,
         is_tool=True,

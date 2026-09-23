@@ -42,7 +42,7 @@ class CodeContextRequestResolver:
 
     @classmethod
     def _canonical_context_request_symbol(cls, symbol: str, req_type: str = "") -> str:
-        """将等价函数符号规范为同一去重键（如 CVList::RemoveAll 与 CVList<T>::RemoveAll）。"""
+        """将等价函数符号规范为同一去重键（如 DemoList::RemoveAll 与 DemoList<T>::RemoveAll）。"""
         norm = cls._normalize_context_request_symbol(symbol, req_type)
         if str(req_type or "").strip().lower() != "function":
             return norm
@@ -235,7 +235,7 @@ class CodeContextRequestResolver:
 
     @classmethod
     def _bare_template_class_method_matches_text(cls, symbol: str, *texts: str) -> bool:
-        """CVList::RemoveAll 等未写模板参数的限定符号，匹配 CVList<T>::RemoveAll 实现。"""
+        """DemoList::RemoveAll 等未写模板参数的限定符号，匹配 DemoList<T>::RemoveAll 实现。"""
         from services.code_locator import SymbolLocator
 
         head = str(symbol or "").split("(", 1)[0].strip()
@@ -441,20 +441,14 @@ class CodeContextRequestResolver:
             for token in ("/demo/", "/test/", "/apptest/", "/unittest/", "/systemtest/", "/enginetest/")
         ):
             score -= 120
-        if any(token in path for token in ("/support/", "/huiwei")):
+        if "/support/" in path:
             score -= 150
-        if any(token in path for token in ("/engine-dev/", "/src/app/", "/src/", "/inc/")):
+        if any(token in path for token in ("/src/app/", "/src/", "/inc/", "/include/")):
             score += 80
-        if "/basemap/vmap/" in path:
-            score += 50
-        elif "/basemap/gmap/" in path:
-            score -= 30
         if path.endswith(".h") or path.endswith(".hpp") or path.endswith(".hh"):
             score += 60
         elif path.endswith(".cpp") or path.endswith(".cc") or path.endswith(".cxx"):
             score += 20
-        if path.endswith("vtempl.h"):
-            score += 40
         if class_name:
             stem = class_name.lower().lstrip("cv").lstrip("c")
             base = class_name.lower()

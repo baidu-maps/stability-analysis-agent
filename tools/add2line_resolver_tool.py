@@ -149,7 +149,6 @@ class ResolvedFrame:
     function: Optional[str] = None
     file: Optional[str] = None
     line: Optional[int] = None
-    raw_log_line: Optional[int] = None
     module: Optional[str] = None
     resolved_function: Optional[str] = None
     resolved_file: Optional[str] = None
@@ -1460,7 +1459,6 @@ class Add2lineResolver:
                 function=function,
                 file=raw_file if isinstance(raw_file, str) else None,
                 line=raw_line,
-                raw_log_line=Add2lineResolver._coerce_frame_line(frame.get("raw_log_line")),
                 module=frame.get("module"),
                 resolved_function=semantic_fn,
                 resolved_file=resolved_file,
@@ -1618,7 +1616,6 @@ class Add2lineResolver:
             function=fn,
             file=frame.get("file"),
             line=Add2lineResolver._coerce_frame_line(frame.get("line")),
-            raw_log_line=Add2lineResolver._coerce_frame_line(frame.get("raw_log_line")),
             module=frame.get("module"),
             resolved_function=semantic,
             resolved_file=self._normalize_resolved_file_name(frame.get("file")),
@@ -1695,7 +1692,6 @@ class Add2lineResolver:
             function=function,
             file=frame.get("file"),
             line=Add2lineResolver._coerce_frame_line(frame.get("line")),
-            raw_log_line=Add2lineResolver._coerce_frame_line(frame.get("raw_log_line")),
             module=module,
         )
 
@@ -2425,7 +2421,6 @@ class Add2lineResolver:
                     resolved.function = frame.get('function')
                     resolved.file = frame.get('file')
                     resolved.line = frame.get('line')
-                    resolved.raw_log_line = Add2lineResolver._coerce_frame_line(frame.get('raw_log_line'))
                     resolved.module = frame.get('module')
                     return {"skip": False, "filtered": False, "resolved": resolved, "error": None}
 
@@ -2434,7 +2429,6 @@ class Add2lineResolver:
                     function=frame.get('function'),
                     file=frame.get('file'),
                     line=frame.get('line'),
-                    raw_log_line=Add2lineResolver._coerce_frame_line(frame.get('raw_log_line')),
                     module=frame.get('module')
                 )
                 return {"skip": False, "filtered": False, "resolved": unresolved, "error": f"无法解析地址: {address}"}

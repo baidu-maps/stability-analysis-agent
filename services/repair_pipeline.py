@@ -14,6 +14,7 @@ from services.git_worktree_manager import (
     IsolatedCodeWorkspace,
     WorktreeIsolationError,
     map_result_paths,
+    head_commits_for_code_roots,
     prepare_isolated_workspace,
     revision_for_code_roots,
     workspace_revision,
@@ -28,6 +29,7 @@ from services.repair_actions import (
 )
 from services.decide_scorer import score_repair_decision
 from services.stage_artifacts import save_decide_artifact
+from services.evidence_contract import build_evidence_contract, evaluate_source_identity
 from services.runtime_actions import ApprovalBinding, VERIFICATION_ACTION_TOOLS, pending_tool_action_name
 from services.verification import (
     build_verification_config_with_reproduce_priority,
@@ -130,6 +132,46 @@ def _has_legacy_runtime_verification(config: Optional[Dict[str, Any]]) -> bool:
 def _runtime_verification_enabled(config: Optional[Dict[str, Any]]) -> bool:
     """Runtime scripts are opt-in; deterministic change safety checks always run."""
     return bool(isinstance(config, dict) and config.get("enable_runtime_verification") is True)
+
+
+def _syntax_build_verification(
+    config: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Normalize optional caller-supplied syntax/build verification outcomes."""
+    if not isinstance(config, dict):
+        return None
+    section = config.get("syntax_build")
+    if not isinstance(section, dict) or section.get("enabled") is not True:
+        return None
+    checks = []
+    for name in ("syntax", "build"):
+        raw = section.get(name)
+        if raw is None:
+            continue
+        check = dict(raw) if isinstance(raw, dict) else {"status": str(raw)}
+        check["name"] = name
+        check["status"] = str(check.get("status") or "unverified").lower()
+        checks.append(check)
+    statuses = {str(item.get("status") or "") for item in checks}
+    if not checks or statuses & {
+        "configured_but_unavailable",
+        "not_configured",
+        "pending",
+        "skipped",
+        "unavailable",
+        "unverified",
+    }:
+        status = "unverified"
+    elif statuses <= {"passed", "verified"}:
+        status = "verified"
+    else:
+        status = "failed"
+    return {
+        "enabled": True,
+        "status": status,
+        "adoptable": status == "verified",
+        "checks": checks,
+    }
 
 
 def _simple_verification_option(config: Dict[str, Any], key: str, default: bool) -> bool:
@@ -238,6 +280,25 @@ def should_run_repair_pipeline(
     if not apply_ai_fixes or result.get("status") != "success" or scope != "full":
         return False
     meta = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    identity_input: Dict[str, Any] = {}
+    if isinstance(meta.get("source_identity"), dict):
+        identity_input.update(meta["source_identity"])
+        identity_input["source_identity"] = meta["source_identity"]
+    elif isinstance(result.get("source_identity"), dict):
+        identity_input.update(result["source_identity"])
+        identity_input["source_identity"] = result["source_identity"]
+    elif isinstance(result.get("evidence_contract"), dict):
+        contract_identity = result["evidence_contract"].get("source_identity")
+        if isinstance(contract_identity, dict):
+            identity_input.update(contract_identity)
+            identity_input["source_identity"] = contract_identity
+    if isinstance(meta.get("repair_safety"), dict):
+        identity_input["repair_safety"] = meta["repair_safety"]
+    identity_gate = evaluate_source_identity(identity_input)
+    if identity_input:
+        result.setdefault("metadata", {})["source_identity_gate"] = identity_gate
+        if identity_gate["hard_block"]:
+            return False
     if meta.get("pipeline_skipped") or meta.get("llm_skipped"):
         return False
     termination = str(result.get("termination_reason") or "").strip().lower()
@@ -468,6 +529,40 @@ def _continue_repair_after_apply_patch(
             out, report_dir=report_dir, trace=trace, runtime_state=runtime_state,
         )
 
+    syntax_build = _syntax_build_verification(verification_config)
+    if syntax_build is not None and not syntax_build["adoptable"]:
+        rollback = actions.execute(
+            "rollback",
+            {**action_context, "artifact_dir": str(report_dir / "artifacts")},
+            approval=workspace_action_approval,
+        )
+        out.applied_fix_result = deps.applied_fix_result
+        out.applied_fix_result["skipped_reason"] = (
+            "syntax/build verification did not produce an adoptable result"
+        )
+        out.verification_result = {
+            "status": syntax_build["status"],
+            "adoptable": False,
+            "safety_verification": safety_report,
+            "syntax_build_verification": syntax_build,
+            "rollback": rollback,
+        }
+        out.result_updates = {
+            "status": "error",
+            "completion_reason": "syntax_build_unverified",
+            "review_required": True,
+            "applied_ai_fixes": out.applied_fix_result,
+            "diff_review": out.diff_review,
+            "safety_verification": safety_report,
+            "verification": out.verification_result,
+        }
+        return _finalize_repair_decide(
+            out,
+            report_dir=report_dir,
+            trace=trace,
+            runtime_state=runtime_state,
+        )
+
     workspace_path = str(
         action_context.get("workspace")
         or (isolated_workspace.root if isolated_workspace is not None else "")
@@ -488,6 +583,7 @@ def _continue_repair_after_apply_patch(
         safety_success = safety_report.get("status") == "passed"
         out.verification_result = {
             "status": "repair_applied" if safety_success else "safety_check_failed",
+            "adoptable": bool(safety_success),
             "safety_verification": safety_report,
             "effectiveness_verification": {
                 "enabled": False,
@@ -498,6 +594,8 @@ def _continue_repair_after_apply_patch(
         }
         if sync is not None:
             out.verification_result["worktree_sync"] = sync
+        if syntax_build is not None:
+            out.verification_result["syntax_build_verification"] = syntax_build
         out.result_updates = {
             "status": "success" if safety_success else "error",
             "completion_reason": "repair_applied" if safety_success else "safety_check_failed",
@@ -757,6 +855,47 @@ def run_repair_pipeline(
     """Apply fixes in an isolated worktree, verify, rollback on failure, sync on pass."""
     out = RepairPipelineResult()
     verification_config = dict(verification_config or {})
+    identity_input = request_record if isinstance(request_record, dict) else {}
+    observed_revision = head_commits_for_code_roots(code_roots)
+    identity_gate = evaluate_source_identity(
+        identity_input,
+        observed_commit=observed_revision,
+    )
+    if any(identity_gate.get(key) for key in (
+        "source_origin",
+        "commit_policy",
+        "base_commit",
+        "identity_confidence",
+        "block_reason",
+    )):
+        result["evidence_contract"] = build_evidence_contract(
+            identity_input,
+            observed_commit=observed_revision,
+        )
+    if identity_gate["hard_block"]:
+        out.applied_fix_result = {
+            "success": False,
+            "applied": [],
+            "status": "blocked",
+            "skipped_reason": "source identity hard gate",
+            "error": "; ".join(identity_gate["reasons"]),
+            "source_identity": identity_gate,
+        }
+        out.verification_result = {
+            "status": "skipped",
+            "adoptable": False,
+            "error": "source identity is unsafe",
+            "source_identity": identity_gate,
+        }
+        out.result_updates = {
+            "status": "error",
+            "completion_reason": "source_identity_blocked",
+            "review_required": True,
+            "applied_ai_fixes": out.applied_fix_result,
+            "verification": out.verification_result,
+            "evidence_contract": result.get("evidence_contract"),
+        }
+        return out
     session = result.get("context_session") if isinstance(result.get("context_session"), dict) else {}
     selection = session.get("reproduction_plan") if isinstance(session.get("reproduction_plan"), dict) else verification_config.get("reproduction_plan")
     claim = session.get("verification_claim") if isinstance(session.get("verification_claim"), dict) else verification_config.get("verification_claim")

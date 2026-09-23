@@ -87,8 +87,16 @@ class CaseWriterTests(unittest.TestCase):
             self.assertTrue(str(pattern.get("pattern_id", "")).startswith("pattern_"))
             self.assertEqual(pattern.get("validation_state"), "draft")
             self.assertEqual(pattern.get("source_type"), "internal_case")
+            self.assertEqual(pattern.get("pack_id"), "default")
+            self.assertEqual(pattern.get("codebase_id"), "default")
+            self.assertIn("crash_here", pattern.get("symbols") or [])
+            self.assertTrue(
+                any(item.get("evidence_type") == "analysis_summary" for item in record["evidence"])
+            )
             self.assertEqual(record["summary"]["signal"], "SIGSEGV")
             self.assertEqual(record["summary"]["fix_files"], ["foo.cpp"])
+            record_again = build_case_record_from_report(report_dir)
+            self.assertEqual(record_again["pattern"]["pattern_id"], pattern["pattern_id"])
 
     def test_commit_case_record_uses_store(self) -> None:
         analyzer = mock.Mock()

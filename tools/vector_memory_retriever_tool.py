@@ -116,6 +116,11 @@ class VectorMemoryRetrieverTool(BaseTool):
             vector_db_readonly = readonly_raw.strip().lower() not in ("0", "false", "no", "off")
         else:
             vector_db_readonly = bool(readonly_raw) if readonly_raw is not None else True
+        domain_raw = input_data.get("include_domain_knowledge", True)
+        if isinstance(domain_raw, str):
+            include_domain_knowledge = domain_raw.strip().lower() not in ("0", "false", "no", "off")
+        else:
+            include_domain_knowledge = bool(domain_raw) if domain_raw is not None else True
 
         return collect_memory_context(
             parse_result=parse_result,
@@ -125,4 +130,5 @@ class VectorMemoryRetrieverTool(BaseTool):
             rule_confidence_threshold=rule_threshold,
             vector_db_max_results=max_results,
             vector_db_readonly=vector_db_readonly,
+            include_domain_knowledge=include_domain_knowledge,
         )

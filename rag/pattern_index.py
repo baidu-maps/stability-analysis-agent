@@ -155,7 +155,8 @@ class PatternIndex:
             embedding = self._get_embedding(text)
             meta = dict(metadata or {})
             meta["pattern_id"] = pattern_id
-            self.collection.add(
+            # upsert 让 Pack 重新索引与历史案例重复提交保持幂等。
+            self.collection.upsert(
                 embeddings=[embedding],
                 documents=[text],
                 metadatas=[meta],

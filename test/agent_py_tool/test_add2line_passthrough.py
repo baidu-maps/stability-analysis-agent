@@ -15,10 +15,10 @@ from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
 
 SAMPLE = """\
 * SIGSEGV: 0x000000024c911b04 A28FFCAD-5B21-3D66-91E4-C7573948C36A + 9874169856
-* QunariPhone_Cook_CM _baidu_vi::MTLVertexBuffer::createPrivateBuffer(id, id, id)
-0 0 QunariPhone_Cook_CM 0x00000001044be644 -[CKCrashReporter recordCrashWithSignal:]
+* DemoAppBinary demo_util::DemoVertexBuffer::createPrivateBuffer(id, id, id)
+0 0 DemoAppBinary 0x00000001044be644 -[CKCrashReporter recordCrashWithSignal:]
 3 3 AGXMetalA11 0x000000024c911b04 A28FFCAD-5B21-3D66-91E4-C7573948C36A + 9874169856
-5 5 QunariPhone_Cook_CM 0x0000000102cbd188 _baidu_vi::MTLVertexBuffer::createPrivateBuffer(id, id, id)
+5 5 DemoAppBinary 0x0000000102cbd188 demo_util::DemoVertexBuffer::createPrivateBuffer(id, id, id)
 """
 
 
@@ -36,7 +36,7 @@ class TestAdd2linePassthrough(unittest.TestCase):
         ]
         self.assertNotIn("-[CKCrashReporter recordCrashWithSignal:]", symbols)
         self.assertIn(
-            "_baidu_vi::MTLVertexBuffer::createPrivateBuffer(id, id, id)",
+            "demo_util::DemoVertexBuffer::createPrivateBuffer(id, id, id)",
             symbols,
         )
 

@@ -347,8 +347,8 @@ def is_forbidden_patch(signature: str, replacement_code: str, uaf_nullptr_guard_
     """拒绝无效/症状级补丁（通用模式，非业务硬编码）。"""
     code = str(replacement_code or "")
     if (
-        re.search(r"\bthis\s*[!=]=\s*(nullptr|NULL|V_NULL|0)\b", code)
-        or re.search(r"\b(nullptr|NULL|V_NULL|0)\s*[!=]=\s*this\b", code)
+        re.search(r"\bthis\s*[!=]=\s*(nullptr|NULL|nullptr|0)\b", code)
+        or re.search(r"\b(nullptr|NULL|nullptr|0)\s*[!=]=\s*this\b", code)
         or re.search(r"\bif\s*\(\s*!\s*this\s*\)", code)
     ):
         sig = str(signature or "")
@@ -358,6 +358,60 @@ def is_forbidden_patch(signature: str, replacement_code: str, uaf_nullptr_guard_
             policy = uaf_nullptr_guard_policy
             if policy in ("strict", "balanced"):
                 return "成员函数内 this/nullptr 防护不能作为 UAF 根因修复（policy={})".format(policy)
+    live_copy_err = _forbidden_live_container_copy_patch(signature, code)
+    if live_copy_err:
+        return live_copy_err
+    return None
+
+
+def _forbidden_live_container_copy_patch(signature: str, replacement_code: str) -> Optional[str]:
+    """拒绝「只给指针加锁、仍跨线程拷贝 live 容器」的假修复。
+
+    通用模式（非业务符号硬编码）：
+    - 签名像按值返回容器（vector / Array / List 等）；
+    - 补丁内加了锁，但仍通过 ``ptr->Getter()`` 取返回值；
+    - 且未改为读取显式 snapshot/cache 成员。
+    """
+    sig = str(signature or "")
+    code = str(replacement_code or "")
+    if not sig or not code:
+        return None
+    # 仅约束「按值返回容器」类入口。
+    if not re.search(
+        r"\b(std\s*::\s*vector|QVector|QList|Array|Vector|List)\s*<",
+        sig,
+        re.I,
+    ):
+        return None
+    # 若已改为读显式 snapshot/cache 成员，且不再经指针调 getter 作为主返回源，则放行。
+    reads_snapshot = bool(re.search(r"\bm_\w*(?:Snapshot|snapshot|Cache|cache)\w*\b", code))
+    live_ptr_getter = re.search(
+        r"\b([A-Za-z_]\w*)\s*->\s*([A-Za-z_]\w*)\s*\(",
+        code,
+    )
+    if reads_snapshot and not live_ptr_getter:
+        return None
+    if reads_snapshot and live_ptr_getter:
+        # snapshot 赋值存在时，允许其它无关指针调用；仅当赋值右侧仍是 ptr->getter 才拒绝。
+        if not re.search(
+            r"=\s*[A-Za-z_]\w*\s*->\s*[A-Za-z_]\w*\s*\(",
+            code,
+        ):
+            return None
+    # 无 snapshot，却加锁后仍经裸指针 getter 取容器。
+    has_lock = bool(
+        re.search(r"\b(Lock|lock|lock_guard|unique_lock|scoped_lock|std::lock)\b", code)
+    )
+    if not has_lock:
+        return None
+    if re.search(r"=\s*[A-Za-z_]\w*\s*->\s*[A-Za-z_]\w*\s*\(", code) or re.search(
+        r"return\s+[A-Za-z_]\w*\s*->\s*[A-Za-z_]\w*\s*\(",
+        code,
+    ):
+        return (
+            "跨线程容器读入口仍通过裸指针调用 live getter 作为返回/赋值来源；"
+            "应在锁下发布/读取快照，禁止只锁指针却继续拷贝 live 容器"
+        )
     return None
 
 
@@ -570,6 +624,7 @@ def _extract_current_function_block(
 
 
 def _contains_placeholder_code(text: str) -> bool:
+    """检测 replacement 是否含省略/截断占位（不得整函数落盘）。"""
     s = str(text or "")
     # 中文省略号和固定短语标记
     phrase_markers = (
@@ -583,10 +638,21 @@ def _contains_placeholder_code(text: str) -> bool:
         "[其他",
         "代码省略",
         "省略",
+        "[snip]",
+        "write-path body truncated",
+        "body truncated",
     )
     if any(mark in s for mark in phrase_markers):
         return True
-    # "..." 仅在非字符串字面量且非注释上下文中视为占位
+    # 单行注释里的显式截断：`// ...` / `// ... 处理xxx ...`
+    for ln in s.splitlines():
+        stripped = ln.strip()
+        if re.match(r"//\s*\.\.\.", stripped):
+            return True
+        if re.match(r"/\*\s*\.\.\.", stripped):
+            return True
+    # "..." 在非字符串字面量中视为占位；注释中的「截断式省略」已在上面拦截，
+    # 普通说明性注释（如 // see docs...）仍允许。
     for m in re.finditer(r"\.{3}", s):
         start = m.start()
         line_start = s.rfind("\n", 0, start)
@@ -595,20 +661,57 @@ def _contains_placeholder_code(text: str) -> bool:
         in_string = prefix.count('"') % 2 == 1
         if in_string:
             continue
-        # 在 // 单行注释内 → 跳过（注释中的 ... 不算占位符）
+        # 在 // 单行注释内：仅当注释以省略开头时已在上方拦截；其余说明性 ... 放行
         dslash = prefix.rfind("//")
         if dslash >= 0:
-            # 确保 // 不在引号内
             before_slash = prefix[:dslash]
             if before_slash.count('"') % 2 == 0:
                 continue
-        # 在 /* */ 块注释内 → 跳过
+        # 在 /* */ 块注释内 → 跳过（块注释截断已由 /* ... 行规则覆盖）
         last_open = prefix.rfind("/*")
         last_close = prefix.rfind("*/")
         if last_open >= 0 and last_open > last_close:
             continue
         return True
     return False
+
+
+def _count_substantive_code_lines(text: str) -> int:
+    """统计实质代码行（忽略空行与纯注释行）。"""
+    count = 0
+    in_block = False
+    for ln in str(text or "").splitlines():
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        if in_block:
+            if "*/" in stripped:
+                in_block = False
+            continue
+        if stripped.startswith("/*"):
+            if "*/" not in stripped:
+                in_block = True
+            continue
+        if stripped.startswith("//"):
+            continue
+        count += 1
+    return count
+
+
+def _check_destructive_body_shrink(old_block: str, replacement: str) -> Optional[str]:
+    """拒绝相对原文大幅缩水的整函数替换（防压缩片段/省略落盘）。"""
+    switch_err = _check_destructive_switch_shrink(old_block, replacement)
+    if switch_err:
+        return switch_err
+    old_n = _count_substantive_code_lines(old_block)
+    new_n = _count_substantive_code_lines(replacement)
+    # 短函数允许加锁等小改；长函数若缩水过半则视为截断风险。
+    if old_n >= 40 and new_n < max(12, int(old_n * 0.45)):
+        return (
+            f"replacement 相对原文大幅缩水（原 {old_n} 实质行，现 {new_n} 行），"
+            "疑似截断/省略落盘，已拒绝"
+        )
+    return None
 
 
 def _is_valid_replacement_code(text: str) -> bool:
@@ -815,7 +918,7 @@ _ALLOWED_CALLEE_NAMES = frozenset(
         "NAVI_CHECK_RESULT_VAL",
         "NAVI_FUNC_ENTERLEAVE_CHECK",
         "V_ASSERT",
-        "V_NULL",
+        "nullptr",
         "memset",
         "memcpy",
         "NNew",
@@ -856,11 +959,72 @@ def _forbidden_method_error(replacement: str) -> Optional[str]:
     return None
 
 
-def _validate_method_calls_in_replacement(original: str, replacement: str) -> Optional[str]:
-    """拒绝明确禁止的方法，以及原文件未出现的常见臆造生命周期 API。"""
+def _declared_receiver_types(source: str) -> Dict[str, str]:
+    """Collect receiver-to-type evidence from local/member C++ declarations."""
+    declarations: Dict[str, str] = {}
+    pattern = re.compile(
+        r"\b((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*(?:\s*<[^;{}]+>)?)"
+        r"\s*(?:[*&]\s*)?([A-Za-z_]\w*)\s*(?:[;=,\[])"
+    )
+    for match in pattern.finditer(str(source or "")):
+        declarations[match.group(2)] = re.sub(r"\s+", "", match.group(1))
+    return declarations
+
+
+def _receiver_method_calls(source: str) -> Dict[str, Set[str]]:
+    """Collect direct ``receiver.Method()`` call evidence."""
+    calls: Dict[str, Set[str]] = {}
+    for match in re.finditer(
+        r"\b([A-Za-z_]\w*)\s*(?:->|\.)\s*([A-Za-z_]\w*)\s*\(",
+        str(source or ""),
+    ):
+        calls.setdefault(match.group(1), set()).add(match.group(2))
+    return calls
+
+
+def _validate_typed_receiver_calls(
+    original: str,
+    old_block: str,
+    replacement: str,
+) -> Optional[str]:
+    """Reject novel methods only when the target receiver type is reliably known."""
+    declarations = _declared_receiver_types(original)
+    original_calls = _receiver_method_calls(original)
+    old_calls = _receiver_method_calls(old_block)
+    replacement_calls = _receiver_method_calls(replacement)
+    for receiver, methods in replacement_calls.items():
+        target_type = declarations.get(receiver, "")
+        base_type = target_type.split("<", 1)[0].split("::")[-1]
+        if base_type not in {"Array", "Vector", "List", "QVector", "QList", "vector"}:
+            continue
+        existing = original_calls.get(receiver, set())
+        novel = sorted(methods - old_calls.get(receiver, set()) - existing)
+        if novel:
+            return (
+                "replacement 为已解析类型 {} 的接收者 {} 新增了不存在的 API 调用：{}；"
+                "该接收者现有 API 证据为 {}，已跳过"
+            ).format(
+                target_type,
+                receiver,
+                ", ".join(f"{name}()" for name in novel),
+                ", ".join(f"{name}()" for name in sorted(existing)) or "无",
+            )
+    return None
+
+
+def _validate_method_calls_in_replacement(
+    original: str,
+    replacement: str,
+    *,
+    old_block: str = "",
+) -> Optional[str]:
+    """拒绝禁止方法，以及可可靠绑定到目标类型的新增臆造 API。"""
     forbidden = _forbidden_method_error(replacement)
     if forbidden:
         return forbidden
+    typed_error = _validate_typed_receiver_calls(original, old_block, replacement)
+    if typed_error:
+        return typed_error
     # 常见幻觉：在无 COM/智能指针证据时臆造 AddRef/Release/Retain
     invented_life = re.findall(
         r"(?:->|\.)\s*(AddRef|Release|Retain|retain|release)\s*\(",
@@ -891,7 +1055,7 @@ def _check_destructive_switch_shrink(old_block: str, replacement: str) -> Option
 def _extract_entry_null_guard_var(replacement: str) -> Optional[str]:
     guard_match = re.search(
         r'\{[^\S\n]*\n'
-        r'\s*if\s*\(\s*(\w+)\s*==\s*(?:V_NULL|nullptr|NULL|0)\s*\)\s*\{[^}]*return[^}]*\}',
+        r'\s*if\s*\(\s*(\w+)\s*==\s*(?:nullptr|nullptr|NULL|0)\s*\)\s*\{[^}]*return[^}]*\}',
         replacement,
     )
     if not guard_match:
@@ -939,7 +1103,7 @@ def _check_null_guard_only_patch(
         return None
     stripped = re.sub(
         r'(\{[^\S\n]*\n)'
-        r'(\s*if\s*\(\s*!?\s*\w+\s*(?:==\s*(?:V_NULL|nullptr|NULL|0)\s*)?\)\s*\{[^}]*return[^}]*\}\s*\n?)',
+        r'(\s*if\s*\(\s*!?\s*\w+\s*(?:==\s*(?:nullptr|nullptr|NULL|0)\s*)?\)\s*\{[^}]*return[^}]*\}\s*\n?)',
         r'\1',
         replacement,
         count=1,
@@ -1806,7 +1970,7 @@ def _replacement_signature_compatible(target_signature: str, replacement_code: s
         if target_owner != block_owner and t_tail != b_tail:
             return False
     if _target_is_destructor(target_norm):
-        # 析构函数没有返回类型；`VBool Class::~Class()` 或 `VBool ~Class()` 都不可直接替换。
+        # 析构函数没有返回类型；`bool Class::~Class()` 或 `bool ~Class()` 都不可直接替换。
         if re.match(r"^\s*(?:[\w:<>,*&]+\s+)+[A-Za-z_]\w*::~[A-Za-z_]\w*\s*\(", block_sig):
             return False
         if re.match(r"^\s*(?:[\w:<>,*&]+\s+)+~[A-Za-z_]\w*\s*\(", block_sig):
@@ -2746,7 +2910,25 @@ class CodeFixer:
                 record["error"] = sync_err
                 applied.append(record)
                 continue
-            method_err = _validate_method_calls_in_replacement(original, replacement_code)
+            forbidden_err = is_forbidden_patch(
+                signature,
+                replacement_code,
+                uaf_nullptr_guard_policy=str(self._uaf_policy or "strict"),
+            )
+            if forbidden_err:
+                record["error"] = forbidden_err
+                applied.append(record)
+                continue
+            destructive_err = _check_destructive_body_shrink(old_block, replacement_code)
+            if destructive_err:
+                record["error"] = destructive_err
+                applied.append(record)
+                continue
+            method_err = _validate_method_calls_in_replacement(
+                original,
+                replacement_code,
+                old_block=old_block,
+            )
             if method_err:
                 record["error"] = method_err
                 applied.append(record)

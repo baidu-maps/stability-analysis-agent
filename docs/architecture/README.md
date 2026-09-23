@@ -14,7 +14,9 @@
 - 编排层：Tool System / Workflow / Executor
 - 工具层：`crash_log_parser`、`add2line_resolver`、`code_content_provider`
 - AI 层：Direct / LangChain / LangGraph 适配器
-- 记忆层：规则 + 向量 + 元数据（RAG）
+- 知识层：Codebase Knowledge Pack + 规则 + 向量 + 元数据；`knowledge_plane/`
+  负责 Pack 路由和裁剪，Workflow 将 Pack 命中与 RAG 结果统一写入
+  `05_memory_context.json` / `memory_context`
 
 ## 核心流程
 
@@ -37,6 +39,7 @@
 - `workflows/`：Workflow 定义
 - `tool_system/`：注册表、配置、执行器、LLM 适配器
 - `tools/`：具体工具实现
+- `knowledge_plane/`：代码库知识包加载、路由、检索以及与 RAG 的统一输出门面
 - `rag/`：RAG 相关实现
 - `examples/`：demo crash cases
 - `test/`：测试集（文档见 [docs/testing/README.md](../testing/README.md)）

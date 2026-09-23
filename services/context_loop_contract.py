@@ -80,12 +80,12 @@ def build_round0_output_format_lines(*, agent_loop: str) -> List[str]:
         "### Agent 将回填的内容（按 type 选择请求）",
         (
             "- `function`：返回**函数定义处完整源码**（含签名与函数体）。"
-            "模板类方法优先写全 `CVList<TArgs>::Method`（如 `CVList<CBaseLayer*, CBaseLayer*>::RemoveAll`）；"
-            "也可写 `CVList::RemoveAll`，Agent 会自动搜索模板实现。"
+            "模板类方法优先写全 `DemoList<TArgs>::Method`（如 `DemoList<DemoLayer*, DemoLayer*>::RemoveAll`）；"
+            "也可写 `DemoList::RemoveAll`，Agent 会自动搜索模板实现。"
         ),
         (
             "- `field`：返回**所属类的成员声明**（优先头文件），请写 `ClassName::member`；"
-            "若需查看**类型/容器本身的类结构**，可写 `field: TypeName`（如 `CVList`），"
+            "若需查看**类型/容器本身的类结构**，可写 `field: TypeName`（如 `DemoList`），"
             "将返回 `class/struct` 声明块。"
             "若无声明则返回同类中的初始化语句；**不包含**调用链或并发读写路径。"
         ),
@@ -127,7 +127,7 @@ def build_round0_output_format_lines(*, agent_loop: str) -> List[str]:
         "    },",
         "    {",
         '      "type": "read_file",',
-        '      "file": "inc/vi/vos/VTempl.h",',
+        '      "file": "include/util/DemoTempl.h",',
         '      "expected_return_form": "file_snippet",',
         '      "reason": "读取头文件中的模板实现（不要用 type=file）",',
         '      "priority": "high"',

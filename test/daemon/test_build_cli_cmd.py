@@ -27,6 +27,26 @@ def _argv_from_cmd(cmd: list) -> list:
 
 
 class BuildCliCmdTests(unittest.TestCase):
+    def test_knowledge_plane_flags_are_forwarded(self) -> None:
+        req = run_request_from_dict(
+            {
+                "crash_log": "/tmp/a.crash",
+                "knowledge_pack_dirs": ["/tmp/packs-a", "/tmp/packs-b"],
+                "knowledge_pack_id": "demo-app",
+                "knowledge_max_hits": 6,
+                "knowledge_max_chars": 7000,
+                "domain_knowledge": False,
+            }
+        )
+        cmd, _ = _build_cli_cmd(req)
+        argv = _argv_from_cmd(cmd)
+        parsed = build_parser().parse_args(argv)
+        self.assertEqual(parsed.knowledge_pack_dir, ["/tmp/packs-a", "/tmp/packs-b"])
+        self.assertEqual(parsed.knowledge_pack, "demo-app")
+        self.assertEqual(parsed.knowledge_max_hits, 6)
+        self.assertEqual(parsed.knowledge_max_chars, 7000)
+        self.assertFalse(parsed.domain_knowledge)
+
     def test_crash_log_dir_preferred(self) -> None:
         req = run_request_from_dict(
             {

@@ -170,12 +170,12 @@ class TestBuildPromptFinalTip(unittest.TestCase):
 
     def test_stack_adjacent_verified_path_high_confidence_in_final_tip(self):
         crash_id = (
-            "func|/tmp/VTempl.h|VVoid VDestructElements(TYPE* pElements, VInt iCount)"
+            "func|/tmp/DemoTempl.h|void DemoDestructElements(TYPE* pElements, int iCount)"
         )
         release_all_id = (
-            "func|/tmp/VMapControl.cpp|VVoid CVMapControl::ReleaseAllLayers()"
+            "func|/tmp/DemoMapControl.cpp|void DemoMapControl::ReleaseAllLayers()"
         )
-        release_id = "func|/tmp/BaseLayer.cpp|VVoid CBaseLayer::Release()"
+        release_id = "func|/tmp/DemoLayer.cpp|void DemoLayer::Release()"
         code_ctx = {
             "crash_summary": {
                 "node_id": crash_id + " {",
@@ -188,11 +188,11 @@ class TestBuildPromptFinalTip(unittest.TestCase):
                     {
                         "id": crash_id,
                         "type": "function",
-                        "signature": "VVoid VDestructElements(TYPE* pElements, VInt iCount)",
-                        "file": "/tmp/VTempl.h",
+                        "signature": "void DemoDestructElements(TYPE* pElements, int iCount)",
+                        "file": "/tmp/DemoTempl.h",
                         "snippet": [
                             "template<class TYPE>",
-                            "VVoid VDestructElements(TYPE* pElements, VInt iCount) {",
+                            "void DemoDestructElements(TYPE* pElements, int iCount) {",
                             "  pElements->~TYPE();",
                             "}",
                         ],
@@ -200,22 +200,22 @@ class TestBuildPromptFinalTip(unittest.TestCase):
                     {
                         "id": release_all_id,
                         "type": "function",
-                        "signature": "VVoid CVMapControl::ReleaseAllLayers()",
-                        "file": "/tmp/VMapControl.cpp",
+                        "signature": "void DemoMapControl::ReleaseAllLayers()",
+                        "file": "/tmp/DemoMapControl.cpp",
                         "snippet": [
-                            "VVoid CVMapControl::ReleaseAllLayers() {",
-                            "  pbaselayer->Release();",
+                            "void DemoMapControl::ReleaseAllLayers() {",
+                            "  player->Release();",
                             "}",
                         ],
                     },
                     {
                         "id": release_id,
                         "type": "function",
-                        "signature": "VVoid CBaseLayer::Release()",
-                        "file": "/tmp/BaseLayer.cpp",
+                        "signature": "void DemoLayer::Release()",
+                        "file": "/tmp/DemoLayer.cpp",
                         "snippet": [
-                            "VVoid CBaseLayer::Release() {",
-                            "  VDelete(this);",
+                            "void DemoLayer::Release() {",
+                            "  DemoDelete(this);",
                             "}",
                         ],
                     },
@@ -244,7 +244,7 @@ class TestBuildPromptFinalTip(unittest.TestCase):
                     },
                     {
                         "nodes": [
-                            "func|/tmp/VMapControl.cpp|VVoid CVMapControl::InvokeLayersReq(VBool needLoad)",
+                            "func|/tmp/DemoMapControl.cpp|void DemoMapControl::InvokeLayersReq(bool needLoad)",
                             crash_id,
                         ],
                         "description": "static_repo_inferred",
@@ -262,9 +262,9 @@ class TestBuildPromptFinalTip(unittest.TestCase):
         wf = iOSCrashAnalyzeWorkflow()
         text = wf._build_prompt_final_tip({}, {"resolved_frames": []}, code_ctx)
         self.assertIn("栈相邻帧 + 源码调用链已校验", text)
-        self.assertIn("CVMapControl::ReleaseAllLayers()", text)
-        self.assertIn("CBaseLayer::Release()", text)
-        self.assertIn("VDestructElements", text)
+        self.assertIn("DemoMapControl::ReleaseAllLayers()", text)
+        self.assertIn("DemoLayer::Release()", text)
+        self.assertIn("DemoDestructElements", text)
         self.assertIn("路径2: 共", text)
 
     def test_evidence_gate_message_in_final_tip(self):
@@ -313,7 +313,7 @@ class TestBuildPromptFinalTip(unittest.TestCase):
         self.assertIn("calls_stack_order", text)
 
     def test_symbol_only_prompt_omits_crash_line_number_and_suspicious_snippet(self):
-        crash_id = "func|/tmp/mtl.mm|void MTLVertexBuffer::createPrivateBuffer()"
+        crash_id = "func|/tmp/mtl.mm|void DemoVertexBuffer::createPrivateBuffer()"
         code_ctx = {
             "crash_summary": {
                 "node_id": crash_id + " {",
@@ -328,9 +328,9 @@ class TestBuildPromptFinalTip(unittest.TestCase):
                     {
                         "id": crash_id,
                         "type": "function",
-                        "signature": "void MTLVertexBuffer::createPrivateBuffer()",
+                        "signature": "void DemoVertexBuffer::createPrivateBuffer()",
                         "file": "/tmp/mtl.mm",
-                        "snippet": ["void MTLVertexBuffer::createPrivateBuffer() {", "}"],
+                        "snippet": ["void DemoVertexBuffer::createPrivateBuffer() {", "}"],
                     }
                 ],
                 "edges": [],
@@ -339,7 +339,7 @@ class TestBuildPromptFinalTip(unittest.TestCase):
         resolved = {
             "resolved_frames": [
                 {
-                    "resolved_function": "MTLVertexBuffer::createPrivateBuffer()",
+                    "resolved_function": "DemoVertexBuffer::createPrivateBuffer()",
                     "resolved_file": None,
                     "resolved_line": None,
                 }
@@ -449,7 +449,7 @@ class TestBuildPromptFinalTip(unittest.TestCase):
         self.assertNotIn("可疑单行", text)
 
     def test_non_crash_thread_analysis_entry_is_not_rendered_as_crash_line(self):
-        crash_id = "func|/tmp/VTaskQueue.cpp|void Loop(void)"
+        crash_id = "func|/tmp/DemoTaskQueue.cpp|void Loop(void)"
         code_ctx = {
             "crash_summary": {
                 "error_type": "SIGSEGV",
@@ -464,7 +464,7 @@ class TestBuildPromptFinalTip(unittest.TestCase):
                 "selected_analysis_confidence": "investigation_hint",
                 "selected_analysis_note": "当前源码上下文来自其它业务线程。",
                 "attributed_crash_location_status": "unresolved_crash_thread_no_business_frame",
-                "analysis_entry_file": "/tmp/VTaskQueue.cpp",
+                "analysis_entry_file": "/tmp/DemoTaskQueue.cpp",
                 "analysis_entry_function": "void Loop(void)",
                 "analysis_entry_line_number": 294,
                 "analysis_entry_line_code": "while (!m_stop && m_tasks.empty())",
@@ -478,7 +478,7 @@ class TestBuildPromptFinalTip(unittest.TestCase):
                         "id": crash_id,
                         "type": "function",
                         "signature": "void Loop(void)",
-                        "file": "/tmp/VTaskQueue.cpp",
+                        "file": "/tmp/DemoTaskQueue.cpp",
                         "snippet": ["void Loop(void) {", "  while (!m_stop && m_tasks.empty()) {", "  }", "}"],
                     }
                 ],
@@ -511,7 +511,7 @@ class TestBuildPromptFinalTip(unittest.TestCase):
                     "frames": [
                         {
                             "resolved_function": "void Loop(void)",
-                            "resolved_file": "/tmp/VTaskQueue.cpp",
+                            "resolved_file": "/tmp/DemoTaskQueue.cpp",
                             "resolved_line": 298,
                             "module": "libapp.so",
                         }
@@ -543,8 +543,8 @@ class TestBuildPromptFinalTip(unittest.TestCase):
         self.assertNotIn("崩溃所属类骨架", text)
 
     def test_owner_class_context_not_in_prompt_summary(self):
-        crash_id = "func|/tmp/mtl.mm|void MTLVertexBuffer::createPrivateBuffer()"
-        skel_id = "class_skeleton|/tmp/mtl_render_vertex_buffer.mm|MTLVertexBuffer"
+        crash_id = "func|/tmp/mtl.mm|void DemoVertexBuffer::createPrivateBuffer()"
+        skel_id = "class_skeleton|/tmp/mtl_render_vertex_buffer.mm|DemoVertexBuffer"
         code_ctx = {
             "crash_summary": {
                 "node_id": crash_id + " {",
@@ -557,16 +557,16 @@ class TestBuildPromptFinalTip(unittest.TestCase):
                     {
                         "id": crash_id,
                         "type": "function",
-                        "signature": "void MTLVertexBuffer::createPrivateBuffer()",
+                        "signature": "void DemoVertexBuffer::createPrivateBuffer()",
                         "file": "/tmp/mtl.mm",
-                        "snippet": ["void MTLVertexBuffer::createPrivateBuffer() {", "}"],
+                        "snippet": ["void DemoVertexBuffer::createPrivateBuffer() {", "}"],
                     },
                     {
                         "id": skel_id,
                         "type": "class_skeleton",
-                        "class_name": "MTLVertexBuffer",
+                        "class_name": "DemoVertexBuffer",
                         "file": "/tmp/mtl_render_vertex_buffer.mm",
-                        "skeleton": "class MTLVertexBuffer {\n};",
+                        "skeleton": "class DemoVertexBuffer {\n};",
                         "member_fields": ["VertexFormatInvalid", "_buffer"],
                     },
                 ],
@@ -580,12 +580,12 @@ class TestBuildPromptFinalTip(unittest.TestCase):
         self.assertNotIn("member_fields:", text)
         self.assertNotIn("- class_name:", text)
         self.assertNotIn("owner_class_context", text)
-        self.assertIn("### 崩溃所属类骨架（MTLVertexBuffer）", text)
+        self.assertIn("### 崩溃所属类骨架（DemoVertexBuffer）", text)
 
     def test_owner_class_sync_keepalive_and_usage_examples_in_prompt(self):
-        crash_id = "func|/tmp/walk_naviengine_control.cpp|CVArray<RenderStep> CNaviEngineControl::GetRenderSteps()"
+        crash_id = "func|/tmp/demo_engine_control.cpp|Array<RenderStep> DemoEngineControl::GetDrawSteps()"
         skel_id = (
-            "class_skeleton|/tmp/walk_naviengine_control.h|CNaviEngineControl"
+            "class_skeleton|/tmp/demo_engine_control.h|DemoEngineControl"
         )
         code_ctx = {
             "crash_summary": {
@@ -600,26 +600,26 @@ class TestBuildPromptFinalTip(unittest.TestCase):
                         "id": crash_id,
                         "type": "function",
                         "signature": (
-                            "CVArray<RenderStep> CNaviEngineControl::GetRenderSteps()"
+                            "Array<RenderStep> DemoEngineControl::GetDrawSteps()"
                         ),
-                        "file": "/tmp/walk_naviengine_control.cpp",
+                        "file": "/tmp/demo_engine_control.cpp",
                         "snippet": [
-                            "CVArray<RenderStep> CNaviEngineControl::GetRenderSteps()",
+                            "Array<RenderStep> DemoEngineControl::GetDrawSteps()",
                             "{",
-                            "    if (m_pclCurRoute) {",
-                            "        return m_pclCurRoute->GetRenderSteps();",
+                            "    if (m_pCurrentItem) {",
+                            "        return m_pCurrentItem->GetDrawSteps();",
                             "    }",
-                            "    return CVArray<RenderStep>();",
+                            "    return Array<RenderStep>();",
                             "}",
                         ],
                     },
                     {
-                        "id": "func|/tmp/walk_naviengine_control.cpp|GetRouteInfo",
+                        "id": "func|/tmp/demo_engine_control.cpp|GetRouteInfo",
                         "type": "function",
-                        "signature": "NE_Ret_Enum CNaviEngineControl::GetRouteInfo()",
-                        "file": "/tmp/walk_naviengine_control.cpp",
+                        "signature": "DemoStatus DemoEngineControl::GetRouteInfo()",
+                        "file": "/tmp/demo_engine_control.cpp",
                         "snippet": [
-                            "NE_Ret_Enum CNaviEngineControl::GetRouteInfo()",
+                            "DemoStatus DemoEngineControl::GetRouteInfo()",
                             "{",
                             "\tm_clRouteInfoMutex.Lock( V_INFINITY_WAIT );",
                             "\t// copy",
@@ -630,15 +630,15 @@ class TestBuildPromptFinalTip(unittest.TestCase):
                     {
                         "id": skel_id,
                         "type": "class_skeleton",
-                        "class_name": "CNaviEngineControl",
-                        "file": "/tmp/walk_naviengine_control.h",
+                        "class_name": "DemoEngineControl",
+                        "file": "/tmp/demo_engine_control.h",
                         "skeleton": (
-                            "class CNaviEngineControl {\n"
+                            "class DemoEngineControl {\n"
                             "\tCNMutex m_clRouteInfoMutex;\n"
-                            "\tCRoute* m_pclCurRoute;\n"
+                            "\tDemoRoute* m_pCurrentItem;\n"
                             "};\n"
                         ),
-                        "member_fields": ["m_clRouteInfoMutex", "m_pclCurRoute"],
+                        "member_fields": ["m_clRouteInfoMutex", "m_pCurrentItem"],
                     },
                 ],
                 "edges": [],
@@ -646,7 +646,7 @@ class TestBuildPromptFinalTip(unittest.TestCase):
         }
         wf = iOSCrashAnalyzeWorkflow()
         text = wf._build_prompt_final_tip({}, {"resolved_frames": []}, code_ctx, problem={})
-        self.assertIn("### 关键同步与共享成员（CNaviEngineControl，压缩保活）", text)
+        self.assertIn("### 关键同步与共享成员（DemoEngineControl，压缩保活）", text)
         self.assertIn("m_clRouteInfoMutex", text)
         self.assertIn("m_clRouteInfoMutex.Lock", text)
         self.assertIn("无接收者的 Lock()/Unlock()", text)
@@ -810,13 +810,13 @@ class TestCodeContentProviderV2(unittest.TestCase):
         root.mkdir(parents=True, exist_ok=True)
         cpp = root / "napi.cpp"
         cpp.write_text(
-            "namespace _baidu_framework {\n"
-            "static int NapiMapIF_GetNearlyObj() { return 0; }\n"
+            "namespace demo_fw {\n"
+            "static int NapiDemo_GetNearObject() { return 0; }\n"
             "}\n",
             encoding="utf-8",
         )
         cls = p._extract_class_name_from_resolved(
-            "_baidu_framework::NapiMapIF_GetNearlyObj(napi_env env)",
+            "demo_fw::NapiDemo_GetNearObject(napi_env env)",
             crash_file=str(cpp),
             code_roots=[str(root.resolve())],
         )
@@ -864,33 +864,33 @@ class TestCodeContentProviderV2(unittest.TestCase):
         self.assertIn("tail", merged)
 
     def test_resolve_stack_adjacent_indirect_chain_release_to_vdestruct(self):
-        """ReleaseAllLayers -> Release -> VDelete 桥接应能连通 VDestructElements。"""
+        """ReleaseAllLayers -> Release -> DemoDelete 桥接应能连通 DemoDestructElements。"""
         root = Path(self.test_dir) / "stack_chain"
         root.mkdir(parents=True, exist_ok=True)
-        templ = root / "VTempl.h"
+        templ = root / "DemoTempl.h"
         templ.write_text(
             "template<class TYPE>\n"
-            "VVoid VDestructElements(TYPE* pElements, VInt iCount) {\n"
+            "void DemoDestructElements(TYPE* pElements, int iCount) {\n"
             "  pElements->~TYPE();\n"
             "}\n"
             "template<class TYPE>\n"
-            "VVoid VDelete(TYPE* pObjects) {\n"
-            "  VDestructElements<TYPE>(pObjects, 1);\n"
+            "void DemoDelete(TYPE* pObjects) {\n"
+            "  DemoDestructElements<TYPE>(pObjects, 1);\n"
             "}\n",
             encoding="utf-8",
         )
-        vmap = root / "VMapControl.cpp"
+        vmap = root / "DemoMapControl.cpp"
         vmap.write_text(
-            "VVoid CVMapControl::ReleaseAllLayers() {\n"
-            "  CBaseLayer* pbaselayer = nullptr;\n"
-            "  pbaselayer->Release();\n"
+            "void DemoMapControl::ReleaseAllLayers() {\n"
+            "  DemoLayer* player = nullptr;\n"
+            "  player->Release();\n"
             "}\n",
             encoding="utf-8",
         )
-        base = root / "BaseLayer.cpp"
+        base = root / "DemoLayer.cpp"
         base.write_text(
-            "VVoid CBaseLayer::Release() {\n"
-            "  VDelete(this);\n"
+            "void DemoLayer::Release() {\n"
+            "  DemoDelete(this);\n"
             "}\n",
             encoding="utf-8",
         )
@@ -901,9 +901,9 @@ class TestCodeContentProviderV2(unittest.TestCase):
         crash_node = GraphNode(
             id="crash",
             type="function",
-            name="VDestructElements",
+            name="DemoDestructElements",
             file=str(templ.resolve()),
-            signature="VVoid VDestructElements(TYPE* pElements, VInt iCount)",
+            signature="void DemoDestructElements(TYPE* pElements, int iCount)",
             snippet=templ.read_text(encoding="utf-8").splitlines()[:5],
         )
         outer_node = GraphNode(
@@ -911,7 +911,7 @@ class TestCodeContentProviderV2(unittest.TestCase):
             type="function",
             name="ReleaseAllLayers",
             file=str(vmap.resolve()),
-            signature="VVoid CVMapControl::ReleaseAllLayers()",
+            signature="void DemoMapControl::ReleaseAllLayers()",
             snippet=vmap.read_text(encoding="utf-8").splitlines(),
         )
         nodes: dict = {}
@@ -942,7 +942,7 @@ class TestCodeContentProviderV2(unittest.TestCase):
         sigs = [nodes[cid].signature for cid in chain_ids]
         self.assertTrue(any("ReleaseAllLayers" in s for s in sigs))
         self.assertTrue(any("Release" in s and "ReleaseAllLayers" not in s for s in sigs))
-        self.assertTrue(any("VDestructElements" in s for s in sigs))
+        self.assertTrue(any("DemoDestructElements" in s for s in sigs))
 
     def test_objc_mm_function_snippet_excludes_namespace_macro(self):
         """readlines + 函数体提取不应产生双换行，snippet 不得从 NAMESPACE 宏起跨函数。"""
@@ -950,14 +950,14 @@ class TestCodeContentProviderV2(unittest.TestCase):
         mm.write_text(
             '#include "mtl_render_vertex_buffer.h"\n\n'
             "NAMESPACE_BAIDU_VI_BEGIN\n\n"
-            "void MTLVertexBuffer::createPrivateBuffer(id<MTLDevice> device, id<MTLCommandQueue> commandQueue, id<MTLBuffer> sharedBuffer)\n"
+            "void DemoVertexBuffer::createPrivateBuffer(id<MTLDevice> device, id<MTLCommandQueue> commandQueue, id<MTLBuffer> sharedBuffer)\n"
             "{\n"
             "    @autoreleasepool\n"
             "    {\n"
             "        id<MTLCommandBuffer> cmd_buffer = [commandQueue commandBuffer];\n"
             "    }\n"
             "}\n\n"
-            "MTLVertexBuffer::MTLVertexBuffer(id<MTLDevice> device, size_t len, StorageMode type)\n"
+            "DemoVertexBuffer::DemoVertexBuffer(id<MTLDevice> device, size_t len, StorageMode type)\n"
             "{\n"
             "    if (device) {\n"
             "        _buffer = nil;\n"
@@ -967,7 +967,7 @@ class TestCodeContentProviderV2(unittest.TestCase):
             encoding="utf-8",
         )
         sig = (
-            "void MTLVertexBuffer::createPrivateBuffer(id<MTLDevice> device, "
+            "void DemoVertexBuffer::createPrivateBuffer(id<MTLDevice> device, "
             "id<MTLCommandQueue> commandQueue, id<MTLBuffer> sharedBuffer)"
         )
         p = CodeContentProvider(code_parser_backend="regex")
@@ -976,7 +976,7 @@ class TestCodeContentProviderV2(unittest.TestCase):
         self.assertIsNotNone(cf)
         self.assertEqual(cf.snippet_start_line, 5)
         self.assertEqual(cf.snippet_end_line, 11)
-        self.assertTrue(cf.snippet[0].startswith("void MTLVertexBuffer::createPrivateBuffer"))
+        self.assertTrue(cf.snippet[0].startswith("void DemoVertexBuffer::createPrivateBuffer"))
         self.assertFalse(any("NAMESPACE_BAIDU_VI_BEGIN" in ln for ln in cf.snippet))
         self.assertFalse(any("size_t len" in ln for ln in cf.snippet))
         self.assertEqual(len(cf.snippet), cf.snippet_end_line - cf.snippet_start_line + 1)

@@ -598,6 +598,22 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         parse_result, resolved, code_context, scope, problem
                     )
 
+            lifecycle_evidence: Dict[str, Any] = {}
+            try:
+                lifecycle_evidence = context.execute_tool(
+                    "lifecycle_code_search",
+                    {
+                        "resolved_stack": resolved,
+                        "code_context": code_context,
+                        "code_roots": code_roots,
+                        "max_results": problem.get("lifecycle_search_max_results", 120)
+                        if isinstance(problem, dict)
+                        else 120,
+                    },
+                )
+            except Exception as lifecycle_exc:
+                logger.info("[%s] lifecycle code search skipped: %s", self.definition.name, lifecycle_exc)
+
             memory_context = ""
             memory_retrieval: Dict[str, Any] = {}
             rule_hits: List[Dict[str, Any]] = []
@@ -606,11 +622,15 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             strategy_hits: List[Dict[str, Any]] = []
             decision_trace: List[Dict[str, Any]] = []
             vector_used = False
+            knowledge_retrieval: Dict[str, Any] = {}
 
             rag_input: Dict[str, Any] = {
                 "parse_result": parse_result,
                 "resolved_stack": resolved,
                 "code_context": code_context,
+                "include_domain_knowledge": bool(problem.get("enable_domain_knowledge", True))
+                if isinstance(problem, dict)
+                else True,
             }
             if isinstance(problem, dict):
                 if problem.get("vector_db_path") is not None:
@@ -641,6 +661,91 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 strategy_hits = rag_result.get("strategy_hits", []) or []
                 decision_trace = rag_result.get("decision_trace", []) or []
                 vector_used = bool(rag_result.get("vector_used", False))
+
+            # 代码库领域知识与现有规则/向量记忆共用同一个检索结果和提示词通道。
+            # Pack 文档负责本仓架构/线程/生命周期，RAG 负责通用规则与历史案例。
+            domain_knowledge_enabled = bool(problem.get("enable_domain_knowledge", True)) if isinstance(problem, dict) else True
+            try:
+                from knowledge_plane import retrieve_knowledge
+
+                if domain_knowledge_enabled:
+                    explicit_pack_dirs = problem.get("knowledge_pack_dirs") if isinstance(problem, dict) else None
+                    if isinstance(explicit_pack_dirs, str):
+                        explicit_pack_dirs = [explicit_pack_dirs]
+                    knowledge_retrieval = retrieve_knowledge(
+                        parse_result=parse_result,
+                        resolved_stack=resolved,
+                        code_context=code_context,
+                        pack_dirs=explicit_pack_dirs if isinstance(explicit_pack_dirs, list) else None,
+                        pack_id=str(problem.get("knowledge_pack_id") or "") if isinstance(problem, dict) else "",
+                        max_hits=int(problem.get("knowledge_max_hits") or 4) if isinstance(problem, dict) else 4,
+                        max_chars=int(problem.get("knowledge_max_chars") or 4500) if isinstance(problem, dict) else 4500,
+                    )
+                else:
+                    knowledge_retrieval = {
+                        "success": True,
+                        "skipped": True,
+                        "skip_reason": "domain_knowledge_disabled",
+                        "knowledge_context": "",
+                        "hits": [],
+                        "decision_trace": [
+                            {"stage": "domain_knowledge", "result": "disabled"}
+                        ],
+                    }
+            except Exception as knowledge_exc:
+                logger.info(
+                    "[%s] codebase knowledge retrieval skipped: %s",
+                    self.definition.name,
+                    knowledge_exc,
+                )
+                knowledge_retrieval = {
+                    "success": False,
+                    "error": str(knowledge_exc),
+                    "knowledge_context": "",
+                    "hits": [],
+                }
+            knowledge_context = str(knowledge_retrieval.get("knowledge_context") or "")
+            try:
+                from rag.retrieval_fusion import fuse_retrieval_hits
+
+                fusion = fuse_retrieval_hits(
+                    rule_hits=rule_hits,
+                    pack_hits=knowledge_retrieval.get("hits") or [],
+                    vector_hits=pattern_hits,
+                    max_chars=int(problem.get("knowledge_max_chars") or 4500)
+                    if isinstance(problem, dict)
+                    else 4500,
+                    max_hits=int(problem.get("knowledge_max_hits") or 4)
+                    if isinstance(problem, dict)
+                    else 4,
+                )
+                diagnostic_context = str(memory_retrieval.get("diagnostic_context") or "")
+                strategy_context = str(memory_retrieval.get("strategy_context") or "")
+                fused_context = str(fusion.get("context") or "")
+                memory_context = "\n\n".join(
+                    item
+                    for item in (
+                        diagnostic_context,
+                        "融合知识参考:\n" + fused_context if fused_context else "",
+                        strategy_context,
+                    )
+                    if item
+                )
+                memory_retrieval["retrieval_fusion"] = fusion
+            except Exception as fusion_exc:
+                logger.info("[%s] knowledge fusion skipped: %s", self.definition.name, fusion_exc)
+                if knowledge_context:
+                    memory_context = "\n\n".join(
+                        item for item in (knowledge_context, memory_context) if item
+                    )
+            if not isinstance(memory_retrieval, dict):
+                memory_retrieval = {}
+            memory_retrieval["knowledge_retrieval"] = knowledge_retrieval
+            memory_retrieval["memory_context"] = memory_context
+            knowledge_trace = knowledge_retrieval.get("decision_trace")
+            if isinstance(knowledge_trace, list):
+                decision_trace = [*knowledge_trace, *decision_trace]
+                memory_retrieval["decision_trace"] = decision_trace
 
             # === 确定性结论已并入 04a.prompt_section_zh，此处不再旁路重复注入 ===
 
@@ -682,6 +787,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     "memory_diagnosis": memory_diagnosis or {},
                     "timeline_diagnosis": timeline_diagnosis or {},
                     "code_context": code_context,
+                    "lifecycle_evidence": lifecycle_evidence,
                     "analysis": None,
                     "final_tip": assembled_prompt or None,
                     "note": "LLM not configured, AI analysis skipped",
@@ -759,6 +865,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     "memory_diagnosis": memory_diagnosis or {},
                     "timeline_diagnosis": timeline_diagnosis or {},
                     "code_context": code_context,
+                    "lifecycle_evidence": lifecycle_evidence,
                     "analysis": None,
                     "final_tip": analysis_prompt,
                     "rule_hits": rule_hits,
@@ -808,6 +915,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 "memory_diagnosis": memory_diagnosis or {},
                 "timeline_diagnosis": timeline_diagnosis or {},
                 "code_context": code_context,
+                "lifecycle_evidence": lifecycle_evidence,
                 "analysis": analysis_text,
                 "final_tip": analysis_prompt,
                 "agent_rounds": agent_rounds,
@@ -848,6 +956,12 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         meta: Dict[str, Any] = {"problem_type": problem_type}
         if not isinstance(problem, dict):
             return meta
+        source_identity = problem.get("source_identity")
+        if isinstance(source_identity, dict) and source_identity:
+            from services.evidence_contract import build_evidence_contract
+
+            meta["source_identity"] = dict(source_identity)
+            meta["evidence_contract"] = build_evidence_contract(problem)
         state = problem.get("_llm_router_state")
         if state is not None and hasattr(state, "to_summary_dict"):
             try:
@@ -1838,6 +1952,45 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
 
         lines: List[str] = []
         summary_emitted_structured_crash_point = False
+        lines.extend(
+            [
+                "## Evidence Contract（必须遵守）",
+                "- 将结论逐项标注为「日志事实」「符号事实」「源码事实」或「推断」，禁止混写。",
+                "- 日志没有明确 signal 字段时，不得宣称信号为 SIGABRT；Abort 字样也不能替代 signal 证据。",
+                "- 宣称数据竞态时，必须列出读线程、写线程、共享对象，以及两侧锁覆盖；若读写受同一 mutex",
+                "  完整保护，不得强制提出竞态修复。",
+                "- 栈顶若为容器拷贝（如 Copy / operator= / 按值返回容器），共享对象优先视为被拷贝的容器",
+                "  内容，而非仅外层裸指针；须沿赋值右侧继续追踪到 return 的成员容器，并检索其写点",
+                "  （原地重建 / Clear / RemoveAll / Add / Append / SetSize 等），不得只给指针加锁后结束。",
+                "- 容器写点包含无赋值号的就地修改（mutator 调用），不得只搜 `=`。",
+                "- 锁住指针不等于锁住指针指向对象的内部容器；写路径若「先赋值指针再加锁」不能算已保护。",
+                "- 不得把模板头文件行号安到业务 .cpp 函数上作为崩溃行。",
+                "- 若补丁后跨线程读路径仍拷贝 live 容器成员（未改为锁下快照/发布），不得宣称已覆盖",
+                "  容器 Copy 崩溃帧；读入口仍经裸指针调用 live getter 并按值返回的补丁视为无效。",
+                "- 若上文已给出「展开容器成员」写路径函数，主根因必须点名该写路径；禁止仅用外层指针置空/",
+                "  释放函数充当唯一写点，除非源码证明容器写点不存在或与本次栈无关。",
+                "- 若 source identity、release/source 版本或 base commit 存在不确定、错配或阻断原因，",
+                "  必须停止生成补丁，只报告需要补齐的源码身份材料。",
+                "",
+            ]
+        )
+        source_identity = (
+            problem.get("source_identity")
+            if isinstance(problem, dict) and isinstance(problem.get("source_identity"), dict)
+            else {}
+        )
+        if source_identity:
+            lines.append("## Source Identity")
+            for key in (
+                "source_origin",
+                "commit_policy",
+                "base_commit",
+                "identity_confidence",
+                "block_reason",
+            ):
+                if source_identity.get(key) not in (None, ""):
+                    lines.append(f"- {key}: {source_identity.get(key)}")
+            lines.append("")
         lines.append("下面是本次崩溃的相关信息：")
         lines.append("")
         lines.append("## 崩溃摘要")
@@ -1856,7 +2009,10 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 lines.append(f"- 日志标记的崩溃线程: {label}")
             entry_func = str(crash_summary.get("analysis_entry_function") or "").strip()
             entry_file = str(crash_summary.get("analysis_entry_file") or "").strip()
-            entry_line = crash_summary.get("crash_line_number")
+            # 优先用分析入口自身行号，避免把 addr2line 模板头文件行号安到业务 .cpp 上。
+            entry_line = crash_summary.get("analysis_entry_line_number")
+            if entry_line in (None, "", 0, "0"):
+                entry_line = crash_summary.get("crash_line_number")
             entry_code = str(crash_summary.get("crash_line_code") or "").strip()
             try:
                 entry_line_int = int(entry_line or 0)
@@ -1911,6 +2067,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         has_calls_stack_order = False
         has_stack_adjacent_verified_chain = False
         has_shared_var_write_upstream = False
+        container_copy_write_incomplete = False
         if isinstance(evidence_summary, dict):
             has_calls_direct = bool(evidence_summary.get("has_calls_direct"))
             has_calls_to_crash_site = bool(evidence_summary.get("has_calls_to_crash_site"))
@@ -1920,6 +2077,9 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             )
             has_shared_var_write_upstream = bool(
                 evidence_summary.get("has_shared_var_write_upstream")
+            )
+            container_copy_write_incomplete = bool(
+                evidence_summary.get("container_copy_write_path_incomplete")
             )
         if isinstance(edges_list_early, list):
             for e in edges_list_early:
@@ -2205,10 +2365,29 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
 
         if var_rel_by_tid:
             lines.append("### 共享成员与写路径交叉（崩溃点关联）")
-            if has_shared_var_write_upstream:
+            if container_copy_write_incomplete:
+                lines.append(
+                    "- 证据强度说明：中置信度。已展开到容器成员，但尚未定位该成员在其它函数中的"
+                    "写/就地修改路径；禁止只给外层指针加锁并宣称覆盖 Copy 崩溃帧。"
+                )
+            elif has_shared_var_write_upstream:
                 lines.append("- 证据强度说明：高置信度，可单独作为改码依据。")
             else:
                 lines.append("- 证据强度说明：本节仅提供共享变量关联线索；若无“其它函数写/删同一变量”，不能单独作为改码依据。")
+            if isinstance(evidence_summary, dict):
+                expanded = evidence_summary.get("expanded_container_members") or []
+                if expanded:
+                    lines.append(
+                        "- 箭头展开容器成员: "
+                        + ", ".join(str(x) for x in expanded if str(x).strip())
+                    )
+                if evidence_summary.get("expanded_container_member_write_found"):
+                    lines.append("- 已定位展开成员的写/就地修改路径（可作为 Copy 竞态主证据）。")
+                elif expanded:
+                    lines.append(
+                        "- 尚未定位展开成员写路径：须继续检索容器 mutator（Clear/Add/RemoveAll/"
+                        "SetSize/原地重建）等，不得把外层指针置空/释放当成唯一写点。"
+                    )
             lines.append("崩溃函数关联的成员/共享变量：")
             lines.append(
                 "说明：以下“声明摘录”来自成员变量定义行（通常位于头文件），用于识别变量类型与存储形态，不代表运行时值。"
@@ -2842,7 +3021,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         sync_keepalive_blocks: List[List[str]] = []
         if emit_class_skeleton:
             sync_line_re = re.compile(
-                r"(?i)(mutex|rwlock|spinlock|semaphore|critical|locker|\block\b|m_pcl\w+|m_\w*Mutex|m_\w*Lock)"
+                r"(?i)(mutex|rwlock|spinlock|semaphore|critical|locker|\block\b|m_p\w+|m_\w*Mutex|m_\w*Lock)"
             )
             for nid, n in node_map.items():
                 if not isinstance(n, dict) or n.get("type") != "class_skeleton":
@@ -3110,7 +3289,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         crash_file_hints.add(fp)
                     break
 
-        def _write_keep_rank(fid_raw: str) -> Tuple[int, int, str]:
+        def _write_keep_rank(fid_raw: str) -> Tuple[int, int, int, str]:
             node = None
             for nid, n in node_map.items():
                 if not isinstance(n, dict) or n.get("type") != "function":
@@ -3124,18 +3303,102 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 same_file = 0
             else:
                 same_file = 1
+            # 展开容器成员的写点（mutator）优先于外层裸指针 assign。
+            expanded_write = 1
+            expanded_members = set()
+            if isinstance(evidence_summary, dict):
+                expanded_members = {
+                    str(x).strip()
+                    for x in (evidence_summary.get("expanded_container_members") or [])
+                    if str(x).strip()
+                }
+            if expanded_members:
+                for e in edges_list:
+                    if not isinstance(e, dict) or e.get("type") != "use_shared_var":
+                        continue
+                    if _norm_graph_nid(str(e.get("from_id") or "")) != fid_raw:
+                        continue
+                    if not _relation_write_like(str(e.get("relation") or "")):
+                        continue
+                    tid = str(e.get("to_id") or "")
+                    bare = tid.split("::")[-1] if "::" in tid else tid
+                    if bare.startswith("var|"):
+                        bare = bare[4:]
+                        bare = bare.split("::")[-1]
+                    if bare in expanded_members:
+                        expanded_write = 0
+                        break
             sig = str((node or {}).get("signature") or fid_raw)
-            return (same_crash_var, same_file, sig)
+            return (expanded_write, same_crash_var, same_file, sig)
 
         write_keep_emitted = 0
         write_keep_budget_chars = 12000
         write_keep_used = 0
         write_keep_lines: List[str] = []
+
+        def _compress_write_snippet(snippet_lines: List[Any], *, max_lines: int = 80) -> List[str]:
+            """大函数写路径只保活含共享变量的窗口，避免 Build 等超长体挤掉整个写路径区。"""
+            rows = [str(s) for s in (snippet_lines or [])]
+            if len(rows) <= max_lines:
+                return rows
+            hit_idxs = [
+                i for i, row in enumerate(rows)
+                if re.search(r"\bm_\w+\s*\.\s*(?:Add|Append|RemoveAll|Clear|SetSize|Copy)\s*\(", row)
+                or re.search(r"\bm_\w+\s*=(?!=)", row)
+            ]
+            if not hit_idxs:
+                head = rows[: max_lines // 2]
+                tail = rows[-(max_lines // 2) :]
+                return head + ["...[write-path body truncated]..."] + tail
+            windows: List[Tuple[int, int]] = []
+            for idx in hit_idxs[:8]:
+                lo = max(0, idx - 12)
+                hi = min(len(rows), idx + 13)
+                if windows and lo <= windows[-1][1]:
+                    windows[-1] = (windows[-1][0], max(windows[-1][1], hi))
+                else:
+                    windows.append((lo, hi))
+            out: List[str] = []
+            for lo, hi in windows:
+                if out:
+                    out.append("...[snip]...")
+                out.extend(rows[lo:hi])
+                if len(out) >= max_lines:
+                    break
+            return out[:max_lines]
+
         for fid_raw in sorted(write_shared_func_norm, key=_write_keep_rank):
             if write_keep_emitted >= 6:
                 break
-            # 若已识别崩溃共享变量的写边，则只保活这些写路径，避免 PDR 等误报 assign 占满配额
-            if crash_write_fids and fid_raw not in crash_write_fids:
+            # 若已识别崩溃共享变量的写边，则只保活这些写路径，避免 PDR 等误报 assign 占满配额。
+            # 展开容器成员的写点始终保活（即使不在 crash_write_fids，例如 id 归一化偶发不一致）。
+            expanded_members = set()
+            if isinstance(evidence_summary, dict):
+                expanded_members = {
+                    str(x).strip()
+                    for x in (evidence_summary.get("expanded_container_members") or [])
+                    if str(x).strip()
+                }
+
+            def _fid_writes_expanded(fid: str) -> bool:
+                if not expanded_members:
+                    return False
+                for e in edges_list:
+                    if not isinstance(e, dict) or e.get("type") != "use_shared_var":
+                        continue
+                    if _norm_graph_nid(str(e.get("from_id") or "")) != fid:
+                        continue
+                    if not _relation_write_like(str(e.get("relation") or "")):
+                        continue
+                    tid = str(e.get("to_id") or "")
+                    bare = tid[4:] if tid.startswith("var|") else tid
+                    bare = bare.split("::")[-1]
+                    if bare in expanded_members:
+                        return True
+                return False
+
+            is_expanded_writer = _fid_writes_expanded(fid_raw)
+            if crash_write_fids and fid_raw not in crash_write_fids and not is_expanded_writer:
                 continue
             node = None
             for nid, n in node_map.items():
@@ -3145,6 +3408,26 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     node = n
                     break
             if not isinstance(node, dict):
+                # node_map 键偶发不一致：按边 from_id 原文回退，避免业务符号硬编码。
+                for e in edges_list:
+                    if not isinstance(e, dict) or e.get("type") != "use_shared_var":
+                        continue
+                    if _norm_graph_nid(str(e.get("from_id") or "")) != fid_raw:
+                        continue
+                    raw_fid = str(e.get("from_id") or "")
+                    cand = node_map.get(raw_fid)
+                    if isinstance(cand, dict) and cand.get("type") == "function":
+                        node = cand
+                        break
+                    for nid, n in node_map.items():
+                        if not isinstance(n, dict) or n.get("type") != "function":
+                            continue
+                        if str(n.get("id") or "") == raw_fid:
+                            node = n
+                            break
+                    if isinstance(node, dict):
+                        break
+            if not isinstance(node, dict):
                 continue
             if _norm_graph_nid(str(node.get("id") or "")) in crash_fn_norm_ids:
                 continue
@@ -3152,24 +3435,76 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             if not (isinstance(snippet, list) and snippet):
                 continue
             sig = str(node.get("signature") or node.get("id") or "write_path")
+            kept_snip = _compress_write_snippet(snippet, max_lines=60 if is_expanded_writer else 80)
+            is_compressed = (
+                len(kept_snip) < len([str(s) for s in (snippet or [])])
+                or any(
+                    ("snip" in str(x)) or ("truncated" in str(x))
+                    for x in kept_snip
+                )
+            )
+            completeness = (
+                "压缩片段（非整函数；禁止整函数落盘替换；优先在持有同锁的调用方保护，或列入需人工处理）"
+                if is_compressed
+                else "完整函数体（可纳入必改并给出可替换代码）"
+            )
             block = [
                 f"#### 写路径函数源码: {sig}",
                 f"- 文件: {node.get('file', 'N/A')}",
+                f"- 完整性: {completeness}",
                 "- 代码片段:",
-                *[str(s) for s in snippet],
+                *kept_snip,
                 "",
             ]
             block_text = "\n".join(block)
             if write_keep_used + len(block_text) > write_keep_budget_chars and write_keep_emitted > 0:
-                break
+                if is_expanded_writer and write_keep_emitted < 2:
+                    # 展开容器写点优先占用预算：压缩到更短窗口再试一次。
+                    kept_snip = _compress_write_snippet(snippet, max_lines=40)
+                    is_compressed = True
+                    completeness = (
+                        "压缩片段（非整函数；禁止整函数落盘替换；优先在持有同锁的调用方保护，或列入需人工处理）"
+                    )
+                    block = [
+                        f"#### 写路径函数源码: {sig}",
+                        f"- 文件: {node.get('file', 'N/A')}",
+                        f"- 完整性: {completeness}",
+                        "- 代码片段:",
+                        *kept_snip,
+                        "",
+                    ]
+                    block_text = "\n".join(block)
+                else:
+                    break
+            if write_keep_emitted == 0 and len(block_text) > write_keep_budget_chars:
+                kept_snip = _compress_write_snippet(snippet, max_lines=60)
+                is_compressed = True
+                completeness = (
+                    "压缩片段（非整函数；禁止整函数落盘替换；优先在持有同锁的调用方保护，或列入需人工处理）"
+                )
+                block = [
+                    f"#### 写路径函数源码: {sig}",
+                    f"- 文件: {node.get('file', 'N/A')}",
+                    f"- 完整性: {completeness}",
+                    "- 代码片段:",
+                    *kept_snip,
+                    "",
+                ]
+                block_text = "\n".join(block)
             write_keep_lines.extend(block)
             write_keep_used += len(block_text)
             write_keep_emitted += 1
         if write_keep_lines:
             lines.append("### 写路径函数源码（压缩保活，可纳入需要修改的函数）")
             lines.append(
-                "- 说明: 以下优先保留与崩溃点共享变量相关的 assign/delete/write 函数完整体；"
-                "与崩溃读路径同锁保护时，应一并评估是否修改。"
+                "- 说明: 以下优先保留与崩溃点共享变量相关的 assign/delete/write 函数体；"
+                "与崩溃读路径同锁保护时，应一并评估是否修改。展开容器成员的就地写点"
+                "优先于外层裸指针置空/释放。"
+            )
+            lines.append(
+                "- 若条目标注「完整性: 压缩片段」，仅作证据，**禁止**输出该函数的整函数可替换体并落盘；"
+                "应改为：在持有共享锁的调用方保护写操作，或列入「需人工处理」。"
+                "仅「完整性: 完整函数体」才允许列入必改并给出完整 ```cpp 替换。"
             )
             lines.extend(write_keep_lines)
 
@@ -3231,6 +3566,16 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             "禁止把旁路缺陷写成唯一根因而忽略栈更贴合的主因；"
             "也禁止为了「多改」而臆造未给出源码的函数。"
         )
+        if isinstance(evidence_summary, dict) and evidence_summary.get(
+            "expanded_container_member_write_found"
+        ):
+            lines.append(
+                "- **容器展开写点优先（必须）**：上文已定位「箭头展开容器成员」的写/就地修改路径。"
+                "主根因的共享对象须指向该容器成员及其写路径函数；"
+                "禁止把外层指针置空/释放写成唯一主根因，除非你先用源码证明容器写点与本次 Copy 栈无关。"
+                "修复须覆盖：读侧停止跨线程拷贝 live 容器（改为锁下快照/发布），"
+                "以及写路径与快照发布的同锁边界；禁止只给指针加锁却继续 `ptr->getter()` 按值返回。"
+            )
         lines.append("")
         lines.append("**通用分析步骤**：")
         lines.append("1. 明确崩溃点的直接原因（例如空指针、越界访问、使用已释放内存等）。")
@@ -3339,10 +3684,11 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 "- 若根因涉及共享指针/共享状态的 TOCTOU（检查与使用之间被并发改写）："
                 "读者与写者（赋值、置空、delete/释放）应一并评估；"
                 "写路径函数体可能在「函数源码」或「写路径函数源码（压缩保活）」中给出；"
-                "只要上文已给出完整函数体，就**必须**将其列入「需要修改的函数（必改）」并与读侧同锁保护，"
-                "且修复代码中必须给出该写路径的完整可替换函数体；"
-                "禁止只输出读侧修复。若写路径体未给出，则把写路径保护列为「需人工处理」，"
-                "禁止只改读侧却声称竞态已彻底修复。"
+                "仅当条目标注「完整性: 完整函数体」或「函数源码」中已给出无截断完整体时，"
+                "才**必须**将其列入「需要修改的函数（必改）」并给出完整可替换函数体；"
+                "若仅为「完整性: 压缩片段」，禁止臆造整函数落盘，应写「需人工处理」"
+                "或改为在持有同锁的调用方保护写操作；"
+                "禁止只输出读侧修复却声称竞态已彻底修复。"
             )
             lines.append("- **修复代码格式**：每个修复函数必须使用独立的 ```cpp 围栏包裹；函数体必须完整，禁止用 `...`、`// ...`、`/* ... */`、`[其他代码]`、`其他逻辑保持不变`、`省略` 等任何占位内容代替代码行。")
             lines.append(
@@ -3353,7 +3699,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.append("- “需要修改的函数（必改）”列表中的每一项，都必须在“修复代码”中给出对应的完整函数定义（包含函数签名、完整函数体和全部原有必要逻辑），不能只给函数体片段、局部代码片段、diff 片段或伪代码。")
             lines.append(
                 "- 修复代码必须保持原函数签名不变：不得修改返回类型、函数名、类作用域、参数列表、const/static/virtual 等限定；"
-                "构造函数和析构函数绝对不能添加返回类型（例如禁止写成 `VBool Class::~Class()`）。"
+                "构造函数和析构函数绝对不能添加返回类型（例如禁止写成 `bool Class::~Class()`）。"
             )
             lines.append(
                 "- 每个修复函数的类名必须与目标文件中的定义一致；"
@@ -3365,9 +3711,10 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 "应放到“无法生成完整修复代码/需人工处理”或「建议修改的函数」并说明缺少哪些上下文。"
             )
             lines.append(
-                "- 仅当上文「函数源码」「崩溃行关键源码」「同文件旁路候选源码」或「写路径函数源码（压缩保活）」中已给出该函数的完整函数体时，"
+                "- 仅当上文「函数源码」「崩溃行关键源码」「同文件旁路候选源码」中已给出该函数完整函数体，"
+                "或「写路径函数源码（压缩保活）」中标注「完整性: 完整函数体」时，"
                 "才允许将其列入「需要修改的函数（必改）」或「建议修改的函数」并输出可替换代码；"
-                "禁止修改仅出现在分析文字、类骨架或不完整片段中的函数。"
+                "禁止修改仅出现在分析文字、类骨架、不完整片段或「完整性: 压缩片段」中的函数。"
             )
             lines.append("- 禁止在修复函数中用注释表示保留原逻辑；所有未改动但仍需要保留的原代码也必须原样写出。")
         else:
@@ -3836,7 +4183,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         if not code_roots:
             return None
         normalized = resolved_file.replace("\\", "/")
-        markers = ["engine-dev/src/", "src/"]
+        markers = ["src/"]
         suffixes: List[str] = []
         for marker in markers:
             idx = normalized.find(marker)

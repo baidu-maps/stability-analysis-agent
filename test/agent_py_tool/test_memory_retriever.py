@@ -288,12 +288,12 @@ class TestMemoryRetriever(unittest.TestCase):
             {
                 "request": {
                     "type": "function",
-                    "symbol": "VTaskQueue::PushTask",
+                    "symbol": "DemoTaskQueue::PushTask",
                     "reason": "验证竞态",
                     "priority": "medium",
                 },
                 "success": False,
-                "error": "未定位到函数定义: VTaskQueue::PushTask",
+                "error": "未定位到函数定义: DemoTaskQueue::PushTask",
             }
         ]
         prompt = assemble_loop_prompt(
@@ -304,7 +304,7 @@ class TestMemoryRetriever(unittest.TestCase):
             }]},
         )["content"]
         self.assertIn("## 其它代码上下文", prompt)
-        self.assertIn("#### 其它代码上下文: VTaskQueue::PushTask（function）", prompt)
+        self.assertIn("#### 其它代码上下文: DemoTaskQueue::PushTask（function）", prompt)
         self.assertIn("- 状态: 未定位", prompt)
         self.assertIn("## 本轮任务", prompt)
         self.assertNotIn("上一轮模型分析摘要如下", prompt)
@@ -349,7 +349,7 @@ class TestMemoryRetriever(unittest.TestCase):
                     "function_signature": "void Foo::bar()",
                 },
                 {
-                    "request": {"type": "references", "symbol": "CVList::RemoveAll()"},
+                    "request": {"type": "references", "symbol": "DemoList::RemoveAll()"},
                     "success": False,
                     "lookup_exhausted": True,
                     "error": "此前已尝试但未定位",
@@ -434,11 +434,11 @@ class TestMemoryRetriever(unittest.TestCase):
             src.write_text(
                 "\n".join(
                     [
-                        "class CVMapSchedule {",
-                        "  CVTask* m_lastTask;",
-                        "  void onTaskEventHandler(CVTask* task);",
+                        "class DemoMapSchedule {",
+                        "  DemoTask* m_lastTask;",
+                        "  void onTaskEventHandler(DemoTask* task);",
                         "};",
-                        "void CVMapSchedule::onTaskEventHandler(CVTask* task) {",
+                        "void DemoMapSchedule::onTaskEventHandler(DemoTask* task) {",
                         "  m_lastTask = task;",
                         "}",
                     ]
@@ -449,17 +449,17 @@ class TestMemoryRetriever(unittest.TestCase):
                 [
                     {
                         "type": "function",
-                        "symbol": "CVMapSchedule::m_lastTask",
+                        "symbol": "DemoMapSchedule::m_lastTask",
                         "reason": "错误地把字段当函数",
                     },
                     {
                         "type": "field",
-                        "symbol": "CVMapSchedule::m_lastTask",
+                        "symbol": "DemoMapSchedule::m_lastTask",
                         "reason": "查看字段声明",
                     },
                     {
                         "type": "field",
-                        "symbol": "CVMapSchedule::m_lastTask",
+                        "symbol": "DemoMapSchedule::m_lastTask",
                         "reason": "重复请求",
                     },
                 ],
@@ -481,10 +481,10 @@ class TestMemoryRetriever(unittest.TestCase):
             [
                 "## 函数源码",
                 "",
-                "#### 函数源码: void CVMapSchedule::onTaskEventHandler(CVTask*)",
+                "#### 函数源码: void DemoMapSchedule::onTaskEventHandler(DemoTask*)",
                 "- 文件: /tmp/MapSchedule.cpp",
                 "- 代码片段:",
-                "void CVMapSchedule::onTaskEventHandler(CVTask* task) {}",
+                "void DemoMapSchedule::onTaskEventHandler(DemoTask* task) {}",
                 "",
                 "# 崩溃分析任务",
                 "请基于以上信息，并严格遵循前文要求，给出专业的崩溃分析。",
@@ -498,7 +498,7 @@ class TestMemoryRetriever(unittest.TestCase):
             } for item in result]},
         )["content"]
         self.assertIn("## 其它代码上下文", prompt)
-        self.assertIn("#### 其它代码上下文: CVMapSchedule::m_lastTask（field）", prompt)
+        self.assertIn("#### 其它代码上下文: DemoMapSchedule::m_lastTask（field）", prompt)
         self.assertIn("- 状态: 已定位", prompt)
         self.assertIn("## 本轮任务", prompt)
         self.assertNotIn("## 已处理的上下文请求", prompt)
@@ -544,7 +544,7 @@ class TestMemoryRetriever(unittest.TestCase):
   "context_requests": [
     {
       "type": "field",
-      "symbol": "CVMapControl::m_Layers",
+      "symbol": "DemoMapControl::m_Layers",
       "expected_return_form": "member_declaration",
       "fulfillment_note": "需要容器类型声明",
       "reason": "确认 layers 类型",
@@ -563,7 +563,7 @@ class TestMemoryRetriever(unittest.TestCase):
             {
                 "request": {
                     "type": "field",
-                    "symbol": "CBaseLayer::m_iRef",
+                    "symbol": "DemoLayer::m_iRef",
                     "reason": "t",
                     "priority": "high",
                     "expected_return_form": "member_declaration",
@@ -572,7 +572,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 "context_type": "field",
                 "matches": [
                     {
-                        "file": "/tmp/BaseLayer.h",
+                        "file": "/tmp/DemoLayer.h",
                         "line_number": 1,
                         "match_kind": "declaration",
                         "line_text": "VAtomicInt32 m_iRef;",
@@ -606,7 +606,7 @@ class TestMemoryRetriever(unittest.TestCase):
         outcomes: dict = {}
         req = {
             "type": "references",
-            "symbol": "CVList::RemoveAll()",
+            "symbol": "DemoList::RemoveAll()",
             "reason": "查看实现",
             "priority": "medium",
         }
@@ -635,19 +635,19 @@ class TestMemoryRetriever(unittest.TestCase):
             demo.write_text(
                 "\n".join(
                     [
-                        "VVoid CCloudControlTest::Release()",
+                        "void CCloudControlTest::Release()",
                         "{",
                         "}",
                     ]
                 ),
                 encoding="utf-8",
             )
-            src = Path(tmp) / "engine-dev" / "src" / "app" / "map" / "basemap" / "common" / "BaseLayer.cpp"
+            src = Path(tmp) / "demo-app" / "src" / "app" / "map" / "src" / "common" / "DemoLayer.cpp"
             src.parent.mkdir(parents=True, exist_ok=True)
             src.write_text(
                 "\n".join(
                     [
-                        "VULong CBaseLayer::Release() {",
+                        "VULong DemoLayer::Release() {",
                         "  return 0;",
                         "}",
                     ]
@@ -658,7 +658,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 [
                     {
                         "type": "function",
-                        "symbol": "CBaseLayer::Release",
+                        "symbol": "DemoLayer::Release",
                         "reason": "查看 Release 实现",
                         "priority": "high",
                     }
@@ -668,16 +668,16 @@ class TestMemoryRetriever(unittest.TestCase):
             )
         self.assertEqual(len(result), 1)
         self.assertTrue(result[0]["success"], result[0].get("error"))
-        self.assertIn("BaseLayer.cpp", str(result[0].get("file") or ""))
+        self.assertIn("DemoLayer.cpp", str(result[0].get("file") or ""))
         snippet = "\n".join(result[0].get("snippet") or [])
-        self.assertIn("CBaseLayer::Release", snippet)
+        self.assertIn("DemoLayer::Release", snippet)
         self.assertNotIn("CCloudControlTest::Release", snippet)
 
     def test_qualified_invoke_not_confused_with_unrelated_invoke(self):
         with tempfile.TemporaryDirectory() as tmp:
             decoy = (
                 Path(tmp)
-                / "engine-dev"
+                / "demo-app"
                 / "src"
                 / "app"
                 / "walk"
@@ -700,19 +700,19 @@ class TestMemoryRetriever(unittest.TestCase):
             )
             src = (
                 Path(tmp)
-                / "engine-dev"
+                / "demo-app"
                 / "src"
                 / "app"
                 / "map"
-                / "basemap"
+                / "src"
                 / "vmap"
-                / "VMapControl.cpp"
+                / "DemoMapControl.cpp"
             )
             src.parent.mkdir(parents=True, exist_ok=True)
             src.write_text(
                 "\n".join(
                     [
-                        "VVoid CVMapControl::Invoke(const std::function<void ()> &&fn) {",
+                        "void DemoMapControl::Invoke(const std::function<void ()> &&fn) {",
                         "  fn();",
                         "}",
                     ]
@@ -723,7 +723,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 [
                     {
                         "type": "function",
-                        "symbol": "CVMapControl::Invoke",
+                        "symbol": "DemoMapControl::Invoke",
                         "reason": "确认异步调度",
                         "priority": "high",
                     }
@@ -733,16 +733,16 @@ class TestMemoryRetriever(unittest.TestCase):
             )
         self.assertEqual(len(result), 1)
         self.assertTrue(result[0]["success"], result[0].get("error"))
-        self.assertIn("VMapControl.cpp", str(result[0].get("file") or ""))
+        self.assertIn("DemoMapControl.cpp", str(result[0].get("file") or ""))
         snippet = "\n".join(result[0].get("snippet") or [])
-        self.assertIn("CVMapControl::Invoke", snippet)
+        self.assertIn("DemoMapControl::Invoke", snippet)
         self.assertNotIn("ThreadManager", snippet)
 
     def test_qualified_field_prefers_class_member_declaration(self):
         with tempfile.TemporaryDirectory() as tmp:
             decoy = (
                 Path(tmp)
-                / "engine-dev"
+                / "demo-app"
                 / "demo"
                 / "win32"
                 / "enginetest"
@@ -753,33 +753,33 @@ class TestMemoryRetriever(unittest.TestCase):
             decoy.write_text(
                 "\n".join(
                     [
-                        "class CVMapControl {",
+                        "class DemoMapControl {",
                         "public:",
                         "    int m_iRef;",
                         "};",
-                        "CVMapControl::CVMapControl() { m_iRef = 0; }",
-                        "void CVMapControl::Release() { if (m_iRef == 0) return; m_iRef--; }",
+                        "DemoMapControl::DemoMapControl() { m_iRef = 0; }",
+                        "void DemoMapControl::Release() { if (m_iRef == 0) return; m_iRef--; }",
                     ]
                 ),
                 encoding="utf-8",
             )
             header = (
                 Path(tmp)
-                / "engine-dev"
+                / "demo-app"
                 / "inc"
                 / "app"
                 / "map"
-                / "basemap"
+                / "src"
                 / "common"
-                / "BaseLayer.h"
+                / "DemoLayer.h"
             )
             header.parent.mkdir(parents=True, exist_ok=True)
             header.write_text(
                 "\n".join(
                     [
-                        "class CBaseLayer {",
+                        "class DemoLayer {",
                         "public:",
-                        "    CBaseLayer();",
+                        "    DemoLayer();",
                         "protected:",
                         "    VAtomicInt32 m_iRef;",
                         "};",
@@ -791,7 +791,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 [
                     {
                         "type": "field",
-                        "symbol": "CBaseLayer::m_iRef",
+                        "symbol": "DemoLayer::m_iRef",
                         "reason": "确认成员类型",
                         "priority": "high",
                     }
@@ -804,7 +804,7 @@ class TestMemoryRetriever(unittest.TestCase):
         matches = result[0].get("matches") or []
         self.assertTrue(matches)
         first = matches[0]
-        self.assertIn("BaseLayer.h", str(first.get("file") or ""))
+        self.assertIn("DemoLayer.h", str(first.get("file") or ""))
         self.assertEqual(first.get("match_kind"), "declaration")
         self.assertIn("VAtomicInt32", str(first.get("line_text") or ""))
         self.assertNotIn("MapControl.cpp", str(first.get("file") or ""))
@@ -813,21 +813,21 @@ class TestMemoryRetriever(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             header = (
                 Path(tmp)
-                / "engine-dev"
+                / "demo-app"
                 / "src"
                 / "app"
                 / "map"
-                / "basemap"
+                / "src"
                 / "vmap"
-                / "VMapControl.h"
+                / "DemoMapControl.h"
             )
             header.parent.mkdir(parents=True, exist_ok=True)
             header.write_text(
                 "\n".join(
                     [
-                        "class CVMapControl {",
+                        "class DemoMapControl {",
                         "protected:",
-                        "    CVList<CBaseLayer*, CBaseLayer*> m_Layers;",
+                        "    DemoList<DemoLayer*, DemoLayer*> m_Layers;",
                         "};",
                     ]
                 ),
@@ -837,7 +837,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 [
                     {
                         "type": "field",
-                        "symbol": "CVMapControl::m_Layers",
+                        "symbol": "DemoMapControl::m_Layers",
                         "reason": "确认 layers 容器类型",
                         "priority": "high",
                     }
@@ -851,17 +851,17 @@ class TestMemoryRetriever(unittest.TestCase):
         self.assertTrue(matches)
         snippet = "\n".join(matches[0].get("context") or [])
         self.assertIn("m_Layers", snippet)
-        self.assertIn("CVList", snippet)
+        self.assertIn("DemoList", snippet)
         self.assertEqual(matches[0].get("match_kind"), "declaration")
 
     def test_destructor_without_parens_still_resolves(self):
         with tempfile.TemporaryDirectory() as tmp:
-            src = Path(tmp) / "engine-dev" / "src" / "app" / "map" / "basemap" / "common" / "BaseLayer.cpp"
+            src = Path(tmp) / "demo-app" / "src" / "app" / "map" / "src" / "common" / "DemoLayer.cpp"
             src.parent.mkdir(parents=True, exist_ok=True)
             src.write_text(
                 "\n".join(
                     [
-                        "CBaseLayer::~CBaseLayer() {",
+                        "DemoLayer::~DemoLayer() {",
                         "  m_flag = -1;",
                         "}",
                     ]
@@ -872,7 +872,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 [
                     {
                         "type": "function",
-                        "symbol": "CBaseLayer::~CBaseLayer",
+                        "symbol": "DemoLayer::~DemoLayer",
                         "reason": "查看析构",
                         "priority": "high",
                     }
@@ -886,19 +886,19 @@ class TestMemoryRetriever(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             src = (
                 Path(tmp)
-                / "engine-dev"
+                / "demo-app"
                 / "src"
                 / "app"
                 / "map"
-                / "basemap"
+                / "src"
                 / "vmap"
-                / "VMapControl.cpp"
+                / "DemoMapControl.cpp"
             )
             src.parent.mkdir(parents=True, exist_ok=True)
             src.write_text(
                 "\n".join(
                     [
-                        "void CVMapControl::ReleaseAllLayers() {",
+                        "void DemoMapControl::ReleaseAllLayers() {",
                         "  m_Layers.RemoveAll();",
                         "}",
                     ]
@@ -924,16 +924,16 @@ class TestMemoryRetriever(unittest.TestCase):
 
     def test_template_remove_all_resolves(self):
         with tempfile.TemporaryDirectory() as tmp:
-            header = Path(tmp) / "engine-dev" / "inc" / "vi" / "vos" / "VTempl.h"
+            header = Path(tmp) / "demo-app" / "inc" / "vi" / "vos" / "DemoTempl.h"
             header.parent.mkdir(parents=True, exist_ok=True)
             header.write_text(
                 "\n".join(
                     [
-                        "class CVList {",
+                        "class DemoList {",
                         "};",
                         "template<class TYPE, class ARG_TYPE>",
-                        "VVoid CVList<TYPE, ARG_TYPE>::RemoveAll() {",
-                        "  VDestructElements<TYPE>(V_NULL, 0);",
+                        "void DemoList<TYPE, ARG_TYPE>::RemoveAll() {",
+                        "  DemoDestructElements<TYPE>(nullptr, 0);",
                         "}",
                     ]
                 ),
@@ -943,7 +943,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 [
                     {
                         "type": "function",
-                        "symbol": "CVList<CBaseLayer*, CBaseLayer*>::RemoveAll",
+                        "symbol": "DemoList<DemoLayer*, DemoLayer*>::RemoveAll",
                         "reason": "查看 RemoveAll",
                         "priority": "high",
                     }
@@ -953,24 +953,24 @@ class TestMemoryRetriever(unittest.TestCase):
             )
         self.assertTrue(result[0]["success"], result[0].get("error"))
         snippet = "\n".join(result[0].get("snippet") or [])
-        self.assertIn("CVList", snippet)
+        self.assertIn("DemoList", snippet)
         self.assertIn("RemoveAll", snippet)
 
     def test_cvlist_remove_all_without_template_args_resolves(self):
         with tempfile.TemporaryDirectory() as tmp:
-            header = Path(tmp) / "engine-dev" / "inc" / "vi" / "vos" / "VTempl.h"
+            header = Path(tmp) / "demo-app" / "inc" / "vi" / "vos" / "DemoTempl.h"
             header.parent.mkdir(parents=True, exist_ok=True)
             header.write_text(
                 "\n".join(
                     [
                         "template<class TYPE, class ARG_TYPE>",
-                        "class CVList {",
+                        "class DemoList {",
                         "};",
                         "template<class TYPE, class ARG_TYPE>",
-                        "VVoid CVList<TYPE, ARG_TYPE>::RemoveAll() {",
-                        "  VDestructElements<TYPE>(V_NULL, 0);",
+                        "void DemoList<TYPE, ARG_TYPE>::RemoveAll() {",
+                        "  DemoDestructElements<TYPE>(nullptr, 0);",
                         "}",
-                        "CVList<int, int>::CVList() {}",
+                        "DemoList<int, int>::DemoList() {}",
                     ]
                 ),
                 encoding="utf-8",
@@ -979,7 +979,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 [
                     {
                         "type": "function",
-                        "symbol": "CVList::RemoveAll",
+                        "symbol": "DemoList::RemoveAll",
                         "reason": "查看 RemoveAll",
                         "priority": "high",
                     }
@@ -990,23 +990,23 @@ class TestMemoryRetriever(unittest.TestCase):
         self.assertTrue(result[0]["success"], result[0].get("error"))
         snippet = "\n".join(result[0].get("snippet") or [])
         self.assertIn("RemoveAll", snippet)
-        self.assertNotIn("CVList() {}", snippet)
+        self.assertNotIn("DemoList() {}", snippet)
 
     def test_field_cvlist_returns_class_declaration_not_ctor(self):
         with tempfile.TemporaryDirectory() as tmp:
-            header = Path(tmp) / "engine-dev" / "inc" / "vi" / "vos" / "VTempl.h"
+            header = Path(tmp) / "demo-app" / "inc" / "vi" / "vos" / "DemoTempl.h"
             header.parent.mkdir(parents=True, exist_ok=True)
             header.write_text(
                 "\n".join(
                     [
                         "template<class TYPE, class ARG_TYPE>",
-                        "class CVList {",
+                        "class DemoList {",
                         "public:",
-                        "  CVList();",
-                        "  VVoid RemoveAll();",
+                        "  DemoList();",
+                        "  void RemoveAll();",
                         "};",
                         "template<class TYPE, class ARG_TYPE>",
-                        "CVList<TYPE, ARG_TYPE>::CVList() {}",
+                        "DemoList<TYPE, ARG_TYPE>::DemoList() {}",
                     ]
                 ),
                 encoding="utf-8",
@@ -1015,8 +1015,8 @@ class TestMemoryRetriever(unittest.TestCase):
                 [
                     {
                         "type": "field",
-                        "symbol": "CVList",
-                        "reason": "查看 CVList 容器结构",
+                        "symbol": "DemoList",
+                        "reason": "查看 DemoList 容器结构",
                         "priority": "high",
                     }
                 ],
@@ -1028,21 +1028,21 @@ class TestMemoryRetriever(unittest.TestCase):
         self.assertTrue(matches)
         self.assertEqual(matches[0].get("match_kind"), "class_declaration")
         snippet = "\n".join(matches[0].get("context") or [])
-        self.assertIn("class CVList", snippet)
-        self.assertNotIn("CVList<TYPE, ARG_TYPE>::CVList", snippet)
+        self.assertIn("class DemoList", snippet)
+        self.assertNotIn("DemoList<TYPE, ARG_TYPE>::DemoList", snippet)
         enriched = attach_return_form_metadata(result[0])
         self.assertTrue(enriched.get("fulfillment_matched"))
 
     def test_template_function_duplicate_key_across_symbol_forms(self):
         with tempfile.TemporaryDirectory() as tmp:
-            header = Path(tmp) / "engine-dev" / "inc" / "vi" / "vos" / "VTempl.h"
+            header = Path(tmp) / "demo-app" / "inc" / "vi" / "vos" / "DemoTempl.h"
             header.parent.mkdir(parents=True, exist_ok=True)
             header.write_text(
                 "\n".join(
                     [
                         "template<class TYPE, class ARG_TYPE>",
-                        "VVoid CVList<TYPE, ARG_TYPE>::RemoveAll() {",
-                        "  VDestructElements<TYPE>(V_NULL, 0);",
+                        "void DemoList<TYPE, ARG_TYPE>::RemoveAll() {",
+                        "  DemoDestructElements<TYPE>(nullptr, 0);",
                         "}",
                     ]
                 ),
@@ -1053,7 +1053,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 [
                     {
                         "type": "function",
-                        "symbol": "CVList<CBaseLayer*, CBaseLayer*>::RemoveAll",
+                        "symbol": "DemoList<DemoLayer*, DemoLayer*>::RemoveAll",
                         "reason": "查看 RemoveAll",
                     }
                 ],
@@ -1065,7 +1065,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 [
                     {
                         "type": "function",
-                        "symbol": "CVList::RemoveAll",
+                        "symbol": "DemoList::RemoveAll",
                         "reason": "重复写法",
                     }
                 ],
@@ -1079,12 +1079,12 @@ class TestMemoryRetriever(unittest.TestCase):
 
     def test_bare_m_layers_prefers_vmap_over_gmap(self):
         with tempfile.TemporaryDirectory() as tmp:
-            gmap = Path(tmp) / "engine-dev" / "src" / "app" / "map" / "basemap" / "gmap" / "GMapControl.h"
-            vmap = Path(tmp) / "engine-dev" / "src" / "app" / "map" / "basemap" / "vmap" / "VMapControl.h"
+            gmap = Path(tmp) / "demo-app" / "src" / "app" / "map" / "src" / "overlay" / "OverlayControl.h"
+            vmap = Path(tmp) / "demo-app" / "src" / "app" / "map" / "src" / "map" / "DemoMapControl.h"
             gmap.parent.mkdir(parents=True, exist_ok=True)
             vmap.parent.mkdir(parents=True, exist_ok=True)
-            gmap.write_text("class CGMapControl {\n  int m_Layers;\n};\n", encoding="utf-8")
-            vmap.write_text("class CVMapControl {\n  CVList<CBaseLayer*, CBaseLayer*> m_Layers;\n};\n", encoding="utf-8")
+            gmap.write_text("class COverlayControl {\n  int m_Layers;\n};\n", encoding="utf-8")
+            vmap.write_text("class DemoMapControl {\n  DemoList<DemoLayer*, DemoLayer*> m_Layers;\n};\n", encoding="utf-8")
             result = CodeContextRequestResolver.resolve_requests(
                 [
                     {
@@ -1096,26 +1096,26 @@ class TestMemoryRetriever(unittest.TestCase):
                 ],
                 code_roots=[tmp],
                 max_requests=5,
-                stack_priority_classes=["CVMapControl"],
+                stack_priority_classes=["DemoMapControl"],
             )
         self.assertTrue(result[0]["success"])
-        self.assertIn("VMapControl.h", str(result[0]["matches"][0].get("file") or ""))
+        self.assertIn("DemoMapControl.h", str(result[0]["matches"][0].get("file") or ""))
 
     def test_destructor_context_request_prefers_dtor_not_ctor(self):
         with tempfile.TemporaryDirectory() as tmp:
-            src = Path(tmp) / "BaseLayer.cpp"
+            src = Path(tmp) / "DemoLayer.cpp"
             src.write_text(
                 "\n".join(
                     [
-                        "class CBaseLayer {",
+                        "class DemoLayer {",
                         "public:",
-                        "  CBaseLayer();",
-                        "  ~CBaseLayer();",
+                        "  DemoLayer();",
+                        "  ~DemoLayer();",
                         "};",
-                        "CBaseLayer::CBaseLayer() {",
+                        "DemoLayer::DemoLayer() {",
                         "  m_flag = 0;",
                         "}",
-                        "CBaseLayer::~CBaseLayer() {",
+                        "DemoLayer::~DemoLayer() {",
                         "  m_flag = -1;",
                         "}",
                     ]
@@ -1126,7 +1126,7 @@ class TestMemoryRetriever(unittest.TestCase):
                 [
                     {
                         "type": "function",
-                        "symbol": "CBaseLayer::~CBaseLayer()",
+                        "symbol": "DemoLayer::~DemoLayer()",
                         "reason": "查看析构",
                         "priority": "high",
                     }
@@ -1137,8 +1137,8 @@ class TestMemoryRetriever(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertTrue(result[0]["success"])
         snippet = "\n".join(result[0].get("snippet") or [])
-        self.assertIn("~CBaseLayer", snippet)
-        self.assertNotIn("CBaseLayer::CBaseLayer()", snippet)
+        self.assertIn("~DemoLayer", snippet)
+        self.assertNotIn("DemoLayer::DemoLayer()", snippet)
 
     def test_cli_prompt_mode_flag(self):
         from cli.main import build_parser

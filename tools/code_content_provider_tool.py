@@ -318,7 +318,7 @@ def _file_under_any_project_root(path: Path, code_roots_abs: List[str]) -> bool:
     判断 path 是否位于任一 code_root 下。
 
     使用 abspath（不展开 code_root 内的符号链接）与 resolve 两种路径各判一次：
-    工程内常见 src/vi -> engine-vi/src/vi 等布局，若仅用 resolve() 会把已定位的源文件
+    工程内常见 src/vi -> demo-lib/src/vi 等布局，若仅用 resolve() 会把已定位的源文件
     误判为在 code_root 之外，导致整帧被过滤。
     """
     if not code_roots_abs:
@@ -2370,11 +2370,11 @@ class CodeContentProvider:
                 return parts[-1]
 
         # 目标：从形如
-        #  - _baidu_framework::CIntelligentChargeData::Handle(...)
+        #  - demo_fw::DemoChargeData::Handle(...)
         #  - std::__ndk1::shared_ptr<T>::shared_ptr[abi:ne180000](...)
-        #  - _baidu_framework::tagHouseDrawObjKey::~tagHouseDrawObjKey()
-        #  - ParseRGCOverlay(...)
-        #  中提取 "函数名 token"（Handle/shared_ptr/~tagHouseDrawObjKey/ParseRGCOverlay）
+        #  - demo_fw::DemoDrawKey::~DemoDrawKey()
+        #  - ParseOverlay(...)
+        #  中提取 "函数名 token"（Handle/shared_ptr/~DemoDrawKey/ParseOverlay）
         #
         # 注意：resolved_function 里模板参数也包含 '::'，不能用 split('::')[-1]
         m = re.search(
@@ -3099,7 +3099,7 @@ class CodeContentProvider:
                 r'(?:void\s+)?\w+::\w+\s*\([^)]*\)\s*$',          # Class::fn(...) 或 void Class::fn(...)
                 r'(?:void\s+)?\w+\s+\w+\s*\([^)]*\)\s*$',            # return_type fn(...)
                 r'((?:static|inline|constexpr|extern|virtual)\s+[\w:\<\>\~\*&\s]+\s+[A-Za-z_]\w*\s*\([^)]*\))',
-                # 覆盖模板类成员函数：CVList< TYPE, ARG_TYPE >::RemoveAt(...)
+                # 覆盖模板类成员函数：DemoList< TYPE, ARG_TYPE >::RemoveAt(...)
                 r'([\w:\<\>\,\s\*&\~]+\s+[A-Za-z_]\w*(?:\s*<[^;{}()]+>)?\s*::\s*[A-Za-z_]\w*\s*\([^)]*\))',
             ]
 
@@ -3550,7 +3550,7 @@ class CodeContentProvider:
                 break
         return out
 
-    _STACK_BRIDGE_CALL_NAMES = frozenset({"VDelete", "RemoveAll"})
+    _STACK_BRIDGE_CALL_NAMES = frozenset({"DemoDelete", "RemoveAll"})
 
     def _graph_node_body_text(self, node: GraphNode) -> str:
         """读取 GraphNode 可分析的函数体文本（snippet 优先，否则按行号读文件）。"""
@@ -3622,10 +3622,10 @@ class CodeContentProvider:
 
     def _callee_is_vdestruct_elements(self, callee: GraphNode) -> bool:
         sig = (callee.signature or callee.name or "").strip()
-        return "VDestructElements" in sig
+        return "DemoDestructElements" in sig
 
     def _node_has_bridge_to_callee(self, node: GraphNode, callee: GraphNode) -> bool:
-        """判断 node 是否通过 VDelete/RemoveAll 等桥接逻辑可达模板析构 callee。"""
+        """判断 node 是否通过 DemoDelete/RemoveAll 等桥接逻辑可达模板析构 callee。"""
         if self._verify_stack_caller_resolves_call_to_callee(node, callee):
             return True
         if not self._callee_is_vdestruct_elements(callee):
@@ -3633,7 +3633,7 @@ class CodeContentProvider:
         body = self._graph_node_body_text(node)
         if not body:
             return False
-        if re.search(r"\bVDelete\s*[<(]", body):
+        if re.search(r"\bDemoDelete\s*[<(]", body):
             return True
         if re.search(r"\bRemoveAll\s*\(", body):
             return True
@@ -3716,16 +3716,16 @@ class CodeContentProvider:
         code_roots: List[str],
         stack_priority_files: Optional[List[str]],
     ) -> List[GraphNode]:
-        """在 from_node 与 to_node 之间插入 VDelete 等桥接节点（仅当源码可见）。"""
+        """在 from_node 与 to_node 之间插入 DemoDelete 等桥接节点（仅当源码可见）。"""
         if not self._callee_is_vdestruct_elements(to_node):
             return []
         body = self._graph_node_body_text(from_node)
         if not body:
             return []
         bridges: List[GraphNode] = []
-        if re.search(r"\bVDelete\s*[<(]", body):
+        if re.search(r"\bDemoDelete\s*[<(]", body):
             vd = self._probe_called_function_node(
-                "VDelete", from_node, code_roots, stack_priority_files
+                "DemoDelete", from_node, code_roots, stack_priority_files
             )
             if vd is not None:
                 bridges.append(vd)
@@ -4458,7 +4458,7 @@ class CodeContentProvider:
             r'\w+::\w+\s*\([^)]*\)\s*\{',             # Class::function_name(...) {
             # 支持带 static/inline/constexpr 等限定词的自由函数（含同一行大括号）
             r'(?:static|inline|constexpr|extern|virtual)\s+[\w:\<\>\~\*&\s]+\s+\w+\s*\([^;{}]*\)\s*\{',
-            # 支持模板类成员函数（同一行大括号）：VVoid CVList< TYPE, ARG_TYPE >::RemoveAt(...)
+            # 支持模板类成员函数（同一行大括号）：void DemoList< TYPE, ARG_TYPE >::RemoveAt(...)
             r'[\w:\<\>\,\s\*&\~]+\s+[A-Za-z_]\w*(?:\s*<[^;{}()]+>)?\s*::\s*[A-Za-z_]\w*\s*\([^;{}]*\)\s*\{',
             # 支持函数定义行和大括号分开的情况（大括号在下一行）
             r'void\s+\w+::\w+\s*\([^)]*\)\s*$',       # void Class::function_name(...) (大括号在下一行)
@@ -4469,7 +4469,7 @@ class CodeContentProvider:
             r'\w+::\w+\s*\([^)]*\)\s*(?:const|override|noexcept|final)[\s{]*$',
             # 支持普通自由函数（含 static）定义行与大括号分行
             r'(?:static|inline|constexpr|extern|virtual)?\s*[\w:\<\>\~\*&]+\s+\w+\s*\([^;{}]*\)\s*$',
-            # 支持模板类成员函数（大括号在下一行）：VVoid CVList< TYPE, ARG_TYPE >::RemoveAt(...)
+            # 支持模板类成员函数（大括号在下一行）：void DemoList< TYPE, ARG_TYPE >::RemoveAt(...)
             r'[\w:\<\>\,\s\*&\~]+\s+[A-Za-z_]\w*(?:\s*<[^;{}()]+>)?\s*::\s*[A-Za-z_]\w*\s*\([^;{}]*\)\s*$',
             # 支持初始化列表的构造函数
             r'\w+::\w+\s*\([^)]*\)\s*:',              # Class::function_name(...) :
@@ -4617,9 +4617,9 @@ class CodeContentProvider:
         """
         从 C++ 符号中提取 (owner, method)。
         例：
-        - _baidu_vi::CVString::CVString() -> (_baidu_vi::CVString, CVString)
+        - demo_util::DemoString::DemoString() -> (demo_util::DemoString, DemoString)
         - Foo::bar(int) -> (Foo, bar)
-        - walk_navi::CRoute::GetLegSize -> (walk_navi::CRoute, GetLegSize)
+        - demo_ns::DemoRoute::GetSegmentCount -> (demo_ns::DemoRoute, GetSegmentCount)
         """
         s = sanitize_stack_symbol(resolved_function) or ""
         s = s.strip()
@@ -4710,7 +4710,7 @@ class CodeContentProvider:
             return -1
         score = 0
         owner_macro_optional = owner
-        # 宏命名空间可选：允许忽略前缀形如 _baidu_framework::
+        # 宏命名空间可选：允许忽略前缀形如 _vendor_sdk::
         if "::" in owner and owner.split("::", 1)[0].startswith("_"):
             owner_macro_optional = owner.split("::", 1)[1]
 
@@ -4937,7 +4937,7 @@ class CodeContentProvider:
         }
     )
     # 业务中高频且语义宽泛的方法名，易在全仓静态扫描中发生"同名误匹配"
-    # （例如 m_render->UnInit() 被误连到 WalkMapControl::UnInit）。
+    # （例如 m_render->UnInit() 被误连到 CallerControl::UnInit）。
     _GENERIC_METHOD_NAMES_FOR_CALL_CHAIN = frozenset(
         {
             "init",
@@ -5837,7 +5837,7 @@ class CodeContentProvider:
             if typed_seen:
                 return False
 
-        # 允许"变量调用 + 近邻声明里出现 owner 类型名"的场景（如 shared_ptr<WalkMapControl> walkMap; walkMap->UnInit();）
+        # 允许"变量调用 + 近邻声明里出现 owner 类型名"的场景（如 shared_ptr<CallerControl> ctrl; ctrl->UnInit();）
         var_call_pat = re.compile(rf"\b([A-Za-z_]\w*)\s*(?:->|\.)\s*{re.escape(method)}\s*\(")
         owner_pat = re.compile(rf"\b{re.escape(owner)}\b")
         decl_pat_tpl = r"\b{owner}\b[^;\n]*\b{var}\b"
@@ -6138,7 +6138,7 @@ class CodeContentProvider:
     def _parse_template_container_function(self, crash_function_name: str) -> Optional[Dict[str, str]]:
         """
         解析模板容器成员函数签名，例如：
-        _baidu_vi::CVList<_baidu_framework::CBVDEOptCacheElement, ...>::RemoveAt(void*)
+        demo_util::DemoList<demo_fw::DemoCacheElement, ...>::RemoveAt(void*)
         """
         if not crash_function_name or "::" not in crash_function_name or "<" not in crash_function_name:
             return None
@@ -6306,7 +6306,7 @@ class CodeContentProvider:
         if "::" in (function_name or ""):
             # 去掉参数列表，仅保留 Class::func
             qualified_name = function_name.split("(")[0].strip()
-            # 对 _baidu_vi::CVPlex::Create 这类多级命名空间，保留最后一级类 + 方法，避免过严匹配
+            # 对 demo_util::DemoPool::Create 这类多级命名空间，保留最后一级类 + 方法，避免过严匹配
             q_parts = qualified_name.split("::")
             if len(q_parts) >= 2:
                 qualified_name = "::".join(q_parts[-2:])
@@ -7203,8 +7203,8 @@ class CodeContentProvider:
     ) -> List[str]:
         """从调用方 snippet 中提取通过指针解引用调用崩溃函数（或同类方法）的成员变量。
 
-        例如调用方代码含 m_pclRoute->GetID()，崩溃函数为 CRoute::GetLegSize，
-        则提取 m_pclRoute 作为补充共享变量候选（因为 m_pclRoute 是 CRoute* 类型）。
+        例如调用方代码含 m_pRoute->GetID()，崩溃函数为 DemoRoute::GetSegmentCount，
+        则提取 m_pRoute 作为补充共享变量候选（因为 m_pRoute 是 DemoRoute* 类型）。
         """
         # 崩溃函数的短名和类名
         short_name = crash_function_name or ""
@@ -7243,8 +7243,8 @@ class CodeContentProvider:
             _extract_from_lines(caller.snippet or [], found_static)
 
         # 2. 从 add2line 栈第 2 帧（直接调用方）的源文件中提取
-        #    场景：HandleDataFail 调用 m_pclRoute->GetID()（同类不同方法），
-        #    静态分析找不到它调用 GetLegSize，但运行时栈表明它是调用方。
+        #    场景：HandleDataFail 调用 m_pRoute->GetID()（同类不同方法），
+        #    静态分析找不到它调用 GetSegmentCount，但运行时栈表明它是调用方。
         if add2line_data and stack_priority_files and crash_class:
             from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
 
@@ -7292,10 +7292,138 @@ class CodeContentProvider:
                     except Exception:
                         continue
         # add2line 派生的变量优先（更可能是实际崩溃路径上的指针）
-        return found_add2line + found_static
+        return list(dict.fromkeys(found_add2line + found_static))
+
+    def _expand_arrow_callee_return_members(
+        self,
+        shared_vars: List[str],
+        func_code: str,
+        code_roots: List[str],
+    ) -> List[str]:
+        """把 ``ptr->GetX()`` 展开为 GetX 返回的成员（如 ``return m_renderSteps;``）。
+
+        用于容器 Copy 崩溃：崩溃行常是 ``routes = m_pCurrentItem->GetDrawSteps()``，
+        真正被并发修改的是 DemoRoute 内部容器，而不是指针本身。
+
+        副作用：写入 ``self._expanded_member_sites``，供写点扫描 seed 定义文件与 owner 类。
+        """
+        text = str(func_code or "")
+        sites: List[Dict[str, str]] = []
+        self._expanded_member_sites = sites
+        if not text.strip() or not code_roots:
+            return list(shared_vars or [])
+        expanded: List[str] = list(shared_vars or [])
+        seen = set(expanded)
+        # m_foo->GetBar( 或 foo->GetBar(
+        call_pat = re.compile(
+            r"\b([A-Za-z_]\w*)\s*->\s*([A-Za-z_]\w*)\s*\("
+        )
+        return_pat = re.compile(
+            r"\breturn\s+(?:this\s*->\s*)?(m_[A-Za-z_]\w*)\s*;"
+        )
+        methods: List[str] = []
+        for match in call_pat.finditer(text):
+            method = match.group(2)
+            if method.startswith("Get") or method.startswith("get"):
+                methods.append(method)
+        methods = list(dict.fromkeys(methods))
+        if not methods:
+            return expanded
+
+        locator = getattr(self, "_locator", None)
+        for method in methods[:6]:
+            # 在 code_roots 下搜 ``Type::Method(`` 或 ``Method()`` 定义附近的 return m_。
+            try:
+                from pathlib import Path
+
+                method_owner_pat = re.compile(
+                    rf"(?:^|\n)[^\n]*\b([A-Za-z_]\w*)\s*::\s*{re.escape(method)}\s*\([^;]*\)\s*(?:const\s*)?\{{",
+                    re.MULTILINE,
+                )
+                for root in code_roots[:8]:
+                    root_path = Path(str(root))
+                    if not root_path.is_dir():
+                        continue
+                    # 优先常见文件名模式，避免全仓扫爆。
+                    candidates = []
+                    for pattern in (
+                        f"**/*{method}*",
+                        "**/*route*.cpp",
+                        "**/*control*.cpp",
+                    ):
+                        try:
+                            candidates.extend(root_path.glob(pattern))
+                        except OSError:
+                            continue
+                    seen_files = set()
+                    for path in candidates[:40]:
+                        key = str(path)
+                        if key in seen_files or not path.is_file():
+                            continue
+                        seen_files.add(key)
+                        try:
+                            if locator is not None and hasattr(locator, "_ctx"):
+                                content = locator._ctx.read_file_cached(str(path))
+                            else:
+                                content = path.read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            continue
+                        if not content or method not in content:
+                            continue
+                        # 截取 Method 定义后的一小段函数体。
+                        def_pat = re.compile(
+                            rf"(?:^|\n)[^\n]*\b{re.escape(method)}\s*\([^;]*\)\s*(?:const\s*)?\{{",
+                            re.MULTILINE,
+                        )
+                        for dm in def_pat.finditer(content):
+                            body = content[dm.end() : dm.end() + 400]
+                            # 只看到第一个顶层 return / 简单函数结束，避免吃到相邻函数。
+                            end_at = body.find("\n}")
+                            if end_at > 0:
+                                body = body[: end_at + 2]
+                            owner_class = ""
+                            # 在定义头里取 owner：向前看定义行
+                            header_start = max(0, dm.start() - 120)
+                            header = content[header_start:dm.end()]
+                            om = method_owner_pat.search(header)
+                            if om:
+                                owner_class = om.group(1)
+                            for rm in return_pat.finditer(body):
+                                member = rm.group(1)
+                                if (
+                                    member not in seen
+                                    and member not in self._SHARED_VAR_BLOCKLIST
+                                    and self._is_valid_variable_name(member)
+                                ):
+                                    expanded.append(member)
+                                    seen.add(member)
+                                if member and self._is_valid_variable_name(member):
+                                    sites.append(
+                                        {
+                                            "member": member,
+                                            "owner_class": owner_class,
+                                            "definition_file": str(path),
+                                            "getter_method": method,
+                                        }
+                                    )
+                            if return_pat.search(body):
+                                break
+            except Exception as exc:
+                logger.warning("arrow callee return member expand failed: %s", exc)
+        # 去重 sites（同成员保留首个带 owner 的）
+        dedup: Dict[str, Dict[str, str]] = {}
+        for site in sites:
+            key = str(site.get("member") or "")
+            if not key:
+                continue
+            prev = dedup.get(key)
+            if prev is None or (not prev.get("owner_class") and site.get("owner_class")):
+                dedup[key] = site
+        self._expanded_member_sites = list(dedup.values())
+        return expanded
 
     def _extract_class_from_function_name(self, func_name: str) -> str:
-        """从函数全名中提取类名，如 'CPanoramaRouteDataFactory::HandleDataFail' -> 'CPanoramaRouteDataFactory'。"""
+        """从函数全名中提取类名，如 'DemoRouteDataFactory::HandleDataFail' -> 'DemoRouteDataFactory'。"""
         if "::" not in (func_name or ""):
             return ""
         parts = func_name.split("::")
@@ -7607,6 +7735,8 @@ class CodeContentProvider:
     def _build_graph_evidence_summary(
         edges_list: List[Any],
         crash_node_id: str,
+        *,
+        expanded_members: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         """汇总图边类型，供 prompt 与自动改码门禁使用（通用规则，非业务硬编码）。"""
         cf_norm = str(crash_node_id or "").rstrip().rstrip("{").rstrip()
@@ -7617,6 +7747,12 @@ class CodeContentProvider:
         def _write_like(rel: Any) -> bool:
             r = str(rel or "").strip().lower()
             return r in ("write", "assign", "delete")
+
+        def _bare_var(raw: Any) -> str:
+            text = str(raw or "").strip()
+            if text.startswith("var|"):
+                text = text[4:]
+            return text.split("::")[-1] if "::" in text else text
 
         has_direct = False
         has_stack = False
@@ -7643,6 +7779,12 @@ class CodeContentProvider:
                 has_to_crash = True
 
         sv_write_upstream = False
+        expanded_write_found = False
+        expanded_bare = {
+            _bare_var(item)
+            for item in (expanded_members or [])
+            if str(item or "").strip()
+        }
         for e in edges_list or []:
             if not isinstance(e, dict):
                 continue
@@ -7654,6 +7796,9 @@ class CodeContentProvider:
             fid = _norm_fid(e.get("from_id"))
             if fid and fid != cf_norm and fid in proven_caller_norm:
                 sv_write_upstream = True
+            edge_var = _bare_var(e.get("variable") or e.get("var") or e.get("to_id"))
+            if expanded_bare and edge_var in expanded_bare and fid != cf_norm:
+                expanded_write_found = True
 
         auto_ok = bool(has_stack_verified or has_direct or has_to_crash or sv_write_upstream)
         block_reason = ""
@@ -7669,6 +7814,8 @@ class CodeContentProvider:
                 "；".join(parts)
                 + "。仅允许输出调查假设，禁止自动改码。"
             )
+        # 展开到容器成员后若仍无其写边：允许调查，但禁止把「只锁指针」当完整修复依据。
+        container_write_incomplete = bool(expanded_bare) and not expanded_write_found
         return {
             "has_calls_direct": has_direct,
             "has_calls_stack_order": has_stack,
@@ -7676,6 +7823,9 @@ class CodeContentProvider:
             "has_calls_to_crash_site": has_to_crash,
             "has_use_shared_var": has_sv,
             "has_shared_var_write_upstream": sv_write_upstream,
+            "expanded_container_members": sorted(expanded_bare),
+            "expanded_container_member_write_found": expanded_write_found,
+            "container_copy_write_path_incomplete": container_write_incomplete,
             "auto_fix_allowed": auto_ok,
             "auto_fix_block_reason": block_reason or None,
         }
@@ -8340,7 +8490,7 @@ class CodeContentProvider:
                 if not simple_name:
                     continue
                 # 崩溃函数本身已作为节点，保持 file 一致。
-                # 仅按 simple name 对齐会把 WalkMapControl::Foo 折叠成 NaviMapRender::Foo。
+                # 仅按 simple name 对齐会把 CallerControl::Foo 折叠成 CrashRender::Foo。
                 if stack_symbol_aliases_crash_function(
                     fn,
                     crash_func.name,
@@ -8925,7 +9075,7 @@ class CodeContentProvider:
             r'int\s+(\w+)\s*\([^)]*\)\s*\{',                # int function_name(
             r'int\s+(\w+)\s*\([^)]*\)\s*$',                 # int function_name(
             # C++ 运算符重载：Class::operator...(...)
-            r'([A-Za-z_][A-Za-z_0-9:]*::operator[^\s(]*)\s*\(',  # CVStringHash::operator(
+            r'([A-Za-z_][A-Za-z_0-9:]*::operator[^\s(]*)\s*\(',  # DemoStringHash::operator(
         ]
 
         from tools.function_snippet_utils import (
@@ -9825,8 +9975,15 @@ class CodeContentProvider:
         elif not graph_dict.get("edges_empty_reason"):
             graph_dict["edges_empty_reason"] = "未生成任何边；原因未单独记录。"
         crash_nid = str(cs.get("node_id") or "") if isinstance(cs, dict) else ""
+        expand_members = [
+            str(site.get("member") or "").strip()
+            for site in (getattr(self, "_expanded_member_sites", None) or [])
+            if isinstance(site, dict) and str(site.get("member") or "").strip()
+        ]
         graph_dict["evidence_summary"] = self._build_graph_evidence_summary(
-            edges_list, crash_nid
+            edges_list,
+            crash_nid,
+            expanded_members=expand_members,
         )
         result_dict["graph"] = graph_dict
         code_context_options = {
@@ -10144,7 +10301,7 @@ class CodeContentProvider:
                     if actual_file_path:
                         # 找到实际文件路径，检查是否在代码根目录下
                         try:
-                            # 勿对 actual_file_path 先 resolve()：code_root 内符号链接（如 src/vi -> engine-vi）
+                            # 勿对 actual_file_path 先 resolve()：code_root 内符号链接（如 src/vi -> demo-lib）
                             # 展开后会落到兄弟目录，被误判为"不在 code_root 下"。
                             actual_path = Path(actual_file_path)
                             try:
@@ -10756,6 +10913,11 @@ class CodeContentProvider:
                             merge_crash_file,
                             code_roots_abs_strs,
                         )
+                        _shared_vars = self._expand_arrow_callee_return_members(
+                            _shared_vars,
+                            merge_src,
+                            code_roots_abs_strs,
+                        )
 
                     if _shared_vars:
                         crash_local_scan_files: List[str] = []
@@ -10775,16 +10937,151 @@ class CodeContentProvider:
                             owner_fields_sv = list(octx_sv.get("member_fields") or [])
                             if octx_sv.get("definition_file"):
                                 owner_def_sv.append(str(octx_sv.get("definition_file")))
-                        _var_funs = self._find_variable_functions_for_vars(
-                            _shared_vars,
-                            resolved_function,
-                            code_roots_abs_strs,
-                            stack_priority_files=stack_priority_files,
-                            crash_local_files=crash_local_scan_files,
-                            owner_class=owner_cls_sv or None,
-                            owner_member_fields=owner_fields_sv,
-                            owner_definition_files=owner_def_sv,
-                        )
+                        owner_field_set = set(owner_fields_sv)
+                        # 箭头返回的容器成员（如 m_renderSteps）不属于崩溃类字段，
+                        # 必须去掉 owner 过滤，否则写点（Build/Clear）会被丢掉。
+                        owner_scoped = [
+                            v for v in _shared_vars
+                            if (v.split("::")[-1] if "::" in v else v) in owner_field_set
+                            or not owner_field_set
+                        ]
+                        cross_object = [
+                            v for v in _shared_vars
+                            if v not in owner_scoped
+                        ]
+                        _var_funs = []
+                        if owner_scoped:
+                            _var_funs.extend(
+                                self._find_variable_functions_for_vars(
+                                    owner_scoped,
+                                    resolved_function,
+                                    code_roots_abs_strs,
+                                    stack_priority_files=stack_priority_files,
+                                    crash_local_files=crash_local_scan_files,
+                                    owner_class=owner_cls_sv or None,
+                                    owner_member_fields=owner_fields_sv,
+                                    owner_definition_files=owner_def_sv,
+                                )
+                            )
+                        if cross_object:
+                            expand_sites = list(
+                                getattr(self, "_expanded_member_sites", None) or []
+                            )
+                            expand_def_files: List[str] = []
+                            expand_owner_by_member: Dict[str, str] = {}
+                            for site in expand_sites:
+                                if not isinstance(site, dict):
+                                    continue
+                                member = str(site.get("member") or "").strip()
+                                owner = str(site.get("owner_class") or "").strip()
+                                def_file = str(site.get("definition_file") or "").strip()
+                                if member and owner:
+                                    expand_owner_by_member[member] = owner
+                                if def_file and def_file not in expand_def_files:
+                                    expand_def_files.append(def_file)
+                            cross_scan_files = list(crash_local_scan_files or [])
+                            for def_file in expand_def_files:
+                                if def_file not in cross_scan_files:
+                                    cross_scan_files.append(def_file)
+                            # 按展开成员的真实 owner 类检索写点（如 DemoRoute::m_renderSteps）。
+                            owners_for_search = sorted(set(expand_owner_by_member.values()))
+                            if owners_for_search:
+                                for owner_name in owners_for_search:
+                                    members_for_owner = [
+                                        m for m in cross_object
+                                        if expand_owner_by_member.get(
+                                            m.split("::")[-1] if "::" in m else m, ""
+                                        ) == owner_name
+                                        or expand_owner_by_member.get(m, "") == owner_name
+                                    ]
+                                    if not members_for_owner:
+                                        continue
+                                    _var_funs.extend(
+                                        self._find_variable_functions_for_vars(
+                                            members_for_owner,
+                                            resolved_function,
+                                            code_roots_abs_strs,
+                                            stack_priority_files=stack_priority_files,
+                                            crash_local_files=cross_scan_files,
+                                            owner_class=owner_name,
+                                            owner_member_fields=[
+                                                (
+                                                    m.split("::")[-1]
+                                                    if "::" in m
+                                                    else m
+                                                )
+                                                for m in members_for_owner
+                                            ],
+                                            owner_definition_files=expand_def_files,
+                                        )
+                                    )
+                                orphan_members = [
+                                    m for m in cross_object
+                                    if (
+                                        m.split("::")[-1] if "::" in m else m
+                                    ) not in expand_owner_by_member
+                                    and m not in expand_owner_by_member
+                                ]
+                                if orphan_members:
+                                    _var_funs.extend(
+                                        self._find_variable_functions_for_vars(
+                                            orphan_members,
+                                            resolved_function,
+                                            code_roots_abs_strs,
+                                            stack_priority_files=stack_priority_files,
+                                            crash_local_files=cross_scan_files,
+                                            owner_class=None,
+                                            owner_member_fields=None,
+                                            owner_definition_files=expand_def_files or None,
+                                        )
+                                    )
+                            else:
+                                _var_funs.extend(
+                                    self._find_variable_functions_for_vars(
+                                        cross_object,
+                                        resolved_function,
+                                        code_roots_abs_strs,
+                                        stack_priority_files=stack_priority_files,
+                                        crash_local_files=cross_scan_files,
+                                        owner_class=None,
+                                        owner_member_fields=None,
+                                        owner_definition_files=expand_def_files or None,
+                                    )
+                                )
+                            # 让崩溃函数与箭头返回成员建立 read 关联，prompt 才能列出该共享对象。
+                            crash_sig = str(
+                                getattr(crash_func, "signature", None)
+                                or resolved_function
+                                or ""
+                            ).strip()
+                            crash_name = str(
+                                getattr(crash_func, "name", None) or crash_sig or ""
+                            ).strip()
+                            crash_file_for_edge = str(
+                                getattr(crash_func, "file", None)
+                                or merge_crash_file
+                                or ""
+                            ).strip()
+                            crash_snip = list(getattr(crash_func, "snippet", None) or [])
+                            for member in cross_object:
+                                bare = member.split("::")[-1] if "::" in member else member
+                                owner_for_member = expand_owner_by_member.get(bare) or (
+                                    expand_owner_by_member.get(member) or ""
+                                )
+                                scoped = (
+                                    f"{owner_for_member}::{bare}"
+                                    if owner_for_member and "::" not in member
+                                    else member
+                                )
+                                _var_funs.append(
+                                    VariableFunction(
+                                        name=crash_name or "unknown",
+                                        file=crash_file_for_edge,
+                                        variable=scoped,
+                                        relation="read",
+                                        snippet=crash_snip or ([crash_sig] if crash_sig else []),
+                                    )
+                                )
                     return _shared_vars, _var_funs
 
                 # 启动并行执行
@@ -10960,8 +11257,8 @@ class CodeContentProvider:
                 logger.info(f"共享变量候选 {len(shared_vars)} 个，找到 {len(use_same_var_related_fun)} 条函数-变量关系")
 
                 # 3b. 补充：从调用方的调用点提取指针解引用变量作为额外共享变量候选
-                # 场景：崩溃在 GetLegSize()，但真正的问题指针 m_pclRoute 在调用方
-                # HandleDataFail 中（m_pclRoute->GetLegSize()）。
+                # 场景：崩溃在 GetSegmentCount()，但真正的问题指针 m_pRoute 在调用方
+                # HandleDataFail 中（m_pRoute->GetSegmentCount()）。
                 if not is_template_generic_crash and (direct_call_crash_fun or add2line_data):
                     caller_ptr_vars = self._extract_caller_deref_vars(
                         direct_call_crash_fun, resolved_function, shared_vars,

@@ -39,8 +39,8 @@ class ContextInvestigationContractTest(unittest.TestCase):
         """Model slips like type=file / priority=medium should still resolve."""
         out = parse_agent_decision(
             '{"agent_can_fetch_more":true,"context_requests":['
-            '{"type":"file","symbol":"inc/vi/vos/VTempl.h","priority":"medium","reason":"need Copy"},'
-            '{"type":"function","symbol":"CNaviEngineControl::UpdateRoute","priority":"medium","reason":"lifecycle"}'
+            '{"type":"file","symbol":"include/util/DemoTempl.h","priority":"medium","reason":"need Copy"},'
+            '{"type":"function","symbol":"DemoEngineControl::UpdateRoute","priority":"medium","reason":"lifecycle"}'
             "]}"
         )
         self.assertFalse(out["degraded"])
@@ -50,7 +50,7 @@ class ContextInvestigationContractTest(unittest.TestCase):
         types = {item["type"] for item in out["context_requests"]}
         self.assertEqual(types, {"read_file", "function"})
         read_file = next(item for item in out["context_requests"] if item["type"] == "read_file")
-        self.assertEqual(read_file["file"], "inc/vi/vos/VTempl.h")
+        self.assertEqual(read_file["file"], "include/util/DemoTempl.h")
         self.assertEqual(read_file["priority"], "normal")
         func = next(item for item in out["context_requests"] if item["type"] == "function")
         self.assertEqual(func["priority"], "normal")

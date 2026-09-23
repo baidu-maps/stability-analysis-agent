@@ -153,7 +153,7 @@ def format_crash_position_summary_line(
     node = crash_node if isinstance(crash_node, dict) else {}
     func = ""
     file_path = ""
-    line_no = crash_summary.get("crash_line_number")
+    line_no = None
     code = str(
         crash_summary.get("crash_line_code")
         or crash_summary.get("analysis_entry_line_code")
@@ -178,8 +178,37 @@ def format_crash_position_summary_line(
         or (node.get("file") if node else "")
         or ""
     ).strip()
-    if line_no is None:
-        line_no = crash_summary.get("analysis_entry_line_number")
+    entry_file = str(crash_summary.get("analysis_entry_file") or "").strip()
+    entry_line = crash_summary.get("analysis_entry_line_number")
+    try:
+        entry_line_int = int(entry_line or 0)
+    except (TypeError, ValueError):
+        entry_line_int = 0
+    # 业务入口文件与 addr2line 模板行号不得混用（典型：GetDrawSteps.cpp + DemoTempl.h:1022）。
+    file_base = file_path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    entry_base = entry_file.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if entry_base and file_base and entry_base == file_base and entry_line_int > 0:
+        line_no = entry_line_int
+    elif line_no is None:
+        line_no = entry_line if entry_line_int > 0 else crash_summary.get("crash_line_number")
+    else:
+        # crash_loc.line 存在但 file 已换成 analysis_entry 时，仍优先入口行号。
+        if entry_base and file_base and entry_base == file_base and entry_line_int > 0:
+            line_no = entry_line_int
+        elif entry_file and file_path and entry_base != file_base:
+            # 文件已不一致：不要用另一文件的行号；改回入口行号或清空。
+            line_no = entry_line_int if entry_line_int > 0 else None
+            if entry_file:
+                file_path = entry_file
+                func = str(
+                    crash_summary.get("analysis_entry_function") or func or ""
+                ).strip()
+                code = str(
+                    crash_summary.get("crash_line_code")
+                    or crash_summary.get("analysis_entry_line_code")
+                    or code
+                    or ""
+                ).strip()
 
     if source == SOURCE_FROM_LOG_DEDUCE:
         if func and file_path:

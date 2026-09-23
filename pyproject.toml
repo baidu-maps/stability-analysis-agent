@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "stability-analysis-agent"
-version = "1.4.1"
+version = "1.5.0"
 description = "Agent framework that builds evidence chains from Crash/ANR/OOM logs, auto-fixes Crash code, and plugs into test verification & bug trackers"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -60,7 +60,7 @@ Changelog = "https://github.com/baidu-maps/stability-analysis-agent/blob/main/CH
 # 项目根目录平铺结构：agent/ tools/ rag/ workflows/ daemon/ tool_system/ protocol/ prompts/ cli/ 均为顶级子包
 # pip install -e . 后可直接 from agent.xxx / from tools.xxx 等导入
 [tool.hatch.build.targets.wheel]
-packages = ["agent", "tools", "rag", "workflows", "daemon", "tool_system", "skill_system", "protocol", "prompts", "cli", "services"]
+packages = ["agent", "tools", "rag", "knowledge_plane", "workflows", "daemon", "tool_system", "skill_system", "protocol", "prompts", "cli", "services"]
 output-dir = "output/dist"
 
 # Ship example templates next to the cli package (never include *.local.json secrets)

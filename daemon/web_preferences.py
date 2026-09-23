@@ -31,6 +31,13 @@ def _default_prefs() -> Dict[str, Any]:
         "workspace": dict(DEFAULT_DEMO),
         "disabled_skills": [],
         "vector_db": _default_vector_db_config(),
+        "knowledge_plane": {
+            "pack_dirs": [],
+            "pack_id": "",
+            "max_hits": 4,
+            "max_chars": 4500,
+            "enabled": True,
+        },
     }
 
 
@@ -62,6 +69,15 @@ def load_web_preferences() -> Dict[str, Any]:
         from rag.vector_store_config import normalize_vector_db_config
 
         base["vector_db"] = normalize_vector_db_config(data.get("vector_db"))
+    if isinstance(data.get("knowledge_plane"), dict):
+        kp = data["knowledge_plane"]
+        base["knowledge_plane"] = {
+            "pack_dirs": [str(x).strip() for x in kp.get("pack_dirs") or [] if str(x).strip()],
+            "pack_id": str(kp.get("pack_id") or "").strip(),
+            "max_hits": max(1, int(kp.get("max_hits") or 4)),
+            "max_chars": max(500, int(kp.get("max_chars") or 4500)),
+            "enabled": bool(kp.get("enabled", True)),
+        }
     return base
 
 
@@ -83,6 +99,15 @@ def save_web_preferences(payload: Dict[str, Any]) -> Dict[str, Any]:
         current["vector_db"] = normalize_vector_db_config(
             {**(current.get("vector_db") or {}), **payload["vector_db"]}
         )
+    if isinstance(payload.get("knowledge_plane"), dict):
+        kp = {**(current.get("knowledge_plane") or {}), **payload["knowledge_plane"]}
+        current["knowledge_plane"] = {
+            "pack_dirs": [str(x).strip() for x in kp.get("pack_dirs") or [] if str(x).strip()],
+            "pack_id": str(kp.get("pack_id") or "").strip(),
+            "max_hits": max(1, int(kp.get("max_hits") or 4)),
+            "max_chars": max(500, int(kp.get("max_chars") or 4500)),
+            "enabled": bool(kp.get("enabled", True)),
+        }
     path = _prefs_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with _PREFS_LOCK:

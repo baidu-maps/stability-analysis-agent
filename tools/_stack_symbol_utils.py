@@ -51,7 +51,7 @@ def rtf_to_plain_text(content: str) -> str:
 
 
 def _owner_class_token(owner: str) -> str:
-    """owner 末段类名，去掉返回类型（如 'VVoid NaviMapRender' -> 'NaviMapRender'）。"""
+    """owner 末段类名，去掉返回类型（如 'void DemoMapRender' -> 'DemoMapRender'）。"""
     last = (owner or "").split("::")[-1].strip()
     toks = last.split()
     return toks[-1] if toks else last
@@ -60,7 +60,7 @@ def _owner_class_token(owner: str) -> str:
 def cpp_owner_and_method(resolved_function: Optional[str]) -> Optional[Tuple[str, str]]:
     """
     从 C++ 符号提取 (owner, method)。
-    例：walk_navi::NaviMapRender::UpdateFoo(...) -> (walk_navi::NaviMapRender, UpdateFoo)
+    例：demo_ns::DemoMapRender::UpdateFoo(...) -> (demo_ns::DemoMapRender, UpdateFoo)
     """
     s = sanitize_stack_symbol(resolved_function) or ""
     s = s.strip()
@@ -69,7 +69,7 @@ def cpp_owner_and_method(resolved_function: Optional[str]) -> Optional[Tuple[str
     head = s.split("(", 1)[0].strip()
     if "::" not in head:
         return None
-    # 签名行可能带返回类型：VVoid NaviMapRender::Foo
+    # 签名行可能带返回类型：void DemoMapRender::Foo
     pre, rest = head.split("::", 1)
     pre = pre.strip()
     if " " in pre:
@@ -94,7 +94,7 @@ def stack_symbol_aliases_crash_function(
     栈帧符号是否应复用崩溃函数图节点。
 
     同名成员函数挂在不同类上时必须拆开，否则会把
-    WalkMapControl::UpdateFoo 折叠成 NaviMapRender::UpdateFoo。
+    DemoMapControl::UpdateFoo 折叠成 DemoMapRender::UpdateFoo。
     崩溃点源码签名若只有 simple name（无 Class::），不得仅凭同名折叠其它类。
     """
     simple = (crash_simple_name or "").strip()
@@ -149,7 +149,7 @@ def caller_is_same_cpp_method(
 def stack_has_same_named_trampoline(symbols: Sequence[str]) -> bool:
     """
     栈符号列表（崩溃帧在前）是否存在「不同类、同方法名」的转发调用方。
-    例如 NaviMapRender::UpdateFoo ← WalkMapControl::UpdateFoo。
+    例如 DemoMapRender::UpdateFoo ← DemoMapControl::UpdateFoo。
     """
     cleaned = [str(s).strip() for s in (symbols or []) if str(s or "").strip()]
     if len(cleaned) < 2:
@@ -174,7 +174,7 @@ def stack_has_same_named_trampoline(symbols: Sequence[str]) -> bool:
 def sanitize_stack_symbol(symbol: Optional[str]) -> Optional[str]:
     """
     清洗堆栈符号中的 RTF/导出残留。
-    例：walk_navi::CRoute::GetLegSize\\ -> walk_navi::CRoute::GetLegSize
+    例：demo_ns::DemoRoute::GetSegmentCount\\ -> demo_ns::DemoRoute::GetSegmentCount
     """
     if symbol is None:
         return None

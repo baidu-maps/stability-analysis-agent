@@ -67,6 +67,7 @@ _LOCAL_PATH_FIELDS = frozenset(
         "workspace_root",
         "repo_cache_root",
         "vector_db_path",
+        "knowledge_pack_dirs",
     }
 )
 _OUTPUT_FORMATS = frozenset({"markdown", "json", "text"})
@@ -1310,6 +1311,18 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
             if req.backup_original_sources
             else "--no-backup-original-sources"
         ]
+    identity = dict(req.source_identity) if isinstance(req.source_identity, dict) else {}
+    identity_fields = (
+        ("source_origin", "--source-origin"),
+        ("commit_policy", "--commit-policy"),
+        ("base_commit", "--base-commit"),
+        ("identity_confidence", "--identity-confidence"),
+        ("block_reason", "--source-identity-block-reason"),
+    )
+    for field_name, flag in identity_fields:
+        value = getattr(req, field_name, None) or identity.get(field_name)
+        if str(value or "").strip():
+            cmd += [flag, str(value)]
 
     _append_store_true(
         cmd, "--force-disassembly", bool(req.force_disassembly), bool(getattr(defaults, "force_disassembly", False))
@@ -1360,6 +1373,20 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
         ]
 
     _append_nondefault_value(cmd, "--vector-db-path", req.vector_db_path, getattr(defaults, "vector_db_path", None))
+    for pack_dir in getattr(req, "knowledge_pack_dirs", None) or []:
+        if str(pack_dir or "").strip():
+            cmd += ["--knowledge-pack-dir", str(pack_dir)]
+    _append_nondefault_value(
+        cmd, "--knowledge-pack", req.knowledge_pack_id, getattr(defaults, "knowledge_pack", None)
+    )
+    _append_nondefault_value(
+        cmd, "--knowledge-max-hits", req.knowledge_max_hits, getattr(defaults, "knowledge_max_hits", None)
+    )
+    _append_nondefault_value(
+        cmd, "--knowledge-max-chars", req.knowledge_max_chars, getattr(defaults, "knowledge_max_chars", None)
+    )
+    if bool(req.domain_knowledge) != bool(getattr(defaults, "domain_knowledge", True)):
+        cmd += ["--domain-knowledge" if req.domain_knowledge else "--no-domain-knowledge"]
     _append_nondefault_value(
         cmd,
         "--vector-db-max-results",

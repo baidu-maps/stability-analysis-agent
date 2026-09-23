@@ -47,6 +47,49 @@ class RepairPipelineGateTests(unittest.TestCase):
         self.assertFalse(gate.get("allowed"))
         self.assertFalse(gate.get("bypassed"))
 
+    def test_bypass_does_not_override_unpinned_source_identity(self) -> None:
+        """branch_latest 身份风险不能被 repair_gate bypass 覆盖。"""
+        result = self._result()
+        result["metadata"] = {
+            "source_identity": {
+                "source_origin": "icafe_branch_fallback",
+                "commit_policy": "branch_latest",
+                "identity_confidence": "unsafe",
+            },
+            "repair_safety": {
+                "hard_block_auto_repair": True,
+                "signal": "forbid_auto_code_write",
+            },
+        }
+        allowed = should_run_repair_pipeline(
+            apply_ai_fixes=True,
+            result=result,
+            scope="full",
+            bypass_repair_gate=True,
+        )
+        self.assertFalse(allowed)
+        gate = (result.get("metadata") or {}).get("source_identity_gate") or {}
+        self.assertTrue(gate.get("hard_block"))
+
+    def test_empty_source_identity_does_not_block_legacy_runs(self) -> None:
+        result = self._result()
+        result["metadata"] = {
+            "source_identity": {
+                "source_origin": "",
+                "commit_policy": "",
+                "base_commit": "",
+                "identity_confidence": "",
+                "block_reason": "",
+            }
+        }
+        self.assertTrue(
+            should_run_repair_pipeline(
+                apply_ai_fixes=True,
+                result=result,
+                scope="full",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

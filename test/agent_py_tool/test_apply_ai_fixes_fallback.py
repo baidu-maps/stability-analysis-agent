@@ -33,8 +33,8 @@ class TestApplyAiFixesFallback(unittest.TestCase):
         code_context = {
             "crash_summary": {
                 "node_id": (
-                    "func|/Users/liuhong_cd/other_branch/baidu/mapclient/engine-dev/"
-                    "src/app/map/basemap/vmap/VMapControl.cpp|VVoid CVMapControl::ReleaseAllLayers() {"
+                    "func|/tmp/demo-app/"
+                    "src/app/map/layers/DemoMapControl.cpp|void DemoMapControl::ReleaseAllLayers() {"
                 ),
                 "crash_line_number": 850,
             },
@@ -80,7 +80,7 @@ class TestApplyAiFixesFallback(unittest.TestCase):
 
     def test_equivalence_ignores_format_and_comments(self):
         old = """
-        VVoid Foo::Bar()
+        void Foo::Bar()
         {
             LockData();
             DoWork( 1 , 2 );
@@ -89,7 +89,7 @@ class TestApplyAiFixesFallback(unittest.TestCase):
         """
         replacement = """
         // 修复函数: Foo::Bar
-        VVoid Foo::Bar(){
+        void Foo::Bar(){
             // 加锁保护
             LockData();
             DoWork(1,2);
@@ -103,7 +103,7 @@ class TestApplyAiFixesFallback(unittest.TestCase):
 
     def test_placeholder_comments_are_rejected_as_incomplete_code(self):
         replacement = """
-        VVoid Foo::Bar()
+        void Foo::Bar()
         {
             DoBefore();
             // ... [其他清理代码] ...
@@ -112,12 +112,45 @@ class TestApplyAiFixesFallback(unittest.TestCase):
         """
         self.assertTrue(_contains_placeholder_code(replacement))
 
+    def test_placeholder_ellipsis_comment_alone_is_rejected(self):
+        """`// ... 处理...` 截断注释须判为占位，避免半截函数落盘。"""
+        from services.code_fixer import _contains_placeholder_code
+
+        replacement = (
+            "void DemoRoute::Build()\n"
+            "{\n"
+            "    if (m_trafficLightGPBuilder) {\n"
+            "        // ... 处理交通灯数据 ...\n"
+            "    }\n"
+            "}\n"
+        )
+        self.assertTrue(_contains_placeholder_code(replacement))
+
+    def test_destructive_body_shrink_rejects_truncated_long_function(self):
+        """长函数被大幅缩水的 replacement 必须拒绝。"""
+        from services.code_fixer import _check_destructive_body_shrink
+
+        old_lines = ["void DemoRoute::Build()", "{"]
+        for i in range(80):
+            old_lines.append(f"    m_renderSteps.Add(item{i});")
+        old_lines.append("}")
+        old_block = "\n".join(old_lines)
+        replacement = (
+            "void DemoRoute::Build()\n"
+            "{\n"
+            "    m_renderSteps.Add(item0);\n"
+            "}\n"
+        )
+        err = _check_destructive_body_shrink(old_block, replacement)
+        self.assertIsNotNone(err)
+        self.assertIn("大幅缩水", str(err))
+
     def test_function_block_extractor_rejects_call_statement_before_brace(self):
         text = """
 ReleaseAllLayers();
 
 if (m_pTaskGrop) {
-    VDelete<CVTaskGroup>(m_pTaskGrop);
+    DemoDelete<DemoTaskGroup>(m_pTaskGrop);
 }
 """
         idx = text.find("ReleaseAllLayers")
@@ -125,14 +158,14 @@ if (m_pTaskGrop) {
 
     def test_replacement_signature_rejects_destructor_return_type(self):
         replacement = """
-VBool CVMapControl::~CVMapControl()
+bool DemoMapControl::~DemoMapControl()
 {
     ReleaseAllLayers();
 }
 """
         self.assertFalse(
             _replacement_signature_compatible(
-                "_baidu_framework::CVMapControl::~CVMapControl()",
+                "demo_fw::DemoMapControl::~DemoMapControl()",
                 replacement,
             )
         )
@@ -142,12 +175,12 @@ VBool CVMapControl::~CVMapControl()
 // ReleaseAllLayers(); // 已在析构函数末尾统一调用
 
 if (m_pTaskGrop) {
-    VDelete<CVTaskGroup>(m_pTaskGrop);
+    DemoDelete<DemoTaskGroup>(m_pTaskGrop);
 }
 """
         self.assertFalse(
             _replacement_signature_compatible(
-                "VVoid CVMapControl::ReleaseAllLayers()",
+                "void DemoMapControl::ReleaseAllLayers()",
                 replacement,
             )
         )
@@ -201,25 +234,25 @@ if (m_pTaskGrop) {
             {
                 "type": "function",
                 "file": "/tmp/a.cpp",
-                "signature": "VBool CBVMDOfflinePCDN::Cancel(void)",
-                "snippet": ["VBool CBVMDOfflinePCDN::Cancel(void) { return V_TRUE; }"],
+                "signature": "bool CBVMDOfflinePCDN::Cancel(void)",
+                "snippet": ["bool CBVMDOfflinePCDN::Cancel(void) { return V_TRUE; }"],
             },
             {
                 "type": "function",
-                "file": "/tmp/VTaskQueue.h",
+                "file": "/tmp/DemoTaskQueue.h",
                 "signature": "void Cancel()",
                 "snippet": ["void  Cancel(){ m_cancel = true; }"],
             },
         ]
-        targets = _select_required_targets(candidate_nodes, ["CVTask::Cancel()"])
+        targets = _select_required_targets(candidate_nodes, ["DemoTask::Cancel()"])
         self.assertEqual(len(targets), 1)
-        self.assertEqual(targets[0]["file"], "/tmp/VTaskQueue.h")
+        self.assertEqual(targets[0]["file"], "/tmp/DemoTaskQueue.h")
         self.assertEqual(targets[0]["function_signature"], "void Cancel()")
 
     def test_extract_replacement_from_class_block_inline_method(self):
         analysis_text = """
 ```cpp
-class CVTask {
+class DemoTask {
 public:
     void Cancel() {
         m_cancel.store(true, std::memory_order_release);
@@ -240,8 +273,8 @@ public:
         code_context = {
             "crash_summary": {
                 "owner_class_context": {
-                    "class_name": "CVTask",
-                    "definition_file": "/tmp/VTaskQueue.h",
+                    "class_name": "DemoTask",
+                    "definition_file": "/tmp/DemoTaskQueue.h",
                     "class_body_excerpt": [
                         "void  Cancel(){ m_cancel = true; }",
                         "bool  IsCancel()const { return m_cancel; }",
@@ -251,8 +284,8 @@ public:
                 }
             }
         }
-        required_names = ["CVTask::Cancel()", "CVTask::SetState(State state)"]
-        required_targets = [{"file": "/tmp/VTaskQueue.h", "function_signature": "bool IsDone()const"}]
+        required_names = ["DemoTask::Cancel()", "DemoTask::SetState(State state)"]
+        required_targets = [{"file": "/tmp/DemoTaskQueue.h", "function_signature": "bool IsDone()const"}]
         out = _ensure_owner_class_methods_in_targets(code_context, required_names, required_targets)
         sigs = {x["function_signature"] for x in out}
         self.assertIn("Cancel()", sigs)
@@ -262,8 +295,8 @@ public:
         code_context = {
             "crash_summary": {
                 "owner_class_context": {
-                    "class_name": "CVTask",
-                    "definition_file": "/tmp/engine-dev/inc/vi/com/VTaskQueue.h",
+                    "class_name": "DemoTask",
+                    "definition_file": "/tmp/demo-app/include/util/DemoTaskQueue.h",
                     "class_body_excerpt": [
                         "bool  IsDone()const { return m_state == Complete || m_state == Canceled; }",
                     ],
@@ -272,22 +305,22 @@ public:
         }
         out = _ensure_owner_class_methods_in_targets(
             code_context,
-            ["CVTask::IsDone()"],
+            ["DemoTask::IsDone()"],
             [
                 {
-                    "file": "/tmp/engine-dev/engine-vi/inc/vi/com/VTaskQueue.h",
+                    "file": "/tmp/demo-app/demo-lib/include/util/DemoTaskQueue.h",
                     "function_signature": "bool IsDone()const",
                 }
             ],
         )
-        self.assertEqual(out[0]["file"], "/tmp/engine-dev/inc/vi/com/VTaskQueue.h")
+        self.assertEqual(out[0]["file"], "/tmp/demo-app/include/util/DemoTaskQueue.h")
 
     def test_ensure_owner_class_methods_discards_other_class_same_name(self):
         code_context = {
             "crash_summary": {
                 "owner_class_context": {
-                    "class_name": "CVTask",
-                    "definition_file": "/tmp/VTaskQueue.h",
+                    "class_name": "DemoTask",
+                    "definition_file": "/tmp/DemoTaskQueue.h",
                     "class_body_excerpt": [
                         "void  Cancel(){ m_cancel = true; }",
                     ],
@@ -296,26 +329,26 @@ public:
         }
         out = _ensure_owner_class_methods_in_targets(
             code_context,
-            ["CVTask::Cancel()"],
+            ["DemoTask::Cancel()"],
             [
                 {
                     "file": "/tmp/Other.cpp",
-                    "function_signature": "VBool CBVMDOfflinePCDN::Cancel(void)",
+                    "function_signature": "bool CBVMDOfflinePCDN::Cancel(void)",
                 }
             ],
         )
         self.assertEqual(len(out), 1)
-        self.assertEqual(out[0]["file"], "/tmp/VTaskQueue.h")
+        self.assertEqual(out[0]["file"], "/tmp/DemoTaskQueue.h")
         self.assertEqual(out[0]["function_signature"], "Cancel()")
 
     def test_extract_include_directive_edits_from_analysis(self):
         with tempfile.TemporaryDirectory() as td:
-            src = Path(td) / "VTaskQueue.h"
-            src.write_text("class CVTask {};\n", encoding="utf-8")
+            src = Path(td) / "DemoTaskQueue.h"
+            src.write_text("class DemoTask {};\n", encoding="utf-8")
             code_context = {
                 "crash_summary": {
                     "owner_class_context": {
-                        "class_name": "CVTask",
+                        "class_name": "DemoTask",
                         "definition_file": str(src),
                     }
                 }
@@ -324,7 +357,7 @@ public:
 ```cpp
 #include <atomic>
 
-class CVTask {};
+class DemoTask {};
 ```
 """
             edits = _extract_include_directive_edits(analysis_text, code_context)
@@ -335,8 +368,8 @@ class CVTask {};
     def test_apply_include_directive_edit(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            src = root / "VTaskQueue.h"
-            src.write_text("#include <string>\n\nclass CVTask {};\n", encoding="utf-8")
+            src = root / "DemoTaskQueue.h"
+            src.write_text("#include <string>\n\nclass DemoTask {};\n", encoding="utf-8")
             candidate_nodes = [
                 {
                     "type": "function",
@@ -371,7 +404,7 @@ class CVTask {};
 
     def test_atomic_load_store_methods_are_not_rejected_as_unknown(self):
         original = """
-class CVTask {
+class DemoTask {
 private:
     volatile State m_state;
     volatile bool m_cancel;
@@ -393,7 +426,7 @@ void Cancel() {
             root = Path(td)
             src = root / "demo.cpp"
             src.write_text(
-                "bool CVTask::IsDone() const\n"
+                "bool DemoTask::IsDone() const\n"
                 "{\n"
                 "    return m_state == Complete || m_state == Canceled;\n"
                 "}\n",
@@ -403,9 +436,9 @@ void Cancel() {
                 {
                     "type": "function",
                     "file": str(src),
-                    "signature": "bool CVTask::IsDone() const",
+                    "signature": "bool DemoTask::IsDone() const",
                     "snippet": [
-                        "bool CVTask::IsDone() const",
+                        "bool DemoTask::IsDone() const",
                         "{",
                         "    return m_state == Complete || m_state == Canceled;",
                         "}",
@@ -419,9 +452,9 @@ void Cancel() {
                 "edits": [
                     {
                         "file": str(src),
-                        "function_signature": "bool CVTask::IsDone() const",
+                        "function_signature": "bool DemoTask::IsDone() const",
                         "replacement_code": (
-                            "bool CVTask::IsDone() const\n"
+                            "bool DemoTask::IsDone() const\n"
                             "{\n"
                             "    if (this == nullptr) {\n"
                             "        return false;\n"
@@ -447,10 +480,10 @@ void Cancel() {
     def test_extractor_keeps_model_code_without_semantic_filtering(self):
         analysis_text = """
 #### 需要修改的函数
-- `CVTask::IsDone()` - 添加对象有效性检查
+- `DemoTask::IsDone()` - 添加对象有效性检查
 
 ```cpp
-bool CVTask::IsDone() const {
+bool DemoTask::IsDone() const {
     if (this == nullptr) {
         return false;
     }
@@ -461,8 +494,8 @@ bool CVTask::IsDone() const {
         code_context = {
             "crash_summary": {
                 "owner_class_context": {
-                    "class_name": "CVTask",
-                    "definition_file": "/tmp/VTaskQueue.h",
+                    "class_name": "DemoTask",
+                    "definition_file": "/tmp/DemoTaskQueue.h",
                     "class_body_excerpt": [
                         "bool  IsDone()const { return m_state == Complete || m_state == Canceled; }",
                     ],
@@ -472,7 +505,7 @@ bool CVTask::IsDone() const {
                 "nodes": [
                     {
                         "type": "function",
-                        "file": "/tmp/VTaskQueue.h",
+                        "file": "/tmp/DemoTaskQueue.h",
                         "signature": "bool IsDone()const",
                         "snippet": ["bool  IsDone()const { return m_state == Complete || m_state == Canceled; }"],
                     }
@@ -492,10 +525,10 @@ bool CVTask::IsDone() const {
     def test_extractor_keeps_invalid_destructor_signature_for_debugging(self):
         analysis_text = """
 #### 需要修改的函数
-- `CVMapControl::~CVMapControl()` - 调整析构顺序
+- `DemoMapControl::~DemoMapControl()` - 调整析构顺序
 
 ```cpp
-VBool CVMapControl::~CVMapControl()
+bool DemoMapControl::~DemoMapControl()
 {
     ReleaseAllLayers();
 }
@@ -506,9 +539,9 @@ VBool CVMapControl::~CVMapControl()
                 "nodes": [
                     {
                         "type": "function",
-                        "file": "/tmp/VMapControl.cpp",
-                        "signature": "_baidu_framework::CVMapControl::~CVMapControl()",
-                        "snippet": ["CVMapControl::~CVMapControl()", "{", "}"],
+                        "file": "/tmp/DemoMapControl.cpp",
+                        "signature": "demo_fw::DemoMapControl::~DemoMapControl()",
+                        "snippet": ["DemoMapControl::~DemoMapControl()", "{", "}"],
                     }
                 ]
             }
@@ -521,25 +554,25 @@ VBool CVMapControl::~CVMapControl()
         self.assertTrue(out.get("success"), out)
         edits = out.get("fix_plan", {}).get("edits", [])
         self.assertEqual(len(edits), 1)
-        self.assertIn("VBool CVMapControl::~CVMapControl()", edits[0]["replacement_code"])
+        self.assertIn("bool DemoMapControl::~DemoMapControl()", edits[0]["replacement_code"])
 
     def test_extract_replacement_keeps_template_prefix(self):
         analysis_text = """
 ```cpp
 template< class TYPE >
-VINLINE VVoid VDelete(TYPE* pObjects)
+inline void DemoDelete(TYPE* pObjects)
 {
-    if (pObjects == V_NULL)
+    if (pObjects == nullptr)
     {
         return;
     }
-    pObjects = V_NULL;
+    pObjects = nullptr;
 }
 ```
 """
         replacement = _extract_replacement_from_analysis(
             analysis_text,
-            "void _baidu_vi::VDelete<_baidu_framework::CVMapControl>(_baidu_framework::CVMapControl*)",
+            "void demo_util::DemoDelete<demo_fw::DemoMapControl>(demo_fw::DemoMapControl*)",
         )
         self.assertIsNotNone(replacement)
         self.assertTrue(replacement.startswith("template< class TYPE >"), replacement)
@@ -550,9 +583,9 @@ VINLINE VVoid VDelete(TYPE* pObjects)
             src = root / "templ.h"
             src.write_text(
                 "template< class TYPE >\n"
-                "VINLINE VVoid VDelete(TYPE* pObjects)\n"
+                "inline void DemoDelete(TYPE* pObjects)\n"
                 "{\n"
-                "    if (pObjects == V_NULL)\n"
+                "    if (pObjects == nullptr)\n"
                 "    {\n"
                 "        return;\n"
                 "    }\n"
@@ -566,19 +599,19 @@ VINLINE VVoid VDelete(TYPE* pObjects)
                     {
                         "file": str(src),
                         "function_signature": (
-                            "void _baidu_vi::VDelete<_baidu_framework::CVMapControl>"
-                            "(_baidu_framework::CVMapControl*)"
+                            "void demo_util::DemoDelete<demo_fw::DemoMapControl>"
+                            "(demo_fw::DemoMapControl*)"
                         ),
                         "replacement_code": (
                             "template< class TYPE >\n"
-                            "VINLINE VVoid VDelete(TYPE* pObjects)\n"
+                            "inline void DemoDelete(TYPE* pObjects)\n"
                             "{\n"
-                            "    if (pObjects == V_NULL)\n"
+                            "    if (pObjects == nullptr)\n"
                             "    {\n"
                             "        return;\n"
                             "    }\n"
                             "    CVMem::Deallocate(pObjects);\n"
-                            "    pObjects = V_NULL;\n"
+                            "    pObjects = nullptr;\n"
                             "}"
                         ),
                     }
@@ -595,8 +628,8 @@ VINLINE VVoid VDelete(TYPE* pObjects)
 
             self.assertTrue(result.success, result.to_dict())
             text = src.read_text(encoding="utf-8")
-            self.assertIn("template< class TYPE >\nVINLINE VVoid VDelete", text)
-            self.assertIn("pObjects = V_NULL;", text)
+            self.assertIn("template< class TYPE >\ninline void DemoDelete", text)
+            self.assertIn("pObjects = nullptr;", text)
 
     def test_reject_overlapping_snippet_start_line_for_objc_autoreleasepool(self):
         """错误 snippet_start_line（落在 NAMESPACE 行）不应跨函数替换。"""
@@ -606,14 +639,14 @@ VINLINE VVoid VDelete(TYPE* pObjects)
             src.write_text(
                 '#include "mtl_render_vertex_buffer.h"\n\n'
                 "NAMESPACE_BAIDU_VI_BEGIN\n\n"
-                "void MTLVertexBuffer::createPrivateBuffer(id<MTLDevice> device, id<MTLCommandQueue> commandQueue, id<MTLBuffer> sharedBuffer)\n"
+                "void DemoVertexBuffer::createPrivateBuffer(id<MTLDevice> device, id<MTLCommandQueue> commandQueue, id<MTLBuffer> sharedBuffer)\n"
                 "{\n"
                 "    @autoreleasepool\n"
                 "    {\n"
                 "        id<MTLCommandBuffer> cmd_buffer = [commandQueue commandBuffer];\n"
                 "    }\n"
                 "}\n\n"
-                "MTLVertexBuffer::MTLVertexBuffer(id<MTLDevice> device, size_t len, StorageMode type)\n"
+                "DemoVertexBuffer::DemoVertexBuffer(id<MTLDevice> device, size_t len, StorageMode type)\n"
                 "{\n"
                 "    if (device) {\n"
                 "        _buffer = nil;\n"
@@ -623,7 +656,7 @@ VINLINE VVoid VDelete(TYPE* pObjects)
                 encoding="utf-8",
             )
             sig = (
-                "void MTLVertexBuffer::createPrivateBuffer(id<MTLDevice> device, "
+                "void DemoVertexBuffer::createPrivateBuffer(id<MTLDevice> device, "
                 "id<MTLCommandQueue> commandQueue, id<MTLBuffer> sharedBuffer)"
             )
             bad_node = {
@@ -631,7 +664,7 @@ VINLINE VVoid VDelete(TYPE* pObjects)
                 "snippet": src.read_text(encoding="utf-8").splitlines()[2:],
             }
             replacement = (
-                "void MTLVertexBuffer::createPrivateBuffer(id<MTLDevice> device, "
+                "void DemoVertexBuffer::createPrivateBuffer(id<MTLDevice> device, "
                 "id<MTLCommandQueue> commandQueue, id<MTLBuffer> sharedBuffer)\n"
                 "{\n"
                 "    @autoreleasepool { if (device) { _buffer = nil; } }\n"
@@ -668,7 +701,7 @@ VINLINE VVoid VDelete(TYPE* pObjects)
             src.write_text(
                 '#include "mtl_render_vertex_buffer.h"\n\n'
                 "NAMESPACE_BAIDU_VI_BEGIN\n\n"
-                "void MTLVertexBuffer::createPrivateBuffer(id<MTLDevice> device, id<MTLCommandQueue> commandQueue, id<MTLBuffer> sharedBuffer)\n"
+                "void DemoVertexBuffer::createPrivateBuffer(id<MTLDevice> device, id<MTLCommandQueue> commandQueue, id<MTLBuffer> sharedBuffer)\n"
                 "{\n"
                 "    @autoreleasepool { id<MTLCommandBuffer> cmd_buffer = nil; }\n"
                 "}\n\n"
@@ -676,12 +709,12 @@ VINLINE VVoid VDelete(TYPE* pObjects)
                 encoding="utf-8",
             )
             bad_sig = (
-                "NAMESPACE_BAIDU_VI_BEGIN void MTLVertexBuffer::createPrivateBuffer(id<MTLDevice> device, "
+                "NAMESPACE_BAIDU_VI_BEGIN void DemoVertexBuffer::createPrivateBuffer(id<MTLDevice> device, "
                 "id<MTLCommandQueue> commandQueue, id<MTLBuffer> sharedBuffer)"
             )
             bad_replacement = (
                 "}\n\n"
-                "void MTLVertexBuffer::createPrivateBuffer(id<MTLDevice> device, "
+                "void DemoVertexBuffer::createPrivateBuffer(id<MTLDevice> device, "
                 "id<MTLCommandQueue> commandQueue, id<MTLBuffer> sharedBuffer)\n"
                 "{\n"
                 "    @autoreleasepool { if (device) { return; } }\n"
@@ -711,7 +744,7 @@ VINLINE VVoid VDelete(TYPE* pObjects)
             applied = result.applied[0]
             self.assertEqual(applied["status"], "applied")
             self.assertNotIn("NAMESPACE_BAIDU_VI_BEGIN void", applied["function_signature"])
-            self.assertTrue(text.index("NAMESPACE_BAIDU_VI_BEGIN") < text.index("void MTLVertexBuffer::createPrivateBuffer"))
+            self.assertTrue(text.index("NAMESPACE_BAIDU_VI_BEGIN") < text.index("void DemoVertexBuffer::createPrivateBuffer"))
 
     def test_validate_rejects_hallucinated_member_without_unique_match(self):
         original = (
@@ -765,20 +798,20 @@ VINLINE VVoid VDelete(TYPE* pObjects)
             hdr.write_text(
                 "class Engine {\n"
                 "public:\n"
-                "  CVArray<int> GetSteps();\n"
+                "  Array<int> GetSteps();\n"
                 "private:\n"
                 "  CNMutex m_clRouteInfoMutex;\n"
-                "  CRoute* m_pclCurRoute;\n"
+                "  DemoRoute* m_pCurrentItem;\n"
                 "};\n",
                 encoding="utf-8",
             )
             src.write_text(
                 '#include "engine.h"\n'
-                "CVArray<int> Engine::GetSteps()\n"
+                "Array<int> Engine::GetSteps()\n"
                 "{\n"
-                "    CVArray<int> routes;\n"
-                "    if (m_pclCurRoute) {\n"
-                "        routes = m_pclCurRoute->GetRenderSteps();\n"
+                "    Array<int> routes;\n"
+                "    if (m_pCurrentItem) {\n"
+                "        routes = m_pCurrentItem->GetDrawSteps();\n"
                 "    }\n"
                 "    return routes;\n"
                 "}\n"
@@ -794,11 +827,11 @@ VINLINE VVoid VDelete(TYPE* pObjects)
                 "type": "class_skeleton",
                 "class_name": "Engine",
                 "file": str(hdr),
-                "member_fields": ["m_clRouteInfoMutex", "m_pclCurRoute"],
+                "member_fields": ["m_clRouteInfoMutex", "m_pCurrentItem"],
                 "skeleton": (
                     "class Engine {\n"
                     "  CNMutex m_clRouteInfoMutex;\n"
-                    "  CRoute* m_pclCurRoute;\n"
+                    "  DemoRoute* m_pCurrentItem;\n"
                     "};\n"
                 ),
             }
@@ -806,13 +839,13 @@ VINLINE VVoid VDelete(TYPE* pObjects)
                 {
                     "type": "function",
                     "file": str(src),
-                    "signature": "CVArray<int> Engine::GetSteps()",
+                    "signature": "Array<int> Engine::GetSteps()",
                     "snippet": [
-                        "CVArray<int> Engine::GetSteps()",
+                        "Array<int> Engine::GetSteps()",
                         "{",
-                        "    CVArray<int> routes;",
-                        "    if (m_pclCurRoute) {",
-                        "        routes = m_pclCurRoute->GetRenderSteps();",
+                        "    Array<int> routes;",
+                        "    if (m_pCurrentItem) {",
+                        "        routes = m_pCurrentItem->GetDrawSteps();",
                         "    }",
                         "    return routes;",
                         "}",
@@ -825,14 +858,14 @@ VINLINE VVoid VDelete(TYPE* pObjects)
                 "edits": [
                     {
                         "file": str(src),
-                        "function_signature": "CVArray<int> Engine::GetSteps()",
+                        "function_signature": "Array<int> Engine::GetSteps()",
                         "replacement_code": (
-                            "CVArray<int> Engine::GetSteps()\n"
+                            "Array<int> Engine::GetSteps()\n"
                             "{\n"
-                            "    CVArray<int> routes;\n"
+                            "    Array<int> routes;\n"
                             "    CVMutex::ScopedLock lock(m_clRouteDataMutex);\n"
-                            "    if (m_pclCurRoute) {\n"
-                            "        routes = m_pclCurRoute->GetRenderSteps();\n"
+                            "    if (m_pCurrentItem) {\n"
+                            "        routes = m_pCurrentItem->GetDrawSteps();\n"
                             "    }\n"
                             "    return routes;\n"
                             "}\n"
@@ -865,11 +898,11 @@ VINLINE VVoid VDelete(TYPE* pObjects)
             root = Path(td)
             src = root / "engine.cpp"
             src.write_text(
-                "CVArray<int> Engine::GetSteps()\n"
+                "Array<int> Engine::GetSteps()\n"
                 "{\n"
-                "    CVArray<int> routes;\n"
-                "    if (m_pclCurRoute) {\n"
-                "        routes = m_pclCurRoute->GetRenderSteps();\n"
+                "    Array<int> routes;\n"
+                "    if (m_pCurrentItem) {\n"
+                "        routes = m_pCurrentItem->GetDrawSteps();\n"
                 "    }\n"
                 "    return routes;\n"
                 "}\n"
@@ -884,7 +917,7 @@ VINLINE VVoid VDelete(TYPE* pObjects)
                 {
                     "type": "function",
                     "file": str(src),
-                    "signature": "CVArray<int> Engine::GetSteps()",
+                    "signature": "Array<int> Engine::GetSteps()",
                     "snippet": src.read_text(encoding="utf-8").splitlines()[:8],
                     "snippet_start_line": 1,
                 }
@@ -894,14 +927,14 @@ VINLINE VVoid VDelete(TYPE* pObjects)
                 "edits": [
                     {
                         "file": str(src),
-                        "function_signature": "CVArray<int> Engine::GetSteps()",
+                        "function_signature": "Array<int> Engine::GetSteps()",
                         "replacement_code": (
-                            "CVArray<int> Engine::GetSteps()\n"
+                            "Array<int> Engine::GetSteps()\n"
                             "{\n"
-                            "    CVArray<int> routes;\n"
+                            "    Array<int> routes;\n"
                             "    Lock();\n"
-                            "    if (m_pclCurRoute) {\n"
-                            "        routes = m_pclCurRoute->GetRenderSteps();\n"
+                            "    if (m_pCurrentItem) {\n"
+                            "        routes = m_pCurrentItem->GetDrawSteps();\n"
                             "    }\n"
                             "    Unlock();\n"
                             "    return routes;\n"
@@ -927,11 +960,11 @@ VINLINE VVoid VDelete(TYPE* pObjects)
             root = Path(td)
             src = root / "engine.cpp"
             src.write_text(
-                "CVArray<int> Engine::GetSteps()\n"
+                "Array<int> Engine::GetSteps()\n"
                 "{\n"
-                "    CVArray<int> routes;\n"
-                "    if (m_pclCurRoute) {\n"
-                "        routes = m_pclCurRoute->GetRenderSteps();\n"
+                "    Array<int> routes;\n"
+                "    if (m_pCurrentItem) {\n"
+                "        routes = m_pCurrentItem->GetDrawSteps();\n"
                 "    }\n"
                 "    return routes;\n"
                 "}\n"
@@ -946,7 +979,7 @@ VINLINE VVoid VDelete(TYPE* pObjects)
                 {
                     "type": "function",
                     "file": str(src),
-                    "signature": "CVArray<int> Engine::GetSteps()",
+                    "signature": "Array<int> Engine::GetSteps()",
                     "snippet": src.read_text(encoding="utf-8").splitlines()[:8],
                     "snippet_start_line": 1,
                 }
@@ -956,14 +989,14 @@ VINLINE VVoid VDelete(TYPE* pObjects)
                 "edits": [
                     {
                         "file": str(src),
-                        "function_signature": "CVArray<int> Engine::GetSteps()",
+                        "function_signature": "Array<int> Engine::GetSteps()",
                         "replacement_code": (
-                            "CVArray<int> Engine::GetSteps()\n"
+                            "Array<int> Engine::GetSteps()\n"
                             "{\n"
-                            "    CVArray<int> routes;\n"
+                            "    Array<int> routes;\n"
                             "    CVMutex::ScopedLock lock(m_clRouteInfoMutex);\n"
-                            "    if (m_pclCurRoute) {\n"
-                            "        routes = m_pclCurRoute->GetRenderSteps();\n"
+                            "    if (m_pCurrentItem) {\n"
+                            "        routes = m_pCurrentItem->GetDrawSteps();\n"
                             "    }\n"
                             "    return routes;\n"
                             "}\n"
@@ -991,7 +1024,7 @@ VINLINE VVoid VDelete(TYPE* pObjects)
 在类中添加互斥锁：
 
 ```cpp
-class WalkMapOperator : public WalkSafeCallbackObj
+class DemoMapOperator : public DemoSafeCallback
 {
 private:
     mutable std::mutex m_pBaseMapControlMutex; // 新增互斥锁
@@ -1001,11 +1034,11 @@ private:
 
 修改GetMapStatus()函数：
 ```cpp
-CMapStatus WalkMapOperator::GetMapStatus()
+DemoMapStatus DemoMapOperator::GetMapStatus()
 {
     std::lock_guard<std::mutex> lock(m_pBaseMapControlMutex);
     if (m_pBaseMapControl == nullptr) {
-        return CMapStatus();
+        return DemoMapStatus();
     }
     return m_pBaseMapControl->GetMapStatus();
 }
@@ -1013,7 +1046,7 @@ CMapStatus WalkMapOperator::GetMapStatus()
 
 修改析构函数：
 ```cpp
-WalkMapOperator::~WalkMapOperator()
+DemoMapOperator::~DemoMapOperator()
 {
     std::lock_guard<std::mutex> lock(m_pBaseMapControlMutex);
     m_pBaseMapControl = nullptr;
@@ -1026,9 +1059,9 @@ WalkMapOperator::~WalkMapOperator()
                     {
                         "type": "function",
                         "file": "/tmp/walk_map_operator.cpp",
-                        "signature": "CMapStatus WalkMapOperator::GetMapStatus()",
+                        "signature": "DemoMapStatus DemoMapOperator::GetMapStatus()",
                         "snippet": [
-                            "CMapStatus WalkMapOperator::GetMapStatus()",
+                            "DemoMapStatus DemoMapOperator::GetMapStatus()",
                             "{",
                             "    return m_pBaseMapControl->GetMapStatus();",
                             "}",
@@ -1037,9 +1070,9 @@ WalkMapOperator::~WalkMapOperator()
                     {
                         "type": "function",
                         "file": "/tmp/walk_map_operator.cpp",
-                        "signature": "WalkMapOperator::~WalkMapOperator()",
+                        "signature": "DemoMapOperator::~DemoMapOperator()",
                         "snippet": [
-                            "WalkMapOperator::~WalkMapOperator()",
+                            "DemoMapOperator::~DemoMapOperator()",
                             "{",
                             "    m_pBaseMapControl = nullptr;",
                             "}",
@@ -1054,7 +1087,7 @@ WalkMapOperator::~WalkMapOperator()
             names,
         )
         self.assertTrue(
-            any("~WalkMapOperator" in n or "析构" in n for n in names)
+            any("~DemoMapOperator" in n or "析构" in n for n in names)
             or any("~" in n for n in names),
             names,
         )
@@ -1067,7 +1100,7 @@ WalkMapOperator::~WalkMapOperator()
         self.assertGreaterEqual(len(edits), 2, edits)
         joined = "\n".join(str(e.get("replacement_code") or "") for e in edits)
         self.assertIn("GetMapStatus", joined)
-        self.assertIn("~WalkMapOperator", joined)
+        self.assertIn("~DemoMapOperator", joined)
 
 
 if __name__ == "__main__":

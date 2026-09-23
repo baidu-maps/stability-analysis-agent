@@ -18,6 +18,9 @@ def _pattern_ids(result: Dict[str, Any]) -> List[str]:
     ids: List[str] = []
     seen = set()
     for value in values:
+        if isinstance(value, dict) and value.get("source_type") == "knowledge_pack_chunk":
+            # Pack 文档由审核流水线治理，不以单次 Crash 验证结果修改采纳统计。
+            continue
         pattern_id = value.get("pattern_id") if isinstance(value, dict) else value
         token = str(pattern_id or "").strip()
         if token and token not in seen:

@@ -31,7 +31,7 @@ class FixFormatCompletenessTests(unittest.TestCase):
 ## 6. 修复建议
 ### 6.1 直接修复（代码级）
 ```cpp
-class WalkMapOperator {
+class DemoMapOperator {
 private:
     mutable std::mutex m_pBaseMapControlMutex;
     // ... 其他成员 ...
@@ -44,7 +44,7 @@ private:
         analysis = """
 ## 修复代码
 ```cpp
-CMapStatus WalkMapOperator::GetMapStatus()
+DemoMapStatus DemoMapOperator::GetMapStatus()
 {
     std::lock_guard<std::mutex> lock(m_pBaseMapControlMutex);
     return m_pBaseMapControl->GetMapStatus();
@@ -62,7 +62,7 @@ CMapStatus WalkMapOperator::GetMapStatus()
         analysis = """
 ## 修复代码
 ```cpp
-CMapStatus Foo::Get()
+DemoMapStatus Foo::Get()
 {
     m_clRouteInfoMutex.Lock();
     return m_ptr->Get();
@@ -82,7 +82,7 @@ class FixFormatRevisionLoopTests(unittest.TestCase):
 ## 6. 修复建议
 ### 6.1 直接修复
 ```cpp
-class WalkMapOperator {
+class DemoMapOperator {
     mutable std::mutex m_pBaseMapControlMutex;
     // ... 其他成员 ...
 };

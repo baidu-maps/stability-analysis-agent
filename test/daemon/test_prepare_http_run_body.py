@@ -124,8 +124,8 @@ class PrepareHttpRunBodyTests(unittest.TestCase):
         body = _prepare_http_run_body(
             {
                 "icafe_card_id": (
-                    "https://console.cloud.baidu-int.com/devops/icafe/"
-                    "issue/openmap-client-3456/show"
+                    "https://bugs.example.com/"
+                    "issue/demo-client-3456/show"
                 ),
             }
         )
@@ -136,8 +136,8 @@ class PrepareHttpRunBodyTests(unittest.TestCase):
         """Different cards must not share the same idempotency fingerprint."""
         base = {"apply_ai_fixes": False, "output_format": "markdown"}
         self.assertNotEqual(
-            _run_fingerprint({**base, "icafe_card_id": "openmap-client-1"}),
-            _run_fingerprint({**base, "icafe_card_id": "openmap-client-2"}),
+            _run_fingerprint({**base, "icafe_card_id": "demo-client-1"}),
+            _run_fingerprint({**base, "icafe_card_id": "demo-client-2"}),
         )
 
     def test_forbidden_local_path_when_denied(self) -> None:

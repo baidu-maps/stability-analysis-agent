@@ -60,8 +60,8 @@ SAMPLE_DOC = {
 HARMONY_PC_CALL_STACK = (
     "#00 pc 00000000001d8250 /system/lib/ld-musl-aarch64.so.1 (__timedwait_cp+156) [::35422f66114500c7d794bf84b3fd302b]\n"
     "#01 pc 00000000001da328 /system/lib/ld-musl-aarch64.so.1 (pthread_cond_timedwait+172) [::35422f66114500c7d794bf84b3fd302b]\n"
-    "#02 pc 0000000000255f20 /data/storage/el1/bundle/libs/arm64/libapp_BaiduVIlib.so [::4bbc97464fe8933c04dffdf61f1d3e7c]\n"
-    "#03 pc 0000000000255294 /data/storage/el1/bundle/libs/arm64/libapp_BaiduVIlib.so [::4bbc97464fe8933c04dffdf61f1d3e7c]\n"
+    "#02 pc 0000000000255f20 /data/storage/el1/bundle/libs/arm64/libapp_DemoUtil.so [::4bbc97464fe8933c04dffdf61f1d3e7c]\n"
+    "#03 pc 0000000000255294 /data/storage/el1/bundle/libs/arm64/libapp_DemoUtil.so [::4bbc97464fe8933c04dffdf61f1d3e7c]\n"
     "#04 pc 00000000001dca54 /system/lib/ld-musl-aarch64.so.1 (start+240) [::35422f66114500c7d794bf84b3fd302b]\n"
 )
 
@@ -147,20 +147,20 @@ class TestHarmonyCrashDiagnosis(unittest.TestCase):
         frames = primary["frames"]
         self.assertEqual(len(frames), 5)
         self.assertEqual(frames[3]["address"], "0x0000000000255294")
-        self.assertEqual(frames[3]["module"], "libapp_BaiduVIlib.so")
+        self.assertEqual(frames[3]["module"], "libapp_DemoUtil.so")
         self.assertEqual(frames[3]["library_type"], "app")
         self.assertEqual(primary["name"], "worker")
         self.assertEqual(primary["tid"], "worker-1")
         crash = next(t for t in result["threads"] if t.get("is_crash_thread"))
         self.assertEqual(crash["tid"], "21840")
-        baidu_frames = [f for f in frames if f.get("module") == "libapp_BaiduVIlib.so"]
-        self.assertEqual(len(baidu_frames), 2)
-        self.assertEqual(baidu_frames[0]["address"], "0x0000000000255f20")
+        app_frames = [f for f in frames if f.get("module") == "libapp_DemoUtil.so"]
+        self.assertEqual(len(app_frames), 2)
+        self.assertEqual(app_frames[0]["address"], "0x0000000000255f20")
 
     def test_aggregates_unique_app_frames_across_stacks(self):
         second_stack = (
             "#00 pc 00000000001d8250 /system/lib/ld-musl-aarch64.so.1\n"
-            "#01 pc 0000000000425e80 /data/storage/el1/bundle/libs/arm64/libapp_BaiduVIlib.so\n"
+            "#01 pc 0000000000425e80 /data/storage/el1/bundle/libs/arm64/libapp_DemoUtil.so\n"
             "#02 pc 0000000000422eb0 /data/storage/el1/bundle/libs/arm64/libapp_OtherApp.so\n"
         )
         doc = {
@@ -186,9 +186,9 @@ class TestHarmonyCrashDiagnosis(unittest.TestCase):
         agg = next((t for t in result["threads"] if t.get("name") == "aggregated_app_libs"), None)
         self.assertIsNotNone(agg)
         modules = {f.get("module") for f in agg["frames"]}
-        self.assertIn("libapp_BaiduVIlib.so", modules)
+        self.assertIn("libapp_DemoUtil.so", modules)
         self.assertIn("libapp_OtherApp.so", modules)
-        addrs = {f.get("address") for f in agg["frames"] if f.get("module") == "libapp_BaiduVIlib.so"}
+        addrs = {f.get("address") for f in agg["frames"] if f.get("module") == "libapp_DemoUtil.so"}
         self.assertIn("0x0000000000255294", addrs)
         self.assertIn("0x0000000000425e80", addrs)
 
@@ -205,7 +205,7 @@ class TestHarmonyCrashDiagnosis(unittest.TestCase):
         result = json.loads(crash_log_parser(sample))
         self.assertEqual(result["parse_status"], "ok")
         primary = next(t for t in result["threads"] if t.get("tid") == "worker-1")
-        self.assertEqual(primary["frames"][3]["module"], "libapp_BaiduVIlib.so")
+        self.assertEqual(primary["frames"][3]["module"], "libapp_DemoUtil.so")
 
     def test_full_by_threads_when_crash_stack_misses_library_dir(self):
         """崩溃线程栈未命中 library_dir 时，全量输出 body.stacks 各线程。"""
@@ -233,7 +233,7 @@ class TestHarmonyCrashDiagnosis(unittest.TestCase):
         sample = "crashDiagnosis: " + json.dumps(doc, ensure_ascii=False)
         lib_dir = "/tmp/harmony_test_libs_full_extract"
         os.makedirs(lib_dir, exist_ok=True)
-        lib_path = os.path.join(lib_dir, "libapp_BaiduVIlib.so")
+        lib_path = os.path.join(lib_dir, "libapp_DemoUtil.so")
         with open(lib_path, "wb"):
             pass
         try:
@@ -247,7 +247,8 @@ class TestHarmonyCrashDiagnosis(unittest.TestCase):
             self.assertEqual(result["meta_info"]["thread_count_total"], 2)
             self.assertEqual(result["meta_info"]["thread_count_extracted"], 3)
             self.assertNotIn("aggregated_app_libs", [t.get("name") for t in result["threads"]])
-            bg = next(t for t in result["threads"] if t.get("tid") == "OS_VSyncThread")
+            bg = next(t for t in result["threads"] if t.get("name") == "OS_VSyncThread")
+            self.assertEqual(bg.get("tid"), "22102")
             self.assertFalse(bg["is_crash_thread"])
             self.assertFalse(bg["is_main_thread"])
             self.assertGreaterEqual(len(bg["frames"]), 2)

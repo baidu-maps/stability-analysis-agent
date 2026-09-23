@@ -23,10 +23,10 @@ class TestFunctionSnippetUtils(unittest.TestCase):
     def test_mapschedule_m_name_does_not_yield_if_function(self):
         from pathlib import Path
 
-        fp = Path(__file__).resolve().parents[2].parent / "engine-dev"
+        fp = Path(__file__).resolve().parents[2].parent / "demo-app"
         map_file = (
-            Path("/Users/liuhong_cd/baidu/mapclient/engine-dev")
-            / "src/app/map/basemap/vmap/MapSchedule.cpp"
+            Path("/tmp/demo-app")
+            / "src/app/map/src/map/MapSchedule.cpp"
         )
         if not map_file.is_file():
             self.skipTest("MapSchedule.cpp not available locally")

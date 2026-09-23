@@ -81,6 +81,11 @@ python3 cli/main.py [参数...]
 | `--vector-db-path` | `./vector_db` | 向量数据库目录。 |
 | `--vector-db-max-results` | `3` | 向量检索最大条数。 |
 | `--vector-db-record-usage` | 关闭 | 分析时检索是否累加 `hit_count`（默认**只读**，避免污染库；显式加此 flag 才写入）。 |
+| `--knowledge-pack-dir` | 环境变量目录 | Knowledge Pack 根目录，可重复指定。 |
+| `--knowledge-pack` | 自动路由 | 强制使用指定 Pack ID。 |
+| `--knowledge-max-hits` | `4` | Pack/融合知识最大命中数。 |
+| `--knowledge-max-chars` | `4500` | 融合知识进入 `memory_context` 的字符预算。 |
+| `--domain-knowledge` / `--no-domain-knowledge` | 开启 | 是否启用代码库领域知识；关闭时同时排除 Pack 文件和向量库中的 Pack chunk，适合 A/B 对比。 |
 | `--include-memory-in-05` / `--no-include-memory-in-05` | 关闭 | 是否将向量库检索得到的「规则与经验模式参考」并入 `06_ai_prompt.md` / LLM 输入；默认只写 `05_memory_context.json`，不并入提示词。 |
 | `--external-agent-evaluation` / `--no-external-agent-evaluation` | 关闭 | 是否生成 `external_agent_evaluation/` 对比任务、输入清单和提交契约；只生成文件，不调用外部 Agent。 |
 | `--rule-confidence-threshold` | `0.85` | 规则高置信阈值。 |

@@ -18,12 +18,12 @@ _SAMPLE = """\
 Reason:Signal:SIGSEGV(SEGV_MAPERR)@0x0055555555555555
 Fault thread info:
 Tid:1, Name:test
-#00 pc 000000000038620c /data/storage/el1/bundle/libs/arm64/libapp_BaiduMapApplib.so
+#00 pc 000000000038620c /data/storage/el1/bundle/libs/arm64/libapp_DemoApp.so
 Registers:
 x0:0000000000000000 x1:0000007f3da2a944 x20:5555555555555555
 x29:0000007f3da2a9a0 lr:0000006590d8620c sp:0000007f3da2a970 pc:0000006590d8620c
 Maps:
-6590d64000-659183d000 r-xp 00363000 /data/storage/el1/bundle/libs/arm64/libapp_BaiduMapApplib.so
+6590d64000-659183d000 r-xp 00363000 /data/storage/el1/bundle/libs/arm64/libapp_DemoApp.so
 7f3da00000-7f3db00000 rw-p 00000000 [stack]
 OpenFiles:
 """
@@ -38,8 +38,8 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0
     sp  0000006e2f7f8450  lr  0000006d3ab41cd8  pc  0000006d3ab41cdc  pst 0000000060001000
 
 backtrace:
-    #00 pc 000000000073bcdc  /data/app/app/lib/arm64/libBaiduMapSDK_map_v7_6_7.so
-    #01 pc 000000000073a000  /data/app/app/lib/arm64/libBaiduMapSDK_map_v7_6_7.so
+    #00 pc 000000000073bcdc  /data/app/app/lib/arm64/libDemoMapSDK_core_v7_6_7.so
+    #01 pc 000000000073a000  /data/app/app/lib/arm64/libDemoMapSDK_core_v7_6_7.so
 """
 
 
@@ -50,7 +50,7 @@ class MemoryMapsAddressMapTest(unittest.TestCase):
         hit = lookup_va(entries, 0x6590D8620C)
         self.assertIsNotNone(hit)
         assert hit is not None
-        self.assertEqual(hit.basename, "libapp_BaiduMapApplib.so")
+        self.assertEqual(hit.basename, "libapp_DemoApp.so")
         self.assertIn("x", hit.perms)
         self.assertEqual(hit.file_offset_for_va(0x6590D8620C), 0x38520C)
         from tools.crash_parser.memory_maps import so_relative_offset
@@ -62,12 +62,12 @@ class MemoryMapsAddressMapTest(unittest.TestCase):
         assert regs is not None
         amap = regs["address_map"]
         self.assertEqual(amap["pc"]["kind"], "code")
-        self.assertEqual(amap["pc"]["module"], "libapp_BaiduMapApplib.so")
+        self.assertEqual(amap["pc"]["module"], "libapp_DemoApp.so")
         self.assertEqual(amap["pc"]["offset"], "0x38520c")
         self.assertEqual(amap["x20"]["kind"], "poison_or_fill")
         self.assertEqual(amap["x0"]["kind"], "null")
         self.assertEqual(amap["sp"]["kind"], "stack")
-        self.assertIn("libapp_BaiduMapApplib.so", bases)
+        self.assertIn("libapp_DemoApp.so", bases)
 
     def test_backtrace_fallback_without_maps(self):
         regs, _ = build_registers_section(_ANDROID_NO_MAPS, "0x0")
@@ -85,12 +85,12 @@ class MemoryMapsAddressMapTest(unittest.TestCase):
                     StackFrame(
                         frame_number=0,
                         address="000000000073bcdc",
-                        module="libBaiduMapSDK_map_v7_6_7.so",
+                        module="libDemoMapSDK_core_v7_6_7.so",
                     ),
                     StackFrame(
                         frame_number=1,
                         address="000000000073a000",
-                        module="libBaiduMapSDK_map_v7_6_7.so",
+                        module="libDemoMapSDK_core_v7_6_7.so",
                     ),
                 ],
                 stack_domains=["native"],
@@ -105,7 +105,7 @@ class MemoryMapsAddressMapTest(unittest.TestCase):
         assert regs2 is not None
         amap = regs2["address_map"]
         self.assertEqual(amap["pc"]["kind"], "code")
-        self.assertEqual(amap["pc"]["module"], "libBaiduMapSDK_map_v7_6_7.so")
+        self.assertEqual(amap["pc"]["module"], "libDemoMapSDK_core_v7_6_7.so")
         self.assertEqual(amap["pc"]["offset"], "0x73bcdc")
         self.assertEqual(amap["pc"]["source"], "backtrace_frame0")
         # lr != #01；应为 pc-4 对应偏移
@@ -114,7 +114,7 @@ class MemoryMapsAddressMapTest(unittest.TestCase):
         self.assertEqual(amap["lr"]["source"], "backtrace_load_base")
         self.assertNotEqual(amap["lr"]["offset"], "0x73a000")
         self.assertEqual(amap["sp"]["kind"], "stack")
-        self.assertIn("libBaiduMapSDK_map_v7_6_7.so", bases)
+        self.assertIn("libDemoMapSDK_core_v7_6_7.so", bases)
 
 
 if __name__ == "__main__":

@@ -188,9 +188,15 @@ def _inspect_diff_handler(deps: RepairActionDeps, payload: Dict[str, Any]) -> Di
     if deps.isolated_workspace is not None:
         actual = collect_workspace_diff(deps.isolated_workspace)
         changed = list(actual.get("changed_files") or [])
+        diff_text = str(actual.get("diff_text") or "")
         workspace_roots = list(deps.isolated_workspace.isolated_code_roots)
     else:
         changed = list(declared_changed)
+        diff_text = "\n".join(
+            str(item.get("diff") or "")
+            for item in (applied.get("applied") or [])
+            if isinstance(item, dict)
+        )
         workspace_roots = list(deps.code_roots)
     report = SafetyVerificationRunner.from_mapping(deps.verification_config).run(
         SafetyContext(
@@ -198,6 +204,7 @@ def _inspect_diff_handler(deps: RepairActionDeps, payload: Dict[str, Any]) -> Di
             declared_changed_files=declared_changed,
             actual_changed_files=changed,
             workspace_roots=workspace_roots,
+            diff_text=diff_text,
         )
     )
     deps.diff_review = report

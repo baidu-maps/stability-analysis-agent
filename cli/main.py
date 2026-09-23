@@ -3386,6 +3386,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="项目 C/C++ 源码目录（可重复指定；建议精确到工程/模块根目录，避免传整个仓库根目录）",
     )
     p.add_argument("--config", required=False, help="SystemConfig JSON 文件")
+    p.add_argument("--source-origin", default=None, help="源码来源标识（仓库、制品或 release origin）")
+    p.add_argument("--commit-policy", default=None, help="源码提交匹配策略；strict/require_match 会启用硬门禁")
+    p.add_argument("--base-commit", default=None, help="崩溃制品对应的源码基线提交")
+    p.add_argument("--identity-confidence", default=None, help="源码身份置信度；low/unsafe/mismatch 会阻止改码")
+    p.add_argument("--source-identity-block-reason", default=None, help="上游判定源码身份不安全的阻断原因")
     p.add_argument(
         "--verification-config-json", default=None,
         help="显式验证配置 JSON；默认不执行其中的 Crash 复现和回归脚本",
@@ -3403,6 +3408,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--vector-db-path", default="./vector_db", help="向量数据库目录（默认: ./vector_db）")
     p.add_argument("--vector-db-max-results", type=int, default=3, help="向量检索最大返回数")
+    p.add_argument(
+        "--knowledge-pack-dir",
+        action="append",
+        default=[],
+        help="代码库 Knowledge Pack 根目录（可重复；默认读取 STABILITY_AGENT_KNOWLEDGE_PACK_DIRS）",
+    )
+    p.add_argument("--knowledge-pack", default="", help="强制选择 Knowledge Pack ID（默认自动路由）")
+    p.add_argument("--knowledge-max-hits", type=int, default=4, help="Knowledge 命中最大条数")
+    p.add_argument("--knowledge-max-chars", type=int, default=4500, help="Knowledge 提示词字符预算")
+    p.add_argument(
+        "--domain-knowledge",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否启用代码库领域知识（默认开启；--no-domain-knowledge 用于 A/B 对比）",
+    )
     p.add_argument(
         "--vector-db-record-usage",
         action="store_true",
@@ -3912,10 +3932,46 @@ def _run_vector_db_command(args: argparse.Namespace) -> Optional[int]:
     return None
 
 
-def _sanitize_report_name(name: str) -> str:
+# 报告目录名中日志 stem 的长度上限，避免路径过长；完整路径仍在 00_run_request.json。
+_REPORT_CRASH_STEM_MAX = 80
+
+
+def _sanitize_report_name(name: str, *, max_len: Optional[int] = None) -> str:
     text = (name or "stdin").strip()
     text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
-    return text.strip("_") or "stdin"
+    text = text.strip("_") or "stdin"
+    if max_len is not None and int(max_len) > 0 and len(text) > int(max_len):
+        text = text[: int(max_len)].rstrip("._-") or "stdin"
+    return text
+
+
+def _crash_stem_from_args(args: argparse.Namespace) -> str:
+    """从分析参数提取用于报告目录名的日志文件 stem。"""
+    crash_ref = str(
+        getattr(args, "crash_log", None)
+        or getattr(args, "crash_log_file", None)
+        or ""
+    ).strip()
+    if not crash_ref:
+        if getattr(args, "crash_log_content", None) is not None:
+            crash_ref = "content"
+        elif getattr(args, "crash_log_dir", None):
+            crash_ref = str(Path(getattr(args, "crash_log_dir")).name or "dir")
+    if crash_ref and crash_ref != "-":
+        stem = Path(crash_ref).stem
+    else:
+        stem = "stdin"
+    return _sanitize_report_name(stem, max_len=_REPORT_CRASH_STEM_MAX)
+
+
+def _build_report_dirname(args: argparse.Namespace) -> str:
+    """默认报告子目录名：``{timestamp}_{crash_stem}``。
+
+    企业入口可替换本函数（例如在时间戳后插入 iCafe 编号）。
+    scope / engine / run_id 等运行参数已写入 ``00_run_request.json``，不再编入目录名。
+    """
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{stamp}_{_crash_stem_from_args(args)}"
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -3940,24 +3996,7 @@ def _strip_outer_fence(text: Optional[str]) -> Optional[str]:
 
 
 def _build_report_dir(args: argparse.Namespace) -> Path:
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    scope = str(getattr(args, "scope", "full") or "full")
-    mode = f"analysis_{scope}"
-    crash_ref = str(
-        getattr(args, "crash_log", None)
-        or getattr(args, "crash_log_file", None)
-        or ""
-    ).strip()
-    if not crash_ref:
-        if getattr(args, "crash_log_content", None) is not None:
-            crash_ref = "content"
-        elif getattr(args, "crash_log_dir", None):
-            crash_ref = str(Path(getattr(args, "crash_log_dir")).name or "dir")
-    crash_name = _sanitize_report_name(Path(crash_ref).stem if crash_ref and crash_ref != "-" else "stdin")
-    run_id = _sanitize_report_name(str(os.environ.get("STABILITY_AGENT_RUN_ID") or "").strip())
-    run_suffix = f"_{run_id}" if run_id else ""
-    dirname = f"{stamp}_{mode}_{args.engine}_{crash_name}{run_suffix}"
-    return report_root() / dirname
+    return report_root() / _build_report_dirname(args)
 
 
 def _now_iso() -> str:
@@ -4557,6 +4596,9 @@ def _write_cli_report(
                 _write_json(report_dir / "04b_code_content_provider.json", code_context)
             if isinstance(location_trace, dict) and location_trace.get("steps"):
                 _write_json(report_dir / "04b2_code_location_trace.json", location_trace)
+            lifecycle_evidence = result.get("lifecycle_evidence")
+            if isinstance(lifecycle_evidence, dict) and lifecycle_evidence.get("findings"):
+                _write_json(report_dir / "04b3_lifecycle_evidence.json", lifecycle_evidence)
         if scope in {"full", "gen_prompt_only"}:
             memory_payload = result.get("memory_retrieval")
             if not isinstance(memory_payload, dict):
@@ -4835,6 +4877,18 @@ def _build_run_request_record(
     library_dir = str(getattr(args, "library_dir", None) or "").strip()
     config_path = str(getattr(args, "config", None) or "").strip()
     vector_db_path = str(getattr(args, "vector_db_path", "./vector_db") or "./vector_db")
+    knowledge_pack_dirs = getattr(args, "knowledge_pack_dir", [])
+    if not isinstance(knowledge_pack_dirs, (list, tuple)):
+        knowledge_pack_dirs = []
+    knowledge_pack_id = getattr(args, "knowledge_pack", "")
+    if not isinstance(knowledge_pack_id, str):
+        knowledge_pack_id = ""
+    knowledge_max_hits = getattr(args, "knowledge_max_hits", 4)
+    if not isinstance(knowledge_max_hits, (int, float)):
+        knowledge_max_hits = 4
+    knowledge_max_chars = getattr(args, "knowledge_max_chars", 4500)
+    if not isinstance(knowledge_max_chars, (int, float)):
+        knowledge_max_chars = 4500
     verification_raw = getattr(args, "verification_config_json", None)
     try:
         verification_record = _parse_verification_config_json(verification_raw)
@@ -4852,6 +4906,11 @@ def _build_run_request_record(
         "apply_ai_fixes": bool(getattr(args, "apply_ai_fixes", True)),
         "bypass_repair_gate": bool(getattr(args, "bypass_repair_gate", True)),
         "backup_original_sources": bool(getattr(args, "backup_original_sources", True)),
+        "source_origin": str(getattr(args, "source_origin", None) or ""),
+        "commit_policy": str(getattr(args, "commit_policy", None) or ""),
+        "base_commit": str(getattr(args, "base_commit", None) or ""),
+        "identity_confidence": str(getattr(args, "identity_confidence", None) or ""),
+        "block_reason": str(getattr(args, "source_identity_block_reason", None) or ""),
         "engine": getattr(args, "engine", "direct"),
         "verification": verification_record,
         "enable_runtime_verification": bool(getattr(args, "enable_runtime_verification", False)),
@@ -4861,6 +4920,10 @@ def _build_run_request_record(
         "vector_db_max_results": int(getattr(args, "vector_db_max_results", 3) or 3),
         "vector_db_record_usage": bool(getattr(args, "vector_db_record_usage", False)),
         "rule_confidence_threshold": float(getattr(args, "rule_confidence_threshold", 0.85) or 0.85),
+        "knowledge_pack_id": knowledge_pack_id,
+        "knowledge_max_hits": max(1, int(knowledge_max_hits or 4)),
+        "knowledge_max_chars": max(500, int(knowledge_max_chars or 4500)),
+        "domain_knowledge": bool(getattr(args, "domain_knowledge", True)),
         "max_sibling_member_functions": int(
             getattr(args, "max_sibling_member_functions", DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS) or 0
         ),
@@ -4930,6 +4993,13 @@ def _build_run_request_record(
         worktree_revision = revision_for_code_roots(code_roots, include_diff=True)
     except Exception:
         pass
+    source_identity = {
+        "source_origin": str(getattr(args, "source_origin", None) or ""),
+        "commit_policy": str(getattr(args, "commit_policy", None) or ""),
+        "base_commit": str(getattr(args, "base_commit", None) or ""),
+        "identity_confidence": str(getattr(args, "identity_confidence", None) or ""),
+        "block_reason": str(getattr(args, "source_identity_block_reason", None) or ""),
+    }
     return {
         "schema_version": 2,
         "run_id": datetime.datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8],
@@ -4943,9 +5013,14 @@ def _build_run_request_record(
             "library_dir": str(Path(library_dir).expanduser().resolve()) if library_dir else None,
             "code_roots": [str(Path(root).expanduser().resolve()) for root in code_roots],
             "vector_db_path": str(Path(vector_db_path).expanduser().resolve()),
+            "knowledge_pack_dirs": [
+                str(Path(item).expanduser().resolve())
+                for item in knowledge_pack_dirs
+            ],
             "config": str(Path(config_path).expanduser().resolve()) if config_path else None,
         },
         "effective_parameters": effective_parameters,
+        "source_identity": source_identity,
         "llm": llm_snapshot,
         "runtime": {
             "python_version": platform.python_version(),
@@ -4981,6 +5056,7 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
             "library_dir": paths.get("library_dir"),
             "code_roots": paths.get("code_roots"),
             "vector_db_path": paths.get("vector_db_path"),
+            "knowledge_pack_dirs": paths.get("knowledge_pack_dirs"),
             "config": paths.get("config"),
         }
 
@@ -5089,6 +5165,19 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
     vector_db_path = str(record.get("vector_db_path") or "").strip()
     if vector_db_path:
         argv += ["--vector-db-path", vector_db_path]
+    for pack_dir in record.get("knowledge_pack_dirs") or []:
+        pack_dir_text = str(pack_dir or "").strip()
+        if pack_dir_text:
+            argv += ["--knowledge-pack-dir", pack_dir_text]
+    knowledge_pack_id = str(record.get("knowledge_pack_id") or "").strip()
+    if knowledge_pack_id:
+        argv += ["--knowledge-pack", knowledge_pack_id]
+    if record.get("knowledge_max_hits") is not None:
+        argv += ["--knowledge-max-hits", str(record.get("knowledge_max_hits"))]
+    if record.get("knowledge_max_chars") is not None:
+        argv += ["--knowledge-max-chars", str(record.get("knowledge_max_chars"))]
+    if record.get("domain_knowledge") is False:
+        argv += ["--no-domain-knowledge"]
     vector_db_max_results = record.get("vector_db_max_results")
     if vector_db_max_results is not None:
         argv += ["--vector-db-max-results", str(vector_db_max_results)]
@@ -6441,6 +6530,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         "scope": scope,
         "apply_ai_fixes": bool(args.apply_ai_fixes),
         "bypass_repair_gate": bool(getattr(args, "bypass_repair_gate", True)),
+        "source_identity": dict(request_record.get("source_identity") or {}),
         "force_disassembly": bool(getattr(args, "force_disassembly", False)),
         "force_anr_analysis": bool(getattr(args, "force_anr_analysis", False)),
         "force_memory_analysis": bool(getattr(args, "force_memory_analysis", False)),
@@ -6460,6 +6550,11 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         "vector_db_max_results": args.vector_db_max_results,
         "vector_db_readonly": not bool(getattr(args, "vector_db_record_usage", False)),
         "rule_confidence_threshold": args.rule_confidence_threshold,
+        "knowledge_pack_dirs": list(getattr(args, "knowledge_pack_dir", []) or []),
+        "knowledge_pack_id": str(getattr(args, "knowledge_pack", "") or ""),
+        "knowledge_max_hits": max(1, int(getattr(args, "knowledge_max_hits", 4) or 4)),
+        "knowledge_max_chars": max(500, int(getattr(args, "knowledge_max_chars", 4500) or 4500)),
+        "enable_domain_knowledge": bool(getattr(args, "domain_knowledge", True)),
         "max_sibling_member_functions": int(
             getattr(args, "max_sibling_member_functions", DEFAULT_MAX_SIBLING_MEMBER_FUNCTIONS) or 0
         ),
@@ -6705,6 +6800,13 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
                 cli_mode=getattr(args, "llm_mode", None),
             )
             meta["llm_routing"] = skipped_summary(scope=scope, mode=mode_skip)
+        source_identity = {}
+        if isinstance(request_record, dict) and isinstance(request_record.get("source_identity"), dict):
+            source_identity = dict(request_record["source_identity"])
+        elif isinstance(problem.get("source_identity"), dict):
+            source_identity = dict(problem["source_identity"])
+        if source_identity:
+            meta["source_identity"] = source_identity
         result["metadata"] = meta
 
     applied_fix_result: Optional[Dict[str, Any]] = None

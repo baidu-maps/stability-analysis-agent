@@ -212,7 +212,8 @@ def run_log_timeline_diagnosis(
             "category": op.category,
             "description": op.description,
             "source_tag": op.source_tag,
-            "suspicious": op.suspicious,
+            "severity": op.severity,
+            "line_number": op.line_number,
         }
         for op in (business.suspicious_ops or [])[:10]
     ]

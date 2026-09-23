@@ -27,7 +27,7 @@ class ReportFailureFieldTests(unittest.TestCase):
             fix_notes=[
                 {
                     "file": "walk_guidance_control.cpp",
-                    "function": "CNaviGuidanceControl::GetRenderSteps()",
+                    "function": "DemoGuidanceControl::GetDrawSteps()",
                     "status": "skipped",
                     "error": "replacement_code 的类名/函数名与目标签名不一致，已拒绝写入",
                 }

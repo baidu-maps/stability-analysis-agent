@@ -293,34 +293,34 @@ class AgentContextLoopTests(unittest.TestCase):
     def test_compress_stable_context_pins_sync_member_section(self):
         head = "HEAD_FUNCS\n" + ("fn body line\n" * 400)
         skel = (
-            "### 崩溃所属类骨架（CNaviEngineControl）\n"
-            "- 文件: walk_naviengine_control.h\n"
+            "### 崩溃所属类骨架（DemoEngineControl）\n"
+            "- 文件: demo_engine_control.h\n"
             "- 疑似同步原语成员（优先复用，禁止假设新的 mutex/lock 成员名）："
             "m_clRouteInfoMutex, m_clCurPosInfoMutex\n"
             "- 同步/共享指针相关声明摘录（来自类骨架，优先复用这些成员）：\n"
             "```cpp\n"
             "\tCNMutex\t\t\t\t\t\t\tm_clRouteInfoMutex;\t\t\t/**< 路线信息保护 */\n"
-            "\tCRoute* \t\t\t\t\t\tm_pclCurRoute;\t\t\t\t/**< 当前路线 (仅是引用) */\n"
+            "\tDemoRoute* \t\t\t\t\t\tm_pCurrentItem;\t\t\t\t/**< 当前路线 (仅是引用) */\n"
             "```\n"
             "```cpp\n"
-            + ("    VVoid MethodPad();\n" * 200)
+            + ("    void MethodPad();\n" * 200)
             + "};\n```\n"
         )
         keep = (
-            "### 关键同步与共享成员（CNaviEngineControl，压缩保活）\n"
+            "### 关键同步与共享成员（DemoEngineControl，压缩保活）\n"
             "- 疑似同步原语成员（禁止臆造新 mutex/lock）：m_clRouteInfoMutex\n"
             "- 声明摘录：\n"
             "```cpp\n"
             "CNMutex m_clRouteInfoMutex;\n"
-            "CRoute* m_pclCurRoute;\n"
+            "DemoRoute* m_pCurrentItem;\n"
             "```\n"
         )
         write_keep = (
             "### 写路径函数源码（压缩保活，可纳入需要修改的函数）\n"
-            "#### 写路径函数源码: void HandleRemoveRouteMessage()\n"
+            "#### 写路径函数源码: void HandleClearItem()\n"
             "- 代码片段:\n"
-            "void HandleRemoveRouteMessage() {\n"
-            "  m_pclCurRoute = nullptr;\n"
+            "void HandleClearItem() {\n"
+            "  m_pCurrentItem = nullptr;\n"
             "}\n"
         )
         tail = "# 崩溃分析任务\n分析规则尾部\n"
@@ -331,13 +331,53 @@ class AgentContextLoopTests(unittest.TestCase):
         self.assertIn("m_clRouteInfoMutex", compressed)
         self.assertIn("关键同步与共享成员", compressed)
         self.assertIn("写路径函数源码", compressed)
-        self.assertIn("HandleRemoveRouteMessage", compressed)
+        self.assertIn("HandleClearItem", compressed)
         self.assertIn("# 崩溃分析任务", compressed)
         # 保活段应紧挨任务节之前
         task_at = compressed.find("# 崩溃分析任务")
         sync_at = compressed.find("关键同步与共享成员")
         self.assertGreaterEqual(sync_at, 0)
         self.assertLess(sync_at, task_at)
+
+    def test_compress_stable_context_prefers_write_path_for_container_copy(self):
+        """容器拷贝竞态：展开成员写路径须压过旁路/同步噪音被保活。"""
+        head = (
+            "## 崩溃摘要\n"
+            "- 错误类型: SIGABRT\n"
+            "- 箭头展开容器成员: m_renderSteps\n"
+            "- 已定位展开成员的写/就地修改路径（可作为 Copy 竞态主证据）。\n"
+            + ("evidence pad line\n" * 300)
+        )
+        crash_line_keep = (
+            "### 崩溃行关键源码（压缩保活，优先分析崩溃行实参求值与被调）\n"
+            "#### 函数源码: DemoArray<RenderStep> Reader()\n"
+            "routes = ptr->GetSteps();\n"
+        )
+        sync_keep = (
+            "### 关键同步与共享成员（Owner，压缩保活）\n"
+            "- 疑似同步原语成员：m_clRouteInfoMutex\n"
+        )
+        write_keep = (
+            "### 写路径函数源码（压缩保活，可纳入需要修改的函数）\n"
+            "#### 写路径函数源码: void DemoRoute::Build()\n"
+            "- 代码片段:\n"
+            "void DemoRoute::Build() {\n"
+            "  m_renderSteps.Add(step);\n"
+            "}\n"
+        )
+        tail = "# 崩溃分析任务\n输出契约\n"
+        text = head + crash_line_keep + sync_keep + write_keep + tail
+        compressed = ContextEngine._compress_stable_context(text, 4200)
+        self.assertLessEqual(len(compressed), 4200)
+        self.assertIn("stable context compressed by budget", compressed)
+        self.assertIn("写路径函数源码", compressed)
+        self.assertIn("DemoRoute::Build", compressed)
+        self.assertIn("m_renderSteps.Add", compressed)
+        self.assertIn("# 崩溃分析任务", compressed)
+        write_at = compressed.find("DemoRoute::Build")
+        task_at = compressed.find("# 崩溃分析任务")
+        self.assertGreaterEqual(write_at, 0)
+        self.assertLess(write_at, task_at)
 
     def test_compress_stable_context_pins_crash_line_over_write_path(self):
         """heap/delete 场景：崩溃行 arg_eval 保活应优先于大块写路径。"""

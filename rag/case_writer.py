@@ -80,6 +80,8 @@ def build_case_record_from_report(report_dir: Path) -> Optional[Dict[str, Any]]:
     analyze_data = _analysis_context(report_dir)
     analyze_meta = analyze_data.get("metadata") if isinstance(analyze_data.get("metadata"), dict) else {}
     structured = analyze_meta.get("structured_analysis") if isinstance(analyze_meta.get("structured_analysis"), dict) else {}
+    run_request = _read_json(report_dir / "00_run_request.json") or {}
+    enterprise_snapshot = _read_json(report_dir / "00_enterprise_task_snapshot.json") or {}
 
     from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
 
@@ -137,10 +139,34 @@ def build_case_record_from_report(report_dir: Path) -> Optional[Dict[str, Any]]:
         evidence_requirements.append("log_fragment")
     evidence_requirements.append("fix_applied")
 
-    pattern_id = (
-        "pattern_"
-        + hashlib.md5((pattern_summary + signature + datetime.now().isoformat()).encode()).hexdigest()
+    fix_files = _applied_files_summary(apply_fix)
+    symbols = sorted(
+        {
+            str(frame.get("function") or frame.get("resolved_function") or "").strip()
+            for frame in frames[:20]
+            if str(frame.get("function") or frame.get("resolved_function") or "").strip()
+        }
     )
+    enterprise_identity = enterprise_snapshot.get("identity") if isinstance(enterprise_snapshot.get("identity"), dict) else {}
+    effective = run_request.get("effective_parameters") if isinstance(run_request.get("effective_parameters"), dict) else {}
+    workspace_snapshot = run_request.get("workspace_snapshot") if isinstance(run_request.get("workspace_snapshot"), dict) else {}
+    source_revision = workspace_snapshot.get("source_revision") if isinstance(workspace_snapshot.get("source_revision"), dict) else {}
+    source_commit = str(
+        enterprise_identity.get("source_commit")
+        or source_revision.get("head")
+        or ""
+    )
+    engine_version = str(
+        enterprise_identity.get("sdk_version")
+        or effective.get("engine_version")
+        or ""
+    )
+    stable_seed = json.dumps(
+        {"signature": signature, "fix_files": sorted(fix_files), "codebase": "default"},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    pattern_id = "pattern_" + hashlib.md5(stable_seed.encode()).hexdigest()
     pattern = {
         "pattern_id": pattern_id,
         "pattern_summary": pattern_summary,
@@ -151,8 +177,15 @@ def build_case_record_from_report(report_dir: Path) -> Optional[Dict[str, Any]]:
         "confidence_score": 0.6,
         "validation_state": "draft",
         "source_type": "internal_case",
+        "pack_id": str(effective.get("knowledge_pack_id") or "default"),
+        "codebase_id": str(enterprise_identity.get("codebase_id") or "default"),
+        "engine_version": engine_version,
+        "source_commit": source_commit,
+        "symbols": symbols,
+        "root_cause_confidence": float(structured.get("root_cause_confidence") or 0.6),
+        "provenance": "verified_historical_case" if analyze_data.get("verification") else "historical_case",
         "created_at": datetime.now().isoformat(),
-        "fix_files": _applied_files_summary(apply_fix),
+        "fix_files": fix_files,
         "report_dir": str(report_dir),
         "root_cause": structured.get("root_cause", ""),
         "hypotheses": (analyze_data.get("context_session") or {}).get("hypotheses", []) if isinstance(analyze_data.get("context_session"), dict) else [],
@@ -170,7 +203,7 @@ def build_case_record_from_report(report_dir: Path) -> Optional[Dict[str, Any]]:
                 "evidence_type": "stack_trace",
                 "raw_content": json.dumps(frame, ensure_ascii=False),
                 "normalized_features": {
-                    "function": frame.get("function"),
+                    "function": frame.get("function") or frame.get("resolved_function"),
                     "module": frame.get("module"),
                 },
                 "reliability_score": 0.7,
@@ -189,6 +222,32 @@ def build_case_record_from_report(report_dir: Path) -> Optional[Dict[str, Any]]:
                 "created_at": datetime.now().isoformat(),
             }
         )
+    analysis_payload = {
+        "root_cause": pattern.get("root_cause"),
+        "hypotheses": pattern.get("hypotheses"),
+        "verification": pattern.get("verification"),
+        "reproduction_conditions": pattern.get("reproduction_conditions"),
+        "symbols": symbols,
+        "pack_id": pattern.get("pack_id"),
+        "codebase_id": pattern.get("codebase_id"),
+        "engine_version": engine_version,
+        "source_commit": source_commit,
+    }
+    evidence_list.append(
+        {
+            "evidence_id": f"evidence_{hashlib.md5((pattern_id + 'analysis_summary').encode()).hexdigest()}",
+            "pattern_id": pattern_id,
+            "evidence_type": "analysis_summary",
+            "raw_content": json.dumps(analysis_payload, ensure_ascii=False)[:12000],
+            "normalized_features": {
+                "symbols": symbols,
+                "pack_id": pattern.get("pack_id"),
+                "codebase_id": pattern.get("codebase_id"),
+            },
+            "reliability_score": float(pattern.get("root_cause_confidence") or 0.6),
+            "created_at": datetime.now().isoformat(),
+        }
+    )
 
     return {
         "pattern": pattern,

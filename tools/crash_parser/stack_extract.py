@@ -127,7 +127,7 @@ def extract_stack_frames(
             module = module.split('(')[0]
         # 去掉尾部的 "[arm64-v8a::buildId]" 等装饰，只保留纯文件名
         # 日志示例：
-        #   libBaiduMapSDK_map_for_privatenavi_v7_6_1.so [arm64-v8a::1cf7a8708f9a04a37f85cdffa7983068]
+        #   libDemoMapSDK_core_v7_6_1.so [arm64-v8a::1cf7a8708f9a04a37f85cdffa7983068]
         if ' [' in module:
             module = module.split(' [', 1)[0]
         module = module.strip()
@@ -405,7 +405,7 @@ def extract_stack_frames(
             try:
                 frame_num = int(match.group(1))
                 # ASan 行形如：
-                #   #0 0x7d1e8310f4  (/.../libapp_BaiduMapBaselib.so+0x4b10f4)
+                #   #0 0x7d1e8310f4  (/.../libapp_DemoBase.so+0x4b10f4)
                 # 这里更关注 so 内偏移量（+0x4b10f4），用于符号解析与对齐 SDK 发布符号，
                 # 因此将 address 取为偏移量，而不是绝对 PC 值。
                 absolute_pc = match.group(2)

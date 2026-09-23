@@ -33,7 +33,7 @@ class SnippetExtractorTool(BaseTool):
                 "properties": {
                     "file_path": {"type": "string", "description": "源码文件绝对路径"},
                     "line_number": {"type": "integer", "description": "1-based 目标行号"},
-                    "function_name": {"type": "string", "description": "可选，目标函数名 token（如 GetLegSize）"},
+                    "function_name": {"type": "string", "description": "可选，目标函数名 token（如 GetSegmentCount）"},
                     "max_code_length": {"type": "integer", "description": "最大保留行数，<=0 表示不截断", "default": 0},
                 },
                 "required": ["file_path", "line_number"],

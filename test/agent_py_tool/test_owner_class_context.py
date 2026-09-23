@@ -83,7 +83,7 @@ class TestOwnerClassContext(unittest.TestCase):
                 "    int Get();\n"
                 "private:\n"
                 "    CNMutex m_clStateMutex;			/**< state guard */\n"
-                "    void* m_pclObj;				/**< obj ref */\n"
+                "    void* m_pObj;				/**< obj ref */\n"
                 "};\n",
                 encoding="utf-8",
             )
@@ -91,7 +91,7 @@ class TestOwnerClassContext(unittest.TestCase):
                 '#include "widget.h"\n'
                 "int Widget::Get()\n"
                 "{\n"
-                "    return m_pclObj ? 1 : 0;\n"
+                "    return m_pObj ? 1 : 0;\n"
                 "}\n",
                 encoding="utf-8",
             )
@@ -105,7 +105,7 @@ class TestOwnerClassContext(unittest.TestCase):
             self.assertTrue(str(snap.get("definition_file") or "").endswith("widget.h"))
             fields = set(snap.get("member_fields") or [])
             self.assertIn("m_clStateMutex", fields)
-            self.assertIn("m_pclObj", fields)
+            self.assertIn("m_pObj", fields)
             skel = "\n".join(snap.get("skeleton") or [])
             self.assertIn("m_clStateMutex", skel)
 
