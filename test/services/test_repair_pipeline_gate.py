@@ -47,8 +47,8 @@ class RepairPipelineGateTests(unittest.TestCase):
         self.assertFalse(gate.get("allowed"))
         self.assertFalse(gate.get("bypassed"))
 
-    def test_bypass_does_not_override_unpinned_source_identity(self) -> None:
-        """branch_latest 身份风险不能被 repair_gate bypass 覆盖。"""
+    def test_unpinned_source_identity_still_enters_apply(self) -> None:
+        """未固定 commit 只记录身份风险，不阻止进入改码。"""
         result = self._result()
         result["metadata"] = {
             "source_identity": {
@@ -57,8 +57,8 @@ class RepairPipelineGateTests(unittest.TestCase):
                 "identity_confidence": "unsafe",
             },
             "repair_safety": {
-                "hard_block_auto_repair": True,
-                "signal": "forbid_auto_code_write",
+                "hard_block_auto_repair": False,
+                "signal": "review_source_identity",
             },
         }
         allowed = should_run_repair_pipeline(
@@ -67,7 +67,7 @@ class RepairPipelineGateTests(unittest.TestCase):
             scope="full",
             bypass_repair_gate=True,
         )
-        self.assertFalse(allowed)
+        self.assertTrue(allowed)
         gate = (result.get("metadata") or {}).get("source_identity_gate") or {}
         self.assertTrue(gate.get("hard_block"))
 

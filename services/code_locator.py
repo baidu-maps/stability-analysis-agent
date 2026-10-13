@@ -1209,6 +1209,9 @@ class SymbolLocator:
             located = self._find_qualified_function_definition_location(parsed, code_roots)
             if located is not None:
                 return located
+            located = self._find_in_class_method_definition_location(parsed, code_roots)
+            if located is not None:
+                return located
             tpl_located = self._find_template_member_definition_location(
                 {"template_class": parsed["short_scope"], "member": parsed["method"]},
                 code_roots,
@@ -1279,6 +1282,158 @@ class SymbolLocator:
         best = (candidates[0][1], candidates[0][2])
         self._ctx._function_def_cache[cache_key] = best
         return best
+
+    def _find_in_class_method_definition_location(
+        self, parsed: Dict[str, str], code_roots: List[str]
+    ) -> Optional[Tuple[str, int]]:
+        """类体内联方法没有 Class::method 文本时，在 class/struct 体内按方法名定位。"""
+        short_scope = str(parsed.get("short_scope") or "")
+        method = str(parsed.get("method") or "")
+        if not short_scope or not method or method.startswith("~"):
+            return None
+        cache_key = f"__funcdef_inclass__:{short_scope}::{method}"
+        cached = self._ctx._function_def_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        class_pattern = rf"\b(?:class|struct)\s+{re.escape(short_scope)}\b"
+        rg_hits = self._ctx.rg_grep_lines(class_pattern, code_roots)
+        files: List[str] = []
+        if rg_hits is not None:
+            seen: Set[str] = set()
+            for file_path, _line_no, _line_text in rg_hits:
+                if file_path not in seen:
+                    seen.add(file_path)
+                    files.append(file_path)
+        else:
+            files = self._list_supported_source_files(code_roots)
+        candidates: List[Tuple[int, str, int]] = []
+        for file_path in files:
+            content = self._ctx.read_file_cached(file_path)
+            if not content or short_scope not in content or method not in content:
+                continue
+            lines = content.split("\n")
+            for line_no in self._in_class_method_definition_lines(lines, short_scope, method):
+                score = self._function_definition_path_score(file_path)
+                candidates.append((score, file_path, line_no))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        best = (candidates[0][1], candidates[0][2])
+        self._ctx._function_def_cache[cache_key] = best
+        return best
+
+    def _list_supported_source_files(self, code_roots: List[str]) -> List[str]:
+        """rg 不可用时枚举可检索源文件。"""
+        files: List[str] = []
+        for code_root in code_roots:
+            if not os.path.isdir(code_root):
+                continue
+            for dirpath, dirnames, filenames in os.walk(code_root):
+                dirnames[:] = [name for name in dirnames if not self._ctx.should_skip_directory(name)]
+                for filename in filenames:
+                    file_path = os.path.join(dirpath, filename)
+                    if self._ctx.is_supported_file(file_path) and self._ctx.is_file_readable(file_path):
+                        files.append(file_path)
+        return files
+
+    def _in_class_method_definition_lines(
+        self, lines: List[str], class_name: str, method: str
+    ) -> List[int]:
+        """返回类体直接成员方法定义的 1-based 行号，不含嵌套函数里的调用。"""
+        header = re.compile(rf"\b(?:class|struct)\s+{re.escape(class_name)}\b")
+        method_re = re.compile(rf"\b{re.escape(method)}\s*\(")
+        qualified_re = re.compile(rf"\w+::\s*{re.escape(method)}\s*\(")
+        found: List[int] = []
+        index = 0
+        total = len(lines)
+        while index < total:
+            if not header.search(lines[index]):
+                index += 1
+                continue
+            open_at = self._class_body_open_index(lines, index)
+            if open_at is None:
+                index += 1
+                continue
+            index = self._collect_direct_class_methods(
+                lines, open_at, method_re, qualified_re, found
+            )
+        return found
+
+    def _class_body_open_index(self, lines: List[str], header_index: int) -> Optional[int]:
+        """类定义左花括号所在行；前置声明返回 None。"""
+        scan_end = min(len(lines), header_index + 40)
+        for cursor in range(header_index, scan_end):
+            text = lines[cursor]
+            brace = text.find("{")
+            semi = text.find(";")
+            if brace >= 0 and (semi < 0 or brace < semi):
+                return cursor
+            if semi >= 0 and (brace < 0 or semi < brace):
+                return None
+        return None
+
+    def _collect_direct_class_methods(
+        self,
+        lines: List[str],
+        open_at: int,
+        method_re: re.Pattern,
+        qualified_re: re.Pattern,
+        found: List[int],
+    ) -> int:
+        """扫描一个类体，记录深度为 1 的方法定义，返回类体结束后的下一行下标。"""
+        depth = 0
+        opened = False
+        cursor = open_at
+        total = len(lines)
+        while cursor < total:
+            line = lines[cursor]
+            if not opened:
+                brace = line.find("{")
+                opened = True
+                rest = line[brace + 1:]
+                if self._line_is_in_class_method(rest, method_re, qualified_re):
+                    found.append(cursor + 1)
+                depth = 1 + rest.count("{") - rest.count("}")
+            else:
+                if depth == 1 and self._line_is_in_class_method(line, method_re, qualified_re):
+                    found.append(cursor + 1)
+                depth += line.count("{") - line.count("}")
+            if opened and depth <= 0:
+                break
+            cursor += 1
+        return cursor + 1
+
+    def _line_is_in_class_method(
+        self, line: str, method_re: re.Pattern, qualified_re: re.Pattern
+    ) -> bool:
+        """判断一行是类体内的方法定义，而不是 Class::method 或函数调用。"""
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//") or stripped.startswith("*"):
+            return False
+        if qualified_re.search(stripped):
+            return False
+        if not method_re.search(stripped):
+            return False
+        return self.is_function_definition_line(stripped)
+
+    @staticmethod
+    def source_line_is_in_class_method(
+        lines: List[str], line_number: int, class_name: str, method: str
+    ) -> bool:
+        """给定行是否落在该类的内联方法定义上。"""
+        locator = SymbolLocator(LocatorContext(LocatorConfig()))
+        return line_number in locator._in_class_method_definition_lines(lines, class_name, method)
+
+    @staticmethod
+    def source_text_has_unqualified_method(text: str, method: str) -> bool:
+        """片段里是否有不带 Class:: 前缀的该方法定义行。"""
+        locator = SymbolLocator(LocatorContext(LocatorConfig()))
+        method_re = re.compile(rf"\b{re.escape(method)}\s*\(")
+        qualified_re = re.compile(rf"\w+::\s*{re.escape(method)}\s*\(")
+        for line in str(text or "").splitlines():
+            if locator._line_is_in_class_method(line, method_re, qualified_re):
+                return True
+        return False
 
     def find_function_definition_location(
         self, simple_name: str, code_roots: List[str]

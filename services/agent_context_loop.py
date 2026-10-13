@@ -198,6 +198,17 @@ def run_agent_context_loop(
                 is_final_round=True,
                 early_final_reason="max_rounds",
             )
+        if getattr(context_engine, "prompt_capacity_exceeded", False):
+            turn = ContextTurn(
+                round_index=round_index,
+                kind="error",
+                prompt=next_prompt,
+                termination_reason="prompt_capacity_exceeded",
+            )
+            context_engine.add_turn(turn)
+            context_engine.finish("prompt_capacity_exceeded", degraded=True)
+            hooks.on_round_complete(round_index, turn.to_dict())
+            break
         try:
             response, prompt_used = hooks.call_llm(next_prompt, round_index=round_index)
         except Exception as exc:
@@ -378,12 +389,13 @@ def run_agent_context_loop(
         )
         turn.pre_round_add_res = pre_round_add_res
         has_success = any(bool(x.get("success")) for x in resolved_context if isinstance(x, dict))
-        all_blocked = not has_success and context_engine.all_requests_blocked(resolved_context)
         context_engine.add_turn(turn)
         hooks.on_round_complete(round_index, turn.to_dict())
-        if all_blocked:
-            force_final_reason = "all_requests_blocked"
-        elif round_index + 1 >= max_rounds - 1:
+        # 本轮请求的源码一个都没定位到时，下一轮没有新上下文，不再调用模型。
+        if not has_success:
+            context_engine.finish("all_requests_blocked", degraded=True)
+            break
+        if round_index + 1 >= max_rounds - 1:
             force_final_reason = "max_rounds"
         next_prompt = context_engine.build_prompt(
             stable_prompt,

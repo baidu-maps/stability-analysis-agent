@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-10-12
+
+### Added
+
+- `services/code_locator.py`：新增“类体内联方法定位”——日志无 `Class::method` 文本时，按方法名在 class/struct 体内定位内联方法定义（仅深度为 1 的直接成员，排除嵌套调用）。
+- 新增单测 `test_in_class_method_locator`、`test_glued_so_build_id`、`test_changed_files_from_applied`，并补充 `test_agent_context_loop` 上下文装箱用例。
+
+### Changed
+
+- 上下文引擎（`services/context_engine.py` 等）重构为“整段装箱 + 字符预算”：契约 / 身份 / 崩溃摘要 / 任务为强制段落必整段保留；可选段落只发放得下的完整段落，放不下整段省略并给出说明；先前已定位源码在容量允许时整段重发；引入 prompt ledger——只有真正写入提示的符号才计为“模型已看见”。
+- 上下文轮询：本轮一个源码请求都没定位到、或强制段落超出容量时停止，不再向模型发送残缺上下文。
+- 改码从已有分析文本提取补丁、不调用模型，因此不再预扣 LLM 调用次数，避免已写出的修复在落盘前被预算直接拒绝。
+- 精简改码安全校验（`services/safety_verification.py`）。
+
+### Fixed
+
+- 精简栈中 BuildId 紧贴 `.so`（如 `libBaiduMapSDK_map_v7_6_6.so[<buildId>]` 或 `.so [arm64-v8a::<buildId>]`）时，模块名只保留 `.so` 文件名，不再把 BuildId 并入模块名（`tools/crash_parser/stack_extract.py` / `android.py`）。
+
+### Documentation
+
+- README / PyPI 发布说明中的最新版本号更新为 1.5.1。
+
 ## [1.5.0] - 2026-09-21
 
 ### Added

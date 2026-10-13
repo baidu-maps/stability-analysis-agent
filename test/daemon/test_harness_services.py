@@ -35,8 +35,9 @@ class HarnessServiceTests(unittest.TestCase):
         manager = EvidenceContextManager(max_chars=1000)
         manager.add(EvidenceItem(kind="source", content="x" * 3000, source="test", relevance=1))
         package = manager.package()
-        self.assertEqual(package["item_count"], 1)
-        self.assertEqual(package["truncated_count"], 1)
+        self.assertEqual(package["item_count"], 0)
+        self.assertEqual(package["dropped_count"], 1)
+        self.assertEqual(package["truncated_count"], 0)
         self.assertLessEqual(package["chars"], 1000)
 
     def test_context_loop_prompt_is_assembled_by_manager(self):

@@ -67,7 +67,12 @@ def evaluate_source_identity(
     *,
     observed_commit: Optional[Union[str, Sequence[str]]] = None,
 ) -> Dict[str, Any]:
-    """Return a deterministic hard-gate decision for source/release identity."""
+    """Return source-identity risk for reviewers.
+
+    ``hard_block`` means the checkout is not a pinned match. Callers that
+    already have a concrete patch should still apply it and keep this payload
+    on the report.
+    """
     identity = source_identity_from_mapping(value)
     if isinstance(observed_commit, str):
         observed = [observed_commit.strip()] if observed_commit.strip() else []

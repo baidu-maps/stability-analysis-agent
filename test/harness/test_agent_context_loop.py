@@ -283,9 +283,8 @@ class AgentContextLoopTests(unittest.TestCase):
             is_final_round=True,
         )
         self.assertLessEqual(len(prompt), 4000)
-        self.assertIn("STABLE_MARKER", prompt)
-        self.assertIn("DELTA_MARKER", prompt)
-        self.assertIn("LEDGER_MARKER", prompt)
+        self.assertNotIn("delta truncated", prompt)
+        self.assertNotIn("pinned section truncated", prompt)
         self.assertIn("## 本轮任务", prompt)
         self.assertIn("本轮必须输出最终分析", prompt)
         self.assertIn('{"agent_can_fetch_more": false, "context_requests": []}', prompt)
@@ -327,11 +326,15 @@ class AgentContextLoopTests(unittest.TestCase):
         text = head + skel + keep + write_keep + tail
         compressed = ContextEngine._compress_stable_context(text, 3500)
         self.assertLessEqual(len(compressed), 3500)
-        self.assertIn("stable context compressed by budget", compressed)
+        self.assertNotIn("stable context compressed by budget", compressed)
+        self.assertNotIn("pinned section truncated", compressed)
+        self.assertNotIn("fn body line", compressed)
+        self.assertIn("未放入，因为超出容量", compressed)
         self.assertIn("m_clRouteInfoMutex", compressed)
         self.assertIn("关键同步与共享成员", compressed)
         self.assertIn("写路径函数源码", compressed)
         self.assertIn("HandleClearItem", compressed)
+        self.assertIn("m_pCurrentItem = nullptr", compressed)
         self.assertIn("# 崩溃分析任务", compressed)
         # 保活段应紧挨任务节之前
         task_at = compressed.find("# 崩溃分析任务")
@@ -346,12 +349,13 @@ class AgentContextLoopTests(unittest.TestCase):
             "- 错误类型: SIGABRT\n"
             "- 箭头展开容器成员: m_renderSteps\n"
             "- 已定位展开成员的写/就地修改路径（可作为 Copy 竞态主证据）。\n"
-            + ("evidence pad line\n" * 300)
         )
+        filler = "### 其它证据\n" + ("evidence pad line\n" * 300)
         crash_line_keep = (
             "### 崩溃行关键源码（压缩保活，优先分析崩溃行实参求值与被调）\n"
             "#### 函数源码: DemoArray<RenderStep> Reader()\n"
             "routes = ptr->GetSteps();\n"
+            + ("crash pad line\n" * 250)
         )
         sync_keep = (
             "### 关键同步与共享成员（Owner，压缩保活）\n"
@@ -366,10 +370,13 @@ class AgentContextLoopTests(unittest.TestCase):
             "}\n"
         )
         tail = "# 崩溃分析任务\n输出契约\n"
-        text = head + crash_line_keep + sync_keep + write_keep + tail
-        compressed = ContextEngine._compress_stable_context(text, 4200)
-        self.assertLessEqual(len(compressed), 4200)
-        self.assertIn("stable context compressed by budget", compressed)
+        text = head + filler + crash_line_keep + sync_keep + write_keep + tail
+        compressed = ContextEngine._compress_stable_context(text, 1600)
+        self.assertLessEqual(len(compressed), 1600)
+        self.assertNotIn("stable context compressed by budget", compressed)
+        self.assertNotIn("evidence pad line", compressed)
+        self.assertNotIn("crash pad line", compressed)
+        self.assertIn("未放入，因为超出容量", compressed)
         self.assertIn("写路径函数源码", compressed)
         self.assertIn("DemoRoute::Build", compressed)
         self.assertIn("m_renderSteps.Add", compressed)
@@ -385,7 +392,6 @@ class AgentContextLoopTests(unittest.TestCase):
             "## 崩溃摘要\n"
             "- 错误类型: SIGABRT\n"
             "- signal: heap allocator abort / operator_delete\n"
-            + ("evidence pad line\n" * 300)
         )
         crash_line_keep = (
             "### 崩溃行关键源码（压缩保活，优先分析崩溃行实参求值与被调）\n"
@@ -408,7 +414,9 @@ class AgentContextLoopTests(unittest.TestCase):
         text = head + crash_line_keep + write_keep + tail
         compressed = ContextEngine._compress_stable_context(text, 4500)
         self.assertLessEqual(len(compressed), 4500)
-        self.assertIn("stable context compressed by budget", compressed)
+        self.assertNotIn("stable context compressed by budget", compressed)
+        self.assertNotIn("m_vecAttrDesc[nAttrLoc + i] = desc;", compressed)
+        self.assertIn("未放入，因为超出容量", compressed)
         self.assertIn("GetShaderValue", compressed)
         self.assertIn("g_strShaderVert", compressed)
         self.assertIn("崩溃行关键源码", compressed)
@@ -423,7 +431,6 @@ class AgentContextLoopTests(unittest.TestCase):
         head = (
             "## 崩溃摘要\n"
             "- signal: heap allocator abort / operator_delete\n"
-            + ("pad\n" * 200)
         )
         crash_line = (
             "### 崩溃行关键源码（压缩保活）\n"
@@ -467,12 +474,13 @@ class AgentContextLoopTests(unittest.TestCase):
             "  return g_strShaderVert.c_str();\n"
             "}\n"
         )
-        block = head + mid + hit
-        out = ContextEngine._truncate_crash_line_pin(block, 2500)
+        block = head + mid + hit + "\n# 崩溃分析任务\n输出契约\n"
+        out = ContextEngine._compress_stable_context(block, 2500)
         self.assertLessEqual(len(out), 2500)
-        self.assertIn("GetShaderValue", out)
-        self.assertIn("g_strShaderVert", out)
-        self.assertIn("c_str()", out)
+        self.assertIn("# 崩溃分析任务", out)
+        self.assertIn("未放入，因为超出容量", out)
+        self.assertNotIn("case 200", out)
+        self.assertNotIn("pinned section truncated", out)
 
     def test_context_engine_ledger_records_rejected_and_duplicate_attempts(self):
         registry = ContextResolverRegistry([
@@ -550,6 +558,76 @@ class AgentContextLoopTests(unittest.TestCase):
         self.assertGreaterEqual(calls["resolve"], 1)
         events = [item.get("event") for item in trace.events]
         self.assertIn("agent.context_resolved", events)
+
+    def test_context_loop_stops_when_no_request_is_located(self):
+        """本轮上下文一个都没定位到时，不再消耗后续模型轮次。"""
+        hooks, calls, engine = self._hooks(
+            llm_texts=["need-more", "should-not-run"],
+            parse_result={
+                "context_requests": [{"type": "function", "symbol": "Missing::fn"}],
+                "agent_can_fetch_more": True,
+            },
+            resolve_result=[{"success": False, "error": "未定位到函数定义: Missing::fn"}],
+        )
+        out = run_agent_context_loop(
+            config=ContextLoopConfig(max_rounds=5, agent_loop_mode="context_loop"),
+            hooks=hooks,
+            initial_prompt="start",
+            context_engine=engine,
+        )
+        self.assertEqual(calls["llm"], 1)
+        self.assertEqual(out.analysis_text, "need-more")
+        self.assertEqual(out.termination_reason, "all_requests_blocked")
+
+    def test_prior_source_stays_when_new_block_exceeds_capacity(self):
+        """先前取到的完整函数继续放入；新的超长函数整段不发，也不标成已看见。"""
+        engine = ContextEngine(ContextEngineConfig(max_chars=12000), ContextResolverRegistry([]))
+        small = {
+            "success": True,
+            "snippet": "void Loop(void) {\n  SMALL_LOOP_BODY;\n}\n",
+            "request": {"type": "function", "symbol": "CVTaskQueueThread::Loop"},
+        }
+        huge = {
+            "success": True,
+            "snippet": "void Init() {\n" + ("INIT_PAD\n" * 4000) + "}\n",
+            "request": {"type": "function", "symbol": "CVMapControl::Init"},
+        }
+        engine.ledger.record(small["request"], small, 0)
+        engine.ledger.record(huge["request"], huge, 1)
+        engine.evidence_delta([small], round_index=0)
+        prompt = engine.build_prompt(
+            "## 崩溃摘要\nshort\n\n# 崩溃分析任务\n任务\n",
+            evidence_delta=engine.evidence_delta([huge], round_index=1),
+        )
+        self.assertLessEqual(len(prompt), 12000)
+        self.assertIn("SMALL_LOOP_BODY", prompt)
+        self.assertNotIn("INIT_PAD", prompt)
+        self.assertNotIn("delta truncated", prompt)
+        self.assertIn("未放入，因为超出容量", prompt)
+        self.assertIn("CVTaskQueueThread::Loop", prompt)
+        self.assertIn("已放入提示", prompt)
+        self.assertNotIn("`function: CVMapControl::Init`：已放入提示", prompt)
+        self.assertIn("`function: CVMapControl::Init`：未放入，因为超出容量", prompt)
+
+    def test_context_loop_stops_when_mandatory_prompt_exceeds_capacity(self):
+        """契约和崩溃摘要放不下时停止，不再把残缺摘要发给模型。"""
+        hooks, calls, seeded = self._hooks(llm_texts=["should-not-run"])
+        engine = ContextEngine(
+            ContextEngineConfig(max_chars=4000),
+            seeded.resolvers,
+            decision_parser=seeded.decision_parser,
+        )
+        summary = "## 崩溃摘要\n" + ("摘要必须完整保留\n" * 800)
+        out = run_agent_context_loop(
+            config=ContextLoopConfig(max_rounds=3, agent_loop_mode="context_loop"),
+            hooks=hooks,
+            initial_prompt=summary + "\n# 崩溃分析任务\n任务\n",
+            context_engine=engine,
+        )
+        self.assertEqual(calls["llm"], 0)
+        self.assertEqual(out.termination_reason, "prompt_capacity_exceeded")
+        self.assertIn("提示容量不足", out.rounds[-1]["prompt"])
+        self.assertNotIn("摘要必须完整保留\n摘要必须完整保留", out.rounds[-1]["prompt"])
 
 
 if __name__ == "__main__":

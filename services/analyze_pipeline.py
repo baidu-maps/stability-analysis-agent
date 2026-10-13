@@ -255,7 +255,10 @@ def run_analyze_context_loop(
         code_roots=list(prepare.get("code_roots") or []),
     )
     context_config = getattr(context, "config", {}) if context is not None else {}
-    max_chars = int(context_config.get("evidence_max_chars", 24000) or 24000) if isinstance(context_config, dict) else 24000
+    from services.context_engine import default_prompt_char_budget
+
+    config_dict = context_config if isinstance(context_config, dict) else {}
+    max_chars = default_prompt_char_budget(config_dict)
     max_tokens = int(context_config.get("evidence_max_tokens", 0) or 0) if isinstance(context_config, dict) else 0
     verification_profile = None
     problem_value = problem if isinstance(problem, dict) else {}

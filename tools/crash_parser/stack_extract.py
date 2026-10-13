@@ -20,6 +20,7 @@ from tools.crash_parser.android import (
     _looks_like_android_java_location,
     _parse_android_java_location,
     _parse_art_native_pc_tail,
+    _strip_glued_library_build_id,
 )
 from tools.crash_parser.stack_lines import (
     _try_parse_windows_stack_line,
@@ -120,6 +121,7 @@ def extract_stack_frames(
         - 输入: "/path/to/libxxx.so (_Zfoo+12) [arm64-v8a::xxxxxxxx]"
         - 输出: "libxxx.so"
         - 输入: "/product/.../Foo.apk!libxxx.so" → ``libxxx.so``（APK 内嵌 so）
+        - 输入: ".../libxxx.so[f0040528c6875de8345d6e3dc7109cc1af4ee389]" → ``libxxx.so``
         """
         module = module_path.replace('\\', '/').split('/')[-1]
         # 去掉括号中的符号信息，例如 "libxxx.so (_Zfoo+12"
@@ -135,7 +137,7 @@ def extract_stack_frames(
         if ".apk!" in mod_l:
             idx = mod_l.find(".apk!")
             module = module[idx + len(".apk!") :].strip()
-        return module.strip()
+        return _strip_glued_library_build_id(module.strip())
 
     def _extract_js_module(file_path: str) -> Optional[str]:
         if not file_path:

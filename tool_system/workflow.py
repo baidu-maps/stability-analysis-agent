@@ -120,8 +120,10 @@ class WorkflowContext:
         self.execution_events: List[Dict[str, Any]] = self.trace.events
         self.evidence = EvidenceStore()
         self.observations = ObservationStore()
-        evidence_budget = config.get("evidence_max_chars", 24000) if isinstance(config, dict) else 24000
-        self.context_manager = EvidenceContextManager(self.evidence, max_chars=int(evidence_budget or 24000))
+        from services.context_engine import default_prompt_char_budget
+
+        evidence_budget = default_prompt_char_budget(config if isinstance(config, dict) else {})
+        self.context_manager = EvidenceContextManager(self.evidence, max_chars=int(evidence_budget))
         self.gateway = ToolExecutionGateway(policy, self.trace, ActionSecurityAnalyzer())
 
     def evidence_package(self, *, max_chars: Optional[int] = None,

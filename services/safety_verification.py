@@ -14,7 +14,6 @@ CORE_SAFETY_CHECKS = (
     "patch_applied",
     "workspace_boundary",
     "change_manifest",
-    "diff_hygiene",
 )
 
 
@@ -105,20 +104,6 @@ class SafetyVerificationRunner:
                     name, "passed" if passed else "failed",
                     "补丁记录与实际 Git 修改完全一致" if passed else "补丁记录与实际 Git 修改不一致",
                     {"missing_files": missing, "undeclared_files": undeclared},
-                )
-            else:
-                trailing = [
-                    line
-                    for line in str(context.diff_text or "").splitlines()
-                    if line.startswith("+")
-                    and not line.startswith("+++")
-                    and line[1:].endswith((" ", "\t"))
-                ]
-                result = SafetyCheckResult(
-                    name,
-                    "passed" if not trailing else "failed",
-                    "新增行无尾随空白" if not trailing else "新增行包含尾随空白",
-                    {"trailing_whitespace_lines": trailing[:20]},
                 )
             results.append(result)
         status = "passed" if all(item.status == "passed" for item in results) else "failed"

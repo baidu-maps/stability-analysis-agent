@@ -75,8 +75,6 @@ class ContextCompactor:
         groups.sort(key=lambda group: min(_order(item) for item in group))
         for group in groups:
             group_text = "\n\n".join(str(item.get("content") or "") for item in group)
-            if used + len(group_text) > max_chars and any(str(item.get("priority")) == "control" for item in group):
-                group_text = group_text[: max(0, max_chars - used)]
             if used + len(group_text) > max_chars:
                 dropped += len(group)
                 continue

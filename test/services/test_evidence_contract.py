@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Tests for source-identity hard gates used by automated repair."""
+"""Tests for source-identity risk flags recorded alongside automated repair."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from services.evidence_contract import evaluate_source_identity
 
 
 class SourceIdentityContractTests(unittest.TestCase):
-    """Empty identity stays compatible; unpinned identity must hard-block."""
+    """Empty identity stays compatible; unpinned identity stays flagged for review."""
 
     def test_empty_identity_is_safe(self) -> None:
         gate = evaluate_source_identity({})

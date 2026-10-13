@@ -26,7 +26,31 @@ TERMINATION_REASONS = frozenset({
     "llm_error",
     "ready_to_fix",
     "insufficient_evidence",
+    "prompt_capacity_exceeded",
 })
+
+# 未配置上下文窗口时，按常见模型窗口减去输出预留。字符按 4 字/token 估算。
+DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
+DEFAULT_OUTPUT_RESERVE_TOKENS = 8192
+PROMPT_CAPACITY_STOP = (
+    "提示容量不足：契约与崩溃摘要无法完整放入模型上下文，已停止发送，避免提交残缺内容。"
+)
+
+
+def default_prompt_char_budget(config: Optional[Dict[str, Any]] = None) -> int:
+    """模型上下文去掉输出预留后的字符上限。
+
+    调用方显式传入 ``evidence_max_chars`` 时使用该上限；否则用上下文窗口。
+    """
+    raw = config if isinstance(config, dict) else {}
+    window = int(raw.get("context_window_tokens") or DEFAULT_CONTEXT_WINDOW_TOKENS)
+    reserve = int(raw.get("output_reserve_tokens") or DEFAULT_OUTPUT_RESERVE_TOKENS)
+    usable = max(1024, window - max(0, reserve))
+    capacity = usable * 4
+    explicit = raw.get("evidence_max_chars")
+    if explicit:
+        return max(1, int(explicit))
+    return capacity
 
 
 def resolve_agent_loop(
@@ -338,8 +362,7 @@ class RequestLedger:
             if item.get("error"):
                 line += f"；{item.get('error')}"
             lines.append(line)
-        text = "\n".join(lines)
-        return text if len(text) <= max_chars else text[: max_chars - 24] + "\n...[ledger truncated]"
+        return "\n".join(lines)
 
 
 class ContextEngine:
@@ -385,6 +408,8 @@ class ContextEngine:
         }
         self.session.repo_map = dict(repo_map or {})
         self.compactor = ContextCompactor()
+        self._retained_source: List[Dict[str, Any]] = []
+        self.prompt_capacity_exceeded = False
         self.evidence_graph = EvidenceGraph()
         if isinstance(self.session.repo_map.get("evidence_graph"), dict):
             self.evidence_graph = EvidenceGraph.from_dict(self.session.repo_map["evidence_graph"])
@@ -719,19 +744,39 @@ class ContextEngine:
             resolved_context=list(resolved_context),
         )
 
+    def _remember_source(self, item: Dict[str, Any]) -> None:
+        """保留已定位的完整源码，供后续轮次在容量允许时整段重发。"""
+        content = str(item.get("content") or "")
+        if not content:
+            return
+        symbol = str(item.get("symbol") or "")
+        if symbol:
+            self._retained_source = [
+                prior for prior in self._retained_source if str(prior.get("symbol") or "") != symbol
+            ]
+        elif any(str(prior.get("content") or "") == content for prior in self._retained_source):
+            return
+        self._retained_source.append(dict(item))
+
     def evidence_delta(self, resolved: Sequence[Dict[str, Any]], *, round_index: int) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         for resolution in resolved:
             content = str(self.format_resolution(resolution) or "").strip()
             if not content:
                 continue
-            items.append({
+            request = resolution.get("request") if isinstance(resolution.get("request"), dict) else {}
+            symbol = str(request.get("symbol") or resolution.get("function_signature") or "")
+            item = {
                 "kind": "source_code" if resolution.get("success") else "context_result",
                 "content": content,
                 "source": "context_loop",
                 "file": resolution.get("file"),
+                "symbol": symbol,
                 "round": int(round_index),
-            })
+            }
+            items.append(item)
+            if item["kind"] == "source_code":
+                self._remember_source(item)
         ledger = self.ledger.markdown()
         if ledger:
             items.append({
@@ -1027,62 +1072,105 @@ class ContextEngine:
         return text.rstrip() + "\n...[pinned section truncated]...\n"
 
     @classmethod
+    @staticmethod
+    def _split_atomic_sections(text: str) -> List[Tuple[str, str]]:
+        """按标题把提示切成完整段落，不在段落内部断开。"""
+        sections: List[Tuple[str, str]] = []
+        title = ""
+        buf: List[str] = []
+        heading = re.compile(r"^#{1,3} ")
+        for line in str(text or "").splitlines(keepends=True):
+            if heading.match(line) and buf:
+                sections.append((title, "".join(buf)))
+                title = line.strip()
+                buf = [line]
+                continue
+            if heading.match(line) and not buf:
+                title = line.strip()
+            buf.append(line)
+        if buf:
+            sections.append((title, "".join(buf)))
+        return sections
+
+    @staticmethod
+    def _section_is_mandatory(title: str) -> bool:
+        """契约、身份、崩溃摘要和任务节必须整段保留。"""
+        mandatory = (
+            "Evidence Contract",
+            "Source Identity",
+            "崩溃摘要",
+            "崩溃分析任务",
+            "本轮任务",
+            "输出契约",
+        )
+        return any(token in title for token in mandatory)
+
+    @classmethod
+    def _section_priority(cls, title: str, full_text: str) -> int:
+        """可选段落的装箱优先级。数值越小越优先。"""
+        prefer_write = bool(cls._CONTAINER_COPY_RACE_HINT_RE.search(full_text))
+        if "写路径函数源码" in title and prefer_write:
+            return 0
+        if "崩溃行关键源码" in title:
+            return 0 if not prefer_write else 1
+        if "写路径函数源码" in title:
+            return 1
+        if "旁路" in title:
+            return 2
+        if "关键同步" in title:
+            return 3
+        if "类骨架" in title:
+            return 5
+        return 6
+
+    @staticmethod
+    def _omission_note(titles: Sequence[str]) -> str:
+        """说明哪些完整段落因为超出容量没有发送。"""
+        labels = [str(title or "").strip() or "未命名段落" for title in titles]
+        if not labels:
+            return ""
+        lines = ["## 未放入的上下文", "以下内容未放入，因为超出容量："]
+        lines.extend(f"- {label}：未放入，因为超出容量" for label in labels)
+        return "\n".join(lines)
+
+    @classmethod
     def _compress_stable_context(cls, text: str, limit: int) -> str:
+        """只保留放得下的完整段落；放不下的整段不发。"""
         if len(text) <= limit:
             return text
-        marker = "\n...[stable context compressed by budget]...\n"
-        if limit <= len(marker):
-            return text[: max(0, limit)]
-        pinned_parts = cls._extract_pinned_stable_sections(text)
-        prefer_write_path = bool(cls._CONTAINER_COPY_RACE_HINT_RE.search(text)) or any(
-            prio == 0 and "写路径函数源码" in (block or "") for prio, block in pinned_parts
+        sections: List[Dict[str, Any]] = []
+        for index, (title, body) in enumerate(cls._split_atomic_sections(text)):
+            piece = body.strip()
+            if not piece:
+                continue
+            sections.append({
+                "index": index,
+                "title": title,
+                "body": piece,
+                "mandatory": cls._section_is_mandatory(title),
+                "priority": cls._section_priority(title, text),
+            })
+        mandatory_text = "\n\n".join(item["body"] for item in sections if item["mandatory"])
+        if len(mandatory_text) > limit:
+            return PROMPT_CAPACITY_STOP
+        kept = set(range(len(sections)))
+        drop_order = sorted(
+            (item for item in sections if not item["mandatory"]),
+            key=lambda item: (-int(item["priority"]), -int(item["index"])),
         )
-        prefer_crash_line = (
-            (not prefer_write_path)
-            and (
-                bool(cls._HEAP_DELETE_HINT_RE.search(text))
-                or any(prio == 0 for prio, _block in pinned_parts)
-            )
-        )
-        task_marker = "\n# 崩溃分析任务"
-        task_idx = text.find(task_marker)
-        task_tail = text[task_idx:] if task_idx >= 0 else ""
-        # 任务节至少保留引导与关键规则头，避免压缩后丢失输出契约
-        task_reserve = min(len(task_tail), max(800, int(limit * 0.22))) if task_tail else 0
-        # 容器拷贝竞态把更多预算给写路径 pin；heap 案把预算给崩溃行 pin
-        if prefer_write_path:
-            pin_frac = 0.66
-        elif prefer_crash_line:
-            pin_frac = 0.62
-        else:
-            pin_frac = 0.50
-        pinned_budget = min(
-            max(3500, int(limit * pin_frac)),
-            max(0, limit - len(marker) - task_reserve - 256),
-        )
-        pinned = cls._pack_pinned_sections(
-            pinned_parts,
-            pinned_budget,
-            prefer_crash_line=prefer_crash_line,
-            prefer_write_path=prefer_write_path,
-        )
-        suffix = ""
-        if pinned:
-            suffix += "\n\n" + pinned
-        if task_tail:
-            suffix += "\n" + task_tail[:task_reserve]
-            if len(task_tail) > task_reserve:
-                suffix += "\n...[task section truncated by budget]...\n"
-        remaining = max(0, limit - len(marker) - len(suffix))
-        if remaining <= 0:
-            return (marker + suffix)[:limit]
-        # 头部优先保留崩溃摘要；完整崩溃行源码改由 pin 段保活
-        head = text[:remaining]
-        if task_idx >= 0:
-            head = text[: min(remaining, task_idx)].rstrip()
-            if len(head) > remaining:
-                head = head[:remaining]
-        return (head + marker + suffix)[:limit]
+        for victim in [None, *drop_order]:
+            if victim is not None:
+                kept.discard(int(victim["index"]))
+            chosen = [item for item in sections if int(item["index"]) in kept]
+            omitted = [str(item["title"]) for item in sections if int(item["index"]) not in kept]
+            note = cls._omission_note(omitted)
+            parts = [str(item["body"]) for item in chosen]
+            if note:
+                parts.append(note)
+            packed = "\n\n".join(part for part in parts if part).strip()
+            if len(packed) <= limit:
+                return packed
+        return PROMPT_CAPACITY_STOP
 
     def build_prompt(
         self,
@@ -1092,30 +1180,8 @@ class ContextEngine:
         is_final_round: bool = False,
         early_final_reason: Optional[str] = None,
     ) -> str:
-        def _bound_items(
-            items: Sequence[Dict[str, Any]],
-            limit: int,
-            truncated_label: str,
-        ) -> tuple[List[Dict[str, Any]], int]:
-            selected: List[Dict[str, Any]] = []
-            used = 0
-            suffix = f"\n...[{truncated_label} truncated]"
-            for item in items:
-                content = str(item.get("content") or "")
-                remaining = limit - used
-                if remaining <= 0:
-                    break
-                if len(content) <= remaining:
-                    bounded = content
-                elif remaining > len(suffix):
-                    bounded = content[: remaining - len(suffix)] + suffix
-                else:
-                    bounded = content[:remaining]
-                selected.append({**item, "content": bounded})
-                used += len(bounded)
-            return selected, used
-
         max_chars = self.config.effective_max_chars
+        self.prompt_capacity_exceeded = False
         evidence_delta = list(evidence_delta)
         if not evidence_delta and self.observation_store is not None and hasattr(self.observation_store, "markdown"):
             observation_text = self.observation_store.markdown(max_chars=4000)
@@ -1126,92 +1192,170 @@ class ContextEngine:
                     "source": "observation_store",
                     "round": 0,
                 })
+        from services.context_loop_contract import format_evidence_items_markdown
+
         delta_items = [
             item for item in evidence_delta
             if str(item.get("kind") or "") != "request_ledger"
         ]
-        ledger_items = [
-            item for item in evidence_delta
-            if str(item.get("kind") or "") == "request_ledger"
-        ]
-        compacted = self.compactor.compact(
-            [
-                {"priority": "recent_observation", **item} for item in delta_items
-            ] + [
-                {"priority": "ledger", **item} for item in ledger_items
-            ],
-            max_chars=max(0, int(max_chars * 0.45)),
-            round_index=len(self.session.turns),
-        )
-        self.session.compaction = dict(compacted.metadata)
+        investigation_state = {
+            "hypotheses": self.session.hypotheses,
+            "next_action": self.session.investigation_actions[-1] if self.session.investigation_actions else {},
+            "focus_chain": self.session.focus_chain[-4:],
+            "verification_claim": self.session.verification_claim,
+            "verification_capabilities": self.session.verification_capabilities,
+            "reproduction_plan": self.session.reproduction_plan,
+            "investigation_plan": self.session.repo_map.get("investigation_plan") or [],
+        }
         control_only = str(assemble_loop_prompt(
             "",
             evidence_package={"items": []},
             is_final_round=is_final_round,
             early_final_reason=early_final_reason,
             include_json_reminder=True,
-            investigation_state={
-                "hypotheses": self.session.hypotheses,
-                "next_action": self.session.investigation_actions[-1] if self.session.investigation_actions else {},
-                "focus_chain": self.session.focus_chain[-4:],
-                "verification_claim": self.session.verification_claim,
-                "verification_capabilities": self.session.verification_capabilities,
-                "reproduction_plan": self.session.reproduction_plan,
-                "investigation_plan": self.session.repo_map.get("investigation_plan") or [],
-            },
+            investigation_state=investigation_state,
         )["content"])
-        content_budget = max(0, max_chars - len(control_only) - 256)
-        delta_limit = int(content_budget * 0.30)
-        ledger_limit = int(content_budget * 0.15)
-        bounded_delta, used_delta = _bound_items(delta_items, delta_limit, "delta")
-        bounded_ledger, used_ledger = _bound_items(ledger_items, ledger_limit, "ledger")
-        stable_limit = max(0, content_budget - used_delta - used_ledger)
-        stable_text = str(stable_context or "")
-        bounded_stable = self._compress_stable_context(stable_text, stable_limit)
+        stable_limit = max(0, max_chars - len(control_only) - 64)
+        bounded_stable = self._compress_stable_context(str(stable_context or ""), stable_limit)
+        if bounded_stable == PROMPT_CAPACITY_STOP or bounded_stable.startswith("提示容量不足"):
+            self.prompt_capacity_exceeded = True
+            self.session.budget["last_prompt_chars"] = len(PROMPT_CAPACITY_STOP)
+            self.session.budget["last_prompt_overflow_chars"] = 0
+            return PROMPT_CAPACITY_STOP
 
-        def _assemble() -> str:
+        def _assemble(items: Sequence[Dict[str, Any]]) -> str:
             return str(assemble_loop_prompt(
                 bounded_stable,
-                evidence_package={"items": [*bounded_delta, *bounded_ledger]},
+                evidence_package={"items": list(items)},
                 is_final_round=is_final_round,
                 early_final_reason=early_final_reason,
                 include_json_reminder=True,
-                investigation_state={
-                    "hypotheses": self.session.hypotheses,
-                    "next_action": self.session.investigation_actions[-1] if self.session.investigation_actions else {},
-                    "focus_chain": self.session.focus_chain[-4:],
-                    "verification_claim": self.session.verification_claim,
-                    "verification_capabilities": self.session.verification_capabilities,
-                    "reproduction_plan": self.session.reproduction_plan,
-                    "investigation_plan": self.session.repo_map.get("investigation_plan") or [],
-                },
+                investigation_state=investigation_state,
             )["content"])
 
-        assembled = _assemble()
-        if len(assembled) > max_chars and bounded_stable:
-            overflow = len(assembled) - max_chars
-            stable_limit = max(0, len(bounded_stable) - overflow - 64)
-            bounded_stable = self._compress_stable_context(stable_text, stable_limit)
-            assembled = _assemble()
-        if len(assembled) > max_chars and used_delta:
-            overflow = len(assembled) - max_chars
-            bounded_delta, used_delta = _bound_items(
-                delta_items,
-                max(0, used_delta - overflow - 64),
-                "delta",
-            )
-            assembled = _assemble()
-        if len(assembled) > max_chars and used_ledger:
-            overflow = len(assembled) - max_chars
-            bounded_ledger, used_ledger = _bound_items(
-                ledger_items,
-                max(0, used_ledger - overflow - 64),
-                "ledger",
-            )
-            assembled = _assemble()
+        base_prompt = _assemble([])
+        remaining = max_chars - len(base_prompt)
+        candidates = self._source_candidates(delta_items)
+        included, omitted = self._pack_whole_evidence(candidates, remaining)
+        while included:
+            preview = self._source_omission_item(omitted)
+            extras = [preview] if preview else []
+            if self._rendered_len([*included, *extras]) <= remaining:
+                break
+            omitted.append(included.pop())
+        included_symbols = {
+            str(item.get("symbol") or "") for item in included if str(item.get("symbol") or "")
+        }
+        omitted_symbols = {
+            str(item.get("symbol") or "") for item in omitted if str(item.get("symbol") or "")
+        }
+        packed_items = list(included)
+        omission = self._source_omission_item(omitted)
+        ledger = self._prompt_ledger(included_symbols, omitted_symbols)
+        for extra in (omission, ledger):
+            if not extra:
+                continue
+            rendered = format_evidence_items_markdown([extra])
+            if len(rendered) <= remaining - self._rendered_len(packed_items):
+                packed_items.append(extra)
+        assembled = _assemble(packed_items)
+        self.session.compaction = {
+            "schema_version": 1,
+            "round": len(self.session.turns),
+            "chars_before": sum(len(str(item.get("content") or "")) for item in candidates),
+            "chars_after": sum(len(str(item.get("content") or "")) for item in included),
+            "dropped_duplicates": len(omitted),
+            "retained_sections": len(included),
+            "atomic_groups": len(candidates),
+            "max_tokens": int(self.config.max_tokens or 0),
+            "summary_provider_used": 0,
+        }
         self.session.budget["last_prompt_chars"] = len(assembled)
         self.session.budget["last_prompt_overflow_chars"] = max(0, len(assembled) - max_chars)
         return str(assembled)
+
+    def _source_candidates(self, delta_items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """先前已定位的完整源码在前，本轮新增在后，按内容去重。"""
+        ordered = list(self._retained_source) + [
+            item for item in delta_items if str(item.get("kind") or "") != "request_ledger"
+        ]
+        chosen: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in ordered:
+            symbol = str(item.get("symbol") or "")
+            content = str(item.get("content") or "")
+            key = symbol or content
+            if not content or key in seen:
+                continue
+            seen.add(key)
+            chosen.append(item)
+        return chosen
+
+    def _rendered_len(self, items: Sequence[Dict[str, Any]]) -> int:
+        """估算证据块写进提示后的长度。"""
+        from services.context_loop_contract import format_evidence_items_markdown
+
+        return len(format_evidence_items_markdown(list(items)))
+
+    def _pack_whole_evidence(
+        self, items: Sequence[Dict[str, Any]], budget: int
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """按完整证据块装箱。放不下的整块留在 omitted。"""
+        included: List[Dict[str, Any]] = []
+        omitted: List[Dict[str, Any]] = []
+        for item in items:
+            trial = included + [item]
+            if self._rendered_len(trial) <= budget:
+                included.append(item)
+            else:
+                omitted.append(item)
+        return included, omitted
+
+    @staticmethod
+    def _source_omission_item(omitted: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """为未发送的完整源码生成说明，不附带残缺函数体。"""
+        labels: List[str] = []
+        for item in omitted:
+            label = str(item.get("symbol") or item.get("file") or item.get("kind") or "").strip()
+            if label:
+                labels.append(label)
+        if not labels:
+            return None
+        lines = ["以下源码已定位，但未放入，因为超出容量："]
+        lines.extend(f"- `{label}`：未放入，因为超出容量" for label in labels)
+        return {
+            "kind": "capacity_omission",
+            "content": "\n".join(lines),
+            "source": "context_engine",
+        }
+
+    def _prompt_ledger(self, included_symbols: set[str], omitted_symbols: set[str]) -> Optional[Dict[str, Any]]:
+        """已放入提示的请求才算模型看见；未放入的不标成 success。"""
+        if not self.ledger.entries():
+            return None
+        lines = [
+            "## 已处理的上下文请求",
+            "已放入本轮提示的请求不得重复提出。未放入的源码本轮不可见。",
+        ]
+        for item in self.ledger.entries():
+            target = str(item.get("symbol") or item.get("file") or item.get("key") or "")
+            kind = str(item.get("type") or "function")
+            status = str(item.get("status") or "")
+            if target and target in omitted_symbols:
+                lines.append(f"- `{kind}: {target}`：未放入，因为超出容量")
+                continue
+            if status == "success" and target in included_symbols:
+                lines.append(f"- `{kind}: {target}`：已放入提示")
+                continue
+            line = f"- `{kind}: {target}`：{status}"
+            if item.get("error"):
+                line += f"；{item.get('error')}"
+            lines.append(line)
+        return {
+            "kind": "request_ledger",
+            "content": "\n".join(lines),
+            "source": "context_engine",
+        }
 
     def add_turn(self, turn: ContextTurn) -> None:
         self.session.turns.append(turn)

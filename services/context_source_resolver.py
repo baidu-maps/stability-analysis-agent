@@ -289,6 +289,14 @@ class CodeContextRequestResolver:
                     if m:
                         class_name = m.group(1)
                         return bool(re.search(rf"::~\s*{re.escape(class_name)}\s*\(", sig))
+                parsed_member = SymbolLocator.parse_qualified_member_symbol(norm_symbol)
+                if parsed_member and SymbolLocator.source_line_is_in_class_method(
+                    lines,
+                    line_number,
+                    parsed_member["short_scope"],
+                    parsed_member["method"],
+                ):
+                    return True
                 return False
         if cls._is_destructor_symbol(norm_symbol):
             m = re.search(r"::~(\w+)", norm_symbol)
@@ -301,7 +309,7 @@ class CodeContextRequestResolver:
     def _resolved_snippet_matches_symbol(
         cls, symbol: str, snippet_text: str, function_signature: str = ""
     ) -> bool:
-        """限定成员符号时，要求片段或签名中出现 Class::method。"""
+        """限定成员符号时，要求片段出现 Class::method，或类体内联方法定义。"""
         from services.code_locator import SymbolLocator
 
         if cls._template_symbol_matches_text(symbol, snippet_text, function_signature):
@@ -317,6 +325,12 @@ class CodeContextRequestResolver:
             text = str(candidate or "").strip()
             if text and SymbolLocator.qualified_symbol_matches_line(symbol, text):
                 return True
+        parsed_member = SymbolLocator.parse_qualified_member_symbol(head)
+        if parsed_member and SymbolLocator.source_text_has_unqualified_method(
+            "\n".join(part for part in (function_signature, snippet_text) if part),
+            parsed_member["method"],
+        ):
+            return True
         return False
 
     @staticmethod

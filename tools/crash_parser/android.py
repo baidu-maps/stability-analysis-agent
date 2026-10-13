@@ -11,6 +11,10 @@ from tools.crash_parser.format_detect import detect_os_type
 
 # Android logcat / 部分 tombstone：以含 "backtrace:" 的行作为一次 native 栈块起点
 _BACKTRACE_HEADER_RE = re.compile(r"\bbacktrace\s*:", re.I)
+# 精简栈把 BuildId 直接粘在库名后：``libfoo.so[f0040528...]``，中间没有空格。
+_GLUED_LIBRARY_BUILD_ID_RE = re.compile(
+    r"(?i)(\.(?:so|dylib|dll|a))(?:\[[0-9a-f]{8,}\])+$"
+)
 
 
 def _backtrace_segment_ranges(lines: List[str]) -> List[Tuple[int, int]]:
@@ -55,6 +59,11 @@ def _parse_android_thread_banner(line: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _strip_glued_library_build_id(module: str) -> str:
+    """去掉紧贴库文件名的 BuildId，保留 ``.so`` / ``.dylib`` 等文件名。"""
+    return _GLUED_LIBRARY_BUILD_ID_RE.sub(r"\1", module)
+
+
 def _normalize_art_native_module(raw_mod: str) -> str:
     """与 extract_stack_frames 内 _extract_module_name 对齐的模块名归一化（供行尾解析复用）。"""
     module = raw_mod.strip()
@@ -70,7 +79,7 @@ def _normalize_art_native_module(raw_mod: str) -> str:
     if ".apk!" in mod_l:
         idx = mod_l.find(".apk!")
         module = module[idx + len(".apk!") :].strip()
-    return module.strip()
+    return _strip_glued_library_build_id(module.strip())
 
 
 def _art_native_outermost_paren_pair(tail: str) -> Optional[Tuple[int, int]]:

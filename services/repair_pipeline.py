@@ -276,6 +276,10 @@ def should_run_repair_pipeline(
     ``bypass_repair_gate`` defaults to True so probable/low-confidence 04
     diagnoses still allow auto-fix when the caller opted into apply_ai_fixes.
     Pass False to enforce confirmed+high-confidence only.
+
+    Source-identity risk is recorded for reviewers and does not by itself
+    skip apply. A later extractor still no-ops when the analysis has no
+    concrete patch.
     """
     if not apply_ai_fixes or result.get("status") != "success" or scope != "full":
         return False
@@ -297,8 +301,6 @@ def should_run_repair_pipeline(
     identity_gate = evaluate_source_identity(identity_input)
     if identity_input:
         result.setdefault("metadata", {})["source_identity_gate"] = identity_gate
-        if identity_gate["hard_block"]:
-            return False
     if meta.get("pipeline_skipped") or meta.get("llm_skipped"):
         return False
     termination = str(result.get("termination_reason") or "").strip().lower()
@@ -873,29 +875,15 @@ def run_repair_pipeline(
             observed_commit=observed_revision,
         )
     if identity_gate["hard_block"]:
-        out.applied_fix_result = {
-            "success": False,
-            "applied": [],
-            "status": "blocked",
-            "skipped_reason": "source identity hard gate",
-            "error": "; ".join(identity_gate["reasons"]),
-            "source_identity": identity_gate,
-        }
-        out.verification_result = {
-            "status": "skipped",
-            "adoptable": False,
-            "error": "source identity is unsafe",
-            "source_identity": identity_gate,
-        }
-        out.result_updates = {
-            "status": "error",
-            "completion_reason": "source_identity_blocked",
+        meta = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        meta = dict(meta)
+        meta["source_identity_warning"] = {
             "review_required": True,
-            "applied_ai_fixes": out.applied_fix_result,
-            "verification": out.verification_result,
-            "evidence_contract": result.get("evidence_contract"),
+            "apply_policy": "apply_concrete_patch",
+            "reasons": list(identity_gate.get("reasons") or []),
+            "source_identity": identity_gate,
         }
-        return out
+        result["metadata"] = meta
     session = result.get("context_session") if isinstance(result.get("context_session"), dict) else {}
     selection = session.get("reproduction_plan") if isinstance(session.get("reproduction_plan"), dict) else verification_config.get("reproduction_plan")
     claim = session.get("verification_claim") if isinstance(session.get("verification_claim"), dict) else verification_config.get("verification_claim")

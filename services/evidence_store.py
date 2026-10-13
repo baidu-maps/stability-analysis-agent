@@ -73,12 +73,10 @@ class EvidenceContextManager:
         except Exception:
             if len(content) <= limit:
                 return content
-            marker = "\n...[evidence compressed by context budget]...\n"
-            if limit <= len(marker) + 32:
-                return content[:limit]
-            available = limit - len(marker)
-            head = max(1, int(available * 0.7))
-            return content[:head] + marker + content[-(available - head):]
+            return (
+                "提示容量不足：契约与崩溃摘要无法完整放入模型上下文，"
+                "已停止发送，避免提交残缺内容。"
+            )
 
     def select_prompt(self, prompt: str, *, max_chars: Optional[int] = None,
                       max_tokens: Optional[int] = None) -> Dict[str, Any]:
@@ -161,18 +159,13 @@ class EvidenceContextManager:
             remaining_tokens = token_budget - used_tokens if token_budget else 0
             if token_budget:
                 remaining = min(remaining, max(0, remaining_tokens * 4))
-            if remaining <= 0:
+            if remaining <= 0 or len(content) > remaining:
                 dropped += 1
                 continue
-            if selected and len(content) > remaining:
-                dropped += 1
-                continue
-            bounded = self._compress(content, remaining)
-            if len(bounded) < len(content):
-                truncated += 1
+            bounded = content
             selected_item = dict(item)
             selected_item["content"] = bounded
-            selected_item["truncated"] = len(bounded) < len(content)
+            selected_item["truncated"] = False
             selected.append(selected_item)
             used += len(bounded)
             item_tokens = max(1, (len(bounded) + 3) // 4)

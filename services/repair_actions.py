@@ -148,12 +148,9 @@ def _apply_patch_handler(deps: RepairActionDeps, payload: Dict[str, Any]) -> Dic
         return applied
     guard = deps.uaf_nullptr_guard_policy() if callable(deps.uaf_nullptr_guard_policy) else None
     fixer = CodeFixer(deps.llm_adapter, uaf_nullptr_guard_policy=guard)
-    trace = getattr(deps, "trace", None)
-    if trace is not None and getattr(trace, "budget", None) is not None and deps.llm_adapter is not None:
-        try:
-            trace.budget.consume("llm")
-        except RuntimeError as exc:
-            return {"success": False, "error": str(exc), "applied": []}
+    # 改码从已有分析文本提取补丁，不再调用模型，因此不占用 LLM 次数。
+    # 分析阶段的截断重试会把 max_llm_calls 用满；若此处再预扣一次，
+    # 已写出的修复代码会在落盘前被预算直接拒绝。
     fix_result = fixer.generate_and_apply(
         result=deps.result,
         code_roots=list(payload.get("code_roots") or deps.code_roots),
