@@ -195,8 +195,49 @@ class CtagsFunctionIndex:
         os.makedirs(path, exist_ok=True)
         return path
 
+    @staticmethod
+    def _git_commit(root: str) -> str:
+        """返回 root 的 git HEAD 提交（含 worktree）；非 git 或失败返回空串。"""
+        try:
+            completed = subprocess.run(
+                ["git", "-C", root, "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return ""
+        if completed.returncode != 0:
+            return ""
+        commit = (completed.stdout or "").strip()
+        return commit if re.fullmatch(r"[0-9a-f]{40}", commit or "") else ""
+
+    def _root_identities(self) -> Tuple[List[str], bool]:
+        """按内容而非易变路径标识各 root。
+
+        同一仓库同一 commit 的不同 worktree（如每任务新建的 runs/<id>/... 路径）
+        会得到相同身份 → 命中同一份 ctags 缓存，避免每次运行重建索引。
+        返回 (sorted identities, 是否全部有 commit)。
+        """
+        identities: List[str] = []
+        all_commit = True
+        for root in self.code_roots:
+            commit = self._git_commit(root)
+            if commit:
+                identities.append(f"commit:{commit}")
+            else:
+                all_commit = False
+                try:
+                    mtime = int(os.path.getmtime(root))
+                except OSError:
+                    mtime = 0
+                identities.append(f"path:{os.path.abspath(root)}:mtime:{mtime}")
+        return sorted(identities), all_commit
+
     def _cache_key(self) -> str:
-        payload = json.dumps(sorted(self.code_roots), ensure_ascii=False)
+        identities, _ = self._root_identities()
+        payload = json.dumps(identities, ensure_ascii=False)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
     def _cache_paths(self) -> Tuple[str, str]:
@@ -220,11 +261,15 @@ class CtagsFunctionIndex:
         try:
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
-            if meta.get("roots") != self.code_roots:
+            identities, all_commit = self._root_identities()
+            if meta.get("identities") != identities:
                 return False
-            newest_root_mtime = max(os.path.getmtime(r) for r in self.code_roots)
-            if float(meta.get("built_at", 0)) < newest_root_mtime:
-                return False
+            # 身份完全由 commit 决定时，内容不可变，无需再按目录 mtime 判新鲜度
+            # （worktree 每次 checkout 都会刷新 mtime，会误判缓存失效导致重建）。
+            if not all_commit:
+                newest_root_mtime = max(os.path.getmtime(r) for r in self.code_roots)
+                if float(meta.get("built_at", 0)) < newest_root_mtime:
+                    return False
             # 优先从已解析索引 JSON 加载（跳过 _resolve_line_from_tag）
             index_path = self._index_cache_path()
             if os.path.isfile(index_path):
@@ -284,10 +329,11 @@ class CtagsFunctionIndex:
     def _save_build_meta(self) -> None:
         """只写 meta.json；tags 文件由 ctags -f 直接落在缓存路径，无需读出再回写。"""
         _, meta_path = self._cache_paths()
+        identities, _ = self._root_identities()
         try:
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"roots": self.code_roots, "built_at": time.time()},
+                    {"roots": self.code_roots, "identities": identities, "built_at": time.time()},
                     f,
                     ensure_ascii=False,
                 )

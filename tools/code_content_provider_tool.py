@@ -4202,6 +4202,19 @@ class CodeContentProvider:
         if not simple_function_name:
             return call_chain_functions
 
+        # 全仓扫描时先用 rg 把候选缩到"真正含该函数调用点"的文件，避免对整棵源码树
+        # 做 os.walk + 逐文件 tree-sitter 解析（大仓下这是上溯调用链的主要耗时来源）。
+        if restrict_to_files is None and CodeContentProvider._rg_available:
+            rg_pattern = rf"\b{re.escape(simple_function_name)}\s*\("
+            rg_hits = self._rg_grep_files(rg_pattern, code_roots)
+            if rg_hits is not None:
+                if not rg_hits:
+                    return call_chain_functions
+                restrict_to_files = rg_hits
+                logger.info(
+                    "tree-sitter 调用链 rg 预筛: 全仓缩减到 %d 个候选文件", len(rg_hits)
+                )
+
         # 收集所有待扫描的文件
         all_files = []
         coll_i = 0

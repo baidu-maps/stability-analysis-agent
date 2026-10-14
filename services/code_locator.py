@@ -397,8 +397,9 @@ class LocatorContext:
         except subprocess.TimeoutExpired:
             logger.debug("rg --files-with-matches 超时(60s)")
             return None
-        except Exception:
-            LocatorContext._rg_available = False
+        except Exception as exc:
+            # 瞬时错误仅本次返回 None，不永久禁用 rg（否则一次抖动会把整轮打回 os.walk 全仓扫描）。
+            logger.debug("rg --files-with-matches 异常: %s", exc)
             return None
 
         if proc.returncode not in (0, 1):
@@ -445,8 +446,9 @@ class LocatorContext:
         except subprocess.TimeoutExpired:
             logger.debug("rg grep_lines 超时(60s)")
             return None
-        except Exception:
-            LocatorContext._rg_available = False
+        except Exception as exc:
+            # 瞬时错误仅本次返回 None，不永久禁用 rg（否则一次抖动会把整轮打回 os.walk 全仓扫描）。
+            logger.debug("rg grep_lines 异常: %s", exc)
             return None
 
         if proc.returncode not in (0, 1):
@@ -1197,6 +1199,21 @@ class SymbolLocator:
         symbol = str(full_symbol or "").strip()
         if not symbol or not code_roots:
             return None
+        # ctags 优先：Class::method 的方法名或简单名在 ctags 索引里可 O(1) 命中，
+        # 避免落到 rg/os.walk 的全仓定义搜索（大仓场景定位源码的主要耗时来源）。
+        # 索引为空（如非 universal-ctags）时返回 None，自动回退下方原有策略，无行为回退风险。
+        self._ctx.ensure_ctags_index(code_roots)
+        ctags = getattr(self._ctx, "_ctags_index", None)
+        if ctags is not None and ctags.is_ready():
+            parsed_scope = self.parse_qualified_member_symbol(symbol)
+            if parsed_scope and parsed_scope.get("method"):
+                probe = str(parsed_scope.get("method") or "")
+            else:
+                probe = self.extract_simple_function_name(symbol) or symbol
+            if probe:
+                ctags_hit = ctags.lookup(probe, code_roots)
+                if ctags_hit is not None:
+                    return ctags_hit
         template_parsed = self.parse_template_qualified_symbol(symbol)
         if template_parsed:
             located = self._find_template_member_definition_location(
@@ -1506,6 +1523,9 @@ class SymbolLocator:
             pattern = re.compile(rf"::~\s*{re.escape(dtor_name)}\s*\(")
         else:
             pattern = re.compile(rf"\b{re.escape(simple_name)}\s*\(")
+        # 单符号兜底遍历设硬上限，避免 rg/ctags 都不可用时对大仓逐符号全树扫描。
+        scan_cap = 20000
+        scanned_total = 0
         for code_root in code_roots:
             if not os.path.isdir(code_root):
                 continue
@@ -1519,6 +1539,17 @@ class SymbolLocator:
                     if not self._ctx.is_file_readable(fp):
                         continue
                     file_count += 1
+                    scanned_total += 1
+                    if scanned_total > scan_cap:
+                        self._ctx.record_location(
+                            "find_function_definition",
+                            dedupe_key=dedupe_key,
+                            symbol=simple_name,
+                            strategy="walk",
+                            success=False,
+                            reason="walk_capped",
+                        )
+                        return None
                     if file_count % 50 == 0:
                         self._ctx.code_context_phase_check("function_def_scan")
                     content = self._ctx.read_file_cached(fp)
