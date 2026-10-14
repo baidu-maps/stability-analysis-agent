@@ -132,6 +132,7 @@ def _collect_query_text(
                     "resolved_frames",
                     "resolved_threads",
                     "frames",
+                    "inline_frames",
                     "crashed_thread",
                 }:
                     add_selected(value, depth + 1)

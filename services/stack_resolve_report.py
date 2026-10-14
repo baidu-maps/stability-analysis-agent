@@ -69,6 +69,11 @@ def format_addr2line_detail(frame: Dict[str, Any]) -> str:
         lines.append(location)
     elif module:
         lines.append(f"({module})")
+    from tools.add2line_resolver_tool import format_inline_caller_note
+
+    note = format_inline_caller_note(frame)
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 

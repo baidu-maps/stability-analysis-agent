@@ -78,6 +78,53 @@ RenderEngine::Draw must stop before the framebuffer and context are released.
         self.assertTrue(result["skipped"])
         self.assertEqual(result["skip_reason"], "no_matching_knowledge_pack")
 
+    def test_inline_frame_symbol_retrieves_document(self):
+        """内联调用者里的工程函数名参与知识检索。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pack = root / "demo"
+            (pack / "threading").mkdir(parents=True)
+            (pack / "pack.yaml").write_text(
+                json.dumps(
+                    {
+                        "id": "demo",
+                        "display_name": "Test Engine",
+                        "match": {"stack_hints": ["CGridLayer::"]},
+                        "content_globs": ["**/*.md"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (pack / "threading" / "grid.md").write_text(
+                """---
+title: Grid loading task lists
+kb_layer: code
+confidence: high
+symbols: [CGridLayer::CancelTask]
+---
+
+CGridLayer::CancelTask walks the loading task lists.
+""",
+                encoding="utf-8",
+            )
+            result = retrieve_knowledge(
+                parse_result={"signal": "SIGSEGV"},
+                resolved_stack={
+                    "resolved_frames": [
+                        {
+                            "function": "std::shared_ptr<CVTask>::operator->",
+                            "inline_frames": [
+                                {"function": "CGridLayer::CancelTask(bool)"}
+                            ],
+                        }
+                    ]
+                },
+                code_context={},
+                pack_dirs=[str(root)],
+            )
+        self.assertFalse(result["skipped"])
+        self.assertIn("Grid loading task lists", result["knowledge_context"])
+
     def test_nested_resolved_threads_frames_route_pack(self):
         """真实 add2line 结构是 resolved_threads[].frames[]，不得因深度截断丢符号。"""
         with tempfile.TemporaryDirectory() as temp_dir:

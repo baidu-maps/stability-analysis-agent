@@ -765,6 +765,32 @@ class TestCodeContentProviderV2(unittest.TestCase):
         self.assertTrue(p._is_supported_file("a.h"))
         self.assertFalse(p._is_supported_file("a.zip"))
 
+    def test_named_function_wins_when_compile_line_is_elsewhere(self):
+        """编译时行号落在别的函数里时，按符号函数名提取。"""
+        import os
+
+        path = os.path.join(self.test_dir, "VMapControl.cpp")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "void Init() {\n"
+                "    int heatmap = 1;\n"
+                "}\n"
+                "void RemoveMapControl() {\n"
+                "    int gone = 1;\n"
+                "}\n"
+            )
+        provider = CodeContentProvider(code_parser_backend="regex")
+        found = provider._extract_crash_function(
+            "CVMapControl::RemoveMapControl()::$_0::operator()() const",
+            path,
+            2,
+            [self.test_dir],
+        )
+        self.assertIsNotNone(found)
+        self.assertIn("RemoveMapControl", found.signature)
+        self.assertNotIn("heatmap", "\n".join(found.snippet))
+        self.assertIn("gone", "\n".join(found.snippet))
+
     def test_code_content_provider_v2_output(self):
         p = CodeContentProvider(code_parser_backend="regex")
         out = json.loads(p.code_content_provider(self.sample_add2line_json, str(self.code_root)))

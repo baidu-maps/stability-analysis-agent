@@ -109,6 +109,7 @@ Call Stack:
                 r"C:\\LLVM\\bin\\llvm-symbolizer.exe",
                 r"--obj=C:\\symbols\\demo.exe",
                 "--demangle",
+                "--inlines",
                 "0x140001234",
             ],
         )

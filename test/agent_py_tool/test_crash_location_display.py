@@ -106,6 +106,41 @@ class TestCrashLocationDisplay(unittest.TestCase):
         self.assertIn("/tmp/Crash.cpp:42", text)
         self.assertIn("*p = 0;", text)
 
+    def test_format_crash_position_uses_local_function_range(self):
+        text = format_crash_position_summary_line(
+            {
+                "crash_location_source": "from_add2line",
+                "analysis_entry_function": "void RemoveMapControl()",
+                "analysis_entry_file": "/src/VMapControl.cpp",
+                "analysis_entry_line_number": 2349,
+                "local_function_start": 2349,
+                "local_function_end": 2424,
+                "compile_line_outside": True,
+                "crash_line_code": "SetTag",
+            }
+        )
+        self.assertIn("VMapControl.cpp:2349-2424", text)
+        self.assertIn("以这段本地函数体为修改对象", text)
+        self.assertNotIn("SetTag", text)
+        self.assertNotIn("更外层的调用者", text)
+
+    def test_format_crash_position_keeps_inlined_function(self):
+        """内联工程函数是修改对象，不能改回栈上的外层调用者。"""
+        text = format_crash_position_summary_line(
+            {
+                "crash_location_source": "from_add2line",
+                "analysis_entry_function": "void CGridLayer::CancelTask(bool)",
+                "analysis_entry_file": "/src/GridLayer.cpp",
+                "local_function_start": 5278,
+                "local_function_end": 5304,
+                "compile_line_outside": True,
+                "inlined_instruction_function": "std::shared_ptr<CVTask>::operator->()",
+            }
+        )
+        self.assertIn("GridLayer.cpp:5278-5304", text)
+        self.assertIn("CancelTask", text)
+        self.assertIn("不要改成栈上更外层的调用者", text)
+
     def test_compat_restores_internal_enums_for_05(self):
         compat = BaseCrashAnalysisWorkflow._compat_crash_summary(
             {

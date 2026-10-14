@@ -11,7 +11,22 @@ from cli.phase_spinner import PhaseSpinner
 
 
 logger = logging.getLogger(__name__)
-DEFAULT_ANALYSIS_PROMPT_CHARS = 120000
+
+
+def resolve_analysis_prompt_cap(problem: Optional[Dict[str, Any]]) -> Optional[int]:
+    """只在显式配置为正数时裁剪提示。未配置时不再做二次裁剪。"""
+    raw = problem.get("max_prompt_chars") if isinstance(problem, dict) else None
+    if raw is None:
+        raw = os.getenv("SA_MAX_PROMPT_CHARS")
+    if raw in (None, ""):
+        return None
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if parsed > 0:
+        return parsed
+    return None
 
 
 def _prompt_section_priority(title: str) -> int:
@@ -136,21 +151,7 @@ def call_analyze_llm_with_retries(
     round_index: int = 0,
     stage: str = "analysis",
 ) -> Tuple[Any, str]:
-    prompt_cap_raw = problem.get("max_prompt_chars") if isinstance(problem, dict) else None
-    if prompt_cap_raw is None:
-        prompt_cap_raw = os.getenv("SA_MAX_PROMPT_CHARS")
-    prompt_cap: Optional[int] = None
-    if prompt_cap_raw in (None, ""):
-        prompt_cap = DEFAULT_ANALYSIS_PROMPT_CHARS
-    else:
-        try:
-            parsed = int(prompt_cap_raw)
-            if parsed > 0:
-                prompt_cap = parsed
-            elif parsed == 0:
-                prompt_cap = None
-        except (TypeError, ValueError):
-            prompt_cap = DEFAULT_ANALYSIS_PROMPT_CHARS
+    prompt_cap = resolve_analysis_prompt_cap(problem)
     prompt_used = prompt
     if prompt_cap and len(prompt_used) > prompt_cap:
         original_length = len(prompt_used)

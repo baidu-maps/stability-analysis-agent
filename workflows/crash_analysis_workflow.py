@@ -48,10 +48,6 @@ from tool_system.registry import ToolAndWorkflowRegistry
 
 logger = logging.getLogger(__name__)
 
-# 未设置 SA_MAX_PROMPT_CHARS / max_prompt_chars 时的默认上限（字符）。
-# 硬截断只作为最后手段；0 表示不限制。
-DEFAULT_ANALYSIS_PROMPT_CHARS = 120000
-
 # 尝试导入现有的 prompts
 try:
     from prompts.crash_analysis_prompt_templates import generate_crash_analysis_prompt
@@ -84,6 +80,8 @@ def _prompt_section_priority(title: str) -> int:
         return 95
     if any(key in title for key in ("崩溃函数", "函数源码")):
         return 90
+    if "代码库领域知识" in title:
+        return 88
     if "调用链" in title:
         return 45
     if any(key in title for key in ("变量", "兄弟", "共享")):
@@ -662,8 +660,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 decision_trace = rag_result.get("decision_trace", []) or []
                 vector_used = bool(rag_result.get("vector_used", False))
 
-            # 代码库领域知识与现有规则/向量记忆共用同一个检索结果和提示词通道。
-            # Pack 文档负责本仓架构/线程/生命周期，RAG 负责通用规则与历史案例。
+            # Pack 文档进入提示词；向量库规则/案例仍由 include_memory_context_in_final_tip 控制。
+            pack_knowledge_context = ""
             domain_knowledge_enabled = bool(problem.get("enable_domain_knowledge", True)) if isinstance(problem, dict) else True
             try:
                 from knowledge_plane import retrieve_knowledge
@@ -706,7 +704,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 }
             knowledge_context = str(knowledge_retrieval.get("knowledge_context") or "")
             try:
-                from rag.retrieval_fusion import fuse_retrieval_hits
+                from rag.retrieval_fusion import format_pack_knowledge_context, fuse_retrieval_hits
 
                 fusion = fuse_retrieval_hits(
                     rule_hits=rule_hits,
@@ -719,9 +717,12 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     if isinstance(problem, dict)
                     else 4,
                 )
+                fused_context = str(fusion.get("context") or "")
+                pack_knowledge_context = format_pack_knowledge_context(
+                    fusion.get("selected_hits") or []
+                )
                 diagnostic_context = str(memory_retrieval.get("diagnostic_context") or "")
                 strategy_context = str(memory_retrieval.get("strategy_context") or "")
-                fused_context = str(fusion.get("context") or "")
                 memory_context = "\n\n".join(
                     item
                     for item in (
@@ -734,6 +735,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 memory_retrieval["retrieval_fusion"] = fusion
             except Exception as fusion_exc:
                 logger.info("[%s] knowledge fusion skipped: %s", self.definition.name, fusion_exc)
+                pack_knowledge_context = knowledge_context
                 if knowledge_context:
                     memory_context = "\n\n".join(
                         item for item in (knowledge_context, memory_context) if item
@@ -742,6 +744,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 memory_retrieval = {}
             memory_retrieval["knowledge_retrieval"] = knowledge_retrieval
             memory_retrieval["memory_context"] = memory_context
+            memory_retrieval["pack_knowledge_context"] = pack_knowledge_context
             knowledge_trace = knowledge_retrieval.get("decision_trace")
             if isinstance(knowledge_trace, list):
                 decision_trace = [*knowledge_trace, *decision_trace]
@@ -768,6 +771,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         resolved=resolved,
                         code_context=code_context,
                         memory_context=memory_context,
+                        pack_knowledge_context=pack_knowledge_context,
                         problem=problem,
                         crash_diagnosis=crash_diagnosis,
                         anr_diagnosis=anr_diagnosis,
@@ -812,6 +816,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 resolved=resolved,
                 code_context=code_context,
                 memory_context=memory_context,
+                pack_knowledge_context=pack_knowledge_context,
                 problem=problem,
                 crash_diagnosis=crash_diagnosis,
                 anr_diagnosis=anr_diagnosis,
@@ -1182,21 +1187,9 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         round_index: int = 0,
         stage: str = "analysis",
     ) -> Tuple[Any, str]:
-        prompt_cap_raw = problem.get("max_prompt_chars") if isinstance(problem, dict) else None
-        if prompt_cap_raw is None:
-            prompt_cap_raw = os.getenv("SA_MAX_PROMPT_CHARS")
-        prompt_cap: Optional[int] = None
-        if prompt_cap_raw in (None, ""):
-            prompt_cap = DEFAULT_ANALYSIS_PROMPT_CHARS
-        else:
-            try:
-                parsed = int(prompt_cap_raw)
-                if parsed > 0:
-                    prompt_cap = parsed
-                elif parsed == 0:
-                    prompt_cap = None
-            except (TypeError, ValueError):
-                prompt_cap = DEFAULT_ANALYSIS_PROMPT_CHARS
+        from services.analyze_llm import resolve_analysis_prompt_cap
+
+        prompt_cap = resolve_analysis_prompt_cap(problem)
         prompt_used = prompt
         if prompt_cap and len(prompt_used) > prompt_cap:
             orig_len = len(prompt_used)
@@ -1919,6 +1912,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         resolved: Dict[str, Any],
         code_context: Dict[str, Any],
         memory_context: str = "",
+        pack_knowledge_context: str = "",
         problem: Optional[Dict[str, Any]] = None,
         crash_diagnosis: Optional[Dict[str, Any]] = None,
         anr_diagnosis: Optional[Dict[str, Any]] = None,
@@ -1964,7 +1958,25 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 "  （原地重建 / Clear / RemoveAll / Add / Append / SetSize 等），不得只给指针加锁后结束。",
                 "- 容器写点包含无赋值号的就地修改（mutator 调用），不得只搜 `=`。",
                 "- 锁住指针不等于锁住指针指向对象的内部容器；写路径若「先赋值指针再加锁」不能算已保护。",
+                "- 容器竞态的共享对象是被并发读写的那个容器。复用的 mutex 必须在源码里同时包住",
+                "  该容器的读操作和写操作。锁里只拷出指针、任务组或其它成员，解锁后再",
+                "  erase / emplace / 迭代该容器，不算已保护。保护其它成员的邻近锁不能代替。",
+                "- 补丁必须同时覆盖崩溃函数和写该容器的函数，写端的就地修改留在同一把锁里。",
+                "  Wait 等阻塞调用放在锁外。不遍历、不修改该容器的函数不要改。",
+                "- 若没有任何已有锁同时罩住该容器的读和写，可以新增一把锁。",
+                "  类型、初始化（如 Create）和加锁写法必须照抄本类已有锁。",
+                "  声明单独放一个 ```cpp 块，且只有两行：上一行是头文件里已有的成员声明，下一行是新成员。",
+                "  新成员名必须来自「代码库领域知识」。知识没有点名时不要新造锁，改为需人工处理。",
+                "  构造函数没有完整函数体时不要整段重写；改码会在无预处理条件的同类 Create 旁补上初始化，",
+                "  不放进 #if 分支。",
+                "- 类型名含 ScopedLock 的区间锁在析构时解锁，不要对锁对象调用 Unlock()。",
+                "  Wait 等阻塞调用放在该对象所在代码块结束之后。",
                 "- 不得把模板头文件行号安到业务 .cpp 函数上作为崩溃行。",
+                "- 崩溃指令若内联在另一个工程函数中，以该函数为修改对象，",
+                "  不要改成栈上更外层的调用者。",
+                "- 编译时行号若落在已定位函数范围外，以该本地函数体为修改对象，",
+                "  不要把编译时行号当成要改的行；这条不覆盖上一条。",
+                "  上下文足够时仍须输出修复代码。",
                 "- 若补丁后跨线程读路径仍拷贝 live 容器成员（未改为锁下快照/发布），不得宣称已覆盖",
                 "  容器 Copy 崩溃帧；读入口仍经裸指针调用 live getter 并按值返回的补丁视为无效。",
                 "- 若上文已给出「展开容器成员」写路径函数，主根因必须点名该写路径；禁止仅用外层指针置空/",
@@ -2039,6 +2051,10 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     if self._prompt_has_confident_crash_line(crash_summary, resolved):
                         lines.append(
                             "  - 定位置信度: 低（勿单独作为改码依据）"
+                        )
+                    if str(crash_summary.get("inlined_instruction_function") or "").strip():
+                        lines.append(
+                            "  - 崩溃指令内联在该函数中，不要改成栈上更外层的调用者。"
                         )
             else:
                 pos_summary = format_crash_position_summary_line(
@@ -2234,6 +2250,11 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         lines.append(f"  - {func} ({fp}:{ln}) [{mod or ''}]")
                     else:
                         lines.append(f"  - {func} [{mod or ''}]")
+                    from tools.add2line_resolver_tool import format_inline_caller_note
+
+                    inline_note = format_inline_caller_note(fr)
+                    if inline_note:
+                        lines.append(f"    {inline_note}")
                 if not is_crash and len(frames_rt) > cap:
                     lines.append(f"  - … 省略 {len(frames_rt) - cap} 帧")
                 lines.append("")
@@ -2322,6 +2343,11 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         lines.append(
                             f"- [第{idx}帧][源码函数] {func} ({file_path}:{line_no})"
                         )
+                    from tools.add2line_resolver_tool import format_inline_caller_note
+
+                    inline_note = format_inline_caller_note(frame)
+                    if inline_note:
+                        lines.append(f"  {inline_note}")
             lines.append("")
             lines.append("")
 
@@ -3049,10 +3075,10 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     preview = ", ".join(field_names[:60])
                     if len(field_names) > 60:
                         preview += f", …(+{len(field_names) - 60})"
-                    lines.append(f"- 成员字段名（来自类声明，禁止臆造未列出的 m_*）：{preview}")
+                    lines.append(f"- 成员字段名（来自类声明；未列出的普通 m_* 禁止臆造）：{preview}")
                 if sync_fields:
                     lines.append(
-                        "- 疑似同步原语成员（优先复用，禁止假设新的 mutex/lock 成员名）："
+                        "- 疑似同步原语成员（优先复用；只保护各自声明旁的对象）："
                         + ", ".join(sync_fields[:30])
                     )
                 # 大类骨架可能被后续上下文裁剪；单独摘录同步/指针成员声明行，保证锁名可见
@@ -3105,7 +3131,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 ]
                 if sync_fields:
                     keep.append(
-                        "- 疑似同步原语成员（禁止臆造新 mutex/lock）："
+                        "- 疑似同步原语成员（优先复用；不能用来保护另一组成员）："
                         + ", ".join(sync_fields[:30])
                     )
                 if sync_decl_lines:
@@ -3672,15 +3698,18 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 "- 禁止调用源码片段中未出现的成员方法；不要编造 Cancel/Abort 等异步控制 API。"
             )
             lines.append(
-                "- 禁止臆造类成员变量名（含任何 `m_*Mutex` / `m_*Lock` 等同步原语）；"
-                "同步保护必须优先使用上文「类骨架」/`member_fields` 或同文件源码中**已存在**的成员。"
-                "若上下文未给出可用锁/原子量，不得假设新成员已存在，应写入「无法生成完整修复代码/需人工处理」。"
+                "- 禁止臆造类成员变量名。已有锁能同时罩住该容器读写时必须复用。"
+                "没有任何已有锁能罩住时，只允许新增「代码库领域知识」点名的那一把锁，"
+                "类型和 Create/ScopedLock 写法照抄本类已有锁。"
+                "声明用单独代码块给出，上一行必须是头文件中已有的成员声明。"
+                "知识没有点名时，不得假设新成员已存在，应写入「无法生成完整修复代码/需人工处理」。"
             )
             lines.append(
                 "- 加锁/解锁 API 必须与同文件现有用法一致："
                 "若源码已使用 `成员.Lock(...)/成员.Unlock()`，必须带成员对象接收者，"
                 "禁止写成无接收者的 `Lock()`/`Unlock()`，也禁止改用该文件未出现的 `ScopedLock`/`unique_lock` 等包装；"
                 "反之亦然。禁止把其它无关对象的加锁模板套用到新臆造的成员上。"
+                "区间锁（ScopedLock）用代码块结束来解锁，禁止对锁对象调用 Unlock()。"
             )
             lines.append(
                 "- 若根因涉及共享指针/共享状态的 TOCTOU（检查与使用之间被并发改写）："
@@ -3695,8 +3724,9 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.append("- **修复代码格式**：每个修复函数必须使用独立的 ```cpp 围栏包裹；函数体必须完整，禁止用 `...`、`// ...`、`/* ... */`、`[其他代码]`、`其他逻辑保持不变`、`省略` 等任何占位内容代替代码行。")
             lines.append(
                 "- **禁止**在「修复代码」中输出带 `// ...` /「其他成员」占位的 class/struct 骨架或整类声明块；"
-                "不得用类声明代替可替换函数。新增成员（含 mutex/lock）一律写入「无法生成完整修复代码/需人工处理」，"
-                "「修复代码」仅允许完整的 `Class::method` / 析构函数定义围栏。"
+                "不得用类声明代替可替换函数。"
+                "新增锁只允许上面说的两行声明块，其余「修复代码」必须是完整的 `Class::method` / 析构函数定义。"
+                "构造函数没有完整函数体时不要为了初始化整段重写。"
             )
             lines.append("- “需要修改的函数（必改）”列表中的每一项，都必须在“修复代码”中给出对应的完整函数定义（包含函数签名、完整函数体和全部原有必要逻辑），不能只给函数体片段、局部代码片段、diff 片段或伪代码。")
             lines.append(
@@ -3835,16 +3865,24 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.append("- 对共享状态的其它读写函数，应逐个判断其与崩溃路径的关系；不要因为函数被列出就默认需要修改。")
             lines.append("- 禁止调用源码片段中未出现的成员方法；不要编造 Cancel/Abort 等异步控制 API。")
             lines.append(
-                "- 禁止臆造类成员变量名（含同步原语成员）；同步保护须复用上文类骨架/`member_fields` 或同文件已有成员，"
-                "不得假设新的 mutex/lock 成员已存在。"
+                "- 禁止臆造类成员变量名。已有锁能同时罩住该容器读写时必须复用。"
+                "没有任何已有锁能罩住、且「代码库领域知识」点名了锁时，才允许新增这一把，"
+                "类型和初始化写法照抄本类已有锁。知识没有点名时，不得假设新的 mutex/lock 已存在。"
             )
             lines.append(
-                "- 加锁 API 须与同文件现有风格一致；共享状态 TOCTOU 需同时评估写路径，"
+                "- 加锁 API 须与同文件现有风格一致。区间锁（ScopedLock）用代码块结束来解锁，"
+                "不要对锁对象调用 Unlock()。共享状态 TOCTOU 需同时评估写路径，"
                 "写路径不在完整函数源码中时不得声称已自动修复完毕。"
             )
             lines.append("- 非静态成员函数内不得用 `if (this == nullptr)` 等形式作为 use-after-free/悬空对象 的修复。")
             lines.append("- 若输出修复代码，必须仅针对证据充分且上下文完整的函数，并保持原函数签名不变。")
         lines.append("")
+        pack_text = str(pack_knowledge_context or "").strip()
+        if pack_text:
+            lines.append("## 代码库领域知识")
+            lines.append("这些条目按本次崩溃符号检索得到。与泛化概览冲突时，以点名了崩溃函数的条目为准。")
+            lines.append(pack_text)
+            lines.append("")
         if memory_context and BaseCrashAnalysisWorkflow._include_memory_context_in_final_tip(
             problem
         ):

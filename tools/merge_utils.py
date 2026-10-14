@@ -158,7 +158,13 @@ def build_crash_summary_view(
         "analysis_entry_file": location.get("analysis_entry_file"),
         "analysis_entry_function": location.get("analysis_entry_function"),
         "analysis_entry_line_number": location.get("analysis_entry_line"),
+        "local_function_start": location.get("local_function_start"),
+        "local_function_end": location.get("local_function_end"),
+        "compile_line_outside": location.get("compile_line_outside"),
     }
+    inline_instruction = location.get("inlined_instruction_function")
+    if inline_instruction:
+        summary["inlined_instruction_function"] = inline_instruction
 
     # 合并 code_context 中可能存在的额外 attribution 字段（兼容旧格式）
     old_summary = code_context.get("crash_summary")
@@ -276,11 +282,16 @@ def _resolve_crash_location(
         # analysis_entry 字段
         location["analysis_entry_file"] = crash_node.get("file")
         location["analysis_entry_function"] = crash_node.get("signature")
-        # snippet 中的行号
-        snippet = crash_node.get("snippet")
-        if isinstance(snippet, list) and snippet and not location.get("line"):
-            # crash_node 本身可能不记录行号，仅补充 file
-            pass
+        try:
+            start_line = int(crash_node.get("snippet_start_line") or 0)
+            end_line = int(crash_node.get("snippet_end_line") or 0)
+        except (TypeError, ValueError):
+            start_line, end_line = 0, 0
+        if start_line > 0 and end_line >= start_line:
+            location["local_function_start"] = start_line
+            location["local_function_end"] = end_line
+            if not location.get("line"):
+                location["line"] = start_line
 
     # 从 02 首帧补充（如果 graph 信息不足）
     resolved_threads = add2line_result.get("resolved_threads") or []
@@ -293,13 +304,19 @@ def _resolve_crash_location(
             frames = rt.get("frames") or []
             if frames and isinstance(frames[0], dict):
                 first = frames[0]
+                frame_file = str(first.get("resolved_file") or first.get("file") or "")
+                frame_base = frame_file.replace("\\", "/").rsplit("/", 1)[-1].lower()
+                loc_base_now = str(location.get("file") or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+                same_file = (not loc_base_now) or (not frame_base) or frame_base == loc_base_now
+                if not same_file and location.get("local_function_start"):
+                    location["compile_line_outside"] = True
                 if not location.get("address"):
                     location["address"] = first.get("address") or ""
-                if not location.get("file"):
-                    location["file"] = first.get("resolved_file") or first.get("file") or ""
-                if not location.get("function"):
+                if not location.get("file") and same_file:
+                    location["file"] = frame_file
+                if not location.get("function") and same_file:
                     location["function"] = first.get("resolved_function") or first.get("function") or ""
-                if not location.get("line"):
+                if not location.get("line") and same_file:
                     rl = first.get("resolved_line") or first.get("line")
                     if rl is not None:
                         location["line"] = rl
@@ -309,6 +326,24 @@ def _resolve_crash_location(
                         location["source"] = "from_add2line"
                     else:
                         location["source"] = "from_log_deduce"
+                inline_instruction = str(
+                    first.get("inlined_instruction_function") or ""
+                ).strip()
+                if not inline_instruction:
+                    for item in first.get("inline_frames") or []:
+                        if not isinstance(item, dict):
+                            continue
+                        inline_file = str(item.get("file") or "")
+                        inline_base = inline_file.replace("\\", "/").rsplit("/", 1)[-1].lower()
+                        if inline_base and loc_base_now and inline_base == loc_base_now:
+                            inline_instruction = str(
+                                first.get("resolved_function")
+                                or first.get("function")
+                                or ""
+                            ).strip()
+                            break
+                if inline_instruction:
+                    location["inlined_instruction_function"] = inline_instruction
                 break
 
     # analysis_entry fallback：入口文件可回退到 location.file，但行号不得跨文件混用。
@@ -320,6 +355,17 @@ def _resolve_crash_location(
     loc_file = str(location.get("file") or "")
     entry_base = entry_file.replace("\\", "/").rsplit("/", 1)[-1].lower()
     loc_base = loc_file.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    try:
+        start_line = int(location.get("local_function_start") or 0)
+        end_line = int(location.get("local_function_end") or 0)
+        current_line = int(location.get("line") or 0)
+    except (TypeError, ValueError):
+        start_line, end_line, current_line = 0, 0, 0
+    if start_line > 0 and end_line >= start_line and (
+        current_line <= 0 or current_line < start_line or current_line > end_line
+    ):
+        location["compile_line_outside"] = True
+        location["line"] = start_line
     if not location.get("analysis_entry_line"):
         # 仅当入口文件与定位文件同基名时，才把 line 当作入口行号。
         if entry_base and loc_base and entry_base == loc_base:

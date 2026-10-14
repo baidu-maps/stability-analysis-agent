@@ -121,6 +121,15 @@ def normalize_location_type(value: Any) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def _inline_caller_edit_note(crash_summary: Dict[str, Any]) -> str:
+    """内联工程函数才是修改对象时，附加到崩溃位置说明。"""
+    if not isinstance(crash_summary, dict):
+        return ""
+    if not str(crash_summary.get("inlined_instruction_function") or "").strip():
+        return ""
+    return "崩溃指令内联在该函数中，不要改成栈上更外层的调用者。"
+
+
 def format_crash_position_summary_line(
     crash_summary: Dict[str, Any],
     crash_node: Optional[Dict[str, Any]] = None,
@@ -223,11 +232,35 @@ def format_crash_position_summary_line(
     except (TypeError, ValueError):
         line_int = 0
 
+    try:
+        local_start = int(crash_summary.get("local_function_start") or 0)
+        local_end = int(crash_summary.get("local_function_end") or 0)
+    except (TypeError, ValueError):
+        local_start, local_end = 0, 0
+    line_outside = bool(crash_summary.get("compile_line_outside")) or (
+        local_start > 0 and local_end >= local_start and line_int > 0
+        and (line_int < local_start or line_int > local_end)
+    )
+    if line_outside and local_start > 0 and local_end >= local_start and (file_path or func):
+        span = f"{local_start}-{local_end}"
+        loc = f"{file_path}:{span}" if file_path else span
+        text = (
+            f"日志崩溃线程上的崩溃位置: {func or 'N/A'} ({loc})"
+            "。编译时行号不在该函数范围内，以这段本地函数体为修改对象。"
+        )
+        note = _inline_caller_edit_note(crash_summary)
+        if note:
+            text += note
+        return text
+
     if line_int > 0 and (file_path or func):
         loc = f"{file_path}:{line_int}" if file_path else str(line_int)
         text = f"日志崩溃线程上的崩溃位置: {func or 'N/A'} ({loc})"
-        if code:
+        if code and not line_outside:
             text += f" — `{code}`"
+        note = _inline_caller_edit_note(crash_summary)
+        if note:
+            text += note
         return text
 
     return loc_type

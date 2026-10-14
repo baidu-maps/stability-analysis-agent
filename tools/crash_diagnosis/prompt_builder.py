@@ -139,6 +139,8 @@ def build_diagnosis_prompt_section(
     lines.append("### 2) 符号/源码（addr2line）— 对应什么代码")
     top_frames = stack_summary.get("top_frames") or []
     if top_frames:
+        from tools.add2line_resolver_tool import format_inline_caller_note
+
         for i, fr in enumerate(top_frames[:5]):
             func = fr.get("function") or "?"
             module = fr.get("module") or "?"
@@ -146,6 +148,9 @@ def build_diagnosis_prompt_section(
             if fr.get("file"):
                 file_line = f" @ {fr.get('file')}:{fr.get('line') or '?'}"
             lines.append(f"- #{i:02d} {func} @ {module}{file_line}")
+            inline_note = format_inline_caller_note(fr)
+            if inline_note:
+                lines.append(f"  {inline_note}")
         if not data_availability.get("has_source_file_line") and data_availability.get(
             "has_symbolized_function"
         ):

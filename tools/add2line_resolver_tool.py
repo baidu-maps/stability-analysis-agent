@@ -153,6 +153,8 @@ class ResolvedFrame:
     resolved_function: Optional[str] = None
     resolved_file: Optional[str] = None
     resolved_line: Optional[int] = None
+    # addr2line -i 展开的外层调用者，从内到外。崩溃指令仍记在 resolved_*。
+    inline_frames: Optional[List[Dict[str, Any]]] = None
     # addr2line | log_symbol（崩溃线程沿用 01 符号）| offset_estimate | unresolved
     resolution_kind: Optional[str] = None
 
@@ -273,6 +275,57 @@ class Add2lineResult:
     tools_available: Optional[Dict[str, str]] = None
     # by_addr2line_tool | by_atos_tool | by_resolver_tool | log_symbolicated_passthrough
     resolution_source: Optional[str] = None
+
+def expand_inlined_frame_dicts(frame: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """把一帧展开为崩溃指令位置，以及 addr2line -i 给出的内联调用者。"""
+    if not isinstance(frame, dict):
+        return []
+    locations: List[Dict[str, Any]] = [frame]
+    raw = frame.get("inline_frames")
+    if not isinstance(raw, list):
+        return locations
+    module = frame.get("module")
+    address = frame.get("address")
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        file_path = item.get("file")
+        if not str(function or "").strip() and not str(file_path or "").strip():
+            continue
+        locations.append(
+            {
+                "resolved_function": function,
+                "function": function,
+                "resolved_file": file_path,
+                "file": file_path,
+                "resolved_line": item.get("line"),
+                "line": item.get("line"),
+                "module": module,
+                "address": address,
+            }
+        )
+    return locations
+
+
+def format_inline_caller_note(frame: Dict[str, Any]) -> str:
+    """把内联调用者格式化成一行说明。没有内联帧时返回空串。"""
+    callers = expand_inlined_frame_dicts(frame)[1:]
+    notes: List[str] = []
+    for loc in callers:
+        function = str(loc.get("resolved_function") or "").strip() or "?"
+        file_path = str(loc.get("resolved_file") or "").strip()
+        line = loc.get("resolved_line")
+        if file_path and line not in (None, "", "None"):
+            notes.append(f"{function} ({file_path}:{line})")
+        elif file_path:
+            notes.append(f"{function} ({file_path})")
+        else:
+            notes.append(function)
+    if not notes:
+        return ""
+    return "内联于 " + " ← ".join(notes)
+
 
 def _resolution_source_for_tool(tool_name: Optional[str]) -> str:
     """正常工具链路径的 resolution_source（避免 null）。"""
@@ -1291,7 +1344,7 @@ class Add2lineResolver:
         """使用 LLVM symbolizer 解析 PE/COFF 地址，并读取同目录 PDB。"""
         try:
             result = subprocess.run(
-                [tool_path, f"--obj={library_path}", "--demangle", address],
+                [tool_path, f"--obj={library_path}", "--demangle", "--inlines", address],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -1300,71 +1353,91 @@ class Add2lineResolver:
             )
             if result.returncode != 0:
                 return None
-            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-            if not lines:
+            frames = self._parse_add2line_frames(result.stdout)
+            if not frames:
                 return None
-            function = lines[0] if lines[0] not in {"??", "???"} else None
-            file_path = None
-            line_number = None
-            if len(lines) > 1 and lines[1] not in {"??:0", "??"}:
-                # 非贪婪匹配可保留 Windows 盘符和源码路径中的冒号，并兼容 :line:column。
-                match = re.match(r"(.+?):(\d+)(?::\d+)?$", lines[1])
-                if match:
-                    file_path = match.group(1)
-                    line_number = int(match.group(2))
-            if not function and not file_path:
-                return None
+            function, file_path, line_number = frames[0]
             return ResolvedFrame(
                 address=address,
                 resolved_function=function,
                 resolved_file=file_path,
                 resolved_line=line_number,
+                inline_frames=self._inline_frame_dicts(frames[1:]),
             )
         except (subprocess.TimeoutExpired, OSError, ValueError):
             return None
     
-    def _parse_add2line_output(self, output: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
-        """解析add2line输出"""
-        lines = output.strip().split('\n')
-        if len(lines) < 2:
-            return None, None, None
-        
-        function_line = lines[0].strip()
-        file_line = lines[1].strip()
+    @staticmethod
+    def _is_unknown_addr2line_marker(text: str) -> bool:
+        """判断 addr2line 输出是否为未知占位（如 ??、??:0）。"""
+        token = (text or "").strip()
+        if not token:
+            return True
+        if re.fullmatch(r"\?+", token):
+            return True
+        if re.fullmatch(r"\?+:0(?::0)?", token):
+            return True
+        return False
 
-        def _is_unknown_marker(text: str) -> bool:
-            """判断addr2line输出是否为未知占位（如 ??, ???, ??:0, ???:0 等）"""
-            t = (text or "").strip()
-            if not t:
-                return True
-            # 纯问号：??, ??? 等
-            if re.fullmatch(r"\?+", t):
-                return True
-            # 问号 + :0：??:0, ???:0 等
-            if re.fullmatch(r"\?+:0", t):
-                return True
-            return False
-
-        # 解析函数名
+    @classmethod
+    def _parse_add2line_pair(
+        cls, function_line: str, file_line: str
+    ) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+        """解析 addr2line 的一对「函数名 / 文件:行」。"""
         function = None
-        if not _is_unknown_marker(function_line):
-            function = function_line
-        
-        # 解析文件和行号
+        if not cls._is_unknown_addr2line_marker(function_line):
+            function = function_line.strip()
         file_path = None
         line_number = None
-
-        if not _is_unknown_marker(file_line):
-            # 格式: /path/to/file:123
-            match = re.match(r'(.+):(\d+)$', file_line)
+        if not cls._is_unknown_addr2line_marker(file_line):
+            # 先匹配 file:line:column，再退回 file:line，避免把行号留在路径里。
+            stripped = file_line.strip()
+            match = re.match(r"^(.*):(\d+):(\d+)$", stripped)
+            if match is None:
+                match = re.match(r"^(.*):(\d+)$", stripped)
             if match:
                 file_path = match.group(1)
                 try:
                     line_number = int(match.group(2))
                 except ValueError:
-                    pass
-        
+                    line_number = None
         return function, file_path, line_number
+
+    @classmethod
+    def _parse_add2line_frames(
+        cls, output: str
+    ) -> List[Tuple[Optional[str], Optional[str], Optional[int]]]:
+        """解析 addr2line -i 的多帧输出。第一对是崩溃指令，其后是内联调用者。"""
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        frames: List[Tuple[Optional[str], Optional[str], Optional[int]]] = []
+        index = 0
+        while index + 1 < len(lines):
+            function, file_path, line_number = cls._parse_add2line_pair(
+                lines[index], lines[index + 1]
+            )
+            index += 2
+            if function or file_path:
+                frames.append((function, file_path, line_number))
+        return frames
+
+    @staticmethod
+    def _inline_frame_dicts(
+        frames: List[Tuple[Optional[str], Optional[str], Optional[int]]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """把内联调用者收成可写入 JSON 的列表。"""
+        inline_frames: List[Dict[str, Any]] = []
+        for function, file_path, line_number in frames:
+            inline_frames.append(
+                {"function": function, "file": file_path, "line": line_number}
+            )
+        return inline_frames or None
+
+    def _parse_add2line_output(self, output: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+        """解析 addr2line 输出的第一帧。"""
+        frames = self._parse_add2line_frames(output)
+        if not frames:
+            return None, None, None
+        return frames[0]
     
     def _resolve_address(self, address: str, library_path: str) -> Optional[ResolvedFrame]:
         """解析单个地址"""
@@ -1809,6 +1882,7 @@ class Add2lineResolver:
                     resolved_function=resolved.resolved_function,
                     resolved_file=resolved.resolved_file,
                     resolved_line=resolved.resolved_line,
+                    inline_frames=resolved.inline_frames,
                     resolution_kind="addr2line",
                 ),
                 True,
@@ -2589,51 +2663,92 @@ class Add2lineResolver:
 
 
 
-    def _resolve_with_addr2line(self, address: str, library_path: str, tool_path: str) -> Optional[ResolvedFrame]:
-        """使用addr2line工具解析地址。
+    def _addr2line_command(
+        self, address: str, library_path: str, tool_path: str, inlines: bool
+    ) -> List[str]:
+        """组装 addr2line 命令。默认展开内联，崩溃指令的外层调用者才会出现。"""
+        is_symbolizer_alias = bool(
+            self._llvm_addr2line_alias_path
+            and tool_path == self._llvm_addr2line_alias_path
+        )
+        if is_symbolizer_alias:
+            return [
+                tool_path,
+                "-e", library_path,
+                "--functions=linkage",
+                "--demangle",
+                "--inlines=true" if inlines else "--inlines=false",
+                "--output-style=GNU",
+                address,
+            ]
+        cmd = [
+            tool_path,
+            "-e", library_path,
+            "-f",
+            "-C",
+        ]
+        if inlines:
+            cmd.append("-i")
+        cmd.append(address)
+        return cmd
 
-        若当前 tool_path 是 llvm-symbolizer 别名（系统未提供 llvm-addr2line / addr2line 时启用），
-        则使用 llvm-symbolizer 的兼容参数集合，并通过 --output-style=GNU 让输出与 GNU addr2line 对齐，
-        从而复用现有 _parse_add2line_output 的解析逻辑。
+    def _run_addr2line(
+        self, address: str, library_path: str, tool_path: str
+    ) -> Optional[subprocess.CompletedProcess]:
+        """执行 addr2line。工具不认识 -i 时退回不展开内联。"""
+        cmd = self._addr2line_command(address, library_path, tool_path, True)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return result
+        err = (result.stderr or "").lower()
+        unsupported = (
+            "unknown option",
+            "unrecognized option",
+            "unrecognised option",
+            "invalid option",
+        )
+        if any(token in err for token in unsupported):
+            fallback = self._addr2line_command(address, library_path, tool_path, False)
+            result = subprocess.run(
+                fallback,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+            if result.returncode == 0:
+                return result
+        logger.warning(f"addr2line命令执行失败: {result.stderr}")
+        return None
+
+    def _resolve_with_addr2line(self, address: str, library_path: str, tool_path: str) -> Optional[ResolvedFrame]:
+        """使用 addr2line 解析地址，并保留内联调用者。
+
+        若当前 tool_path 是 llvm-symbolizer 别名，则用 GNU 输出格式复用同一套解析。
         """
         try:
-            is_symbolizer_alias = bool(
-                self._llvm_addr2line_alias_path
-                and tool_path == self._llvm_addr2line_alias_path
-            )
-            if is_symbolizer_alias:
-                cmd = [
-                    tool_path,
-                    "-e", library_path,
-                    "--functions=linkage",  # 显示函数名（与 -f 等价）
-                    "--demangle",           # 还原 C++/Rust 符号（与 -C 等价）
-                    "--inlines=false",      # 关闭内联展开，确保输出仅有 [function, file:line] 两行
-                    "--output-style=GNU",   # 让输出格式对齐 GNU addr2line
-                    address,
-                ]
-            else:
-                cmd = [
-                    tool_path,
-                    "-e", library_path,
-                    "-f",  # 显示函数名
-                    "-C",  # 显示C++符号名
-                    address,
-                ]
-
-            result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
-
-            if result.returncode == 0:
-                function, file_path, line_number = self._parse_add2line_output(result.stdout)
-
-                return ResolvedFrame(
-                    address=address,
-                    resolved_function=function,
-                    resolved_file=file_path,
-                    resolved_line=line_number
-                )
-            else:
-                logger.warning(f"addr2line命令执行失败: {result.stderr}")
+            result = self._run_addr2line(address, library_path, tool_path)
+            if result is None:
                 return None
+            frames = self._parse_add2line_frames(result.stdout)
+            if not frames:
+                return None
+            function, file_path, line_number = frames[0]
+            return ResolvedFrame(
+                address=address,
+                resolved_function=function,
+                resolved_file=file_path,
+                resolved_line=line_number,
+                inline_frames=self._inline_frame_dicts(frames[1:]),
+            )
 
         except subprocess.TimeoutExpired:
             logger.warning(f"addr2line命令超时: {address}")

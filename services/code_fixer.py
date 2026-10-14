@@ -729,11 +729,16 @@ def _is_valid_replacement_code(text: str) -> bool:
 
 
 def _is_within_code_roots(path: Path, code_roots: List[str]) -> bool:
+    """判断路径是否落在给定代码根目录内，符号链接按解析后的路径比较。"""
+    try:
+        candidate = path.resolve()
+    except OSError:
+        candidate = path
     for root in code_roots:
         try:
-            path.relative_to(Path(root).resolve())
+            candidate.relative_to(Path(root).expanduser().resolve())
             return True
-        except ValueError:
+        except (ValueError, OSError):
             continue
     return False
 
@@ -884,6 +889,12 @@ def _validate_sync_api_consistency(original_source: str, replacement: str) -> Op
     original = str(original_source or "")
     replacement = str(replacement or "")
     if "ScopedLock" in replacement:
+        for guard_name in re.findall(r"\bScopedLock\s+(\w+)\s*\(", replacement):
+            if re.search(rf"\b{re.escape(guard_name)}\s*\.\s*Unlock\s*\(", replacement):
+                return (
+                    f"区间锁对象 {guard_name} 在析构时解锁，"
+                    f"replacement 调用了 {guard_name}.Unlock()，已跳过"
+                )
         for member in re.findall(r"ScopedLock\s+\w+\s*\(\s*(m_\w+)\s*\)", replacement):
             uses_lock_unlock = bool(re.search(rf"\b{re.escape(member)}\s*\.\s*Lock\s*\(", original))
             if not uses_lock_unlock:
@@ -2128,23 +2139,249 @@ def _append_missing_edits(
     return {"summary": str(fix_plan.get("summary", "")), "edits": appended}
 
 
+def _header_member_names(header: str) -> Set[str]:
+    """从头文件声明行收集已有 m_* 成员名。"""
+    names: Set[str] = set()
+    for line in str(header or "").splitlines():
+        if ";" not in line:
+            continue
+        names.update(re.findall(r"\bm_\w+\b", line))
+    return names
+
+
+def _format_member_like(sibling_line: str, new_name: str) -> str:
+    """按同类成员声明的缩进和空格，生成新成员那一行。"""
+    matched = re.match(r"^(\s*\S+\s+)(m_\w+)(\s*;.*)$", sibling_line.rstrip())
+    if not matched:
+        return ""
+    return f"{matched.group(1)}{new_name}{matched.group(3)}"
+
+
+def _extract_added_sync_member_edits(
+    analysis_text: str,
+    header: str,
+    file_path: Path,
+) -> List[Dict[str, Any]]:
+    """从两行声明块提取新增的 m_*Mutex / m_*Lock，插到已有成员声明之后。"""
+    known = _header_member_names(header)
+    edits: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    decl_re = re.compile(r"^(\s*)([A-Za-z_][\w:]*)\s+(m_\w*(?:Mutex|Lock))\s*;\s*$")
+    blocks = re.findall(
+        r"```(?:cpp|c\+\+|cc|cxx)?\s*\n(.*?)```",
+        analysis_text or "",
+        re.DOTALL,
+    )
+    for block in blocks:
+        lines = block.splitlines()
+        for index, line in enumerate(lines):
+            matched = decl_re.match(line.rstrip())
+            if not matched:
+                continue
+            type_name = matched.group(2)
+            new_name = matched.group(3)
+            if new_name in known or new_name in seen:
+                continue
+            type_exists = re.search(
+                rf"^\s*{re.escape(type_name)}\s+m_\w+\s*;",
+                header,
+                re.MULTILINE,
+            )
+            if not type_exists:
+                continue
+            anchor_name = ""
+            for prev in reversed(lines[:index]):
+                prev_names = [
+                    name for name in re.findall(r"\bm_\w+\b", prev) if name in known
+                ]
+                if prev_names and ";" in prev:
+                    anchor_name = prev_names[-1]
+                    break
+            if not anchor_name:
+                continue
+            anchor_line = ""
+            for header_line in header.splitlines():
+                if (
+                    re.search(rf"\b{re.escape(anchor_name)}\b", header_line)
+                    and header_line.rstrip().endswith(";")
+                ):
+                    anchor_line = header_line.rstrip()
+                    break
+            sibling_line = type_exists.group(0).rstrip()
+            new_line = _format_member_like(sibling_line, new_name)
+            if not anchor_line or not new_line or new_line in header:
+                continue
+            seen.add(new_name)
+            edits.append(
+                {
+                    "file": str(file_path),
+                    "edit_type": "member_declaration",
+                    "old_text": anchor_line,
+                    "new_text": anchor_line + "\n" + new_line,
+                    "reason": f"新增同步成员 {new_name}，插在 {anchor_name} 之后",
+                    "sync_init_name": new_name,
+                    "sync_init_type": type_name,
+                }
+            )
+    return edits
+
+
+def _members_introduced_by_declaration_edits(edits: List[Dict[str, Any]]) -> Set[str]:
+    """同一修复计划里即将写入头文件的新成员，允许出现在函数替换中。"""
+    names: Set[str] = set()
+    for edit in edits:
+        if not isinstance(edit, dict):
+            continue
+        if str(edit.get("edit_type") or "") != "member_declaration":
+            continue
+        old_names = set(re.findall(r"\bm_\w+\b", str(edit.get("old_text") or "")))
+        new_names = set(re.findall(r"\bm_\w+\b", str(edit.get("new_text") or "")))
+        names.update(new_names - old_names)
+    return names
+
+
+def _preprocessor_depths(lines: List[str]) -> List[int]:
+    """每行所在的 #if/#ifdef/#ifndef 嵌套深度，指令行本身记进入该分支之前的深度。"""
+    depths: List[int] = []
+    depth = 0
+    opened = re.compile(r"^\s*#\s*(?:if|ifdef|ifndef)\b")
+    closed = re.compile(r"^\s*#\s*endif\b")
+    for line in lines:
+        depths.append(depth)
+        if opened.match(line):
+            depth += 1
+        elif closed.match(line):
+            depth = max(0, depth - 1)
+    return depths
+
+
+def _insert_mutex_create_beside_sibling(
+    header_path: Path,
+    new_name: str,
+    type_name: str,
+    code_roots: List[str],
+) -> Optional[str]:
+    """在同目录实现文件里，于同类成员的 Create 调用后插入同样参数的初始化。"""
+    if not new_name or not type_name or not header_path.is_file():
+        return None
+    try:
+        header_text, _encoding = _try_read_source_raw(header_path)
+    except (UnicodeDecodeError, LookupError, OSError):
+        return "头文件无法读取，未补 Create 初始化"
+    siblings = re.findall(
+        rf"^\s*{re.escape(type_name)}\s+(m_\w+)\s*;",
+        header_text,
+        re.MULTILINE,
+    )
+    siblings = [name for name in siblings if name != new_name]
+    if not siblings:
+        return "未找到同类锁，未补 Create 初始化"
+    create_line_re = re.compile(
+        r"^(\s*)("
+        + "|".join(re.escape(name) for name in siblings)
+        + r")\.Create\((.*)\)\s*;\s*$"
+    )
+    own_create_re = re.compile(
+        rf"^(\s*){re.escape(new_name)}\.Create\((.*)\)\s*;\s*$"
+    )
+    for cpp in sorted(header_path.parent.glob("*.cpp")):
+        cpp_path = cpp.resolve()
+        if not _is_within_code_roots(cpp_path, code_roots):
+            continue
+        try:
+            original, encoding = _try_read_source_raw(cpp)
+        except (UnicodeDecodeError, LookupError, OSError):
+            continue
+        lines = original.splitlines()
+        depths = _preprocessor_depths(lines)
+        if any(
+            own_create_re.match(line) and depths[index] == 0
+            for index, line in enumerate(lines)
+        ):
+            return None
+        unconditional = [
+            (index, create_line_re.match(line))
+            for index, line in enumerate(lines)
+            if depths[index] == 0 and create_line_re.match(line)
+        ]
+        if not unconditional:
+            if any(create_line_re.match(line) for line in lines):
+                return "同类 Create 都在预处理条件里，未插入初始化"
+            continue
+        line_no, found = unconditional[0]
+        if found is None:
+            continue
+        indent = found.group(1)
+        args = found.group(3)
+        insert_line = f"{indent}{new_name}.Create({args});"
+        eol = _source_newline_style(original)
+        lines.insert(line_no + 1, insert_line)
+        trailing = eol if original.endswith(("\n", "\r\n")) else ""
+        new_source = _convert_newlines("\n".join(lines) + trailing, eol)
+        try:
+            _write_text_raw(cpp, new_source, encoding=encoding)
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            _write_text_raw(cpp, new_source, encoding="utf-8")
+        return None
+    return "未找到同类 Create 初始化，需人工补构造"
+
+
+def _candidate_member_header_files(code_context: Dict[str, Any]) -> List[Path]:
+    """成员声明可写入的头文件：owner 类，以及图中的 class_skeleton。"""
+    from tools.owner_class_context import resolve_owner_class_from_code_context
+
+    raw_paths: List[str] = []
+    owner = resolve_owner_class_from_code_context(code_context) or {}
+    if isinstance(owner, dict):
+        raw_paths.append(str(owner.get("definition_file") or ""))
+    graph = code_context.get("graph") if isinstance(code_context, dict) else None
+    nodes = graph.get("nodes") if isinstance(graph, dict) else None
+    if isinstance(nodes, list):
+        for node in nodes:
+            if not isinstance(node, dict) or node.get("type") != "class_skeleton":
+                continue
+            raw_paths.append(str(node.get("file") or node.get("definition_file") or ""))
+    found: List[Path] = []
+    seen: Set[str] = set()
+    for raw in raw_paths:
+        text = raw.strip()
+        if not text:
+            continue
+        path = Path(text)
+        if not path.is_file():
+            continue
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(path)
+    return found
+
+
 def _extract_member_declaration_edits(
     analysis_text: str,
     code_context: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     """从AI分析文本的代码块中提取成员变量声明变更，生成 member_declaration 类型的 edit。"""
     edits: List[Dict[str, Any]] = []
-    from tools.owner_class_context import resolve_owner_class_from_code_context
+    seen_keys: Set[str] = set()
+    for file_path in _candidate_member_header_files(code_context):
+        for edit in _member_declaration_edits_in_header(analysis_text, file_path):
+            key = str(edit.get("sync_init_name") or edit.get("old_text") or "")
+            if key and key in seen_keys:
+                continue
+            if key:
+                seen_keys.add(key)
+            edits.append(edit)
+    return edits
 
-    owner_ctx = resolve_owner_class_from_code_context(code_context) or {}
-    if not isinstance(owner_ctx, dict):
-        return edits
-    def_file = str(owner_ctx.get("definition_file", "")).strip()
-    if not def_file:
-        return edits
-    file_path = Path(def_file)
-    if not file_path.is_file():
-        return edits
+
+def _member_declaration_edits_in_header(
+    analysis_text: str,
+    file_path: Path,
+) -> List[Dict[str, Any]]:
+    """在一个头文件上提取 volatile 替换和新增同步成员。"""
+    edits: List[Dict[str, Any]] = []
     code_blocks = re.findall(r"```(?:cpp|c\+\+)?\s*\n(.*?)```", analysis_text or "", re.DOTALL)
     if not code_blocks:
         return edits
@@ -2181,6 +2418,7 @@ def _extract_member_declaration_edits(
                         "reason": f"将 {var_name} 从 volatile 改为 {atomic_type}，确保多线程原子性",
                     })
                     break
+    edits.extend(_extract_added_sync_member_edits(analysis_text, original, file_path))
     return edits
 
 
@@ -2627,6 +2865,7 @@ class CodeFixer:
             )
         fix_plan = repair_plan.to_dict()
         edits = fix_plan["edits"]
+        planned_members = _members_introduced_by_declaration_edits(edits)
         applied: List[Dict[str, Any]] = []
         tracker = file_context_tracker or self.file_context_tracker
         for edit_index, edit in enumerate(edits):
@@ -2771,6 +3010,17 @@ class CodeFixer:
                         record["backup_path"] = str(backup_path)
                 record["status"] = "applied"
                 record["replaced_preview"] = new_text
+                init_name = str(edit.get("sync_init_name") or "").strip()
+                init_type = str(edit.get("sync_init_type") or "").strip()
+                if init_name and init_type:
+                    init_note = _insert_mutex_create_beside_sibling(
+                        file_path,
+                        init_name,
+                        init_type,
+                        code_roots,
+                    )
+                    if init_note:
+                        record["init_note"] = init_note
                 applied.append(record)
                 continue
 
@@ -2895,6 +3145,7 @@ class CodeFixer:
                 applied.append(record)
                 continue
             allowed_members = _collect_allowed_member_names(original, code_context)
+            allowed_members.update(planned_members)
             replacement_code, member_err = _validate_and_fix_member_references(
                 original,
                 replacement_code,

@@ -36,7 +36,7 @@ from tools.crash_parser.abort_message import (
     thread_type_from_name,
 )
 from tools.crash_parser.meta import extract_crash_info
-from services.analyze_llm import truncate_analysis_prompt
+from services.analyze_llm import resolve_analysis_prompt_cap, truncate_analysis_prompt
 
 
 class TestAbortMessageAndHeapAbort(unittest.TestCase):
@@ -240,6 +240,20 @@ class TestPromptTruncateKeepsDiagnosis(unittest.TestCase):
         self.assertIn("getAttributeInfo", out)
         self.assertIn("输出要求", out)
         self.assertNotIn("## 变量相关函数", out)
+
+    def test_unset_cap_does_not_truncate(self) -> None:
+        """未配置时不再使用 12 万字符默认裁剪。"""
+        import os
+
+        saved = os.environ.pop("SA_MAX_PROMPT_CHARS", None)
+        try:
+            self.assertIsNone(resolve_analysis_prompt_cap(None))
+            self.assertIsNone(resolve_analysis_prompt_cap({}))
+            self.assertIsNone(resolve_analysis_prompt_cap({"max_prompt_chars": 0}))
+            self.assertEqual(resolve_analysis_prompt_cap({"max_prompt_chars": 8000}), 8000)
+        finally:
+            if saved is not None:
+                os.environ["SA_MAX_PROMPT_CHARS"] = saved
 
 
 class TestSameNameMethodNotCollapsed(unittest.TestCase):

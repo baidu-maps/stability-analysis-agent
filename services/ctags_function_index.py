@@ -255,7 +255,9 @@ class CtagsFunctionIndex:
             with open(index_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             mapping: Dict[str, List[Tuple[str, int]]] = {}
-            for name, locs in data.items():
+            # pop 渐进消费：避免 data 与 mapping 双份并存导致瞬态内存翻倍。
+            for name in list(data.keys()):
+                locs = data.pop(name)
                 mapping[name] = [(loc[0], loc[1]) for loc in locs]
             self._name_to_locs = mapping
             self._ready = True
@@ -279,11 +281,10 @@ class CtagsFunctionIndex:
         except Exception as exc:
             logger.debug("保存索引 JSON 失败: %s", exc)
 
-    def _save_cache(self, tags_text: str) -> None:
-        tags_path, meta_path = self._cache_paths()
+    def _save_build_meta(self) -> None:
+        """只写 meta.json；tags 文件由 ctags -f 直接落在缓存路径，无需读出再回写。"""
+        _, meta_path = self._cache_paths()
         try:
-            with open(tags_path, "w", encoding="utf-8") as f:
-                f.write(tags_text)
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(
                     {"roots": self.code_roots, "built_at": time.time()},
@@ -314,10 +315,12 @@ class CtagsFunctionIndex:
             if not ok:
                 self._ready = True
                 return
+            # 流式逐行解析 tags 文件：多 repo 大仓的 tags 可达 GB 级，
+            # 整文件 read() + splitlines() 会造成约 3-4 倍瞬时内存峰值。
+            # 缓存命中路径（_load_from_cache）本就走文件句柄，这里保持一致。
             with open(tags_path, "r", encoding="utf-8", errors="ignore") as handle:
-                tags_text = handle.read()
-            self._parse_tags_stream(tags_text.splitlines())
-            self._save_cache(tags_text)
+                self._parse_tags_stream(handle)
+            self._save_build_meta()  # tags 文件由 ctags -f 直接产出，只补写 meta
             self._save_index_json()  # 保存已解析索引，下次加载跳过 resolve
             self._ready = True
             logger.info(

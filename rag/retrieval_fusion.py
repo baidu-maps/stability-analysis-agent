@@ -31,6 +31,28 @@ def _confidence(hit: Dict[str, Any]) -> float:
     return _CONFIDENCE.get(str(hit.get("confidence") or "medium").lower(), 0.6)
 
 
+def _qualified_symbol_rank(hit: Dict[str, Any]) -> int:
+    """命中带 `::` 的函数符号时优先于只匹配路径或模块名的文档。"""
+    terms = hit.get("matched_terms") or []
+    if not isinstance(terms, list):
+        return 0
+    return 1 if any("::" in str(term) for term in terms) else 0
+
+
+def format_pack_knowledge_context(selected_hits: Sequence[Dict[str, Any]]) -> str:
+    """把融合后留下的代码库 Pack 文档拼成提示词段落。"""
+    blocks: List[str] = []
+    for hit in selected_hits:
+        if str(hit.get("backend") or "") != "pack_document":
+            continue
+        title = str(hit.get("title") or hit.get("path") or "").strip()
+        excerpt = str(hit.get("excerpt") or "").strip()
+        if not title or not excerpt:
+            continue
+        blocks.append(f"### {title}\n{excerpt}")
+    return "\n\n".join(blocks).strip()
+
+
 def _fingerprint(hit: Dict[str, Any]) -> str:
     if hit.get("pattern_id"):
         return f"pattern:{hit['pattern_id']}"
@@ -88,6 +110,8 @@ def _normalize(
                 str(hit.get("provenance") or hit.get("source_type") or ""), 0
             ),
             _SOURCE_RANK.get(str(hit.get("backend") or ""), 0),
+            # 函数符号命中优先于路径/模块命中，避免概览文档占满 code 层名额。
+            _qualified_symbol_rank(hit),
             # Pack 文档用检索分决定相关性；勿让 frontmatter confidence 盖过命中分。
             float(hit.get("score") or 0),
             float(hit.get("_confidence_numeric") or 0),

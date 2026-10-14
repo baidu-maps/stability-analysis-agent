@@ -1677,9 +1677,29 @@ class CodeContentProvider:
 
             # 提取函数名和签名
             function_name = self._extract_function_name_from_resolved(resolved_function)
+            extract_line = resolved_line
+            named_line_outside = False
+            if function_name and not function_name.startswith("operator"):
+                named_def = self._find_function_definition_line_by_name(
+                    lines, function_name, resolved_line - 1
+                )
+                if named_def is not None:
+                    named_body = self._extract_full_function_code(
+                        lines, named_def, target_function_name=function_name
+                    )
+                    named_span = (
+                        self._line_span_for_extracted_function_text(
+                            lines, named_body, named_def + 1
+                        )
+                        if named_body
+                        else None
+                    )
+                    if named_span and not (named_span[0] <= resolved_line <= named_span[1]):
+                        extract_line = named_def + 1
+                        named_line_outside = True
             function_signature = self._extract_function_signature(
                 lines,
-                resolved_line - 1,
+                extract_line - 1,
                 target_function_name=function_name,
             )
 
@@ -1766,7 +1786,7 @@ class CodeContentProvider:
             # 提取完整函数代码
             full_function = self._extract_full_function_code(
                 lines,
-                resolved_line - 1,
+                extract_line - 1,
                 target_function_name=function_name,
             )
             if not full_function:
@@ -1826,11 +1846,15 @@ class CodeContentProvider:
             
             # 提取崩溃行代码（重选行时限制在同一函数体内，避免窗口跨入相邻函数）
             fn_span = self._line_span_for_extracted_function_text(
-                lines, full_function, resolved_line
+                lines, full_function, extract_line
             )
             crash_line_code = ""
             display_line_no: Optional[int] = None
-            if resolved_line > 0 and resolved_line <= len(lines):
+            if named_line_outside:
+                display_line_no = extract_line
+                if 0 < extract_line <= len(lines):
+                    crash_line_code = lines[extract_line - 1].strip()
+            elif resolved_line > 0 and resolved_line <= len(lines):
                 crash_line_code = lines[resolved_line - 1].strip()
 
                 picked_line, picked_num = self._pick_best_crash_line_around(
@@ -1847,9 +1871,10 @@ class CodeContentProvider:
                 if picked_num and picked_num > 0:
                     display_line_no = picked_num
             
-            # 构建函数代码片段，并与 addr2line 行对齐（避免误扩到其它函数）
+            # 编译时行号落在其它函数里时，按符号函数定义对齐，不再扩到那一行。
+            anchor_line = extract_line if named_line_outside else resolved_line
             span = self._line_span_for_extracted_function_text(
-                lines, full_function, resolved_line
+                lines, full_function, anchor_line
             )
             if span:
                 s1, e1 = span
@@ -1858,13 +1883,13 @@ class CodeContentProvider:
                 raw_lines = [ln for ln in full_function.splitlines()]
                 while raw_lines and not raw_lines[-1].strip():
                     raw_lines.pop()
-                loc = self._locate_snippet_in_file(lines, raw_lines, resolved_line)
+                loc = self._locate_snippet_in_file(lines, raw_lines, anchor_line)
                 if loc:
                     s1, e1 = loc
                     function_snippet = raw_lines
                 else:
                     function_snippet, s1, e1 = self._ensure_snippet_covers_anchor_line(
-                        lines, resolved_line, raw_lines
+                        lines, anchor_line, raw_lines
                     )
             # 若片段未包含目标函数定义（常见于窗口降级），按函数名再次强制回提。
             if not self._snippet_contains_target_signature(function_snippet, function_name):
@@ -1881,7 +1906,7 @@ class CodeContentProvider:
                         forced_lines = [ln for ln in force_full.splitlines()]
                         while forced_lines and not forced_lines[-1].strip():
                             forced_lines.pop()
-                        loc = self._locate_snippet_in_file(lines, forced_lines, resolved_line)
+                        loc = self._locate_snippet_in_file(lines, forced_lines, anchor_line)
                         if loc:
                             s1, e1 = loc
                         else:
@@ -1892,6 +1917,16 @@ class CodeContentProvider:
             if self.max_code_length > 0:
                 function_snippet = self._truncate_snippet(function_snippet)
 
+            if (
+                named_line_outside
+                and function_name
+                and function_name not in (function_signature or "")
+            ):
+                for raw_line in function_snippet:
+                    head = raw_line.strip()
+                    if function_name in head:
+                        function_signature = head
+                        break
             eff_sig = self._effective_crash_signature(function_signature, resolved_function)
             return CrashFunction(
                 name=function_name,
@@ -3815,23 +3850,26 @@ class CodeContentProvider:
         seen: set = set()
         frames = flatten_resolved_frames_from_stack(add2line_data or {})
         roots_abs = _normalize_code_roots_arg(code_roots)
+        from tools.add2line_resolver_tool import expand_inlined_frame_dicts
+
         for frame in frames:
-            self._code_context_phase_check("stack_priority_source_files")
-            rf = (frame.get("resolved_file") or "").strip()
-            if not rf:
-                continue
-            if self._is_external_path(rf, roots_abs):
-                continue
-            abs_path = self._find_source_file(rf, code_roots) or rf
-            try:
-                ap = os.path.abspath(abs_path)
-            except Exception:
-                ap = abs_path
-            if ap in seen:
-                continue
-            if os.path.isfile(ap) and self._is_supported_file(ap):
-                seen.add(ap)
-                out.append(ap)
+            for loc in expand_inlined_frame_dicts(frame):
+                self._code_context_phase_check("stack_priority_source_files")
+                rf = (loc.get("resolved_file") or "").strip()
+                if not rf:
+                    continue
+                if self._is_external_path(rf, roots_abs):
+                    continue
+                abs_path = self._find_source_file(rf, code_roots) or rf
+                try:
+                    ap = os.path.abspath(abs_path)
+                except Exception:
+                    ap = abs_path
+                if ap in seen:
+                    continue
+                if os.path.isfile(ap) and self._is_supported_file(ap):
+                    seen.add(ap)
+                    out.append(ap)
         return out
 
     def _normalize_scan_file_list(self, paths: Optional[List[str]]) -> List[str]:
@@ -4103,6 +4141,21 @@ class CodeContentProvider:
         self._nearby_module_files_cache[_cache_key] = out
         return out
 
+    def _release_scan_caches(self) -> None:
+        """多 code_root 全仓扫描在仓间释放大对象缓存，使峰值内存≈最大单仓而非所有仓之和。
+
+        只清理「按源文件累积、体量随仓库规模增长」的缓存；函数定位 (_function_def_cache)
+        与调用链结果缓存 (_call_chain_cache) 体量小且跨仓/跨调用复用，保留不清。
+        """
+        try:
+            self._file_content_cache.clear()
+            self._file_content_cache_bytes = 0
+            self._class_info_by_source_cache.clear()
+            self._nearby_module_files_cache.clear()
+            self._cpp_candidate_files_cache.clear()
+        except Exception:
+            pass
+
     def _find_call_chain_functions_tree_sitter(
         self,
         crash_function_name: str,
@@ -4121,6 +4174,26 @@ class CodeContentProvider:
         call_chain_functions: List[CallChainFunction] = []
         if not (self._ts_parser and crash_function_name):
             return call_chain_functions
+
+        # 多 code_root 全仓扫描：逐仓扫描 + 仓间释放缓存，使峰值内存≈最大单仓而非所有仓之和；
+        # 跨仓调用链通过累积 CallChainFunction 结果保留（结果对象很小，不随仓库规模膨胀）。
+        if restrict_to_files is None and len(code_roots) > 1:
+            merged: List[CallChainFunction] = []
+            merged_keys: set = set()
+            for single_root in code_roots:
+                part = self._find_call_chain_functions_tree_sitter(
+                    crash_function_name,
+                    [single_root],
+                    restrict_to_files=None,
+                    exclude_files=exclude_files,
+                )
+                for cf in part:
+                    k = (cf.name, cf.file, cf.snippet[0] if cf.snippet else "")
+                    if k not in merged_keys:
+                        merged_keys.add(k)
+                        merged.append(cf)
+                self._release_scan_caches()
+            return merged
 
         simple_function_name = self._extract_simple_function_name(crash_function_name)
         demangled = self._extract_simple_name_from_mangled(simple_function_name)
@@ -4985,6 +5058,22 @@ class CodeContentProvider:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         out: List[CallChainFunction] = []
+
+        # 多 code_root 全仓扫描：逐仓扫描 + 仓间释放缓存，峰值内存≈最大单仓而非所有仓之和。
+        # 复用传入的 seen_caller_keys 做跨仓去重，结果 out 累积保留跨仓调用链。
+        if restrict_to_files is None and len(code_roots) > 1:
+            for single_root in code_roots:
+                out.extend(
+                    self._regex_scan_callers_in_paths(
+                        simple_function_name,
+                        [single_root],
+                        None,
+                        exclude_files,
+                        seen_caller_keys,
+                    )
+                )
+                self._release_scan_caches()
+            return out
 
         # === rg 快速预筛：仅全仓扫描（restrict_to_files=None）时启用 ===
         rg_prefiltered = False
@@ -7935,51 +8024,56 @@ class CodeContentProvider:
 
         from tools.resolve_stack_errors import flatten_resolved_frames_from_stack
 
+        from tools.add2line_resolver_tool import expand_inlined_frame_dicts
+
+        stop_stack = False
         for frame in flatten_resolved_frames_from_stack(add2line_data):
-            if not isinstance(frame, dict):
-                continue
-            rfile = str(frame.get("resolved_file") or "").strip()
-            try:
-                rline = int(frame.get("resolved_line") or 0)
-            except (TypeError, ValueError):
-                rline = 0
-            rfunc = str(frame.get("resolved_function") or "").strip()
-            if not rfile or rline <= 0 or not rfunc:
-                continue
-            actual = self._find_source_file(rfile, code_roots) if code_roots else rfile
-            if not actual or not os.path.isfile(actual):
-                continue
-            if code_roots:
-                try:
-                    if not _file_under_any_project_root(Path(actual), code_roots):
-                        continue
-                except (OSError, ValueError):
-                    continue
-            simple = self._extract_function_name_from_resolved(rfunc)
-            if not simple:
-                continue
-            try:
-                self._code_context_phase_check("degraded_graph_add2line_frame")
-            except _CodeContextPhaseTimeout:
-                logger.warning("降级图构建因阶段超时提前结束（已保留已收集节点）")
+            if stop_stack or not isinstance(frame, dict):
                 break
-            cf_stack = self._extract_crash_function(rfunc, actual, rline, code_roots)
-            if cf_stack is None or not cf_stack.snippet:
-                continue
-            sig = _normalize_signature(cf_stack.signature, simple)
-            nid = func_node_id(simple, actual, sig)
-            if nid not in nodes:
-                nodes[nid] = GraphNode(
-                    id=nid,
-                    type="function",
-                    name=simple,
-                    file=actual,
-                    signature=sig,
-                    snippet=cf_stack.snippet,
-                    snippet_start_line=getattr(cf_stack, "snippet_start_line", None),
-                    snippet_end_line=getattr(cf_stack, "snippet_end_line", None),
-                )
-            stack_ids.append(nid)
+            for loc in expand_inlined_frame_dicts(frame):
+                rfile = str(loc.get("resolved_file") or "").strip()
+                try:
+                    rline = int(loc.get("resolved_line") or 0)
+                except (TypeError, ValueError):
+                    rline = 0
+                rfunc = str(loc.get("resolved_function") or "").strip()
+                if not rfile or rline <= 0 or not rfunc:
+                    continue
+                actual = self._find_source_file(rfile, code_roots) if code_roots else rfile
+                if not actual or not os.path.isfile(actual):
+                    continue
+                if code_roots:
+                    try:
+                        if not _file_under_any_project_root(Path(actual), code_roots):
+                            continue
+                    except (OSError, ValueError):
+                        continue
+                simple = self._extract_function_name_from_resolved(rfunc)
+                if not simple:
+                    continue
+                try:
+                    self._code_context_phase_check("degraded_graph_add2line_frame")
+                except _CodeContextPhaseTimeout:
+                    logger.warning("降级图构建因阶段超时提前结束（已保留已收集节点）")
+                    stop_stack = True
+                    break
+                cf_stack = self._extract_crash_function(rfunc, actual, rline, code_roots)
+                if cf_stack is None or not cf_stack.snippet:
+                    continue
+                sig = _normalize_signature(cf_stack.signature, simple)
+                nid = func_node_id(simple, actual, sig)
+                if nid not in nodes:
+                    nodes[nid] = GraphNode(
+                        id=nid,
+                        type="function",
+                        name=simple,
+                        file=actual,
+                        signature=sig,
+                        snippet=cf_stack.snippet,
+                        snippet_start_line=getattr(cf_stack, "snippet_start_line", None),
+                        snippet_end_line=getattr(cf_stack, "snippet_end_line", None),
+                    )
+                stack_ids.append(nid)
 
         seen_stack: set = set()
         ordered: List[str] = []
@@ -9126,26 +9220,29 @@ class CodeContentProvider:
                 has_business_frames = False
                 call_chain: List[str] = []
                 frame_details: List[Dict[str, Any]] = []
+                from tools.add2line_resolver_tool import expand_inlined_frame_dicts
+
                 for frame in rt.get("frames") or []:
                     if not isinstance(frame, dict):
                         continue
-                    module = str(frame.get("module") or "")
-                    if module and not self._is_probably_system_module_name(module):
-                        has_business_frames = True
-                    resolved_function = (
-                        frame.get("resolved_function") or frame.get("function") or ""
-                    )
-                    if not str(resolved_function).strip():
-                        continue
-                    call_chain.append(str(resolved_function))
-                    frame_details.append(
-                        {
-                            "resolved_function": resolved_function,
-                            "resolved_file": frame.get("resolved_file", "") or "",
-                            "resolved_line": int(frame.get("resolved_line") or 0),
-                            "module": module,
-                        }
-                    )
+                    for loc in expand_inlined_frame_dicts(frame):
+                        module = str(loc.get("module") or "")
+                        if module and not self._is_probably_system_module_name(module):
+                            has_business_frames = True
+                        resolved_function = (
+                            loc.get("resolved_function") or loc.get("function") or ""
+                        )
+                        if not str(resolved_function).strip():
+                            continue
+                        call_chain.append(str(resolved_function))
+                        frame_details.append(
+                            {
+                                "resolved_function": resolved_function,
+                                "resolved_file": loc.get("resolved_file", "") or "",
+                                "resolved_line": int(loc.get("resolved_line") or 0),
+                                "module": module,
+                            }
+                        )
                 if not call_chain:
                     continue
                 thread_contexts.append(
@@ -9169,17 +9266,20 @@ class CodeContentProvider:
         crash_thread_id = str(add2line_data.get("crash_thread_id") or "unknown")
         crash_call_chain = []
         frame_details = []
+        from tools.add2line_resolver_tool import expand_inlined_frame_dicts
+
         for frame in resolved_frames:
-            resolved_function = frame.get("resolved_function", "")
-            if resolved_function:
-                crash_call_chain.append(resolved_function)
-                frame_details.append(
-                    {
-                        "resolved_function": resolved_function,
-                        "resolved_file": frame.get("resolved_file", "") or "",
-                        "resolved_line": int(frame.get("resolved_line") or 0),
-                    }
-                )
+            for loc in expand_inlined_frame_dicts(frame):
+                resolved_function = loc.get("resolved_function", "")
+                if resolved_function:
+                    crash_call_chain.append(resolved_function)
+                    frame_details.append(
+                        {
+                            "resolved_function": resolved_function,
+                            "resolved_file": loc.get("resolved_file", "") or "",
+                            "resolved_line": int(loc.get("resolved_line") or 0),
+                        }
+                    )
         if crash_call_chain:
             thread_contexts.append(
                 ThreadContext(
@@ -10049,6 +10149,85 @@ class CodeContentProvider:
 
         return json_result
 
+    def _promote_inline_project_frame(
+        self,
+        frame: Dict[str, Any],
+        code_roots: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        """栈帧文件不在代码库时，改用内联进工程源码的调用者。"""
+        raw = frame.get("inline_frames")
+        if not isinstance(raw, list) or not code_roots:
+            return None
+        roots = _normalize_code_roots_arg(code_roots)
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            function = str(item.get("function") or "").strip()
+            file_path = str(item.get("file") or "").strip()
+            if not function or not file_path:
+                continue
+            if not self._is_cpp_native_symbol(function):
+                continue
+            if self._is_standard_library_cpp_symbol(function):
+                continue
+            if self._is_external_path(file_path, roots):
+                continue
+            actual = self._find_source_file(file_path, code_roots)
+            if not actual:
+                continue
+            try:
+                if not _file_under_any_project_root(Path(actual), code_roots):
+                    continue
+            except (OSError, ValueError):
+                continue
+            try:
+                line_no = int(item.get("line") or 0)
+            except (TypeError, ValueError):
+                line_no = 0
+            if line_no <= 0:
+                continue
+            promoted = dict(frame)
+            promoted["resolved_function"] = function
+            promoted["function"] = function
+            promoted["resolved_file"] = actual
+            promoted["file"] = actual
+            promoted["resolved_line"] = line_no
+            promoted["line"] = line_no
+            promoted["crash_location_source"] = "from_add2line"
+            promoted["inline_project_frame"] = True
+            promoted["inlined_instruction_function"] = str(
+                frame.get("resolved_function") or frame.get("function") or ""
+            ).strip()
+            promoted["inlined_instruction_file"] = str(
+                frame.get("resolved_file") or ""
+            ).strip()
+            promoted["inlined_instruction_line"] = frame.get("resolved_line")
+            rest = [entry for entry in raw if entry is not item]
+            promoted["inline_frames"] = rest or None
+            return promoted
+        return None
+
+    def _keep_inline_project_frame(
+        self,
+        frame: Dict[str, Any],
+        code_roots: List[str],
+        filtered_frames: List[Dict[str, Any]],
+        kept_original_indices: List[int],
+        original_idx: int,
+    ) -> bool:
+        """内联工程函数能对上代码库时，用它替换被丢弃的栈帧。"""
+        promoted = self._promote_inline_project_frame(frame, code_roots)
+        if promoted is None:
+            return False
+        filtered_frames.append(promoted)
+        kept_original_indices.append(original_idx)
+        logger.info(
+            "帧[%s] 源文件不在代码库，改用内联工程函数: %s",
+            original_idx,
+            promoted.get("resolved_function"),
+        )
+        return True
+
     def _select_topmost_locatable_crash_frame(
         self,
         resolved_frames: List[Dict[str, Any]],
@@ -10056,6 +10235,7 @@ class CodeContentProvider:
     ) -> Optional[Dict[str, Any]]:
         """
         从栈顶向下选取第一个能在 code_roots 中定位的 C++ 帧（与主路径崩溃函数策略一致）。
+        栈帧文件不在代码库时，先用内联进工程源码的调用者。
         """
         if not resolved_frames or not code_roots:
             return None
@@ -10089,6 +10269,9 @@ class CodeContentProvider:
                         out["resolved_line"] = rline_int
                         out["crash_location_source"] = "from_add2line"
                         return out
+            promoted = self._promote_inline_project_frame(candidate, code_roots)
+            if promoted is not None:
+                return promoted
             if symbol_only_rescue_attempts >= max_symbol_only_rescues:
                 continue
             if self._is_probably_system_module_name(module_c):
@@ -10288,6 +10471,14 @@ class CodeContentProvider:
                     # 例如 NDK/STL 头文件（.../Android/sdk/.../sysroot/usr/include/...），
                     # 不在当前 code_root 中查找，也不保留到 03，避免噪音污染。
                     if self._is_external_path(resolved_file, code_roots_abs_strs):
+                        if self._keep_inline_project_frame(
+                            frame,
+                            code_roots_abs_strs,
+                            filtered_frames,
+                            kept_original_indices,
+                            original_idx,
+                        ):
+                            continue
                         self._append_external_frame_semantic_hint(
                             semantic_hints, original_idx, frame
                         )
@@ -10342,6 +10533,14 @@ class CodeContentProvider:
                                 )
                             except ValueError:
                                 # 文件不在代码目录中，跳过；仍写入外部语义 hint，避免 05 帧号断档
+                                if self._keep_inline_project_frame(
+                                    frame,
+                                    code_roots_abs_strs,
+                                    filtered_frames,
+                                    kept_original_indices,
+                                    original_idx,
+                                ):
+                                    continue
                                 skipped_count += 1
                                 self._append_external_frame_semantic_hint(
                                     semantic_hints, original_idx, frame
@@ -10358,6 +10557,14 @@ class CodeContentProvider:
                             )
                     else:
                         # 未找到文件，跳过该帧；若有符号仍写 hint（常见于工具链路径）
+                        if self._keep_inline_project_frame(
+                            frame,
+                            code_roots_abs_strs,
+                            filtered_frames,
+                            kept_original_indices,
+                            original_idx,
+                        ):
+                            continue
                         skipped_count += 1
                         if self._is_cpp_native_symbol(str(frame.get("resolved_function") or "")):
                             self._append_external_frame_semantic_hint(

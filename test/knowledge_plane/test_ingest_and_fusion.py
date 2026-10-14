@@ -5,7 +5,7 @@ from pathlib import Path
 
 from knowledge_plane.ingest import ingest_pack_dirs
 from rag.memory_retriever import collect_memory_context
-from rag.retrieval_fusion import fuse_retrieval_hits
+from rag.retrieval_fusion import format_pack_knowledge_context, fuse_retrieval_hits
 from rag.vector_database_integration import AIStabilityAnalyzerWithVectorDB
 
 
@@ -112,6 +112,38 @@ RenderEngine::Draw stops before context release.
             [item["title"] for item in result["selected_hits"]],
             ["code", "verified", "playbook"],
         )
+
+    def test_symbol_matched_pack_doc_fills_code_slot_before_overview(self):
+        """函数符号命中应占住 code 层名额，而不是让更高分的路径概览挤掉它。"""
+        def pack(title, path, score, terms):
+            return {
+                "backend": "pack_document",
+                "layer": "code",
+                "pack_id": "engine-dev",
+                "path": path,
+                "title": title,
+                "excerpt": title,
+                "confidence": "high",
+                "provenance": "code",
+                "score": score,
+                "matched_terms": terms,
+            }
+
+        result = fuse_retrieval_hits(
+            rule_hits=[],
+            pack_hits=[
+                pack("概览", "overview.md", 10.0, ["vmap", "engine-dev"]),
+                pack("销毁顺序", "teardown.md", 10.0, ["CVMapControl::RemoveMapControl"]),
+                pack("加载任务链表", "grid.md", 9.5, ["CGridLayer::CancelTask"]),
+            ],
+            vector_hits=[],
+            layer_limits={"code": 2, "crash": 2, "concept": 2},
+        )
+        titles = [item["title"] for item in result["selected_hits"]]
+        self.assertEqual(titles, ["销毁顺序", "加载任务链表"])
+        self.assertIn("加载任务链表", format_pack_knowledge_context(result["selected_hits"]))
+        dropped = [item["hit"]["title"] for item in result["filtered_hits"]]
+        self.assertIn("概览", dropped)
 
     def test_domain_switch_excludes_pack_vectors(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -211,6 +211,95 @@ class TestBuildCrashSummaryView(unittest.TestCase):
         self.assertEqual(summary["crash_line_number"], 10)
         self.assertEqual(summary["crash_location_source"], "from_add2line")
 
+    def test_header_line_is_not_pasted_onto_business_function(self):
+        """模板头行号不得贴到已定位的业务函数上。"""
+        add2line_result = {
+            "resolved_threads": [
+                {
+                    "is_crash_thread": True,
+                    "frames": [
+                        {
+                            "resolved_function": "std::shared_ptr<T>::operator->()",
+                            "resolved_file": "/opt/ndk/include/shared_ptr.h",
+                            "resolved_line": 721,
+                            "resolution_kind": "addr2line",
+                        }
+                    ],
+                }
+            ],
+        }
+        code_context = {
+            "graph": {
+                "nodes": [
+                    {
+                        "type": "function",
+                        "file": "/src/VMapControl.cpp",
+                        "signature": "void RemoveMapControl()",
+                        "snippet_start_line": 2349,
+                        "snippet_end_line": 2424,
+                        "snippet": ["void RemoveMapControl() {"],
+                    }
+                ]
+            }
+        }
+        summary = build_crash_summary_view(
+            {"crash_info": {"signal": "11 (SIGSEGV)"}},
+            add2line_result,
+            code_context,
+        )
+        self.assertEqual(summary["crash_line_number"], 2349)
+        self.assertTrue(summary.get("compile_line_outside"))
+        self.assertNotEqual(summary["analysis_entry_line_number"], 721)
+        self.assertIn("RemoveMapControl", summary["analysis_entry_function"])
+        self.assertNotIn("inlined_instruction_function", summary)
+
+    def test_inline_project_frame_marks_instruction(self):
+        """内联到工程文件时，崩溃函数保持该文件，并记下内联指令。"""
+        add2line_result = {
+            "resolved_threads": [
+                {
+                    "is_crash_thread": True,
+                    "frames": [
+                        {
+                            "resolved_function": "std::shared_ptr<CVTask>::operator->()",
+                            "resolved_file": "/opt/ndk/include/shared_ptr.h",
+                            "resolved_line": 721,
+                            "resolution_kind": "addr2line",
+                            "inline_frames": [
+                                {
+                                    "function": "CGridLayer::CancelTask(bool)",
+                                    "file": "/root/ONLINE/src/GridLayer.cpp",
+                                    "line": 4103,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        code_context = {
+            "graph": {
+                "nodes": [
+                    {
+                        "type": "function",
+                        "file": "/src/GridLayer.cpp",
+                        "signature": "void CGridLayer::CancelTask(bool)",
+                        "snippet_start_line": 5278,
+                        "snippet_end_line": 5304,
+                        "snippet": ["void CGridLayer::CancelTask(bool wait) {"],
+                    }
+                ]
+            }
+        }
+        summary = build_crash_summary_view(
+            {"crash_info": {"signal": "11 (SIGSEGV)"}},
+            add2line_result,
+            code_context,
+        )
+        self.assertIn("CancelTask", summary["analysis_entry_function"])
+        self.assertIn("GridLayer.cpp", summary["analysis_entry_file"])
+        self.assertIn("operator->", summary["inlined_instruction_function"])
+
 
 if __name__ == "__main__":
     unittest.main()

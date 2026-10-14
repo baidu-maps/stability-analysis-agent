@@ -489,6 +489,7 @@ def _extract_stack_summary(
                 "address": fr.get("address"),
                 "file": fr.get("resolved_file") or fr.get("file"),
                 "line": fr.get("resolved_line") or fr.get("line"),
+                "inline_frames": fr.get("inline_frames"),
             })
 
     if not top_frames:
