@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 from services.agent_context_loop import CallableContextLoopHooks, ContextLoopConfig, run_agent_context_loop
+from services.analyze_llm import analysis_token_attempts, output_looks_truncated
 from services.context_engine import (
     CallableContextResolver,
     ContextEngine,
@@ -628,6 +629,56 @@ class AgentContextLoopTests(unittest.TestCase):
         self.assertEqual(out.termination_reason, "prompt_capacity_exceeded")
         self.assertIn("提示容量不足", out.rounds[-1]["prompt"])
         self.assertNotIn("摘要必须完整保留\n摘要必须完整保留", out.rounds[-1]["prompt"])
+
+    def test_first_round_keeps_crash_function_and_drops_unrelated_giant(self):
+        """第一轮保留崩溃函数全文，与崩溃无关的超长函数只留签名。"""
+        giant = "void CVMapControl::Draw() {\n" + ("    draw_pad();\n" * 2000)
+        crash = "void CGridLayer::CancelTask(bool wait) {\n    crash_body();\n}\n"
+        prompt = (
+            "## 崩溃摘要\n"
+            "VVoid CGridLayer::CancelTask(bool wait)\n"
+            "## 函数源码\n"
+            "#### 函数源码: void CVMapControl::Draw()\n"
+            "- 文件: VMapControl.cpp\n"
+            "- 代码片段:\n"
+            + giant
+            + "#### 函数源码: void CGridLayer::CancelTask(bool wait)\n"
+            "- 代码片段:\n"
+            + crash
+            + "## 本轮任务\n继续\n"
+        )
+        packed = ContextEngine._slim_unanchored_function_source(prompt)
+        self.assertIn("crash_body", packed)
+        self.assertNotIn("draw_pad", packed)
+        self.assertIn("未放入函数体", packed)
+        self.assertIn("CVMapControl::Draw", packed)
+
+    def test_followup_round_sends_prior_analysis_without_function_bodies(self):
+        """第二轮带上上一轮分析，不再重发函数全文。"""
+        body = "void CGridLayer::CancelTask(bool wait) {\n" + ("    keep_me();\n" * 40)
+        prompt = (
+            "## 崩溃摘要\nCancelTask\n"
+            "## 函数源码\n"
+            "#### 函数源码: void CGridLayer::CancelTask(bool wait)\n"
+            + body
+            + "\n## 本轮任务\n继续\n"
+        )
+        packed = ContextEngine._fold_prior_analysis(
+            prompt, "上一轮结论：CancelTask 无锁遍历。"
+        )
+        self.assertIn("上一轮结论：CancelTask 无锁遍历。", packed)
+        self.assertIn("已发送源码索引", packed)
+        self.assertIn("CGridLayer::CancelTask", packed)
+        self.assertNotIn("keep_me", packed)
+
+    def test_analysis_retry_does_not_resend_a_full_answer(self):
+        """输出超过请求上限说明网关没截断，不能把同一份提示再打一遍。"""
+        attempts = analysis_token_attempts(4096)
+        self.assertEqual(attempts[0], 12288)
+        self.assertNotIn(2048, attempts)
+        self.assertNotIn(4096, attempts)
+        self.assertFalse(output_looks_truncated(5533, 4096))
+        self.assertTrue(output_looks_truncated(4000, 4096))
 
 
 if __name__ == "__main__":

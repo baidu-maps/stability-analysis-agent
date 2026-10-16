@@ -13,6 +13,34 @@ from cli.phase_spinner import PhaseSpinner
 logger = logging.getLogger(__name__)
 
 
+# 七段报告加修复代码大约 6k～8k token。配置里的 4096 会判成截断，
+# 旧逻辑再降到 2048 后第三次才放行，同一份提示被完整生成三遍。
+ANALYSIS_OUTPUT_TOKEN_FLOOR = 12288
+ANALYSIS_OUTPUT_TOKEN_RAISE = 16384
+
+
+def analysis_token_attempts(configured_max_tokens: int) -> List[Optional[int]]:
+    """分析阶段的输出预算只升不降。"""
+    configured = max(0, int(configured_max_tokens or 0))
+    first = max(ANALYSIS_OUTPUT_TOKEN_FLOOR, configured) if configured else ANALYSIS_OUTPUT_TOKEN_FLOOR
+    attempts: List[Optional[int]] = [first]
+    if ANALYSIS_OUTPUT_TOKEN_RAISE > first:
+        attempts.append(ANALYSIS_OUTPUT_TOKEN_RAISE)
+    attempts.append(None)
+    return attempts
+
+
+def output_looks_truncated(completion_tokens: int, max_tokens: Optional[int]) -> bool:
+    """实际输出超过请求上限时，说明网关没有执行上限，这次已经是完整回答。"""
+    if max_tokens is None or int(max_tokens) <= 0:
+        return False
+    produced = int(completion_tokens or 0)
+    requested = int(max_tokens)
+    if produced > requested:
+        return False
+    return produced >= requested * 0.95
+
+
 def resolve_analysis_prompt_cap(problem: Optional[Dict[str, Any]]) -> Optional[int]:
     """只在显式配置为正数时裁剪提示。未配置时不再做二次裁剪。"""
     raw = problem.get("max_prompt_chars") if isinstance(problem, dict) else None
@@ -171,12 +199,7 @@ def call_analyze_llm_with_retries(
         )
     except Exception:
         configured_max_tokens = 0
-    first_try_tokens = min(8192, configured_max_tokens) if configured_max_tokens > 0 else 8192
-    token_attempts: List[Optional[int]] = [first_try_tokens]
-    for candidate in (4096, 2048):
-        if candidate not in token_attempts and candidate < first_try_tokens:
-            token_attempts.append(candidate)
-    token_attempts.append(None)
+    token_attempts = analysis_token_attempts(configured_max_tokens)
 
     router_state = problem.get("_llm_router_state") if isinstance(problem, dict) else None
     max_endpoint_attempts = 1
@@ -204,7 +227,7 @@ def call_analyze_llm_with_retries(
                 if max_tokens is not None and llm_response is not None:
                     usage = getattr(llm_response, "usage", None) or {}
                     completion_tokens = usage.get("completion_tokens", 0) or 0
-                    if completion_tokens >= max_tokens * 0.95:
+                    if output_looks_truncated(completion_tokens, max_tokens):
                         logger.warning(
                             "LLM output likely truncated (completion_tokens=%s, max_tokens=%s), retrying",
                             completion_tokens,

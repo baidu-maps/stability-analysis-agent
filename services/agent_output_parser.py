@@ -2,30 +2,94 @@
 from __future__ import annotations
 
 import json
-import re
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from services.agent_schema import CONTEXT_REQUEST_TYPES, AgentDecision, AnalysisReport, ContextRequest
 
 
-def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """Best-effort JSON object extraction from model text."""
-    raw = str(text or "").strip()
-    if not raw:
+def _skip_json_string(text: str, index: int) -> Optional[int]:
+    """Return the index after a JSON string starting at ``index``."""
+    if index >= len(text) or text[index] != '"':
         return None
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL | re.I)
-    if fence:
-        raw = fence.group(1).strip()
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start < 0 or end <= start:
+    i = index + 1
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == '"':
+            return i + 1
+        i += 1
+    return None
+
+
+def _match_object_end(text: str, start: int) -> Optional[int]:
+    """Return the closing brace index for the object that starts at ``start``."""
+    if start >= len(text) or text[start] != "{":
         return None
-    try:
-        value = json.loads(raw[start : end + 1])
-        return value if isinstance(value, dict) else None
-    except (TypeError, ValueError):
+    depth = 0
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if ch == '"':
+            nxt = _skip_json_string(text, i)
+            if nxt is None:
+                return None
+            i = nxt
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _json_objects(text: str) -> List[Dict[str, Any]]:
+    """Return maximal JSON objects, ignoring braces that do not form JSON."""
+    raw = str(text or "")
+    found: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(raw):
+        if raw[i] != "{":
+            i += 1
+            continue
+        end = _match_object_end(raw, i)
+        if end is None:
+            i += 1
+            continue
+        try:
+            value = json.loads(raw[i : end + 1])
+        except (TypeError, ValueError):
+            value = None
+        if isinstance(value, dict):
+            found.append(value)
+            i = end + 1
+            continue
+        i += 1
+    return found
+
+
+def extract_json_object(text: str, *, prefer_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Pick one JSON object from model text.
+
+    A trailing control contract is preferred when it contains a boolean
+    ``agent_can_fetch_more``. ``prefer_key`` selects another object first,
+    so a repair plan is not replaced by that contract. Braces in prose or
+    ``cpp`` fences are ignored unless they themselves parse as JSON.
+    """
+    objects = _json_objects(text)
+    if not objects:
         return None
+    if prefer_key:
+        for obj in reversed(objects):
+            if prefer_key in obj:
+                return obj
+    for obj in reversed(objects):
+        if isinstance(obj.get("agent_can_fetch_more"), bool):
+            return obj
+    return objects[-1]
 
 
 def parse_agent_decision(
@@ -85,10 +149,10 @@ def parse_agent_decision(
 
 def parse_analysis_report(analysis_text: str) -> Tuple[Optional[AnalysisReport], Optional[str]]:
     """Parse optional structured analysis report from final LLM output."""
-    payload = extract_json_object(analysis_text)
-    if not payload:
-        return None, "no_json_object"
-    nested = payload.get("analysis_report")
-    if isinstance(nested, dict):
-        payload = nested
-    return AnalysisReport.from_mapping(payload)
+    report_keys = ("summary_zh", "summary", "root_cause", "root_cause_zh")
+    for obj in reversed(_json_objects(analysis_text)):
+        nested = obj.get("analysis_report")
+        candidate = nested if isinstance(nested, dict) else obj
+        if any(candidate.get(key) for key in report_keys):
+            return AnalysisReport.from_mapping(candidate)
+    return None, "no_json_object"

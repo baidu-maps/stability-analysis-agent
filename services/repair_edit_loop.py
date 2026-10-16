@@ -110,9 +110,9 @@ def revise_fix_plan_with_llm(
         content = str(getattr(response, "content", response) or "")
     except Exception as exc:
         return None, f"llm revision failed: {exc}"
-    payload = extract_json_object(content)
-    if not isinstance(payload, dict):
-        nested = extract_json_object(analysis_text)
+    payload = extract_json_object(content, prefer_key="edits")
+    if not isinstance(payload, dict) or not isinstance(payload.get("edits"), list):
+        nested = extract_json_object(analysis_text, prefer_key="edits")
         if isinstance(nested, dict) and isinstance(nested.get("edits"), list):
             payload = nested
         else:

@@ -109,6 +109,7 @@ def run_agent_context_loop(
             evidence_delta=evidence_delta,
             is_final_round=(round_index + 1 >= max_rounds - 1),
             early_final_reason=("max_rounds" if round_index + 1 >= max_rounds - 1 else None),
+            prior_analysis=previous_analysis,
         )
         if trace is not None:
             payload = {
@@ -197,6 +198,7 @@ def run_agent_context_loop(
                 stable_prompt,
                 is_final_round=True,
                 early_final_reason="max_rounds",
+                prior_analysis=previous_analysis,
             )
         if getattr(context_engine, "prompt_capacity_exceeded", False):
             turn = ContextTurn(
@@ -338,6 +340,7 @@ def run_agent_context_loop(
                 stable_prompt,
                 is_final_round=True,
                 early_final_reason="invalid_schema",
+                prior_analysis=previous_analysis,
             )
             continue
         if not requested_more:
@@ -361,6 +364,7 @@ def run_agent_context_loop(
                 stable_prompt,
                 is_final_round=True,
                 early_final_reason="invalid_schema",
+                prior_analysis=previous_analysis,
             )
             continue
 
@@ -402,6 +406,7 @@ def run_agent_context_loop(
             evidence_delta=evidence_delta,
             is_final_round=force_final_reason is not None,
             early_final_reason=force_final_reason,
+            prior_analysis=previous_analysis,
         )
 
     if context_engine.session.status == "running":

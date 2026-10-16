@@ -36,6 +36,12 @@ DEFAULT_OUTPUT_RESERVE_TOKENS = 8192
 PROMPT_CAPACITY_STOP = (
     "提示容量不足：契约与崩溃摘要无法完整放入模型上下文，已停止发送，避免提交残缺内容。"
 )
+# 不在崩溃栈或写路径上的函数，超过该长度只留签名。崩溃函数本身再长也整段保留。
+_OVERSIZED_FUNCTION_CHARS = 6000
+_QUALIFIED_SYMBOL_RE = re.compile(
+    r"\b((?:~?[A-Za-z_][A-Za-z0-9_]*)(?:::(?:~?[A-Za-z_][A-Za-z0-9_]*))+)"
+)
+_LONG_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{7,})\s*\(")
 
 
 def default_prompt_char_budget(config: Optional[Dict[str, Any]] = None) -> int:
@@ -1113,6 +1119,8 @@ class ContextEngine:
             "崩溃分析任务",
             "本轮任务",
             "输出契约",
+            "已发送源码索引",
+            "上一轮分析",
         )
         return any(token in title for token in mandatory)
 
@@ -1183,6 +1191,128 @@ class ContextEngine:
                 return packed
         return PROMPT_CAPACITY_STOP
 
+    @staticmethod
+    def _function_source_span(text: str) -> Optional[Tuple[int, int]]:
+        """定位「## 函数源码」整节，不含后面的其它二级标题。"""
+        marker = "## 函数源码"
+        start = text.find(marker)
+        if start < 0:
+            return None
+        rest = text[start + len(marker):]
+        nxt = re.search(r"\n## ", rest)
+        end = len(text) if nxt is None else start + len(marker) + nxt.start()
+        return start, end
+
+    @staticmethod
+    def _anchor_symbols(text: str) -> set:
+        """从崩溃摘要和写路径清单抽出必须保留全文的函数名。
+
+        只认后面紧跟 ``(`` 的符号，避免把 ``CVMapControl*`` 这种类型名当成锚点，
+        从而把同类里的 Draw、Update 整段留下。
+        """
+        source = text or ""
+        names: set = set()
+        for match in _QUALIFIED_SYMBOL_RE.finditer(source):
+            qualified = match.group(1)
+            if not source[match.end():].lstrip().startswith("("):
+                continue
+            names.add(qualified)
+            tail = qualified.split("::")[-1].lstrip("~")
+            if len(tail) >= 8:
+                names.add(tail)
+        for match in _LONG_CALL_RE.finditer(source):
+            names.add(match.group(1))
+        return names
+
+    @staticmethod
+    def _function_block_anchored(title: str, anchors: set) -> bool:
+        """标题里出现崩溃栈或写路径符号时保留全文。"""
+        return any(name and name in title for name in anchors)
+
+    @classmethod
+    def _abbreviate_function_block(cls, block: str) -> str:
+        """超长且无关的函数只留文件、标签和签名。"""
+        lines = str(block or "").splitlines()
+        title = lines[0] if lines else "#### 函数源码"
+        meta: List[str] = []
+        signature = ""
+        for line in lines[1:]:
+            if line.startswith("- 代码片段"):
+                continue
+            if line.startswith("- "):
+                meta.append(line)
+                continue
+            if line.strip():
+                signature = line.strip()
+                break
+        kept = [title, *meta]
+        kept.append(
+            "- 未放入函数体：不在崩溃栈或写路径上，且全文过长。"
+            "需要全文时用 context_request 指定该符号。"
+        )
+        if signature:
+            kept.append("- 签名: `" + signature + "`")
+        return "\n".join(kept).rstrip() + "\n"
+
+    @classmethod
+    def _slim_function_blocks(cls, section: str, anchors: set) -> str:
+        """压缩「## 函数源码」里与本次崩溃无关的超长函数。"""
+        parts = re.split(r"(?=^#### 函数源码:)", section, flags=re.M)
+        if len(parts) <= 1:
+            return section
+        rendered = [parts[0]]
+        for block in parts[1:]:
+            title = block.splitlines()[0] if block.splitlines() else ""
+            anchored = cls._function_block_anchored(title, anchors)
+            if anchored or len(block) <= _OVERSIZED_FUNCTION_CHARS:
+                rendered.append(block if block.endswith("\n") else block + "\n")
+                continue
+            rendered.append(cls._abbreviate_function_block(block))
+        return "".join(rendered)
+
+    @classmethod
+    def _slim_unanchored_function_source(cls, text: str) -> str:
+        """第一轮保留崩溃相关全文，其余超长函数改成签名。"""
+        span = cls._function_source_span(text)
+        if span is None:
+            return text
+        start, end = span
+        anchors = cls._anchor_symbols(text[:start])
+        slimmed = cls._slim_function_blocks(text[start:end], anchors)
+        return text[:start] + slimmed + text[end:]
+
+    @classmethod
+    def _index_function_source(cls, text: str) -> str:
+        """后续轮用符号索引替换已经发过的函数全文。"""
+        span = cls._function_source_span(text)
+        if span is None:
+            return text
+        start, end = span
+        section = text[start:end]
+        titles = re.findall(r"^#### 函数源码:\s*(.+)$", section, flags=re.M)
+        lines = [
+            "## 已发送源码索引",
+            "下列符号已在上一轮提示中出现，本轮不重复粘贴函数体。",
+            "上一轮分析里已经引用过的代码、行号和结论仍然有效。",
+            "若上一轮只给了签名，或需要重读全文，用 context_request 指定符号。",
+            "",
+        ]
+        lines.extend(f"- `{title.strip()}`" for title in titles)
+        return text[:start] + "\n".join(lines).rstrip() + "\n" + text[end:]
+
+    @classmethod
+    def _fold_prior_analysis(cls, text: str, prior_analysis: str) -> str:
+        """后续轮只追加新证据和上一轮分析，不再重发函数全文。"""
+        folded = cls._index_function_source(text)
+        memory = (
+            "\n\n## 上一轮分析（工作记忆，请延续）\n"
+            "下面是上一轮已经写过的分析。本轮只根据新增反馈修正，"
+            "不要推翻已用源码引用确认的事实，也不要要求重新粘贴已经看过的函数全文。\n\n"
+            + str(prior_analysis or "").strip()
+            + "\n"
+        )
+        return folded.rstrip() + memory
+
     def build_prompt(
         self,
         stable_context: str,
@@ -1190,10 +1320,16 @@ class ContextEngine:
         evidence_delta: Sequence[Dict[str, Any]] = (),
         is_final_round: bool = False,
         early_final_reason: Optional[str] = None,
+        prior_analysis: str = "",
     ) -> str:
         max_chars = self.config.effective_max_chars
         self.prompt_capacity_exceeded = False
         evidence_delta = list(evidence_delta)
+        stable_context = str(stable_context or "")
+        if str(prior_analysis or "").strip():
+            stable_context = self._fold_prior_analysis(stable_context, prior_analysis)
+        else:
+            stable_context = self._slim_unanchored_function_source(stable_context)
         if not evidence_delta and self.observation_store is not None and hasattr(self.observation_store, "markdown"):
             observation_text = self.observation_store.markdown(max_chars=4000)
             if observation_text:

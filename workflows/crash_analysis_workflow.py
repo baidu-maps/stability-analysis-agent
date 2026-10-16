@@ -1187,7 +1187,11 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         round_index: int = 0,
         stage: str = "analysis",
     ) -> Tuple[Any, str]:
-        from services.analyze_llm import resolve_analysis_prompt_cap
+        from services.analyze_llm import (
+            analysis_token_attempts,
+            output_looks_truncated,
+            resolve_analysis_prompt_cap,
+        )
 
         prompt_cap = resolve_analysis_prompt_cap(problem)
         prompt_used = prompt
@@ -1214,17 +1218,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         except Exception:
             configured_max_tokens = 0
 
-        first_try_tokens = 8192
-        if configured_max_tokens > 0:
-            first_try_tokens = min(first_try_tokens, configured_max_tokens)
-
-        token_attempts: List[Optional[int]] = []
-        if first_try_tokens > 0:
-            token_attempts.append(first_try_tokens)
-        for candidate in [4096, 2048]:
-            if candidate not in token_attempts and candidate < first_try_tokens:
-                token_attempts.append(candidate)
-        token_attempts.append(None)
+        token_attempts = analysis_token_attempts(configured_max_tokens)
 
         router_state = problem.get("_llm_router_state") if isinstance(problem, dict) else None
         max_endpoint_attempts = 1
@@ -1251,7 +1245,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     if tok is not None and llm_response is not None:
                         usage = getattr(llm_response, "usage", None) or {}
                         completion_tokens = usage.get("completion_tokens", 0) or 0
-                        if completion_tokens >= tok * 0.95:
+                        if output_looks_truncated(completion_tokens, tok):
                             logger.warning(
                                 "LLM output likely truncated (completion_tokens=%s, max_tokens=%s), retrying",
                                 completion_tokens,
