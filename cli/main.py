@@ -381,7 +381,7 @@ def _prepare_analysis_acceleration(problem: Dict[str, Any], code_roots: List[str
         problem["_code_index_service"] = index
         index.wait_ready(timeout=2.0)
         # 仅在显式启用 ctags 索引时预热
-        if problem.get("use_ctags_index", False):
+        if problem.get("use_ctags_index", True):
             from services.ctags_function_index import warm_ctags_index_for_roots
             warm_ctags_index_for_roots(code_roots)
     except Exception as exc:
@@ -3735,11 +3735,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--use-ctags-index",
         dest="use_ctags_index",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "启用 ctags 函数索引加速（默认关闭）。首次运行会构建索引（~30s），"
-            "后续运行通过缓存加速函数定义查找。已安装 ripgrep 时默认不需要此选项。"
+            "启用 ctags 函数索引加速（默认开启）。首次运行会构建索引（~30s），"
+            "后续运行通过缓存加速函数定义查找；需安装 universal-ctags，缺失时自动回退 rg。"
+            "使用 --no-use-ctags-index 可显式关闭。"
         ),
     )
     p.add_argument(
@@ -4961,7 +4962,7 @@ def _build_run_request_record(
         "min_key_read_related_functions": int(
             getattr(args, "min_key_read_related_functions", 2) or 0
         ),
-        "use_ctags_index": bool(getattr(args, "use_ctags_index", False)),
+        "use_ctags_index": bool(getattr(args, "use_ctags_index", True)),
         "include_memory_in_05": bool(getattr(args, "include_memory_in_05", False)),
         "external_agent_evaluation": bool(
             getattr(args, "external_agent_evaluation", False)
@@ -5184,8 +5185,10 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
     rule_confidence_threshold = record.get("rule_confidence_threshold")
     if rule_confidence_threshold is not None:
         argv += ["--rule-confidence-threshold", str(rule_confidence_threshold)]
-    if bool(record.get("use_ctags_index", False)):
+    if bool(record.get("use_ctags_index", True)):
         argv += ["--use-ctags-index"]
+    else:
+        argv += ["--no-use-ctags-index"]
     if bool(record.get("include_memory_in_05", False)):
         argv += ["--include-memory-in-05"]
     if bool(record.get("external_agent_evaluation", False)):
@@ -6594,7 +6597,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         ),
         "max_symbol_only_rescues": getattr(args, "max_symbol_only_rescues", None),
         "max_crash_caller_search_files": getattr(args, "max_crash_caller_search_files", None),
-        "use_ctags_index": bool(getattr(args, "use_ctags_index", False)),
+        "use_ctags_index": bool(getattr(args, "use_ctags_index", True)),
         "include_memory_context_in_final_tip": bool(
             getattr(args, "include_memory_in_05", False)
         ),

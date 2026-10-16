@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import os
 import re
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 
@@ -43,6 +44,16 @@ def default_prompt_char_budget(config: Optional[Dict[str, Any]] = None) -> int:
     调用方显式传入 ``evidence_max_chars`` 时使用该上限；否则用上下文窗口。
     """
     raw = config if isinstance(config, dict) else {}
+    # 实验用覆盖：环境变量 SA_EVIDENCE_MAX_CHARS 置为正整数时直接作为每轮字符预算上限，
+    # 便于在不改配置管线的情况下验证「发给 LLM 的上下文容量」对耗时的影响。
+    env_override = os.environ.get("SA_EVIDENCE_MAX_CHARS")
+    if env_override:
+        try:
+            value = int(env_override)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
     window = int(raw.get("context_window_tokens") or DEFAULT_CONTEXT_WINDOW_TOKENS)
     reserve = int(raw.get("output_reserve_tokens") or DEFAULT_OUTPUT_RESERVE_TOKENS)
     usable = max(1024, window - max(0, reserve))

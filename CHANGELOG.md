@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.5.4] - 2026-10-16
+
+### Added
+
+- 新增 `services/code_location_cache.py`：代码定位（04b）结果跨运行磁盘缓存。同一卡片重复分析、各 `code_root` 的 git commit 与定位输入未变时直接复用，省去约 89s 重算；worktree 路径不同时按 code_root 下标做哨兵替换后再写回当前路径。环境变量 `SA_DISABLE_CODE_LOCATION_CACHE` 可关闭。
+- 上下文字符预算支持环境变量 `SA_EVIDENCE_MAX_CHARS` 覆盖，便于验证发给 LLM 的上下文容量对耗时的影响。
+- 新增单测 `test/tools/test_code_location_cache.py`，并补充 Daemon 对 `--no-use-ctags-index` 的转发用例。
+
+### Changed
+
+- ctags 函数索引默认开启（CLI `--use-ctags-index`、Daemon `RunRequest`、代码定位与仓库搜索）。未安装 universal-ctags 时自动回退 rg；`--no-use-ctags-index` 可显式关闭。
+- 代码定位工具显式传入 `use_ctags_index=false` 时关闭索引，不再只在为真时透传。
+
 ## [1.5.1] - 2026-10-12
 
 ### Added

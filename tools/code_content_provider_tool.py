@@ -373,7 +373,7 @@ class CodeContentProvider:
                  max_nearby_module_scan_files: Optional[int] = None,
                  max_crash_caller_search_files: Optional[int] = None,
                  seed_callsite_files: Optional[List[str]] = None,
-                 use_ctags_index: bool = False):
+                 use_ctags_index: bool = True):
         """
         初始化代码内容提供器
         
@@ -394,7 +394,7 @@ class CodeContentProvider:
             max_nearby_module_scan_files: 堆栈帧邻近模块补扫时最多参与 tree-sitter/正则扫描的文件数，默认 300
             max_crash_caller_search_files: 反向搜索「谁调用了崩溃函数」时最多扫描的文件数，默认 600
             seed_callsite_files: 外部轻量召回得到的候选调用点文件列表；用于优先扫描补全直接调用者
-            use_ctags_index: 是否启用 ctags 函数索引加速。默认 False（使用 rg 直接搜索，避免首次 29s 构建开销）；设为 True 时首次运行会构建索引（较慢），后续运行通过缓存加速函数定义查找
+            use_ctags_index: 是否启用 ctags 函数索引加速。默认 True（首次运行会构建索引，较慢，后续运行通过缓存加速函数定义查找；需安装 universal-ctags，缺失时自动回退 rg）；设为 False 时直接用 rg 搜索，避免首次构建开销
         """
         self.use_ctags_index = use_ctags_index
         self.supported_extensions = {
@@ -12031,9 +12031,35 @@ class CodeContentProviderTool(BaseTool):
         if code_index_service is not None:
             prov_kw["code_index_service"] = code_index_service
 
-        # use_ctags_index: bool pass-through
-        if input_data.get("use_ctags_index"):
-            prov_kw["use_ctags_index"] = True
+        # use_ctags_index: bool pass-through（默认 True；显式传入 False 时关闭）
+        if "use_ctags_index" in input_data:
+            prov_kw["use_ctags_index"] = bool(input_data.get("use_ctags_index"))
+
+        # 跨运行磁盘缓存：同一卡片重复分析、每个 code_root 的 git commit 与定位输入
+        # 都未变化时，04b 结果确定性可复用，省去 ~89s 重算。详见 services.code_location_cache。
+        _cache_mod = None
+        _cache_key = None
+        try:
+            from services import code_location_cache as _cache_mod
+
+            # 决定结果的输入指纹：定位输入 + 影响输出的配置旋钮（排除不可序列化的
+            # code_index_service；code_roots 的绝对路径由缓存模块按下标归一化为路径无关）。
+            _determining_input = {
+                "resolved_stack": resolved_stack,
+                "exclude_dirs": sorted(self.exclude_dirs or []),
+                "include_subdirs": sorted(self.include_subdirs or []),
+                "knobs": {k: v for k, v in prov_kw.items() if k != "code_index_service"},
+            }
+            _cache_key = _cache_mod.compute_key(code_roots, _determining_input)
+            if _cache_key is not None:
+                _cached = _cache_mod.load(_cache_key, code_roots)
+                if _cached is not None:
+                    import sys as _sys
+
+                    print("[code-location] 命中缓存 %s" % _cache_key, file=_sys.stderr)
+                    return _cached
+        except Exception as _cache_exc:
+            _tool_logger.debug("code-location 缓存查询失败: %s", _cache_exc)
 
         provider = CodeContentProvider(**prov_kw)
         result = provider.code_content_provider(
@@ -12046,4 +12072,12 @@ class CodeContentProviderTool(BaseTool):
             parsed = _json.loads(result)
         except Exception:
             parsed = {"raw_result": result}
+
+        # 写回缓存（JSON-safe 的 parsed 深拷贝归一化后落盘；异常静默降级）。
+        if _cache_mod is not None and _cache_key is not None:
+            try:
+                _cache_mod.store(_cache_key, code_roots, parsed)
+            except Exception as _cache_exc:
+                _tool_logger.debug("code-location 缓存写入失败: %s", _cache_exc)
+
         return parsed

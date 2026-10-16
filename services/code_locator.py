@@ -128,7 +128,7 @@ class LocatorConfig:
     max_crash_caller_search_files: int = 600
     max_workers: Optional[int] = None
     parallel_threshold: int = 100
-    use_ctags_index: bool = False
+    use_ctags_index: bool = True
 
 
 # ==============================================================================

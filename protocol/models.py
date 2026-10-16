@@ -120,7 +120,7 @@ class RunRequest:
     knowledge_max_hits: Optional[int] = None
     knowledge_max_chars: Optional[int] = None
     domain_knowledge: bool = True
-    use_ctags_index: bool = False
+    use_ctags_index: bool = True
     plugin_modules: Optional[List[str]] = None
     max_sibling_member_functions: Optional[int] = None
     max_stack_frames_symbol_enrich: Optional[int] = None

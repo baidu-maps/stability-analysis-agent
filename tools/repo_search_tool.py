@@ -49,7 +49,7 @@ class RepoSearchTool(BaseTool):
                     "use_ctags_index": {
                         "type": "boolean",
                         "description": "find_symbol 时是否使用 ctags 索引",
-                        "default": False,
+                        "default": True,
                     },
                     "use_repo_map": {"type": "boolean", "description": "使用崩溃 anchor 个性化代码地图排序"},
                     "stack_files": {"type": "array"},
@@ -120,7 +120,7 @@ class RepoSearchTool(BaseTool):
             max_matches = 80
         svc = RepoSearchService(
             roots,
-            use_ctags_index=bool(input_data.get("use_ctags_index", False)),
+            use_ctags_index=bool(input_data.get("use_ctags_index", True)),
             max_matches=max_matches,
             trace=input_data.get("_runtime_trace"),
         )

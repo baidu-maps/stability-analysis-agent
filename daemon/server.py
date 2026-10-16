@@ -1405,9 +1405,8 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
         req.rule_confidence_threshold,
         getattr(defaults, "rule_confidence_threshold", None),
     )
-    _append_store_true(
-        cmd, "--use-ctags-index", bool(req.use_ctags_index), bool(getattr(defaults, "use_ctags_index", False))
-    )
+    if bool(req.use_ctags_index) != bool(getattr(defaults, "use_ctags_index", True)):
+        cmd += ["--use-ctags-index" if req.use_ctags_index else "--no-use-ctags-index"]
     _append_nondefault_value(
         cmd,
         "--max-sibling-member-functions",

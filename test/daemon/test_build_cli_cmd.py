@@ -222,6 +222,7 @@ class BuildCliCmdTests(unittest.TestCase):
             "--vector-db-record-usage",
             "--rule-confidence-threshold",
             "--use-ctags-index",
+            "--no-use-ctags-index",
             "--plugin-module",
             "--max-sibling-member-functions",
             "--max-stack-frames-symbol-enrich",
@@ -245,6 +246,8 @@ class BuildCliCmdTests(unittest.TestCase):
         self.assertEqual(parsed.vector_db_path, defaults.vector_db_path)
         self.assertEqual(parsed.vector_db_max_results, defaults.vector_db_max_results)
         self.assertEqual(parsed.include_memory_in_05, defaults.include_memory_in_05)
+        self.assertEqual(parsed.use_ctags_index, defaults.use_ctags_index)
+        self.assertTrue(parsed.use_ctags_index)
         self.assertEqual(
             parsed.external_agent_evaluation,
             defaults.external_agent_evaluation,
@@ -331,6 +334,23 @@ class BuildCliCmdTests(unittest.TestCase):
         self.assertIsNone(req.max_agent_rounds)
         self.assertIsNone(req.max_context_requests_per_round)
         self.assertIsNone(req.streaming)
+
+    def test_use_ctags_index_defaults_on_when_argv_empty(self) -> None:
+        parsed = build_parser().parse_args([])
+        self.assertTrue(parsed.use_ctags_index)
+
+    def test_no_use_ctags_index_flag_turns_off(self) -> None:
+        parsed = build_parser().parse_args(["--no-use-ctags-index"])
+        self.assertFalse(parsed.use_ctags_index)
+
+    def test_use_ctags_index_false_forwards_no_use_ctags_index(self) -> None:
+        req = run_request_from_dict({"crash_log": "/tmp/a.crash", "use_ctags_index": False})
+        cmd, _ = _build_cli_cmd(req)
+        argv = _argv_from_cmd(cmd)
+        self.assertIn("--no-use-ctags-index", argv)
+        self.assertNotIn("--use-ctags-index", argv)
+        parsed = build_parser().parse_args(argv)
+        self.assertFalse(parsed.use_ctags_index)
 
 
 if __name__ == "__main__":

@@ -152,7 +152,7 @@ daemon 将任务分发给 `cli/main.py` 子进程执行，通过 SSE 流式推�
   "vector_db_max_results": null,
   "vector_db_record_usage": false,
   "rule_confidence_threshold": null,
-  "use_ctags_index": false,
+  "use_ctags_index": true,
   "plugin_modules": null,
   "max_sibling_member_functions": null,
   "max_stack_frames_symbol_enrich": null,

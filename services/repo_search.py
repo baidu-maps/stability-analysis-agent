@@ -147,7 +147,7 @@ class RepoSearchService:
         self,
         code_roots: List[str],
         *,
-        use_ctags_index: bool = False,
+        use_ctags_index: bool = True,
         max_matches: int = 80,
         trace: Any = None,
         repo_map: Any = None,
