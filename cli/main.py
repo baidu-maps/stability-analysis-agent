@@ -3483,6 +3483,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--reuse-crash-cache",
+        dest="reuse_crash_cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "是否复用相同崩溃的分析缓冲（默认开启）。"
+            "代码配置、日志和 Agent 版本一致时，大模型不同则复用到提示词之前；"
+            "大模型也一致则复用上次结论，并在已有修改时直接应用补丁。"
+            "使用 --no-reuse-crash-cache 关闭"
+        ),
+    )
+    p.add_argument(
         "--llm-mode",
         dest="llm_mode",
         choices=["fixed", "auto"],
@@ -4045,8 +4057,13 @@ def _runtime_version() -> Optional[str]:
                 return match.group(1)
         except Exception:
             pass
+    return _distribution_version("stability-analysis-agent")
+
+
+def _distribution_version(name: str) -> Optional[str]:
+    """已安装发行版的版本号；未安装时返回 None。"""
     try:
-        return importlib.metadata.version("stability-analysis-agent")
+        return importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:
         return None
 
@@ -4788,6 +4805,12 @@ def _write_cli_report(
                 write_report_manifest(report_dir, request=request_record, result=result)
             except Exception as exc:
                 logger.warning("failed to write report manifest: %s", exc)
+        try:
+            from services.crash_replay_cache import remember_crash_replay
+
+            remember_crash_replay(report_dir, request_record or {}, applied_fix_result)
+        except Exception as exc:
+            logger.warning("failed to record crash replay cache: %s", exc)
         return report_dir
     except Exception as exc:
         print(f"警告: 写入 reports 失败: {exc}", file=sys.stderr)
@@ -4906,6 +4929,7 @@ def _build_run_request_record(
         "max_context_requests_per_round": max_context_requests,
         "apply_ai_fixes": bool(getattr(args, "apply_ai_fixes", True)),
         "bypass_repair_gate": bool(getattr(args, "bypass_repair_gate", True)),
+        "reuse_crash_cache": bool(getattr(args, "reuse_crash_cache", True)),
         "backup_original_sources": bool(getattr(args, "backup_original_sources", True)),
         "source_origin": str(getattr(args, "source_origin", None) or ""),
         "commit_policy": str(getattr(args, "commit_policy", None) or ""),
@@ -5028,6 +5052,8 @@ def _build_run_request_record(
             "python_executable": sys.executable,
             "platform": platform.platform(),
             "agent_version": _runtime_version(),
+            "core_version": _runtime_version(),
+            "enterprise_version": _distribution_version("baidu-stability-analysis-agent"),
             "git": _git_runtime_snapshot(),
         },
         "workspace_snapshot": {
@@ -5153,6 +5179,8 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
         argv += ["--no-apply-ai-fixes"]
     if not bool(record.get("bypass_repair_gate", True)):
         argv += ["--no-bypass-repair-gate"]
+    if not bool(record.get("reuse_crash_cache", True)):
+        argv += ["--no-reuse-crash-cache"]
     if not bool(record.get("backup_original_sources", True)):
         argv += ["--no-backup-original-sources"]
     if bool(record.get("optimized", False)):
@@ -6533,6 +6561,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         "scope": scope,
         "apply_ai_fixes": bool(args.apply_ai_fixes),
         "bypass_repair_gate": bool(getattr(args, "bypass_repair_gate", True)),
+        "reuse_crash_cache": bool(getattr(args, "reuse_crash_cache", True)),
         "source_identity": dict(request_record.get("source_identity") or {}),
         "force_disassembly": bool(getattr(args, "force_disassembly", False)),
         "force_anr_analysis": bool(getattr(args, "force_anr_analysis", False)),
@@ -6614,6 +6643,26 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
 
         problem["max_agent_rounds"] = _resolve_max_rounds(problem)
     _apply_analysis_timeouts_to_problem(problem, args)
+    if bool(getattr(args, "reuse_crash_cache", True)):
+        try:
+            from services.crash_replay_cache import lookup_crash_replay
+
+            replay_hit = lookup_crash_replay(request_record)
+        except Exception as replay_exc:
+            logging.getLogger(__name__).debug("crash replay lookup failed: %s", replay_exc)
+            replay_hit = None
+        if isinstance(replay_hit, dict):
+            problem["_crash_replay"] = replay_hit
+            request_record["crash_replay"] = {
+                "level": replay_hit.get("level"),
+                "source_report": replay_hit.get("source_report"),
+            }
+            print(
+                "[crash-replay] 命中分析缓冲 level=%s source=%s"
+                % (replay_hit.get("level"), replay_hit.get("source_report")),
+                file=sys.stderr,
+                flush=True,
+            )
     _prepare_analysis_acceleration(problem, code_roots, scope)
 
     registry = ToolAndWorkflowRegistry()
@@ -6864,7 +6913,40 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
                 "run_regression_verification": effectiveness.get("run_regression_verification"),
             }
 
-    if should_run_repair_pipeline(
+    replay = problem.get("_crash_replay") if isinstance(problem, dict) else None
+    replay_level = str(replay.get("level") or "") if isinstance(replay, dict) else ""
+    if replay_level == "conclusion":
+        if bool(args.apply_ai_fixes) and str(replay.get("patch_text") or "").strip():
+            from services.crash_replay_cache import replay_cached_fix
+
+            _replay_started = time.perf_counter()
+            applied_fix_result = replay_cached_fix(
+                run_id=str(request_record.get("run_id") or ""),
+                code_roots=code_roots,
+                patch_text=str(replay.get("patch_text") or ""),
+                previous_apply=replay.get("apply_record") if isinstance(replay.get("apply_record"), dict) else None,
+                report_dir=report_dir,
+            )
+            apply_fix_duration_ms = int(round((time.perf_counter() - _replay_started) * 1000))
+        if isinstance(result, dict):
+            runtime._finalize_decision(result)
+            runtime._transition(
+                "decide",
+                status="completed" if result.get("status") == "success" else "error",
+                reason=result.get("error"),
+            )
+            runtime.state.checkpoint(
+                state={"result_status": result.get("status"), "crash_replay": "conclusion"},
+                status="completed" if result.get("status") == "success" else "error",
+            )
+            metadata = result.setdefault("metadata", {})
+            metadata["runtime_state"] = runtime.state.to_dict()
+            metadata["runtime_trace"] = runtime.trace.snapshot() if runtime.trace is not None else {}
+            metadata["crash_replay"] = {
+                "level": "conclusion",
+                "source_report": replay.get("source_report"),
+            }
+    elif should_run_repair_pipeline(
         apply_ai_fixes=bool(args.apply_ai_fixes),
         result=result if isinstance(result, dict) else {},
         scope=scope,

@@ -25,6 +25,7 @@ class HarnessRunSnapshot:
     patch_path: Optional[str] = None
     last_progress: Optional[str] = None
     last_progress_percent: Optional[float] = None
+    progress_history: List[str] = field(default_factory=list)
     completion_reason: Optional[str] = None
     runtime_state: Optional[Dict[str, Any]] = None
     runtime_trace: Optional[Dict[str, Any]] = None
@@ -84,6 +85,7 @@ class HarnessRunSnapshot:
             "patch_path": self.patch_path,
             "last_progress": self.last_progress,
             "last_progress_percent": self.last_progress_percent,
+            "progress_history": list(self.progress_history or []),
             "completion_reason": self.completion_reason,
             "runtime_state": self.runtime_state,
             "runtime_trace": self.runtime_trace,
@@ -119,6 +121,7 @@ class HarnessRunSnapshot:
             patch_path=getattr(run, "patch_path", None),
             last_progress=getattr(run, "last_progress", None),
             last_progress_percent=getattr(run, "last_progress_percent", None),
+            progress_history=list(getattr(run, "progress_history", None) or []),
             completion_reason=getattr(run, "completion_reason", None),
             runtime_state=getattr(run, "runtime_state", None),
             runtime_trace=getattr(run, "runtime_trace", None),
@@ -171,7 +174,13 @@ class HarnessRunSnapshot:
         kwargs = {key: payload.get(key) for key in fields if key in payload}
         if "transport_status" not in kwargs:
             kwargs["transport_status"] = str(payload.get("status") or "unknown")
-        for list_field in ("original_code_roots", "isolated_code_roots", "pending_changed_files", "events"):
+        for list_field in (
+            "original_code_roots",
+            "isolated_code_roots",
+            "pending_changed_files",
+            "events",
+            "progress_history",
+        ):
             if list_field not in kwargs:
                 kwargs[list_field] = list(payload.get(list_field) or [])
         return cls(**kwargs)  # type: ignore[arg-type]
@@ -195,6 +204,11 @@ class HarnessRunSnapshot:
                 setattr(run, name, value)
         run.original_code_roots = list(self.original_code_roots)
         run.isolated_code_roots = list(self.isolated_code_roots)
+        if self.last_progress:
+            run.last_progress = self.last_progress
+        history = list(self.progress_history or [])
+        if history:
+            run.progress_history = history
         run.pending_changed_files = list(self.pending_changed_files)
         if self.events:
             event_log = getattr(run, "event_log", None)

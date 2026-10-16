@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,6 +18,41 @@ logger = logging.getLogger(__name__)
 # 旧逻辑再降到 2048 后第三次才放行，同一份提示被完整生成三遍。
 ANALYSIS_OUTPUT_TOKEN_FLOOR = 12288
 ANALYSIS_OUTPUT_TOKEN_RAISE = 16384
+_previous_prompt_chars: Optional[int] = None
+
+
+def format_llm_send_line(
+    round_index: int,
+    char_count: int,
+    previous_chars: Optional[int],
+) -> str:
+    """发送前的容量行。第一轮不带环比，之后带相对上一轮的百分比。"""
+    chars = max(0, int(char_count or 0))
+    approx_tokens = chars // 4
+    line = (
+        f"[llm] 第{int(round_index) + 1}轮发送 {chars:,} 字"
+        f"（约 {approx_tokens:,} token）"
+    )
+    if previous_chars is not None and int(previous_chars) > 0:
+        delta = int(round((chars - int(previous_chars)) * 100 / int(previous_chars)))
+        sign = "+" if delta > 0 else ""
+        line += f"，较上一轮 {sign}{delta}%"
+    return line
+
+
+def announce_llm_send(round_index: int, prompt: str) -> str:
+    """在真正请求模型之前打一行容量。同一份提示的重试不再打。"""
+    global _previous_prompt_chars
+    line = format_llm_send_line(round_index, len(prompt or ""), _previous_prompt_chars)
+    _previous_prompt_chars = len(prompt or "")
+    print(line, file=sys.stderr, flush=True)
+    return line
+
+
+def reset_llm_send_baseline() -> None:
+    """清空上一轮字数，供新任务和单测隔离。"""
+    global _previous_prompt_chars
+    _previous_prompt_chars = None
 
 
 def analysis_token_attempts(configured_max_tokens: int) -> List[Optional[int]]:
@@ -190,6 +226,7 @@ def call_analyze_llm_with_retries(
             len(prompt_used),
             prompt_cap,
         )
+    announce_llm_send(round_index, prompt_used)
 
     _prepare_router_for_round(context, problem, round_index=round_index)
     llm_adapter = getattr(context, "llm", None)

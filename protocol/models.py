@@ -95,6 +95,8 @@ class RunRequest:
     apply_ai_fixes: bool = True
     # 默认跳过 04 诊断 repair_gate；传 false / --no-bypass-repair-gate 恢复严格门控
     bypass_repair_gate: bool = True
+    # 默认复用相同崩溃的分析缓冲；传 false / --no-reuse-crash-cache 关闭
+    reuse_crash_cache: bool = True
     backup_original_sources: bool = True
 
     force_disassembly: bool = False

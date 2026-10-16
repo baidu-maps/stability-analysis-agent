@@ -5,7 +5,13 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 from services.agent_context_loop import CallableContextLoopHooks, ContextLoopConfig, run_agent_context_loop
-from services.analyze_llm import analysis_token_attempts, output_looks_truncated
+from services.analyze_llm import (
+    analysis_token_attempts,
+    announce_llm_send,
+    format_llm_send_line,
+    output_looks_truncated,
+    reset_llm_send_baseline,
+)
 from services.context_engine import (
     CallableContextResolver,
     ContextEngine,
@@ -679,6 +685,27 @@ class AgentContextLoopTests(unittest.TestCase):
         self.assertNotIn(4096, attempts)
         self.assertFalse(output_looks_truncated(5533, 4096))
         self.assertTrue(output_looks_truncated(4000, 4096))
+
+    def test_llm_send_line_shows_size_and_round_delta(self):
+        """第一轮只报容量，第二轮带上相对上一轮的变化。"""
+        import io
+        from contextlib import redirect_stderr
+
+        first = format_llm_send_line(0, 90155, None)
+        self.assertEqual(first, "[llm] 第1轮发送 90,155 字（约 22,538 token）")
+        second = format_llm_send_line(1, 49174, 90155)
+        self.assertIn("[llm] 第2轮发送 49,174 字（约 12,293 token）", second)
+        self.assertIn("较上一轮 -45%", second)
+        reset_llm_send_baseline()
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            announce_llm_send(0, "a" * 100)
+            announce_llm_send(0, "a" * 100)
+        lines = [line for line in buf.getvalue().splitlines() if line.startswith("[llm]")]
+        self.assertEqual(len(lines), 2)
+        self.assertNotIn("较上一轮", lines[0])
+        self.assertIn("较上一轮 0%", lines[1])
+        reset_llm_send_baseline()
 
 
 if __name__ == "__main__":

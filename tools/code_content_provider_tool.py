@@ -12056,11 +12056,14 @@ class CodeContentProviderTool(BaseTool):
                 if _cached is not None:
                     import sys as _sys
 
-                    print("[code-location] 命中缓存 %s" % _cache_key, file=_sys.stderr)
+                    print("[code-location] 命中定位缓存", file=_sys.stderr, flush=True)
                     return _cached
         except Exception as _cache_exc:
             _tool_logger.debug("code-location 缓存查询失败: %s", _cache_exc)
 
+        import sys as _sys
+
+        print("[code-location] 未命中，正在定位", file=_sys.stderr, flush=True)
         provider = CodeContentProvider(**prov_kw)
         result = provider.code_content_provider(
             resolved_stack,

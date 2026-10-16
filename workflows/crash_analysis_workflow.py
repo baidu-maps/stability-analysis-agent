@@ -8,6 +8,7 @@ import logging
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -331,6 +332,20 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 result["metadata"]["pipeline_skip_reason"] = "checkpoint_replay_hydrate"
                 return result
 
+        replay = problem.get("_crash_replay") if isinstance(problem, dict) else None
+        if not isinstance(replay, dict):
+            replay = {}
+        if replay.get("level") == "conclusion" and isinstance(replay.get("result"), dict):
+            print("[crash-replay] 复用上次分析结论", file=sys.stderr, flush=True)
+            return dict(replay["result"])
+        replay_evidence = replay.get("evidence") if isinstance(replay.get("evidence"), dict) else {}
+        if replay.get("level") == "evidence" and replay_evidence:
+            print(
+                "[crash-replay] 大模型配置不同，复用日志解析、符号化、定位和第一轮提示词",
+                file=sys.stderr,
+                flush=True,
+            )
+
         if not crash_log:
             return {"error": "缺少 crash_log"}
 
@@ -350,12 +365,17 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             # Step 1: 解析崩溃日志
             with PhaseSpinner("解析崩溃日志", step=1, total_steps=total_steps) as _parse_spinner:
                 logger.info(f"[{self.definition.name}] Step 1: Parsing crash log...")
-                parse_result = context.execute_tool("crash_log_parser", {
-                    "log_content": crash_log,
-                    "options": {
-                        "library_dir": os.path.abspath(library_dir),
-                    } if library_dir and os.path.exists(library_dir) else {},
-                })
+                cached_parse = replay_evidence.get("parse_result")
+                if isinstance(cached_parse, dict):
+                    print("[crash-replay] 复用日志解析", file=sys.stderr, flush=True)
+                    parse_result = cached_parse
+                else:
+                    parse_result = context.execute_tool("crash_log_parser", {
+                        "log_content": crash_log,
+                        "options": {
+                            "library_dir": os.path.abspath(library_dir),
+                        } if library_dir and os.path.exists(library_dir) else {},
+                    })
                 if not isinstance(parse_result, dict):
                     parse_result = {}
                 if not parse_result_has_usable_crash_data(parse_result):
@@ -395,19 +415,28 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
 
             # Step 2: 提取内存映射（轻量，紧跟 01 之后）
             memory_maps_data: Dict[str, Any] = {}
-            try:
-                from tools.crash_diagnosis.maps_extractor import extract_memory_maps
-                memory_maps_data = extract_memory_maps(crash_log)
-            except Exception as maps_exc:
-                logger.debug("memory_maps extraction skipped: %s", maps_exc)
+            cached_maps = replay_evidence.get("memory_maps")
+            if isinstance(cached_maps, dict) and cached_maps:
+                memory_maps_data = cached_maps
+            else:
+                try:
+                    from tools.crash_diagnosis.maps_extractor import extract_memory_maps
+                    memory_maps_data = extract_memory_maps(crash_log)
+                except Exception as maps_exc:
+                    logger.debug("memory_maps extraction skipped: %s", maps_exc)
 
             # Step 3: 堆栈符号化
             with PhaseSpinner("堆栈符号化", step=2, total_steps=total_steps) as _resolve_spinner:
                 logger.info(f"[{self.definition.name}] Step 2: Resolving symbols...")
-                resolved = context.execute_tool("add2line_resolver", {
-                    "crash_json": json.dumps(parse_result),
-                    "library_dir": library_dir
-                })
+                cached_resolved = replay_evidence.get("resolved_stack")
+                if isinstance(cached_resolved, dict):
+                    print("[crash-replay] 复用堆栈地址", file=sys.stderr, flush=True)
+                    resolved = cached_resolved
+                else:
+                    resolved = context.execute_tool("add2line_resolver", {
+                        "crash_json": json.dumps(parse_result),
+                        "library_dir": library_dir
+                    })
                 if not isinstance(resolved, dict):
                     resolved = {}
                 if not resolved_stack_has_usable_resolution(resolved):
@@ -443,19 +472,24 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 )
             try:
                 with PhaseSpinner("崩溃证据诊断", step=3, total_steps=total_steps):
-                    from tools.crash_diagnosis.core import run_crash_diagnosis
-                    crash_diagnosis = run_crash_diagnosis(
-                        parse_result,
-                        memory_maps_data,
-                        resolved,
-                        crash_log_content=crash_log_content,
-                        library_dir=str(library_dir or ""),
-                        force_disassembly=bool(
-                            problem.get("force_disassembly")
-                            or problem.get("enable_disassembly")
-                        ),
-                        trace=getattr(context, "trace", None) if context is not None else None,
-                    )
+                    cached_diagnosis = replay_evidence.get("crash_diagnosis")
+                    if isinstance(cached_diagnosis, dict) and cached_diagnosis:
+                        print("[crash-replay] 复用崩溃诊断", file=sys.stderr, flush=True)
+                        crash_diagnosis = cached_diagnosis
+                    else:
+                        from tools.crash_diagnosis.core import run_crash_diagnosis
+                        crash_diagnosis = run_crash_diagnosis(
+                            parse_result,
+                            memory_maps_data,
+                            resolved,
+                            crash_log_content=crash_log_content,
+                            library_dir=str(library_dir or ""),
+                            force_disassembly=bool(
+                                problem.get("force_disassembly")
+                                or problem.get("enable_disassembly")
+                            ),
+                            trace=getattr(context, "trace", None) if context is not None else None,
+                        )
             except Exception as diag_exc:
                 logger.warning("[%s] crash_diagnosis failed: %s", self.definition.name, diag_exc)
                 crash_diagnosis = {
@@ -542,48 +576,56 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             # Step 4b: 定位崩溃源码
             with PhaseSpinner("定位崩溃源码", step=4, total_steps=total_steps) as _ccp_spinner:
                 logger.info(f"[{self.definition.name}] Step 3: Extracting code context...")
-                ccp_input: Dict[str, Any] = {
-                    "resolved_stack": json.dumps(resolved),
-                    "code_roots": code_roots,
-                }
-                # Step 3a: 先做轻量调用点召回，给 code_content_provider 提供优先文件 seed
-                try:
-                    callsite_seed = context.execute_tool(
-                        "symbol_callsite_finder",
-                        {
-                            "resolved_stack": json.dumps(resolved),
-                            "code_roots": code_roots,
-                            "max_results": 500,
-                        },
-                    )
-                    if isinstance(callsite_seed, dict):
-                        candidate_files = callsite_seed.get("candidate_files") or []
-                        if isinstance(candidate_files, list) and candidate_files:
-                            ccp_input["_candidate_callsite_files"] = candidate_files
-                except Exception as seed_exc:
-                    logger.info(f"[{self.definition.name}] symbol_callsite_finder skipped: {seed_exc}")
-                for _k in (
-                    "max_sibling_member_functions",
-                    "max_direct_callers",
-                    "max_shared_var_related_functions",
-                    "min_key_read_related_functions",
-                    "max_static_call_chain_depth",
-                    "max_symbol_only_rescues",
-                    "find_source_timeout_sec",
-                    "code_context_timeout_sec",
-                    "max_nearby_module_scan_files",
-                    "max_prompt_stack_frame_functions",
-                    "max_stack_frames_symbol_enrich",
-                    "max_stack_frames_in_prompt",
-                    "max_crash_caller_search_files",
-                    "_code_index_service",
-                    "use_ctags_index",
-                ):
-                    if isinstance(problem, dict) and _k in problem and problem[_k] is not None:
-                        ccp_input[_k] = problem[_k]
-                code_context = context.execute_tool("code_content_provider", ccp_input)
-                if code_context_has_failure(code_context):
-                    _ccp_spinner.set_partial_failure()
+                cached_code = replay_evidence.get("code_context")
+                if isinstance(cached_code, dict) and cached_code:
+                    print("[crash-replay] 复用定位代码", file=sys.stderr, flush=True)
+                    code_context = cached_code
+                else:
+                    ccp_input: Dict[str, Any] = {
+                        "resolved_stack": json.dumps(resolved),
+                        "code_roots": code_roots,
+                    }
+                    try:
+                        callsite_seed = context.execute_tool(
+                            "symbol_callsite_finder",
+                            {
+                                "resolved_stack": json.dumps(resolved),
+                                "code_roots": code_roots,
+                                "max_results": 500,
+                            },
+                        )
+                        if isinstance(callsite_seed, dict):
+                            candidate_files = callsite_seed.get("candidate_files") or []
+                            if isinstance(candidate_files, list) and candidate_files:
+                                ccp_input["_candidate_callsite_files"] = candidate_files
+                    except Exception as seed_exc:
+                        logger.info(
+                            "[%s] symbol_callsite_finder skipped: %s",
+                            self.definition.name,
+                            seed_exc,
+                        )
+                    for _k in (
+                        "max_sibling_member_functions",
+                        "max_direct_callers",
+                        "max_shared_var_related_functions",
+                        "min_key_read_related_functions",
+                        "max_static_call_chain_depth",
+                        "max_symbol_only_rescues",
+                        "find_source_timeout_sec",
+                        "code_context_timeout_sec",
+                        "max_nearby_module_scan_files",
+                        "max_prompt_stack_frame_functions",
+                        "max_stack_frames_symbol_enrich",
+                        "max_stack_frames_in_prompt",
+                        "max_crash_caller_search_files",
+                        "_code_index_service",
+                        "use_ctags_index",
+                    ):
+                        if isinstance(problem, dict) and _k in problem and problem[_k] is not None:
+                            ccp_input[_k] = problem[_k]
+                    code_context = context.execute_tool("code_content_provider", ccp_input)
+                    if code_context_has_failure(code_context):
+                        _ccp_spinner.set_partial_failure()
 
                 if not code_context_has_usable_code(code_context):
                     logger.info(
@@ -1189,6 +1231,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
     ) -> Tuple[Any, str]:
         from services.analyze_llm import (
             analysis_token_attempts,
+            announce_llm_send,
             output_looks_truncated,
             resolve_analysis_prompt_cap,
         )
@@ -1204,6 +1247,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 len(prompt_used),
                 prompt_cap,
             )
+        announce_llm_send(round_index, prompt_used)
 
         BaseCrashAnalysisWorkflow._prepare_router_for_round(
             context, problem, round_index=round_index

@@ -376,6 +376,29 @@ class DaemonRunLifecycleTests(unittest.TestCase):
         self.assertEqual(q.get_nowait(), "b")
         self.assertEqual(q.get_nowait(), "c")
 
+    def test_progress_history_keeps_cache_and_llm_lines(self) -> None:
+        """定位缓存和 LLM 容量行进入历史，普通日志仍被丢掉。"""
+        run = server.RunState(run_id="progress-history", transport_status="running", created_at=time.time())
+        lines = [
+            "[sdk-release] 复用镜像，提交已在本地，只建立工作区",
+            "[code-location] 命中定位缓存",
+            "[llm] 第1轮发送 90,155 字（约 22,538 token）",
+            "[阶段 5/6] 第一轮：AI推理分析 ✓ 1m27s",
+            "普通日志",
+            "[llm] 第2轮发送 49,174 字（约 12,293 token），较上一轮 -45%",
+        ]
+        for line in lines:
+            server._capture_progress(run, line)
+        self.assertEqual(run.last_progress, lines[-1])
+        self.assertEqual(run.progress_history, [item for item in lines if item != "普通日志"])
+        payload = server._run_public_dict(run)
+        self.assertEqual(payload["progress_history"], run.progress_history)
+        self.assertEqual(payload["progress"], lines[-1])
+        for _ in range(20):
+            server._capture_progress(run, f"[llm] 额外第{len(run.progress_history)}行")
+        self.assertEqual(len(run.progress_history), server._PROGRESS_HISTORY_LIMIT)
+        self.assertEqual(run.progress_history[0], lines[1])
+
     def test_evict_finished_runs_drops_old_terminal_state(self) -> None:
         """Finished runs older than TTL leave memory and 404."""
         run = server.RUNS.create_run(RunRequest(crash_log="a"))

@@ -95,6 +95,7 @@ def _prepare_http_run_body(body: Dict[str, Any]) -> Dict[str, Any]:
         "run_regression_verification",
         "generate_reproduction_by_llm",
         "bypass_repair_gate",
+        "reuse_crash_cache",
     ):
         if field_name in payload and payload[field_name] is not None and not isinstance(payload[field_name], bool):
             raise DaemonHttpError(
@@ -371,6 +372,7 @@ class RunState:
     patch_path: Optional[str] = None
     last_progress: Optional[str] = None
     last_progress_percent: Optional[int] = None
+    progress_history: List[str] = field(default_factory=list)
     completion_reason: Optional[str] = None
     runtime_state: Optional[Dict[str, Any]] = None
     approval: Optional[Dict[str, Any]] = None
@@ -521,9 +523,12 @@ class RunManager:
                 run = RunState(run_id=str(item.get("run_id")), transport_status=transport,
                                created_at=float(item.get("created_at") or time.time()),
                                output_format=str(item.get("output_format") or "markdown"), request=request)
-                for name in ("started_at", "finished_at", "exit_code", "error", "report_dir", "workspace_dir",
-                             "workspace_manifest", "patch_path", "last_progress", "last_progress_percent", "completion_reason",
-                             "runtime_state", "approval", "runtime_trace", "pending_tool_approval"):
+                for name in (
+                    "started_at", "finished_at", "exit_code", "error", "report_dir", "workspace_dir",
+                    "workspace_manifest", "patch_path", "last_progress", "last_progress_percent",
+                    "progress_history", "completion_reason", "runtime_state", "approval",
+                    "runtime_trace", "pending_tool_approval",
+                ):
                     if name in item:
                         setattr(run, name, item[name])
                 run.original_code_roots = list(item.get("original_code_roots") or [])
@@ -949,6 +954,7 @@ def _health_package_info() -> Dict[str, Any]:
         "http_apply_ai_fixes": False,
         "cli_apply_ai_fixes": cli_apply_default,
         "http_bypass_repair_gate": True,
+        "http_reuse_crash_cache": True,
     }
     return payload
 
@@ -964,6 +970,7 @@ def _run_fingerprint(body: Dict[str, Any]) -> str:
         "sdk_version": body.get("sdk_version"),
         "apply_ai_fixes": body.get("apply_ai_fixes"),
         "bypass_repair_gate": body.get("bypass_repair_gate"),
+        "reuse_crash_cache": body.get("reuse_crash_cache"),
         "output_format": body.get("output_format"),
         "external_agent_evaluation": body.get("external_agent_evaluation", False),
     }
@@ -1302,6 +1309,12 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
     ):
         cmd += [
             "--bypass-repair-gate" if req.bypass_repair_gate else "--no-bypass-repair-gate"
+        ]
+    if bool(getattr(req, "reuse_crash_cache", True)) != bool(
+        getattr(defaults, "reuse_crash_cache", True)
+    ):
+        cmd += [
+            "--reuse-crash-cache" if req.reuse_crash_cache else "--no-reuse-crash-cache"
         ]
     if bool(getattr(req, "backup_original_sources", True)) != bool(
         getattr(defaults, "backup_original_sources", True)
@@ -1952,23 +1965,36 @@ def _summarize_cli_outcome(
     return None
 
 
+_PROGRESS_PREFIXES = (
+    "[阶段",
+    "[sdk-release]",
+    "[code-location]",
+    "[llm]",
+    "[crash-replay]",
+    "ERROR:",
+)
+_PROGRESS_HISTORY_LIMIT = 12
+
+
 def _capture_progress(run: RunState, text: str) -> None:
-    """Keep the latest human-readable stage line for GET /status."""
+    """记下最近的阶段行。最新一行仍给 progress，历史留给多轮对比。"""
     stripped = str(text or "").strip()
-    if not stripped:
+    if not stripped or not stripped.startswith(_PROGRESS_PREFIXES):
         return
-    if (
-        stripped.startswith("[阶段")
-        or stripped.startswith("[sdk-release]")
-        or stripped.startswith("ERROR:")
-    ):
-        run.last_progress = stripped[:500]
-        percent = _progress_percent_from_text(stripped)
-        if percent is not None:
-            run.last_progress_percent = percent
-        reason = _extract_completion_reason(stripped)
-        if reason:
-            run.completion_reason = reason
+    line = stripped[:500]
+    history = getattr(run, "progress_history", None)
+    if not isinstance(history, list):
+        history = []
+    if not history or history[-1] != line:
+        history.append(line)
+    run.progress_history = history[-_PROGRESS_HISTORY_LIMIT:]
+    run.last_progress = line
+    percent = _progress_percent_from_text(line)
+    if percent is not None:
+        run.last_progress_percent = percent
+    reason = _extract_completion_reason(line)
+    if reason:
+        run.completion_reason = reason
 
 
 def _extract_report(output: str) -> str:
@@ -2044,6 +2070,7 @@ def _run_public_dict(run: RunState) -> Dict[str, Any]:
         "transport_status": run.transport_status,
         "message": _status_message(run),
         "progress": run.last_progress,
+        "progress_history": list(getattr(run, "progress_history", None) or []),
         "progress_percent": run.last_progress_percent,
         "queue_position": _queue_position(run),
         "created_at": run.created_at,
@@ -2279,6 +2306,7 @@ def _respond_result(
                 "status": run.status,
                 "message": _status_message(run),
                 "progress": run.last_progress,
+                "progress_history": list(getattr(run, "progress_history", None) or []),
                 "progress_percent": run.last_progress_percent,
             },
         )

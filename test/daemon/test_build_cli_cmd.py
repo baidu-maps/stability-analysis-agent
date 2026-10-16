@@ -93,6 +93,22 @@ class BuildCliCmdTests(unittest.TestCase):
         self.assertNotIn("--no-bypass-repair-gate", default_cmd)
         self.assertNotIn("--bypass-repair-gate", default_cmd)
 
+    def test_no_reuse_crash_cache(self) -> None:
+        """HTTP false 映射为 --no-reuse-crash-cache；默认 true 不传旗标。"""
+        req = run_request_from_dict(
+            {
+                "crash_log": "/tmp/a.crash",
+                "reuse_crash_cache": False,
+            }
+        )
+        cmd, _ = _build_cli_cmd(req)
+        self.assertIn("--no-reuse-crash-cache", cmd)
+
+        default_req = run_request_from_dict({"crash_log": "/tmp/a.crash"})
+        default_cmd, _ = _build_cli_cmd(default_req)
+        self.assertNotIn("--no-reuse-crash-cache", default_cmd)
+        self.assertNotIn("--reuse-crash-cache", default_cmd)
+
     def test_force_and_llm_flags(self) -> None:
         req = run_request_from_dict(
             {
