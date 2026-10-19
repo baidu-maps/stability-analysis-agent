@@ -59,9 +59,8 @@ def _log_sha256(request: Dict[str, Any]) -> str:
 
 
 def evidence_material(request: Dict[str, Any]) -> Dict[str, Any]:
-    """代码配置、日志和 Agent 版本。不含大模型，也不含每次都会变的路径。"""
+    """代码配置、日志和闭源 Agent 版本。不含开源版本、开源仓库提交，也不含大模型。"""
     runtime = request.get("runtime") if isinstance(request.get("runtime"), dict) else {}
-    git = runtime.get("git") if isinstance(runtime.get("git"), dict) else {}
     effective = (
         request.get("effective_parameters")
         if isinstance(request.get("effective_parameters"), dict)
@@ -74,10 +73,7 @@ def evidence_material(request: Dict[str, Any]) -> Dict[str, Any]:
         "base_commit": str(source.get("base_commit") or effective.get("base_commit") or "").lower(),
         "source_origin": str(source.get("source_origin") or effective.get("source_origin") or ""),
         "library_dir": str(paths.get("library_dir") or ""),
-        "core_version": str(runtime.get("core_version") or runtime.get("agent_version") or ""),
         "enterprise_version": str(runtime.get("enterprise_version") or ""),
-        "agent_git": str(git.get("commit") or ""),
-        "agent_dirty": bool(git.get("dirty")),
     }
     for key in EVIDENCE_PARAM_KEYS:
         material[key] = effective.get(key)
@@ -140,12 +136,10 @@ def _append_index(row: Dict[str, Any]) -> None:
 
 
 def _usable_evidence(material: Dict[str, Any]) -> bool:
-    """脏工作区、缺日志或缺核心版本时不能复用。"""
-    if material.get("agent_dirty"):
-        return False
+    """缺日志或缺闭源版本时不能复用。"""
     if not str(material.get("log_sha256") or "").strip():
         return False
-    if not str(material.get("core_version") or "").strip():
+    if not str(material.get("enterprise_version") or "").strip():
         return False
     return True
 

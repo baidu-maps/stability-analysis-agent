@@ -3489,8 +3489,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help=(
             "是否复用相同崩溃的分析缓冲（默认开启）。"
-            "代码配置、日志和 Agent 版本一致时，大模型不同则复用到提示词之前；"
+            "代码配置、日志和闭源 Agent 版本一致时，大模型不同则复用到提示词之前；"
             "大模型也一致则复用上次结论，并在已有修改时直接应用补丁。"
+            "开源核心版本和开源仓库是否有未提交改动都不参与对比。"
             "使用 --no-reuse-crash-cache 关闭"
         ),
     )
@@ -6657,12 +6658,15 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
                 "level": replay_hit.get("level"),
                 "source_report": replay_hit.get("source_report"),
             }
-            print(
-                "[crash-replay] 命中分析缓冲 level=%s source=%s"
-                % (replay_hit.get("level"), replay_hit.get("source_report")),
-                file=sys.stderr,
-                flush=True,
-            )
+            _replay_level = str(replay_hit.get("level") or "")
+            if _replay_level == "conclusion":
+                _replay_notice = "[crash-replay] 命中分析缓冲，复用上次结论"
+            else:
+                _replay_notice = "[crash-replay] 命中分析缓冲，大模型不同，复用到提示词之前"
+            _replay_source = str(replay_hit.get("source_report") or "").strip()
+            if _replay_source:
+                _replay_notice = "%s，来源 %s" % (_replay_notice, _replay_source)
+            print(_replay_notice, file=sys.stderr, flush=True)
     _prepare_analysis_acceleration(problem, code_roots, scope)
 
     registry = ToolAndWorkflowRegistry()

@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.5.6] - 2026-10-16
+
+### Changed
+
+- 同一崩溃的分析缓冲只比较代码配置、日志和闭源 Agent 版本。开源核心版本、开源仓库提交和未提交改动不再参与对比，避免开发树脏工作区导致缓冲永远不命中。
+- 命中时的进度文案区分「复用上次结论」和「大模型不同，复用到提示词之前」，并带上来源报告路径。
+
 ## [1.5.5] - 2026-10-16
 
 ### Changed

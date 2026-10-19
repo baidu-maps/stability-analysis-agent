@@ -18,7 +18,14 @@ from services.crash_replay_cache import (
 )
 
 
-def _request(*, model: str = "Claude Sonnet 5.5", dirty: bool = False, version: str = "1.5.5") -> dict:
+def _request(
+    *,
+    model: str = "Claude Sonnet 5.5",
+    dirty: bool = False,
+    enterprise: str = "1.5.5",
+    core: str = "1.5.5",
+    git_commit: str = "404f0a9",
+) -> dict:
     """构造一份最小运行记录。"""
     return {
         "crash_input": {"sha256": "abc123", "source": "content"},
@@ -34,9 +41,9 @@ def _request(*, model: str = "Claude Sonnet 5.5", dirty: bool = False, version: 
             "knowledge_pack_id": "",
         },
         "runtime": {
-            "core_version": version,
-            "enterprise_version": "1.5.5",
-            "git": {"commit": "404f0a9", "dirty": dirty},
+            "core_version": core,
+            "enterprise_version": enterprise,
+            "git": {"commit": git_commit, "dirty": dirty},
         },
         "llm": {
             "provider": "oneapi",
@@ -99,20 +106,28 @@ class CrashReplayCacheTests(unittest.TestCase):
         self.assertIn("code_context", hit["evidence"])
         self.assertNotIn("patch_text", hit)
 
-    def test_dirty_agent_tree_is_not_reused(self) -> None:
-        """Agent 工作区有未提交改动时不命中。"""
+    def test_open_source_git_state_still_hits(self) -> None:
+        """开源仓库提交不同或有未提交改动时仍可复用。"""
         source = Path(self._tmpdir.name) / "source"
         _write_report(source)
-        remember_crash_replay(source, _request(dirty=True))
-        self.assertIsNone(lookup_crash_replay(_request(dirty=True)))
-        self.assertIsNone(lookup_crash_replay(_request(dirty=False)))
+        remember_crash_replay(source, _request(dirty=True, git_commit="aaaa"))
+        hit = lookup_crash_replay(_request(dirty=False, git_commit="bbbb"))
+        self.assertEqual(hit["level"], "conclusion")
 
-    def test_version_mismatch_misses(self) -> None:
-        """核心版本不同不能复用。"""
+    def test_enterprise_version_mismatch_misses(self) -> None:
+        """闭源 Agent 版本不同不能复用。"""
         source = Path(self._tmpdir.name) / "source"
         _write_report(source)
-        remember_crash_replay(source, _request(version="1.5.5"))
-        self.assertIsNone(lookup_crash_replay(_request(version="1.5.6")))
+        remember_crash_replay(source, _request(enterprise="1.5.5"))
+        self.assertIsNone(lookup_crash_replay(_request(enterprise="1.5.6")))
+
+    def test_core_version_difference_still_hits(self) -> None:
+        """开源核心版本不同仍可复用。"""
+        source = Path(self._tmpdir.name) / "source"
+        _write_report(source)
+        remember_crash_replay(source, _request(core="1.5.5"))
+        hit = lookup_crash_replay(_request(core="1.5.6"))
+        self.assertEqual(hit["level"], "conclusion")
 
     def test_failed_apply_is_not_a_conclusion(self) -> None:
         """改码失败的运行不能当作可直接应用的结论。"""
