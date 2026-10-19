@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.5.7] - 2026-10-19
+
+### Added
+
+- 上下文请求新增 `class`（别名 `struct` / `class_declaration`）：返回类或结构体声明块，可跨过导出宏定位。函数符号未命中时，按请求 `reason` 里的检索提示回填相关行。
+- 新增单测 `test/harness/test_class_context_request.py`，并补充 LLM 路由失败分类用例。
+
+### Changed
+
+- 大模型调用：过载、超时和 5xx 先在当前模型重试一次，再切换下一个端点；网关过载文案即使包在成功响应里也视为失败。进度输出 `[llm] 同模型重试` 与 `[llm] 改用下一模型`。
+
 ## [1.5.6] - 2026-10-16
 
 ### Changed

@@ -1230,10 +1230,15 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         stage: str = "analysis",
     ) -> Tuple[Any, str]:
         from services.analyze_llm import (
+            active_model_name,
             analysis_token_attempts,
+            announce_llm_failover,
+            announce_llm_same_model_retry,
             announce_llm_send,
+            gateway_failure_from_response,
             output_looks_truncated,
             resolve_analysis_prompt_cap,
+            should_retry_same_model,
         )
 
         prompt_cap = resolve_analysis_prompt_cap(problem)
@@ -1271,12 +1276,13 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
 
         llm_response = None
         last_llm_exc: Optional[Exception] = None
-        call_started = None
-        for endpoint_attempt in range(max_endpoint_attempts):
+        import time as _time
+
+        endpoint_switches = 0
+        same_model_retries_left = 1
+        while endpoint_switches < max_endpoint_attempts:
             llm_response = None
             last_llm_exc = None
-            import time as _time
-
             call_started = _time.perf_counter()
             for idx, tok in enumerate(token_attempts, start=1):
                 try:
@@ -1307,6 +1313,11 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     )
             duration_ms = int(round((_time.perf_counter() - call_started) * 1000))
             if llm_response is not None:
+                gateway = gateway_failure_from_response(llm_response)
+                if gateway:
+                    llm_response = None
+                    last_llm_exc = RuntimeError(gateway)
+            if llm_response is not None:
                 if router_state is not None:
                     try:
                         from tool_system.llm.llm_router import record_call
@@ -1322,30 +1333,50 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         pass
                 break
 
-            # Endpoint-level failure → optional failover
+            cause = str(last_llm_exc or "llm_call_failed")
+            if should_retry_same_model(cause, same_model_retries_left):
+                same_model_retries_left -= 1
+                if router_state is not None:
+                    try:
+                        from tool_system.llm.llm_router import record_call
+
+                        record_call(
+                            router_state,
+                            stage=stage,
+                            round_index=round_index,
+                            status="retry",
+                            duration_ms=duration_ms,
+                            error=cause,
+                        )
+                    except Exception:
+                        pass
+                announce_llm_same_model_retry(active_model_name(context, router_state), cause)
+                continue
+            same_model_retries_left = 1
             if router_state is not None:
                 try:
                     from tool_system.llm.llm_router import failover_next, record_call
 
+                    previous_model = active_model_name(context, router_state)
                     record_call(
                         router_state,
                         stage=stage,
                         round_index=round_index,
                         status="error",
                         duration_ms=duration_ms,
-                        error=str(last_llm_exc or "unknown"),
+                        error=cause,
                     )
-                    next_ep = failover_next(
-                        router_state, cause=str(last_llm_exc or "llm_call_failed")
-                    )
+                    next_ep = failover_next(router_state, cause=cause)
                     if next_ep is None:
                         break
                     BaseCrashAnalysisWorkflow._apply_router_endpoint_to_context(context, next_ep)
+                    announce_llm_failover(previous_model, next_ep.model, cause)
                     logger.warning(
                         "LLM failover to provider=%s model=%s",
                         next_ep.provider_key,
                         next_ep.model,
                     )
+                    endpoint_switches += 1
                     continue
                 except Exception as fo_exc:
                     logger.debug("LLM failover skipped: %s", fo_exc)

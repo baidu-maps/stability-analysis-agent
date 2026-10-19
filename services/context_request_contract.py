@@ -9,6 +9,7 @@ from services.agent_schema import CONTEXT_REQUEST_TYPES
 
 CONTEXT_REQUEST_RETURN_FORMS: Dict[str, str] = {
     "function": "function_source",
+    "class": "class_declaration",
     "field": "member_declaration",
     "references": "read_write_references",
     "callers": "caller_snippets",
@@ -48,6 +49,9 @@ def normalize_expected_return_form(request_type: str, raw_form: Any) -> str:
         "function": "function_source",
         "function_source": "function_source",
         "source": "function_source",
+        "class": "class_declaration",
+        "struct": "class_declaration",
+        "class_declaration": "class_declaration",
         "field": "member_declaration",
         "member_declaration": "member_declaration",
         "declaration": "member_declaration",
@@ -60,6 +64,7 @@ def normalize_expected_return_form(request_type: str, raw_form: Any) -> str:
     normalized = aliases.get(token, token) if token else default_form
     allowed_by_type = {
         "function": {"function_source"},
+        "class": {"class_declaration"},
         "field": {"member_declaration", "member_initialization"},
         "references": {"read_write_references"},
         "callers": {"caller_snippets"},
@@ -75,6 +80,8 @@ def infer_actual_return_form(item: Dict[str, Any]) -> Optional[str]:
     context_type = str(item.get("context_type") or "function").strip().lower()
     if context_type == "function":
         return "function_source"
+    if context_type == "class":
+        return "class_declaration"
     if context_type == "field":
         matches = item.get("matches")
         if isinstance(matches, list) and matches:
@@ -267,12 +274,14 @@ def format_context_resolution(item: Dict[str, Any]) -> str:
 
     context_type = str(item.get("context_type") or "function")
     lines.append("- 状态: 已定位")
-    if context_type in {"field", "references"}:
-        lines.append(
-            "- 回填说明: 优先返回所属类的成员声明；若无声明则返回同类初始化；不包含调用链。"
-            if context_type == "field"
-            else "- 回填说明: 返回符号在所属类相关文件中的读写/引用位置。"
-        )
+    if context_type in {"field", "references", "class"}:
+        if context_type == "class":
+            note = "- 回填说明: 返回类或结构体声明块（含紧邻的 template 行）。"
+        elif context_type == "field":
+            note = "- 回填说明: 优先返回所属类的成员声明；若无声明则返回同类初始化；不包含调用链。"
+        else:
+            note = "- 回填说明: 返回符号在所属类相关文件中的读写/引用位置。"
+        lines.append(note)
         for index, match in enumerate(item.get("matches", [])[:8]):
             if not isinstance(match, dict):
                 continue
@@ -302,6 +311,8 @@ def format_context_resolution(item: Dict[str, Any]) -> str:
         return "\n".join(lines)
     if context_type == "grep":
         lines.append("- 回填说明: 仓库 grep 匹配结果。")
+        if item.get("note"):
+            lines.append(f"- 说明: {item.get('note')}")
         for index, match in enumerate(item.get("matches", [])[:12]):
             if not isinstance(match, dict):
                 continue

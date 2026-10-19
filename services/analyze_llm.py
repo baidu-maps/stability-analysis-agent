@@ -40,6 +40,55 @@ def format_llm_send_line(
     return line
 
 
+def _short_failure(cause: str) -> str:
+    """把失败原因压成一行，避免网关正文刷屏。"""
+    short = " ".join(str(cause or "").split())
+    if len(short) > 80:
+        return short[:79] + "…"
+    return short or "调用失败"
+
+
+def announce_llm_same_model_retry(model: str, cause: str) -> None:
+    """同一模型的瞬时失败先重试一次。"""
+    print(
+        f"[llm] {model or '当前模型'} 调用失败，同模型重试一次（{_short_failure(cause)}）",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def announce_llm_failover(previous_model: str, next_model: str, cause: str) -> None:
+    """切换到下一个模型时打一行，方便从服务日志里看到路由。"""
+    print(
+        f"[llm] {previous_model or '当前模型'} 调用失败，改用 {next_model}（{_short_failure(cause)}）",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def active_model_name(context: Any, router_state: Any) -> str:
+    """当前这次调用实际使用的模型名。"""
+    selected = getattr(router_state, "selected", None)
+    model = str(getattr(selected, "model", "") or "").strip()
+    if model:
+        return model
+    return str(getattr(getattr(context, "llm", None), "model", "") or "").strip()
+
+
+def gateway_failure_from_response(response: Any) -> str:
+    """成功响应里如果只剩网关过载文案，把它当成调用失败。"""
+    from tool_system.llm.llm_router import gateway_error_text
+
+    return gateway_error_text(str(getattr(response, "content", "") or ""))
+
+
+def should_retry_same_model(cause: str, retries_left: int) -> bool:
+    """过载、超时和 5xx 先在当前模型上再试一次。"""
+    from tool_system.llm.llm_router import classify_llm_failure
+
+    return int(retries_left or 0) > 0 and classify_llm_failure(cause) == "retryable"
+
+
 def announce_llm_send(round_index: int, prompt: str) -> str:
     """在真正请求模型之前打一行容量。同一份提示的重试不再打。"""
     global _previous_prompt_chars
@@ -245,7 +294,9 @@ def call_analyze_llm_with_retries(
 
     llm_response = None
     last_llm_exc: Optional[Exception] = None
-    for _endpoint_attempt in range(max_endpoint_attempts):
+    endpoint_switches = 0
+    same_model_retries_left = 1
+    while endpoint_switches < max_endpoint_attempts:
         llm_response = None
         last_llm_exc = None
         call_started = time.perf_counter()
@@ -282,6 +333,11 @@ def call_analyze_llm_with_retries(
                 )
         duration_ms = int(round((time.perf_counter() - call_started) * 1000))
         if llm_response is not None:
+            gateway = gateway_failure_from_response(llm_response)
+            if gateway:
+                llm_response = None
+                last_llm_exc = RuntimeError(gateway)
+        if llm_response is not None:
             if router_state is not None:
                 try:
                     from tool_system.llm.llm_router import record_call
@@ -296,30 +352,50 @@ def call_analyze_llm_with_retries(
                 except Exception:
                     pass
             break
+        cause = str(last_llm_exc or "llm_call_failed")
+        if should_retry_same_model(cause, same_model_retries_left):
+            same_model_retries_left -= 1
+            if router_state is not None:
+                try:
+                    from tool_system.llm.llm_router import record_call
+
+                    record_call(
+                        router_state,
+                        stage=stage,
+                        round_index=round_index,
+                        status="retry",
+                        duration_ms=duration_ms,
+                        error=cause,
+                    )
+                except Exception:
+                    pass
+            announce_llm_same_model_retry(active_model_name(context, router_state), cause)
+            continue
+        same_model_retries_left = 1
         if router_state is not None:
             try:
                 from tool_system.llm.llm_router import failover_next, record_call
 
+                previous_model = active_model_name(context, router_state)
                 record_call(
                     router_state,
                     stage=stage,
                     round_index=round_index,
                     status="error",
                     duration_ms=duration_ms,
-                    error=str(last_llm_exc or "unknown"),
+                    error=cause,
                 )
-                next_endpoint = failover_next(
-                    router_state,
-                    cause=str(last_llm_exc or "llm_call_failed"),
-                )
+                next_endpoint = failover_next(router_state, cause=cause)
                 if next_endpoint is None:
                     break
                 _apply_router_endpoint(context, next_endpoint)
+                announce_llm_failover(previous_model, next_endpoint.model, cause)
                 logger.warning(
                     "LLM failover to provider=%s model=%s",
                     next_endpoint.provider_key,
                     next_endpoint.model,
                 )
+                endpoint_switches += 1
                 continue
             except Exception as exc:
                 logger.debug("LLM failover skipped: %s", exc)

@@ -546,10 +546,10 @@ class CodeContextRequestResolver:
         max_matches: int = 2,
         stack_priority_classes: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        class_name = str(symbol or "").strip()
+        class_name = cls._plain_type_name(symbol)
         if not class_name:
             return []
-        class_re = re.compile(rf"\b(?:class|struct)\s+{re.escape(class_name)}\b")
+        class_re = cls._class_decl_re(class_name)
         ctor_re = re.compile(
             rf"\b{re.escape(class_name)}\s*::\s*{re.escape(class_name)}\s*\("
         )
@@ -571,9 +571,11 @@ class CodeContextRequestResolver:
                 if ctor_re.search(line) or not class_re.search(line):
                     continue
                 start, end = cls._extract_class_declaration_span(lines, idx)
+                span_text = "\n".join(lines[start - 1 : end])
+                score = path_score + (300 if "{" in span_text else 0)
                 ranked.append(
                     (
-                        path_score,
+                        score,
                         {
                             "file": file_path,
                             "line_number": idx,
@@ -591,11 +593,26 @@ class CodeContextRequestResolver:
         ranked.sort(key=lambda item: (-item[0], item[1]["file"], item[1]["line_number"]))
         return [entry for _, entry in ranked[:max_matches]]
 
+    @staticmethod
+    def _plain_type_name(symbol: str) -> str:
+        """去掉命名空间和模板参数，得到类名本身。"""
+        raw = str(symbol or "").strip().split("(", 1)[0].strip()
+        raw = raw.split("::")[-1]
+        return raw.split("<", 1)[0].strip()
+
+    @classmethod
+    def _class_decl_re(cls, class_name: str) -> "re.Pattern[str]":
+        """匹配 class/struct 声明，允许导出宏插在关键字和类名之间。"""
+        name = re.escape(cls._plain_type_name(class_name))
+        return re.compile(
+            rf"\b(?:class|struct)\s+(?:[A-Za-z_][A-Za-z0-9_]*\s+)*{name}\b"
+        )
+
     @classmethod
     def _file_declares_class(cls, lines: List[str], class_name: str) -> bool:
         if not class_name or not lines:
             return False
-        pattern = re.compile(rf"\b(?:class|struct)\s+{re.escape(class_name)}\b")
+        pattern = cls._class_decl_re(class_name)
         return any(pattern.search(line) for line in lines)
 
     @classmethod
@@ -654,7 +671,7 @@ class CodeContextRequestResolver:
         field = str(parsed.get("member") or "")
         if not template_class or not field:
             return []
-        class_re = re.compile(rf"\b(?:class|struct)\s+{re.escape(template_class)}\b")
+        class_re = cls._class_decl_re(template_class)
         token_re = re.compile(rf"\b{re.escape(field)}\b")
         ranked: List[Tuple[int, Dict[str, Any]]] = []
         files = cls._iter_context_search_files(code_roots)
@@ -960,6 +977,27 @@ class CodeContextRequestResolver:
         tool_executor: Optional[Any] = None,
         stack_priority_classes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
+        if req_type == "class":
+            matches = cls._find_class_declaration_context_matches(
+                symbol,
+                code_roots,
+                max_matches=2,
+                stack_priority_classes=stack_priority_classes,
+            )
+            if matches:
+                return {
+                    "request": req,
+                    "success": True,
+                    "context_type": "class",
+                    "symbol": symbol,
+                    "matches": matches,
+                }
+            return {
+                "request": req,
+                "success": False,
+                "context_type": "class",
+                "error": f"未定位到类声明: {symbol}",
+            }
         if req_type == "field":
             matches = cls._find_text_context_matches(
                 symbol,
@@ -1067,9 +1105,151 @@ class CodeContextRequestResolver:
             "success": False,
             "error": (
                 f"不支持的 context request type: {req_type}; "
-                "支持 function/field/references/callers"
+                "支持 function/class/field/references/callers"
             ),
         }
+
+    _SEARCH_HINT_RE = re.compile(
+        r"(?:检索|搜索|grep)\s*[`「\"']?"
+        r"(.+?)"
+        r"(?=[`」\"']|的调用|的定义|的声明|的位置|[。；;\n]|$)"
+    )
+
+    @classmethod
+    def _function_fallback_patterns(cls, symbol: str, reason: str) -> List[str]:
+        """从失败原因和请求说明里抽出可检索的字面量。"""
+        patterns: List[str] = []
+        for match in cls._SEARCH_HINT_RE.finditer(str(reason or "")):
+            text = " ".join(match.group(1).split()).strip(" ，,")
+            if len(text) < 4:
+                continue
+            text = text[:80]
+            if text not in patterns:
+                patterns.append(text)
+            if "<" in text:
+                loosened = re.sub(r"\s*<[^>]*>", "", text).strip()
+                if len(loosened) >= 4 and loosened not in patterns:
+                    patterns.append(loosened[:80])
+        head = str(symbol or "").split("(", 1)[0].strip()
+        if "::" in head:
+            class_name = head.split("::")[-2].split("<", 1)[0].strip()
+            qualified = f"{class_name}::" if class_name else ""
+            if qualified and qualified not in patterns:
+                patterns.append(qualified)
+        return patterns
+
+    @classmethod
+    def _grep_literal_matches(
+        cls,
+        pattern: str,
+        code_roots: List[str],
+        *,
+        max_matches: int = 8,
+        stack_priority_classes: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """在源码根里按字面量找若干行。"""
+        needle = str(pattern or "").strip()
+        if len(needle) < 3:
+            return []
+        class_name = cls._plain_type_name(needle)
+        files = cls._iter_context_search_files(code_roots)
+        files.sort(
+            key=lambda fp: -cls._field_context_path_score(
+                fp, class_name, stack_priority_classes=stack_priority_classes
+            )
+        )
+        matches: List[Dict[str, Any]] = []
+        for file_path in files:
+            lines = cls._read_source_lines(file_path)
+            for idx, line in enumerate(lines, start=1):
+                if needle not in line:
+                    continue
+                matches.append({
+                    "file": file_path,
+                    "line": idx,
+                    "line_number": idx,
+                    "line_text": line.strip()[:200],
+                })
+                if len(matches) >= max_matches:
+                    return matches
+        return matches
+
+    @classmethod
+    def _function_search_fallback(
+        cls,
+        req: Dict[str, Any],
+        symbol: str,
+        code_roots: List[str],
+        error: str,
+        *,
+        stack_priority_classes: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """函数定位失败时，改用请求里的检索提示或同类符号回填。"""
+        patterns = cls._function_fallback_patterns(symbol, str(req.get("reason") or ""))
+        matches: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, int]] = set()
+        for pattern in patterns:
+            for entry in cls._grep_literal_matches(
+                pattern,
+                code_roots,
+                max_matches=8,
+                stack_priority_classes=stack_priority_classes,
+            ):
+                key = (str(entry.get("file")), int(entry.get("line_number") or 0))
+                if key in seen:
+                    continue
+                seen.add(key)
+                matches.append(entry)
+                if len(matches) >= 8:
+                    break
+            if len(matches) >= 8:
+                break
+        if not matches:
+            return None
+        shown = "、".join(patterns[:4])
+        return {
+            "request": req,
+            "success": True,
+            "context_type": "grep",
+            "symbol": symbol,
+            "fallback_from": "function",
+            "note": f"函数未精确命中（{error}）。已改为检索：{shown}",
+            "matches": matches,
+        }
+
+    @classmethod
+    def _finish_unresolved_function(
+        cls,
+        resolved: List[Dict[str, Any]],
+        outcomes: Dict[str, str],
+        req: Dict[str, Any],
+        req_type: str,
+        symbol: str,
+        file_path: str,
+        line_number: int,
+        code_roots: List[str],
+        error: str,
+        *,
+        stack_priority_classes: Optional[List[str]] = None,
+    ) -> None:
+        """记录函数定位失败；能检索到相关源码时改为成功回填。"""
+        fallback = cls._function_search_fallback(
+            req,
+            symbol,
+            code_roots,
+            error,
+            stack_priority_classes=stack_priority_classes,
+        )
+        if fallback is not None:
+            resolved.append(fallback)
+            cls._record_context_request_outcome(
+                outcomes, req_type, symbol, file_path, line_number, "success"
+            )
+            return
+        resolved.append({"request": req, "success": False, "error": error})
+        cls._record_context_request_outcome(
+            outcomes, req_type, symbol, file_path, line_number, "failed"
+        )
 
     @classmethod
     def resolve_requests(
@@ -1111,7 +1291,7 @@ class CodeContextRequestResolver:
             if not isinstance(req, dict):
                 continue
             req_type = str(req.get("type") or "function").strip().lower()
-            if req_type not in {"function", "field", "references", "callers"}:
+            if req_type not in {"function", "class", "field", "references", "callers"}:
                 resolved.append({
                     "request": req,
                     "success": False,
@@ -1255,10 +1435,17 @@ class CodeContextRequestResolver:
                 error = "缺少 symbol/function 或 file+line"
 
             if not target_file or target_line <= 0:
-                item = {"request": req, "success": False, "error": error or "定位失败"}
-                resolved.append(item)
-                cls._record_context_request_outcome(
-                    outcomes, req_type, symbol, file_path, line_number, "failed"
+                cls._finish_unresolved_function(
+                    resolved,
+                    outcomes,
+                    req,
+                    req_type,
+                    symbol,
+                    file_path,
+                    line_number,
+                    code_roots,
+                    error or "定位失败",
+                    stack_priority_classes=stack_priority_classes,
                 )
                 continue
 
@@ -1271,10 +1458,17 @@ class CodeContextRequestResolver:
                 }
             )
             if out.get("error"):
-                item = {"request": req, "success": False, "error": str(out.get("error"))}
-                resolved.append(item)
-                cls._record_context_request_outcome(
-                    outcomes, req_type, symbol, file_path, line_number, "failed"
+                cls._finish_unresolved_function(
+                    resolved,
+                    outcomes,
+                    req,
+                    req_type,
+                    symbol,
+                    file_path,
+                    line_number,
+                    code_roots,
+                    str(out.get("error")),
+                    stack_priority_classes=stack_priority_classes,
                 )
                 continue
             out = cls._repair_template_function_snippet(
@@ -1289,17 +1483,20 @@ class CodeContextRequestResolver:
             if not cls._resolved_function_matches_symbol(
                 symbol, target_file, target_line, resolved_sig, snippet_text
             ) or not cls._resolved_snippet_matches_symbol(symbol, snippet_text, resolved_sig):
-                item = {
-                    "request": req,
-                    "success": False,
-                    "error": (
-                        f"定位结果与请求符号不一致（疑似误命中构造函数/其它同名函数）: "
+                cls._finish_unresolved_function(
+                    resolved,
+                    outcomes,
+                    req,
+                    req_type,
+                    symbol,
+                    file_path,
+                    line_number,
+                    code_roots,
+                    (
+                        "定位结果与请求符号不一致（疑似误命中构造函数/其它同名函数）: "
                         f"{symbol}"
                     ),
-                }
-                resolved.append(item)
-                cls._record_context_request_outcome(
-                    outcomes, req_type, symbol, file_path, line_number, "failed"
+                    stack_priority_classes=stack_priority_classes,
                 )
                 continue
             resolved.append(

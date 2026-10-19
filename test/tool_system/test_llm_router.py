@@ -13,6 +13,9 @@ from tool_system.llm.endpoint_pool import (
     discover_candidates,
 )
 from tool_system.llm.llm_router import (
+    classify_llm_failure,
+    failover_next,
+    gateway_error_text,
     resolve_for_run,
     skipped_summary,
 )
@@ -105,6 +108,77 @@ class DiscoverTest(unittest.TestCase):
         self.assertEqual(state.selected.provider_key, "claude")
 
 
+def _oneapi_config():
+    return _sample_llm_config(
+        mode="fixed",
+        active_provider="baidu_one_api",
+        routing={"failover_enabled": True, "health_check": False},
+        providers={
+            "baidu_one_api": {
+                "api_key": "sk-real-oneapi-key-for-test",
+                "request_format": "anthropic_messages_compatible",
+                "auth_header": "x-api-key",
+                "auth_prefix": "",
+                "base_url": "https://oneapi-comate.baidu-int.com/v1/messages",
+                "model": "Claude Sonnet 5.5",
+                "models": [
+                    "Claude Haiku 4.5",
+                    "Claude Sonnet 5.5",
+                    "gpt-5.5",
+                ],
+            }
+        },
+    )
+
+
+class ModelListFailoverTest(unittest.TestCase):
+    def tearDown(self):
+        clear_health_cache()
+
+    def test_models_keep_primary_first(self):
+        clear_health_cache()
+        state = resolve_for_run(_oneapi_config(), health_check_override=False)
+        self.assertEqual(
+            [ep.model for ep in state.pool],
+            ["Claude Sonnet 5.5", "Claude Haiku 4.5", "gpt-5.5"],
+        )
+        assert state.selected is not None
+        self.assertEqual(state.selected.model, "Claude Sonnet 5.5")
+
+    def test_failover_follows_model_order(self):
+        clear_health_cache()
+        state = resolve_for_run(_oneapi_config(), health_check_override=False)
+        cause = "LLM call failed: Error code: 503 - 当前系统负载过高，请稍后再试"
+        nxt = failover_next(state, cause=cause)
+        assert nxt is not None
+        self.assertEqual(nxt.model, "Claude Haiku 4.5")
+        self.assertTrue(state.failover_occurred)
+        self.assertEqual(state.failover_from["model"], "Claude Sonnet 5.5")
+        nxt = failover_next(state, cause="timed out")
+        assert nxt is not None
+        self.assertEqual(nxt.model, "gpt-5.5")
+        self.assertIsNone(failover_next(state, cause=cause))
+        clear_health_cache()
+
+    def test_auth_failure_does_not_switch_models(self):
+        clear_health_cache()
+        state = resolve_for_run(_oneapi_config(), health_check_override=False)
+        nxt = failover_next(state, cause="LLM call failed: Error code: 401 - unauthorized")
+        self.assertIsNone(nxt)
+        self.assertFalse(state.failover_occurred)
+        clear_health_cache()
+
+    def test_classify_overload_and_gateway_body(self):
+        self.assertEqual(
+            classify_llm_failure("LLM call failed: 当前系统负载过高，请稍后再试"),
+            "retryable",
+        )
+        self.assertEqual(classify_llm_failure("Error code: 401 unauthorized"), "auth")
+        self.assertEqual(gateway_error_text("当前系统负载过高，请稍后再试"), "当前系统负载过高，请稍后再试")
+        long_text = "分析结论正常。" * 40
+        self.assertEqual(gateway_error_text(long_text), "")
+
+
 class RoutingPolicyTest(unittest.TestCase):
     def test_force_profile(self):
         tier, reason = resolve_tier(RoutingContext(force_profile="fast"))
@@ -166,6 +240,23 @@ class FinalSummaryLlmFieldTest(unittest.TestCase):
 
         out2 = _llm_summary_from_result({}, scope="parse_stack_only", request_record={})
         self.assertFalse(out2["engaged"])
+
+    def test_request_snapshot_keeps_the_model_that_answered(self):
+        from cli.main import _sync_request_llm_with_selected
+
+        request = {"llm": {"provider": "baidu_one_api", "model": "Claude Sonnet 5.5"}}
+        result = {
+            "metadata": {
+                "llm_routing": {
+                    "selected": {
+                        "provider": "baidu_one_api",
+                        "model": "Claude Haiku 4.5",
+                    }
+                }
+            }
+        }
+        _sync_request_llm_with_selected(request, result)
+        self.assertEqual(request["llm"]["model"], "Claude Haiku 4.5")
 
 
 if __name__ == "__main__":

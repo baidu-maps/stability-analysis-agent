@@ -216,7 +216,7 @@ def build_context_resolver_registry(
     code_roots: Optional[List[str]] = None,
 ) -> ContextResolverRegistry:
     registry = ContextResolverRegistry()
-    for request_type in ("function", "field", "references", "callers"):
+    for request_type in ("function", "field", "class", "references", "callers"):
         registry.register(CallableContextResolver(request_type, code_resolver))
     roots = list(code_roots or [])
     if not roots and isinstance(prepare, dict):
@@ -237,7 +237,7 @@ def build_context_resolver_registry(
 
 def supported_context_request_types_doc() -> str:
     return (
-        "`function`→函数完整源码；`field`→成员声明（优先 .h）；"
+        "`function`→函数完整源码；`class`→类或结构体声明；`field`→成员声明（优先 .h）；"
         "`references`→读写/引用位置；`callers`→调用方片段；"
         "`grep`→仓库文本/正则搜索（symbol=pattern，可选 file=path_glob）；"
         "`read_file`→按路径读取源码片段（file 必填，line_number/line_end 可选）；"

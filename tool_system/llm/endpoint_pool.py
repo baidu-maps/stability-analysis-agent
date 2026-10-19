@@ -155,6 +155,23 @@ def _adapter_provider_for(provider_key: str, provider_cfg: Dict[str, Any]) -> st
     return "openai"
 
 
+def _ordered_model_names(provider_cfg: Dict[str, Any], fallback: str) -> List[str]:
+    """首选 model 放在最前，其余按 models 的书写顺序。"""
+    primary = str(provider_cfg.get("model") or fallback or "").strip()
+    ordered: List[str] = []
+    raw_models = provider_cfg.get("models")
+    if isinstance(raw_models, list):
+        for item in raw_models:
+            name = str(item or "").strip()
+            if name and name not in ordered:
+                ordered.append(name)
+    if primary:
+        if primary in ordered:
+            ordered.remove(primary)
+        ordered.insert(0, primary)
+    return ordered
+
+
 def discover_candidates(llm_config: Dict[str, Any]) -> List[LLMEndpoint]:
     """Statically discover configured providers with real secrets (no network)."""
     if not isinstance(llm_config, dict):
@@ -204,8 +221,8 @@ def discover_candidates(llm_config: Dict[str, Any]) -> List[LLMEndpoint]:
         if auth_type != "none" and _is_placeholder_secret(secret):
             continue
 
-        model = str(merged.get("model") or default_models.get(provider_key) or "").strip()
-        if not model:
+        models = _ordered_model_names(merged, default_models.get(provider_key, ""))
+        if not models:
             continue
         base_url = _normalize_base_url(
             merged.get("base_url") or default_base_urls.get(provider_key)
@@ -213,7 +230,6 @@ def discover_candidates(llm_config: Dict[str, Any]) -> List[LLMEndpoint]:
         if not base_url:
             continue
 
-        tier, score = score_model(provider_key, model)
         adapter_provider = _adapter_provider_for(provider_key, merged)
         stream_val = merged.get("stream")
         if "auth_prefix" in merged:
@@ -227,24 +243,26 @@ def discover_candidates(llm_config: Dict[str, Any]) -> List[LLMEndpoint]:
         auth_header = str(merged.get("auth_header") or "Authorization").strip() or "Authorization"
         if request_format.startswith("anthropic") and "auth_header" not in merged and "auth_header" not in defaults:
             auth_header = "x-api-key"
-        ep = LLMEndpoint(
-            provider_key=provider_key,
-            model=model,
-            adapter_provider=adapter_provider,
-            base_url=base_url,
-            auth_type=auth_type,
-            secret=secret if auth_type != "none" else "",
-            request_format=request_format,
-            auth_header=auth_header,
-            auth_prefix=auth_prefix,
-            request_timeout=int(merged.get("request_timeout") or merged.get("timeout") or 180),
-            stream=bool(stream_val) if stream_val is not None else None,
-            temperature=float(merged.get("temperature") or 0.7),
-            max_tokens=int(merged.get("max_tokens") or 4096),
-            tier=tier,
-            score=score,
-        )
-        out.append(ep)
+        for model in models:
+            tier, score = score_model(provider_key, model)
+            ep = LLMEndpoint(
+                provider_key=provider_key,
+                model=model,
+                adapter_provider=adapter_provider,
+                base_url=base_url,
+                auth_type=auth_type,
+                secret=secret if auth_type != "none" else "",
+                request_format=request_format,
+                auth_header=auth_header,
+                auth_prefix=auth_prefix,
+                request_timeout=int(merged.get("request_timeout") or merged.get("timeout") or 180),
+                stream=bool(stream_val) if stream_val is not None else None,
+                temperature=float(merged.get("temperature") or 0.7),
+                max_tokens=int(merged.get("max_tokens") or 4096),
+                tier=tier,
+                score=score,
+            )
+            out.append(ep)
     return out
 
 

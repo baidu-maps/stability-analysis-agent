@@ -107,7 +107,7 @@ def build_round0_output_format_lines(*, agent_loop: str) -> List[str]:
         "### 需要 Agent 补充的上下文",
         "- 当前还不能形成最终结论的原因：[简要说明缺少哪些关键证据]",
         "- 下一轮需要 Agent 补充的内容：",
-        "  1. `[符号]`（function/field/references/callers/grep/read_file）：",
+        "  1. `[符号]`（function/class/field/references/callers/grep/read_file）：",
         "     - 原因：[为什么当前证据不足]",
         "     - 希望验证：[补充后要验证的根因假设]",
         "     - 优先级：[critical/high/normal/low]（禁止 medium）",
@@ -152,7 +152,7 @@ def build_round0_output_format_lines(*, agent_loop: str) -> List[str]:
         "}",
         "",
         "`expected_return_form` 必须与 `type` 一致：",
-        "`function`→`function_source`；`field`→`member_declaration`；",
+        "`function`→`function_source`；`class`→`class_declaration`；`field`→`member_declaration`；",
         "`references`→`read_write_references`；`callers`→`caller_snippets`；",
         "`grep`→`grep_matches`；`read_file`→`file_snippet`。",
         "禁止：`type=file`（改用 `read_file`）、`priority=medium`（改用 `normal`）。",
@@ -184,7 +184,7 @@ def build_round_task_section(
                 "- 上一轮 `context_requests` 未产出任何**有效**请求（类型/优先级不合法或列表为空）。"
             )
             lines.append(
-                "- 合法 `type` 仅限：`function` / `field` / `references` / `callers` / "
+                "- 合法 `type` 仅限：`function` / `class` / `field` / `references` / `callers` / "
                 "`grep` / `read_file` / `memory_pattern` / `verification_log` / `trace_snippet`。"
                 "不要使用 `file`（请改用 `read_file`，路径放在 `file` 字段）。"
             )

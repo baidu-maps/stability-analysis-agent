@@ -24,6 +24,80 @@ from .routing_policy import RoutingContext, assign_role_endpoints, resolve_tier,
 logger = logging.getLogger(__name__)
 
 
+_AUTH_CODES = ("401", "403")
+_RETRYABLE_CODES = ("408", "409", "425", "429", "500", "502", "503", "504")
+_RETRYABLE_PHRASES = (
+    "timeout",
+    "timed out",
+    "超时",
+    "rate limit",
+    "too many requests",
+    "overloaded",
+    "overload",
+    "负载过高",
+    "稍后再试",
+    "系统繁忙",
+    "bad gateway",
+    "service unavailable",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "temporarily unavailable",
+    "remote end closed",
+)
+_GATEWAY_BODY_MARKERS = (
+    "负载过高",
+    "稍后再试",
+    "系统繁忙",
+    "overloaded",
+    "rate limit",
+    "too many requests",
+)
+
+
+def _has_status_code(lowered: str, code: str) -> bool:
+    """识别适配器写进异常文本里的 HTTP 状态码。"""
+    return (
+        f"error code: {code}" in lowered
+        or f"status code: {code}" in lowered
+        or f"http {code}" in lowered
+        or f"status={code}" in lowered
+    )
+
+
+def classify_llm_failure(message: str) -> str:
+    """把一次调用失败分成 auth、retryable 或 other。"""
+    text = str(message or "")
+    lowered = text.lower()
+    if any(_has_status_code(lowered, code) for code in _AUTH_CODES):
+        return "auth"
+    auth_markers = (
+        "unauthorized",
+        "forbidden",
+        "invalid api",
+        "authentication",
+        "invalid_api_key",
+    )
+    if any(marker in lowered for marker in auth_markers):
+        return "auth"
+    if any(_has_status_code(lowered, code) for code in _RETRYABLE_CODES):
+        return "retryable"
+    if any(phrase in text or phrase in lowered for phrase in _RETRYABLE_PHRASES):
+        return "retryable"
+    return "other"
+
+
+def gateway_error_text(content: str) -> str:
+    """HTTP 200 但正文其实是网关过载时，返回这段短文本。"""
+    text = " ".join(str(content or "").split())
+    if not text or len(text) > 180:
+        return ""
+    lowered = text.lower()
+    if any(marker in text or marker in lowered for marker in _GATEWAY_BODY_MARKERS):
+        return text
+    return ""
+
+
 def normalize_mode(raw: Any) -> str:
     mode = str(raw or "fixed").strip().lower()
     # strong_only was an early public mode. Keep old config files usable by
@@ -201,7 +275,6 @@ def resolve_for_run(
         # Discover all then pick active; if active missing from discover (placeholder),
         # fall back to building from raw config via discover of only that key.
         all_cands = discover_candidates(llm_config)
-        state.pool = [ep for ep in all_cands if ep.provider_key == active] or all_cands[:0]
         selected = None
         for ep in all_cands:
             if ep.provider_key == active:
@@ -213,7 +286,10 @@ def resolve_for_run(
             state.reason = state.skip_reason
             return state
         selected.health_status = "unknown"
-        state.pool = [selected]
+        matching = [ep for ep in all_cands if ep.provider_key == active]
+        for ep in matching:
+            ep.health_status = "unknown"
+        state.pool = matching if state.failover_enabled else [selected]
         state.selected = selected
         state.requested_tier = "default"
         state.reason = f"mode=fixed;active_provider={active}"
@@ -297,38 +373,61 @@ def re_resolve_tier(state: LLMRouterState, ctx: RoutingContext) -> Optional[LLME
     return state.selected
 
 
+def _next_in_pool_order(state: LLMRouterState) -> Optional[LLMEndpoint]:
+    """按配置顺序取下一个还没试过的模型。"""
+    for ep in state.pool:
+        if ep.endpoint_id in state.tried_ids:
+            continue
+        if ep.health_status == "auth_failed":
+            continue
+        return ep
+    return None
+
+
 def failover_next(state: LLMRouterState, *, cause: str) -> Optional[LLMEndpoint]:
     """Mark current unhealthy and pick next candidate."""
     if not state.failover_enabled:
         return None
     if state.selected is None:
         return None
+    kind = classify_llm_failure(cause)
     prev = state.selected
-    mark_endpoint_unhealthy(prev, error=cause, status="unreachable")
+    status = "auth_failed" if kind == "auth" else "unreachable"
+    mark_endpoint_unhealthy(prev, error=cause, status=status)
+    if kind == "auth":
+        for ep in state.pool:
+            if ep.provider_key != prev.provider_key:
+                continue
+            if ep.endpoint_id not in state.tried_ids:
+                state.tried_ids.append(ep.endpoint_id)
+        if state.mode == "fixed":
+            return None
+
+    if state.mode == "fixed":
+        next_ep = _next_in_pool_order(state)
+    else:
+        next_ep = select_endpoint(
+            state.pool,
+            state.requested_tier,  # type: ignore[arg-type]
+            preferences=state.preferences,
+            exclude_ids=state.tried_ids,
+        )
+        if next_ep is None:
+            next_ep = select_endpoint(
+                state.pool,
+                "default",
+                preferences=state.preferences,
+                exclude_ids=state.tried_ids,
+            )
+    if next_ep is None:
+        return None
     if not state.failover_occurred:
         state.failover_occurred = True
         state.failover_from = {"provider": prev.provider_key, "model": prev.model}
         state.failover_cause = cause[:300]
-
-    next_ep = select_endpoint(
-        state.pool,
-        state.requested_tier,  # type: ignore[arg-type]
-        preferences=state.preferences,
-        exclude_ids=state.tried_ids,
-    )
-    if next_ep is None:
-        # try any remaining healthy-ish
-        next_ep = select_endpoint(
-            state.pool,
-            "default",
-            preferences=state.preferences,
-            exclude_ids=state.tried_ids,
-        )
-    if next_ep is None:
-        return None
     state.selected = next_ep
     state.tried_ids.append(next_ep.endpoint_id)
-    state.reason = f"{state.reason};failover_to={next_ep.provider_key}"
+    state.reason = f"{state.reason};failover_to={next_ep.model}"
     return next_ep
 
 

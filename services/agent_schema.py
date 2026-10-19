@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 CONTEXT_REQUEST_TYPES = frozenset({
     "function",
     "field",
+    "class",
     "references",
     "callers",
     "grep",
@@ -30,6 +31,9 @@ _CONTEXT_REQUEST_TYPE_ALIASES = {
     "header": "read_file",
     "func": "function",
     "method": "function",
+    "struct": "class",
+    "type": "class",
+    "class_declaration": "class",
     "member": "field",
     "ref": "references",
     "refs": "references",

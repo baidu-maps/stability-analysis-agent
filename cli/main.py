@@ -2751,7 +2751,7 @@ def _configure_llm_routing_interactive() -> None:
         "设置大模型路由模式",
         [
             ("back", "返回"),
-            ("fixed", "固定模式：只使用当前启用的大模型"),
+            ("fixed", "固定模式：使用当前 provider，失败时按 models 切换"),
             ("auto", "自动模式：按分析阶段动态选择已配置的大模型"),
         ],
         default_index=1 if current == "fixed" else 2,
@@ -2760,11 +2760,11 @@ def _configure_llm_routing_interactive() -> None:
         return
     llm_cfg["mode"] = choice
     routing = llm_cfg.get("routing") if isinstance(llm_cfg.get("routing"), dict) else {}
+    routing["failover_enabled"] = _prompt_yes_no(
+        "调用失败时是否切换到下一个模型？同一入口的 models 按书写顺序切换",
+        bool(routing.get("failover_enabled", choice == "auto")),
+    )
     if choice == "auto":
-        routing["failover_enabled"] = _prompt_yes_no(
-            "调用失败时是否自动切换到其他可用大模型？",
-            bool(routing.get("failover_enabled", True)),
-        )
         routing["health_check"] = _prompt_yes_no(
             "自动模式运行前是否进行健康检查？",
             routing.get("health_check", True) is not False,
@@ -4525,6 +4525,31 @@ def _llm_summary_from_result(
     }
 
 
+def _sync_request_llm_with_selected(
+    request_record: Optional[Dict[str, Any]],
+    result: Dict[str, Any],
+) -> None:
+    """把实际答完的模型写回请求快照，分析缓冲按这个模型对比。"""
+    if not isinstance(request_record, dict) or not isinstance(result, dict):
+        return
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    routing = metadata.get("llm_routing") if isinstance(metadata, dict) else None
+    if not isinstance(routing, dict):
+        return
+    selected = routing.get("selected")
+    if not isinstance(selected, dict):
+        return
+    llm = request_record.get("llm")
+    if not isinstance(llm, dict):
+        return
+    model = str(selected.get("model") or "").strip()
+    provider = str(selected.get("provider") or "").strip()
+    if model:
+        llm["model"] = model
+    if provider:
+        llm["provider"] = provider
+
+
 def _write_cli_report(
     report_dir: Path,
     result: Dict[str, Any],
@@ -4541,6 +4566,7 @@ def _write_cli_report(
 ) -> Optional[Path]:
     try:
         report_dir.mkdir(parents=True, exist_ok=True)
+        _sync_request_llm_with_selected(request_record, result)
         if isinstance(request_record, dict):
             _write_json(report_dir / "00_run_request.json", request_record)
         if result.get("parse_result") is not None:
