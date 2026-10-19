@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.5.8] - 2026-10-19
+
+### Changed
+
+- 分析缓冲打开时不再比对大模型。同一证据下跳过失败记录，复用最近一次成功的结论、补丁和评审链接。没有成功结论时仍只复用到提示词之前。
+
 ## [1.5.7] - 2026-10-19
 
 ### Added

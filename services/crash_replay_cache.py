@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""同一崩溃的分析缓冲：证据层可跨模型复用，结论层只在大模型配置相同时复用。"""
+"""同一崩溃的分析缓冲：证据一致时复用最近一次成功结论，不比较大模型。"""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def evidence_material(request: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def llm_material(request: Dict[str, Any]) -> Dict[str, Any]:
-    """决定结论能否复用的大模型配置。不含密钥。"""
+    """记下产出结论的大模型配置。不含密钥，查找时不参与匹配。"""
     llm = request.get("llm") if isinstance(request.get("llm"), dict) else {}
     return {
         "provider": llm.get("provider"),
@@ -242,51 +242,75 @@ def _load_evidence(report_dir: Path) -> Dict[str, Any]:
     return payload
 
 
+def _load_ready_evidence(report_dir: Path) -> Optional[Dict[str, Any]]:
+    """读齐解析、符号化和源码定位后才可复用。"""
+    if not report_dir.is_dir():
+        return None
+    evidence = _load_evidence(report_dir)
+    if "parse_result" not in evidence or "resolved_stack" not in evidence:
+        return None
+    if "code_context" not in evidence:
+        return None
+    return evidence
+
+
+def _conclusion_text(report_dir: Path) -> str:
+    """上次结论文本。读不到时返回空串。"""
+    try:
+        return (report_dir / "final_output.md").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
 def lookup_crash_replay(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """按当前请求找最近一次可复用的报告。"""
+    """按证据找可复用报告。跳过失败，用最近一次成功结论。"""
     if not isinstance(request, dict):
         return None
     material = evidence_material(request)
     if not _usable_evidence(material):
         return None
     evidence_key = _digest(material)
-    model_key = _digest(llm_material(request))
-    chosen: Optional[Dict[str, Any]] = None
+    evidence_hit: Optional[Dict[str, Any]] = None
+    conclusion_hit: Optional[Dict[str, Any]] = None
     for row in reversed(_read_index()):
         if str(row.get("evidence_key") or "") != evidence_key:
             continue
         source = Path(str(row.get("report_dir") or ""))
-        if not source.is_dir():
+        evidence = _load_ready_evidence(source)
+        if evidence is None:
             continue
-        if not (source / "01_crash_log_parser.json").is_file():
-            continue
-        chosen = row
-        break
-    if chosen is None:
+        if evidence_hit is None:
+            evidence_hit = {"row": row, "source": source, "evidence": evidence}
+        if conclusion_hit is None and bool(row.get("conclusion_reusable")):
+            analysis = _conclusion_text(source)
+            if analysis.strip():
+                conclusion_hit = {
+                    "row": row,
+                    "source": source,
+                    "evidence": evidence,
+                    "analysis": analysis,
+                }
+        if evidence_hit is not None and conclusion_hit is not None:
+            break
+    if conclusion_hit is not None:
+        return _conclusion_lookup(evidence_key, conclusion_hit)
+    if evidence_hit is None:
         return None
-    source = Path(str(chosen.get("report_dir") or ""))
-    evidence = _load_evidence(source)
-    if "parse_result" not in evidence or "resolved_stack" not in evidence:
-        return None
-    if "code_context" not in evidence:
-        return None
-    same_model = str(chosen.get("llm_key") or "") == model_key and bool(chosen.get("conclusion_reusable"))
-    hit: Dict[str, Any] = {
-        "level": "conclusion" if same_model else "evidence",
+    source = evidence_hit["source"]
+    return {
+        "level": "evidence",
         "source_report": str(source),
         "evidence_key": evidence_key,
-        "llm_key": model_key,
-        "evidence": evidence,
+        "llm_key": str(evidence_hit["row"].get("llm_key") or ""),
+        "evidence": evidence_hit["evidence"],
     }
-    if not same_model:
-        return hit
-    try:
-        analysis = (source / "final_output.md").read_text(encoding="utf-8")
-    except OSError:
-        analysis = ""
-    if not analysis.strip():
-        hit["level"] = "evidence"
-        return hit
+
+
+def _conclusion_lookup(evidence_key: str, chosen: Dict[str, Any]) -> Dict[str, Any]:
+    """把最近一次成功结论装成可直接套用的命中。"""
+    source = chosen["source"]
+    evidence = chosen["evidence"]
+    analysis = str(chosen["analysis"] or "")
     apply_record = _load_json(source / "08_apply_ai_fixes.json")
     patch_text = ""
     patch_path = source / "09_ai_fix.patch"
@@ -295,26 +319,32 @@ def lookup_crash_replay(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             patch_text = patch_path.read_text(encoding="utf-8")
         except OSError:
             patch_text = ""
-    hit["analysis"] = analysis
-    hit["patch_text"] = patch_text
-    hit["apply_record"] = apply_record if patch_text else None
-    hit["result"] = {
-        "status": "success",
-        "parse_result": evidence.get("parse_result") or {},
-        "memory_maps": evidence.get("memory_maps") or {},
-        "resolved_stack": evidence.get("resolved_stack") or {},
-        "crash_diagnosis": evidence.get("crash_diagnosis") or {},
-        "code_context": evidence.get("code_context") or {},
+    return {
+        "level": "conclusion",
+        "source_report": str(source),
+        "evidence_key": evidence_key,
+        "llm_key": str(chosen["row"].get("llm_key") or ""),
+        "evidence": evidence,
         "analysis": analysis,
-        "final_tip": analysis,
-        "metadata": {
-            "crash_replay": {
-                "level": "conclusion",
-                "source_report": str(source),
+        "patch_text": patch_text,
+        "apply_record": apply_record if patch_text else None,
+        "result": {
+            "status": "success",
+            "parse_result": evidence.get("parse_result") or {},
+            "memory_maps": evidence.get("memory_maps") or {},
+            "resolved_stack": evidence.get("resolved_stack") or {},
+            "crash_diagnosis": evidence.get("crash_diagnosis") or {},
+            "code_context": evidence.get("code_context") or {},
+            "analysis": analysis,
+            "final_tip": analysis,
+            "metadata": {
+                "crash_replay": {
+                    "level": "conclusion",
+                    "source_report": str(source),
+                },
             },
         },
     }
-    return hit
 
 
 def replay_cached_fix(
@@ -382,23 +412,20 @@ def find_reusable_review(
     repo: str,
     branch: str,
 ) -> Optional[Dict[str, Any]]:
-    """同分析缓冲、同补丁、同仓库分支、同创建者时返回已有评审。"""
+    """同分析缓冲、同补丁、同仓库分支、同创建者时返回已有评审。不看大模型。"""
     current = _load_json(Path(report_dir) / CACHE_NAME)
     if not isinstance(current, dict) or not current.get("reusable"):
         return None
     creator_text = str(creator or "").strip()
     patch_sha = str(current.get("patch_sha256") or "").strip()
     evidence_key = str(current.get("evidence_key") or "").strip()
-    llm_key = str(current.get("llm_key") or "").strip()
-    if not creator_text or not patch_sha or not evidence_key or not llm_key:
+    if not creator_text or not patch_sha or not evidence_key:
         return None
     current_dir = str(Path(report_dir).resolve())
     for row in reversed(_read_index()):
         if str(row.get("report_dir") or "") == current_dir:
             continue
         if str(row.get("evidence_key") or "") != evidence_key:
-            continue
-        if str(row.get("llm_key") or "") != llm_key:
             continue
         if str(row.get("patch_sha256") or "") != patch_sha:
             continue

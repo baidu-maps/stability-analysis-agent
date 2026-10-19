@@ -95,16 +95,49 @@ class CrashReplayCacheTests(unittest.TestCase):
         self.assertIn("CancelTask", hit["analysis"])
         self.assertIn("GridLayer.cpp", hit["patch_text"])
 
-    def test_different_model_stops_before_llm(self) -> None:
-        """大模型不同时只复用模型之前的文件。"""
+    def test_different_model_reuses_conclusion(self) -> None:
+        """大模型不同仍复用最近一次成功结论和补丁。"""
         source = Path(self._tmpdir.name) / "source"
         _write_report(source)
         remember_crash_replay(source, _request())
         hit = lookup_crash_replay(_request(model="other-model"))
-        self.assertEqual(hit["level"], "evidence")
-        self.assertIn("parse_result", hit["evidence"])
-        self.assertIn("code_context", hit["evidence"])
-        self.assertNotIn("patch_text", hit)
+        self.assertEqual(hit["level"], "conclusion")
+        self.assertIn("CancelTask", hit["analysis"])
+        self.assertIn("GridLayer.cpp", hit["patch_text"])
+
+    def test_newer_failure_uses_latest_success(self) -> None:
+        """较新的失败记录不挡住更早的成功结论。"""
+        older = Path(self._tmpdir.name) / "older"
+        _write_report(older)
+        (older / "final_output.md").write_text("结论：较早的成功\n", encoding="utf-8")
+        remember_crash_replay(older, _request(model="model-a"))
+        newer = Path(self._tmpdir.name) / "newer"
+        _write_report(newer, success_apply=False)
+        (newer / "final_output.md").write_text("结论：较晚的失败\n", encoding="utf-8")
+        remember_crash_replay(newer, _request(model="model-b"))
+        hit = lookup_crash_replay(_request(model="model-c"))
+        self.assertEqual(hit["level"], "conclusion")
+        self.assertIn("较早的成功", hit["analysis"])
+        self.assertNotIn("较晚的失败", hit["analysis"])
+        self.assertEqual(Path(hit["source_report"]).resolve(), older.resolve())
+
+    def test_latest_success_wins_when_several_succeed(self) -> None:
+        """多次成功时用最近一次，不用最早一次。"""
+        first = Path(self._tmpdir.name) / "first"
+        _write_report(first)
+        (first / "final_output.md").write_text("结论：第一次成功\n", encoding="utf-8")
+        (first / "09_ai_fix.patch").write_text("diff first\n", encoding="utf-8")
+        remember_crash_replay(first, _request(model="model-a"))
+        second = Path(self._tmpdir.name) / "second"
+        _write_report(second)
+        (second / "final_output.md").write_text("结论：第二次成功\n", encoding="utf-8")
+        (second / "09_ai_fix.patch").write_text("diff second\n", encoding="utf-8")
+        remember_crash_replay(second, _request(model="model-b"))
+        hit = lookup_crash_replay(_request(model="model-c"))
+        self.assertEqual(hit["level"], "conclusion")
+        self.assertIn("第二次成功", hit["analysis"])
+        self.assertIn("diff second", hit["patch_text"])
+        self.assertEqual(Path(hit["source_report"]).resolve(), second.resolve())
 
     def test_open_source_git_state_still_hits(self) -> None:
         """开源仓库提交不同或有未提交改动时仍可复用。"""
@@ -171,6 +204,32 @@ class CrashReplayCacheTests(unittest.TestCase):
                 branch="v20.15.0",
             )
         )
+
+    def test_review_reused_when_model_differs(self) -> None:
+        """评审链接不看产出结论的大模型。"""
+        source = Path(self._tmpdir.name) / "source"
+        _write_report(source)
+        remember_crash_replay(source, _request(model="model-a"))
+        attach_review(
+            source,
+            {
+                "review_url": "http://icode.example/reviews/2",
+                "creator": "liuhong_cd",
+                "repo": "baidu/mapclient/engine-dev",
+                "branch": "v20.15.0",
+                "commit": "b935229",
+            },
+        )
+        current = Path(self._tmpdir.name) / "current"
+        _write_report(current)
+        remember_crash_replay(current, _request(model="model-b"))
+        found = find_reusable_review(
+            current,
+            creator="liuhong_cd",
+            repo="baidu/mapclient/engine-dev",
+            branch="v20.15.0",
+        )
+        self.assertEqual(found["review_url"], "http://icode.example/reviews/2")
 
 
 if __name__ == "__main__":

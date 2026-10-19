@@ -341,7 +341,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         replay_evidence = replay.get("evidence") if isinstance(replay.get("evidence"), dict) else {}
         if replay.get("level") == "evidence" and replay_evidence:
             print(
-                "[crash-replay] 大模型配置不同，复用日志解析、符号化、定位和第一轮提示词",
+                "[crash-replay] 复用日志解析、符号化、定位和第一轮提示词",
                 file=sys.stderr,
                 flush=True,
             )
