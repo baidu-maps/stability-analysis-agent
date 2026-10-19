@@ -30,8 +30,10 @@ from tools.code_content_provider_tool import CodeContentProvider
 from tools.cpp_crash.core import match_cpp_fault_modes
 from tools.crash_diagnosis.classifier import classify_crash
 from tools.crash_diagnosis.types import FaultAnalysis, FpAnalysis, PcLrAnalysis, RegisterCorrelation, SpAnalysis
+from tools.crash_diagnosis.core import _build_evidence_chain
 from tools.crash_parser.abort_message import (
     extract_abort_message,
+    is_destroyed_mutex_abort,
     is_heap_allocator_abort,
     thread_type_from_name,
 )
@@ -105,6 +107,53 @@ class TestAbortMessageAndHeapAbort(unittest.TestCase):
             {"signal": "SIGABRT", "abort_message": "Scudo ERROR: invalid chunk state", "crash_reason": "abort"},
         )
         self.assertEqual(result.primary_pattern, "heap_corruption")
+
+    def test_fortify_destroyed_mutex_is_quoted(self) -> None:
+        """FORTIFY 互斥量 abort 必须带上原文，且不当成堆损坏。"""
+        message = "FORTIFY: pthread_mutex_destroy called on a destroyed mutex (0x1)"
+        sample = (
+            "pid: 1, tid: 20021, name: Tmcom-MapDRende >>> app\n"
+            "signal 6 (SIGABRT), code -1 (SI_QUEUE)\n"
+            f"Abort message: '{message}'\n"
+        )
+        info = extract_crash_info(sample)
+        self.assertIn("pthread_mutex_destroy called on a destroyed mutex", info.abort_message or "")
+        self.assertTrue(is_destroyed_mutex_abort(info.abort_message))
+        self.assertFalse(is_heap_allocator_abort(info.abort_message))
+        out = DeterministicAnalyzer().analyze(
+            {
+                "crash_info": {
+                    "signal": "SIGABRT",
+                    "abort_message": info.abort_message,
+                    "crash_reason": "abort",
+                }
+            },
+            {},
+            sample,
+        )
+        types = [fact.fact_type for fact in out.facts]
+        self.assertIn("fortify_mutex_abort", types)
+        self.assertNotIn("heap_abort", types)
+        fact = next(item for item in out.facts if item.fact_type == "fortify_mutex_abort")
+        self.assertIn(message, fact.evidence)
+
+    def test_evidence_chain_quotes_any_abort_message(self) -> None:
+        """证据链保留 Abort message，不限堆分配器。"""
+        message = "FORTIFY: pthread_mutex_destroy called on a destroyed mutex"
+        chain = _build_evidence_chain(
+            {
+                "signal": "SIGABRT (SI_QUEUE)",
+                "crash_reason": "abort",
+                "abort_message": message,
+            },
+            SpAnalysis(),
+            FpAnalysis(),
+            PcLrAnalysis(),
+            FaultAnalysis(),
+            RegisterCorrelation(),
+        )
+        findings = " ".join(str(item.get("finding") or "") for item in chain)
+        self.assertIn(message, findings)
 
 
 class TestSystemLibMatch(unittest.TestCase):

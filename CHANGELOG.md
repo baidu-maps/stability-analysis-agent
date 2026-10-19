@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.5.9] - 2026-10-19
+
+### Fixed
+
+- SIGABRT 的 Abort message 一律写入诊断事实和证据链。FORTIFY 对已销毁 mutex 再次 `pthread_mutex_destroy` 单独成条，不再被当成缺少原文的外部信号。
+- 隔离改码工作区会检出源目录里已经存在的子模块，并把子模块登记为独立仓库。补丁和评审落在子模块上，不再因为父仓库 worktree 里的空目录报「目标文件不存在」。复用补丁时 `git apply` 带 `--recount`，避免行号漂移导致校验失败。
+
 ## [1.5.8] - 2026-10-19
 
 ### Changed

@@ -227,22 +227,27 @@ class DeterministicAnalyzer:
         if "SIGABRT" not in signal.upper():
             return
 
-        from tools.crash_parser.abort_message import extract_abort_message, is_heap_allocator_abort
+        from tools.crash_parser.abort_message import (
+            extract_abort_message,
+            is_destroyed_mutex_abort,
+            is_heap_allocator_abort,
+        )
 
         reason = str(crash_info.get("crash_reason") or "")
         abort_message = str(
             crash_info.get("abort_message") or extract_abort_message(log_content) or ""
         )
+        evidence = "信号=SIGABRT"
+        if abort_message:
+            evidence += f", Abort message={abort_message}"
+        if reason:
+            evidence += f", reason={reason}"
         if is_heap_allocator_abort(abort_message, reason, log_content):
             out.facts.append(DeterministicFact(
                 fact_type="heap_abort",
                 description="堆分配器在释放/校验时 abort（非业务 assert）",
                 confidence=1.0,
-                evidence=(
-                    f"信号=SIGABRT"
-                    + (f", Abort message={abort_message}" if abort_message else "")
-                    + (f", reason={reason}" if reason else "")
-                ),
+                evidence=evidence,
                 implication=(
                     "Scudo/jemalloc 等在 deallocate 时发现 chunk 非法，说明更早发生了越界写或 double-free。"
                     "应检查业务栈第一帧及其被调函数中的堆操作，不要当作普通 assert，也不要根据错误的 libc 符号编故事。"
@@ -250,15 +255,37 @@ class DeterministicAnalyzer:
             ))
             return
 
+        if abort_message and is_destroyed_mutex_abort(abort_message):
+            out.facts.append(DeterministicFact(
+                fact_type="fortify_mutex_abort",
+                description="Bionic FORTIFY 在销毁已销毁的互斥量时 abort",
+                confidence=0.98,
+                evidence=evidence,
+                implication=(
+                    "Abort message 已给出原因：pthread_mutex_destroy 作用在已销毁的 mutex。"
+                    "这是当前调用里的 libc/驱动检查失败，不是日志缺口。"
+                    "Android 上 abort 常以 SI_QUEUE 送达，不能据此当成外部看门狗。"
+                    "应沿业务栈第一帧核对 context 或对象是否已销毁。"
+                ),
+            ))
+            return
+
+        implication = (
+            "可能是 assert/显式 abort，也可能是未抽取到的分配器错误。"
+            "请先阅读 Abort message；仅在确认是业务断言后再查 assert 条件。"
+        )
+        if abort_message:
+            implication = (
+                "Abort message 已抽取，必须先按原文解释 abort，不要写成日志缺口。"
+                "仅在原文确认是业务断言后再查 assert 条件。"
+                "不要仅凭 SI_QUEUE 判断为外部投递。"
+            )
         out.facts.append(DeterministicFact(
             fact_type="abort",
             description="进程主动 abort（非随机崩溃）",
             confidence=0.92,
-            evidence=f"信号=SIGABRT" + (f", reason={reason}" if reason else ""),
-            implication=(
-                "可能是 assert/显式 abort，也可能是未抽取到的分配器错误。"
-                "请先阅读 Abort message；仅在确认是业务断言后再查 assert 条件。"
-            ),
+            evidence=evidence,
+            implication=implication,
         ))
 
     def _check_detector_report(self, log_content: str, out: DeterministicConclusions) -> None:

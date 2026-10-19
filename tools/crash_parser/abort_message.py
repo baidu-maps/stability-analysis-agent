@@ -11,6 +11,11 @@ _ABORT_MESSAGE_RE = re.compile(
     r"(?im)^\s*(?:Abort message|LastFatalMessage)\s*:\s*(.+?)\s*$",
 )
 
+_DESTROYED_MUTEX_RE = re.compile(
+    r"pthread_mutex_destroy called on a destroyed mutex",
+    re.I,
+)
+
 _HEAP_ABORT_RE = re.compile(
     r"scudo|"
     r"jemalloc|"
@@ -44,6 +49,14 @@ def extract_abort_message(content: str) -> str:
     if not match:
         return ""
     return str(match.group(1) or "").strip().strip("'\"")
+
+
+def is_destroyed_mutex_abort(*texts: Optional[str]) -> bool:
+    """是否为 Bionic FORTIFY 对已销毁 mutex 再次 destroy。"""
+    blob = "\n".join(str(item or "") for item in texts)
+    if not blob.strip():
+        return False
+    return bool(_DESTROYED_MUTEX_RE.search(blob))
 
 
 def is_heap_allocator_abort(*texts: Optional[str]) -> bool:

@@ -113,6 +113,7 @@ def collect_workspace_diff(workspace: IsolatedCodeWorkspace) -> Dict[str, object
     original_contents: Dict[str, str] = {}
     changed_contents: Dict[str, str] = {}
     for item in workspace.repositories:
+        nested = _nested_worktree_paths(item, workspace.repositories)
         # Preserve the two-column porcelain status prefix.  Using the common
         # stripped Git helper here removes the leading space for modifications
         # and shifts the parsed path by one character.
@@ -127,7 +128,7 @@ def collect_workspace_diff(workspace: IsolatedCodeWorkspace) -> Dict[str, object
             relative = line[3:].strip() if len(line) > 3 else ""
             if " -> " in relative:
                 relative = relative.split(" -> ", 1)[1]
-            if not relative:
+            if not relative or any(relative == name or relative.startswith(name + "/") for name in nested):
                 continue
             path = (item.worktree / relative).resolve()
             changed_files.append(str(path))
@@ -139,7 +140,11 @@ def collect_workspace_diff(workspace: IsolatedCodeWorkspace) -> Dict[str, object
             )
             if old.returncode == 0:
                 original_contents[str(path)] = old.stdout
-        diff = _run_git(item.worktree, ["diff", "--no-ext-diff", "--unified=3", item.base_commit, "--"])
+        diff_cmd = ["diff", "--no-ext-diff", "--unified=3", item.base_commit]
+        if nested:
+            diff_cmd.append("--ignore-submodules=all")
+        diff_cmd.append("--")
+        diff = _run_git(item.worktree, diff_cmd)
         if diff:
             diff_parts.append(diff)
     return {
@@ -242,6 +247,73 @@ def _scoped_status(repository: Path, code_roots: Sequence[Path]) -> str:
     )
 
 
+def _checked_out_submodules(repository: Path) -> List[str]:
+    """源目录里已经检出的子模块相对路径。行首为 - 的未初始化项跳过。"""
+    try:
+        text = _run_git(repository, ["submodule", "status", "--recursive"])
+    except WorktreeIsolationError:
+        return []
+    paths: List[str] = []
+    for line in text.splitlines():
+        if not line or line[0] == "-":
+            continue
+        body = line[1:].strip() if line[0] in " +U" else line.strip()
+        parts = body.split()
+        if len(parts) >= 2 and parts[1]:
+            paths.append(parts[1])
+    return paths
+
+
+def _remove_empty_dir(path: Path) -> None:
+    """去掉 worktree 里空的子模块占位目录，便于在原位挂新检出。"""
+    if not path.exists():
+        return
+    if not path.is_dir() or any(path.iterdir()):
+        raise WorktreeIsolationError(f"子模块目录非空，无法建立隔离检出: {path}")
+    path.rmdir()
+
+
+def _attach_checked_out_submodules(
+    repository: Path,
+    worktree: Path,
+    created: List[RepositoryWorktree],
+) -> None:
+    """把源仓库已检出的子模块挂到隔离工作区，并登记为独立仓库。"""
+    for relative in _checked_out_submodules(repository):
+        source = (repository / relative).resolve()
+        if not source.is_dir():
+            continue
+        try:
+            submodule = Path(_run_git(source, ["rev-parse", "--show-toplevel"])).resolve()
+            commit = _run_git(source, ["rev-parse", "HEAD"])
+        except WorktreeIsolationError:
+            continue
+        destination = worktree / relative
+        _remove_empty_dir(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _run_git(submodule, ["worktree", "add", "--detach", str(destination), commit])
+        created.append(RepositoryWorktree(submodule, destination, commit))
+
+
+def _nested_worktree_paths(
+    item: RepositoryWorktree,
+    repositories: Sequence[RepositoryWorktree],
+) -> List[str]:
+    """落在当前工作区里面的子模块检出相对路径。"""
+    paths: List[str] = []
+    base = item.worktree.resolve()
+    for other in repositories:
+        if other.worktree.resolve() == base:
+            continue
+        try:
+            relative = other.worktree.resolve().relative_to(base)
+        except ValueError:
+            continue
+        if relative.parts:
+            paths.append(relative.as_posix())
+    return paths
+
+
 def _workspace_name(repository: Path, index: int) -> str:
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", repository.name).strip("_") or "repository"
     digest = hashlib.sha256(str(repository).encode("utf-8")).hexdigest()[:10]
@@ -300,6 +372,7 @@ def prepare_isolated_workspace(
                 )
             )
             worktree_by_repo[repository] = worktree
+            _attach_checked_out_submodules(repository, worktree, created)
     except Exception:
         for item in reversed(created):
             subprocess.run(
@@ -341,12 +414,14 @@ def write_workspace_artifacts(
 
     patch_parts: List[str] = []
     for item in workspace.repositories:
-        patch = _run_git(
-            item.worktree,
-            ["diff", "--binary", "--no-ext-diff", item.base_commit, "--"],
-        )
+        diff_cmd = ["diff", "--binary", "--no-ext-diff", item.base_commit]
+        if _nested_worktree_paths(item, workspace.repositories):
+            diff_cmd.append("--ignore-submodules=all")
+        diff_cmd.append("--")
+        patch = _run_git(item.worktree, diff_cmd)
         if patch:
-            patch_parts.append(patch.rstrip() + "\n")
+            # 保留 diff 末尾空行。rstrip 会吃掉上下文空行，git apply 报 corrupt patch。
+            patch_parts.append(patch if patch.endswith("\n") else patch + "\n")
 
     patch_path: Optional[Path] = None
     if patch_parts:

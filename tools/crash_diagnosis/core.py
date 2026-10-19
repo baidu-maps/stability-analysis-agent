@@ -388,6 +388,13 @@ def _build_evidence_chain(
             "finding": f"信号: {signal}",
             "implication": crash_reason or "异常终止",
         })
+    abort_message = str(crash_info.get("abort_message") or "").strip()
+    if abort_message:
+        chain.append({
+            "type": "abort_message",
+            "finding": f"Abort message: {abort_message}",
+            "implication": "进程 abort 的原文，先于 si_code 解释原因",
+        })
 
     # 故障地址
     if fault.crash_address:

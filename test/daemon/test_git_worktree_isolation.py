@@ -26,7 +26,7 @@ from protocol.models import RunRequest
 
 def _git(repository: Path, *args: str) -> str:
     proc = subprocess.run(
-        ["git", "-C", str(repository), *args],
+        ["git", "-c", "protocol.file.allow=always", "-C", str(repository), *args],
         capture_output=True,
         text=True,
         check=False,
@@ -93,6 +93,57 @@ class GitWorktreeIsolationTests(unittest.TestCase):
             patch = Path(str(artifacts["patch_path"])).read_text(encoding="utf-8")
             self.assertEqual(manifest["original_code_roots"], [str((repository / "src").resolve())])
             self.assertIn("+int value() { return 42; }", patch)
+
+    def _init_repo(self, path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        _git(path, "init")
+        _git(path, "config", "user.email", "tests@example.invalid")
+        _git(path, "config", "user.name", "Test User")
+
+    def test_checked_out_submodule_is_materialized_for_apply(self) -> None:
+        """已检出的子模块在隔离工作区里有文件，未初始化的子模块不克隆。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vendor_src = root / "vendor-src"
+            self._init_repo(vendor_src)
+            (vendor_src / "render.cpp").write_text("void clear() { return; }\n", encoding="utf-8")
+            _git(vendor_src, "add", "render.cpp")
+            _git(vendor_src, "commit", "-m", "vendor")
+            extra_src = root / "extra-src"
+            self._init_repo(extra_src)
+            (extra_src / "other.cpp").write_text("void other() {}\n", encoding="utf-8")
+            _git(extra_src, "add", "other.cpp")
+            _git(extra_src, "commit", "-m", "extra")
+
+            super_repo = root / "super"
+            self._init_repo(super_repo)
+            (super_repo / "README").write_text("root\n", encoding="utf-8")
+            _git(super_repo, "add", "README")
+            _git(super_repo, "commit", "-m", "root")
+            _git(super_repo, "submodule", "add", str(vendor_src), "vendor")
+            _git(super_repo, "submodule", "add", str(extra_src), "extra")
+            _git(super_repo, "commit", "-m", "add submodules")
+            _git(super_repo, "submodule", "deinit", "-f", "extra")
+
+            workspace = prepare_isolated_workspace(
+                "run-submodule",
+                [str(super_repo)],
+                workspace_base=root / "worktrees",
+            )
+            isolated_file = Path(workspace.isolated_code_roots[0]) / "vendor" / "render.cpp"
+            self.assertTrue(isolated_file.is_file())
+            self.assertFalse((Path(workspace.isolated_code_roots[0]) / "extra" / "other.cpp").exists())
+            repos = {item.repository.resolve() for item in workspace.repositories}
+            self.assertIn((super_repo / "vendor").resolve(), repos)
+            self.assertNotIn((super_repo / "extra").resolve(), repos)
+
+            isolated_file.write_text("void clear() { return 1; }\n", encoding="utf-8")
+            self.assertIn("return;", (vendor_src / "render.cpp").read_text(encoding="utf-8"))
+            artifacts = write_workspace_artifacts(workspace, root / "report")
+            patch = Path(str(artifacts["patch_path"])).read_text(encoding="utf-8")
+            self.assertIn("render.cpp", patch)
+            self.assertIn("+void clear() { return 1; }", patch)
+            self.assertNotIn("Subproject commit", patch)
 
     def test_non_git_directory_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -373,7 +373,7 @@ def replay_cached_fix(
     errors: List[str] = []
     for item in workspace.repositories:
         check = subprocess.run(
-            ["git", "-C", str(item.worktree), "apply", "--check", "-"],
+            ["git", "-C", str(item.worktree), "apply", "--recount", "--check", "-"],
             input=patch_text,
             text=True,
             capture_output=True,
@@ -383,7 +383,7 @@ def replay_cached_fix(
             errors.append((check.stderr or check.stdout or "").strip())
             continue
         proc = subprocess.run(
-            ["git", "-C", str(item.worktree), "apply", "-"],
+            ["git", "-C", str(item.worktree), "apply", "--recount", "-"],
             input=patch_text,
             text=True,
             capture_output=True,
@@ -398,6 +398,7 @@ def replay_cached_fix(
         record["replay_error"] = "上次补丁未能应用到当前工作区"
         if errors:
             record["replay_error"] += ": " + errors[0][:400]
+        record["error"] = record["replay_error"]
         return record
     write_workspace_artifacts(workspace, Path(report_dir))
     record["success"] = True

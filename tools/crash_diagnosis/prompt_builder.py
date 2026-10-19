@@ -284,7 +284,10 @@ def _generate_suggestions(
         suggestions.append("排查: 虚表指针(vptr)是否被覆盖、函数指针是否有效")
 
     elif pattern == "explicit_abort":
-        suggestions.append("聚焦: abort 前的日志输出和 assert 条件；若有 Abort message 必须先引用原文")
+        suggestions.append(
+            "聚焦: 证据中的 Abort message 原文；有原文时按原文解释 abort，不要写成日志缺口。"
+            "没有原文时再查 assert。不要仅凭 SI_QUEUE 判断为外部投递"
+        )
     elif pattern == "heap_corruption":
         suggestions.append(
             "聚焦: 业务栈第一帧及其被调函数中的 vector/new/delete 越界或 double-free，而不是 abort 帧"
