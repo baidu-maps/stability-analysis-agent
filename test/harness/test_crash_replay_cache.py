@@ -14,7 +14,9 @@ from services.crash_replay_cache import (
     attach_review,
     find_reusable_review,
     lookup_crash_replay,
+    peek_reusable_review,
     remember_crash_replay,
+    settle_deferred_checkout,
 )
 
 
@@ -230,6 +232,81 @@ class CrashReplayCacheTests(unittest.TestCase):
             branch="v20.15.0",
         )
         self.assertEqual(found["review_url"], "http://icode.example/reviews/2")
+
+    def test_peek_reusable_review_before_current_report(self) -> None:
+        """复用评审的判断不依赖本次报告已经落盘。"""
+        source = Path(self._tmpdir.name) / "source"
+        _write_report(source)
+        remember_crash_replay(source, _request())
+        attach_review(
+            source,
+            {
+                "review_url": "http://icode.example/reviews/9",
+                "creator": "liuhong_cd",
+                "repo": "baidu/mapclient/engine-vi",
+                "branch": "v20.15.0",
+                "commit": "b935229",
+            },
+        )
+        cache = json.loads((source / "12_crash_replay_cache.json").read_text(encoding="utf-8"))
+        patch = (source / "09_ai_fix.patch").read_text(encoding="utf-8")
+        found = peek_reusable_review(
+            str(cache.get("evidence_key") or ""),
+            patch,
+            creator="liuhong_cd",
+            code_roots=["/data/engine-dev"],
+            repos=["baidu/mapclient/engine-vi"],
+            branches=["v20.15.0"],
+        )
+        self.assertEqual(found["review_url"], "http://icode.example/reviews/9")
+        self.assertIsNone(
+            peek_reusable_review(
+                str(cache.get("evidence_key") or ""),
+                patch,
+                creator="other",
+                code_roots=["/data/engine-dev"],
+                repos=["baidu/mapclient/engine-vi"],
+                branches=["v20.15.0"],
+            )
+        )
+
+    def test_settle_keeps_patch_or_discards(self) -> None:
+        """对得上评审就留下补丁，对不上就复位。"""
+        source = Path(self._tmpdir.name) / "source"
+        _write_report(source)
+        remember_crash_replay(source, _request())
+        attach_review(
+            source,
+            {
+                "review_url": "http://icode.example/reviews/9",
+                "creator": "liuhong_cd",
+                "repo": "baidu/mapclient/engine-vi",
+                "branch": "v20.15.0",
+                "commit": "b935229",
+            },
+        )
+        cache = json.loads((source / "12_crash_replay_cache.json").read_text(encoding="utf-8"))
+        patch = (source / "09_ai_fix.patch").read_text(encoding="utf-8")
+        hit = {
+            "level": "conclusion",
+            "evidence_key": cache.get("evidence_key"),
+            "patch_text": patch,
+        }
+        os.environ["BD_SA_DEFER_DIRTY_RESET"] = "1"
+        os.environ["BD_SA_REVIEW_CREATOR"] = "liuhong_cd"
+        os.environ["BD_SA_REVIEW_REPOS"] = json.dumps(["baidu/mapclient/engine-vi"])
+        os.environ["BD_SA_REVIEW_BRANCHES"] = json.dumps(["v20.15.0"])
+        self.assertTrue(settle_deferred_checkout(hit, ["/data/engine-dev"]))
+        self.assertEqual(os.environ.get("BD_SA_KEEP_APPLIED_PATCH"), "1")
+        os.environ["BD_SA_DEFER_DIRTY_RESET"] = "1"
+        hit["patch_text"] = "different patch\n"
+        from unittest.mock import patch as mock_patch
+        with mock_patch(
+            "services.git_worktree_manager.discard_deferred_checkout",
+        ) as discard:
+            self.assertFalse(settle_deferred_checkout(hit, ["/data/engine-dev"]))
+        discard.assert_called_once()
+        self.assertNotEqual(os.environ.get("BD_SA_KEEP_APPLIED_PATCH"), "1")
 
 
 if __name__ == "__main__":

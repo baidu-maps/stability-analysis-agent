@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import time
 import uuid
@@ -15,6 +16,7 @@ from services.git_worktree_manager import (
     WorktreeIsolationError,
     map_result_paths,
     head_commits_for_code_roots,
+    adopt_prepared_checkout,
     prepare_isolated_workspace,
     revision_for_code_roots,
     workspace_revision,
@@ -935,7 +937,21 @@ def run_repair_pipeline(
 
     if isolate_worktree:
         try:
-            isolated_workspace = prepare_isolated_workspace(str(run_id or uuid.uuid4().hex), code_roots)
+            params = identity_input.get("effective_parameters")
+            reuse_source = True
+            if isinstance(params, dict) and "reuse_source_cache" in params:
+                reuse_source = bool(params.get("reuse_source_cache"))
+            apply_in_place = str(os.environ.get("BD_SA_APPLY_IN_PLACE") or "").strip().lower()
+            if reuse_source and apply_in_place in {"1", "true", "yes", "on"}:
+                isolated_workspace = adopt_prepared_checkout(
+                    str(run_id or uuid.uuid4().hex),
+                    code_roots,
+                )
+            else:
+                isolated_workspace = prepare_isolated_workspace(
+                    str(run_id or uuid.uuid4().hex),
+                    code_roots,
+                )
             fix_code_roots = isolated_workspace.isolated_code_roots
             fix_result_input = map_result_paths(isolated_workspace, result)
             write_workspace_artifacts(isolated_workspace, report_dir)

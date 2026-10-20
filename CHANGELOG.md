@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.6.2] - 2026-10-20
+
+### Added
+
+- 新增 `--reuse-source-cache` / HTTP `reuse_source_cache`（默认开启）：同一仓库、分支、提交的源码检出可复用，命中后不再重新检出子模块，改码直接落在这份工作区上。与崩溃分析缓冲相互独立，`--no-reuse-source-cache` 可关闭。
+
+### Changed
+
+- 分析缓冲在结论复用前先确认源码工作区是否可直接改码；不可复用时丢弃延后检出。可复用评审按仓库筛选，不再要求同一次运行才返回链接。
+
 ## [1.5.9] - 2026-10-19
 
 ### Fixed

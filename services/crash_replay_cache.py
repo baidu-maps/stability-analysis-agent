@@ -9,7 +9,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 CACHE_NAME = "12_crash_replay_cache.json"
 EVIDENCE_PARAM_KEYS = (
@@ -354,21 +354,43 @@ def replay_cached_fix(
     patch_text: str,
     previous_apply: Optional[Dict[str, Any]],
     report_dir: Path,
+    reuse_source_cache: bool = True,
 ) -> Dict[str, Any]:
-    """在新的隔离工作区上应用上次补丁，不再请求模型。"""
+    """在工作区上应用上次补丁，不再请求模型。
+
+    源码缓冲命中且企业侧标记了就地改码时，补丁打在已检出的目录上。
+    否则仍新建隔离 worktree。
+    """
     import sys
 
-    from services.git_worktree_manager import prepare_isolated_workspace, write_workspace_artifacts
+    from services.git_worktree_manager import (
+        _apply_in_place_requested,
+        adopt_prepared_checkout,
+        prepare_isolated_workspace,
+        write_workspace_artifacts,
+    )
 
-    print("[crash-replay] 复用上次代码修改", file=sys.stderr, flush=True)
     record = dict(previous_apply or {})
     record["replayed"] = True
+    keep_applied = os.environ.get("BD_SA_KEEP_APPLIED_PATCH") == "1"
     try:
-        workspace = prepare_isolated_workspace(run_id, code_roots)
+        if reuse_source_cache and _apply_in_place_requested():
+            workspace = adopt_prepared_checkout(run_id, code_roots)
+        else:
+            workspace = prepare_isolated_workspace(run_id, code_roots)
+            keep_applied = False
     except Exception as exc:
         record["success"] = False
         record["replay_error"] = f"无法建立隔离工作区: {exc}"
         return record
+    if keep_applied:
+        print("[crash-replay] 补丁已在工作区，不再重放", file=sys.stderr, flush=True)
+        write_workspace_artifacts(workspace, Path(report_dir))
+        record["success"] = True
+        record["kept_applied_patch"] = True
+        record["replay_error"] = ""
+        return record
+    print("[crash-replay] 复用上次代码修改", file=sys.stderr, flush=True)
     applied = False
     errors: List[str] = []
     for item in workspace.repositories:
@@ -404,6 +426,108 @@ def replay_cached_fix(
     record["success"] = True
     record["replay_error"] = ""
     return record
+
+
+def _env_json_list(name: str) -> List[str]:
+    """读环境变量里的 JSON 字符串列表。坏数据当成空列表。"""
+    try:
+        payload = json.loads(str(os.environ.get(name) or "[]"))
+    except ValueError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [str(item).strip() for item in payload if str(item).strip()]
+
+
+def _review_repo_selected(
+    repo: str,
+    code_roots: Sequence[str],
+    named_repos: Sequence[str],
+) -> bool:
+    """评审仓库是本次检出目录，或是记下的仓库名。"""
+    text = str(repo or "").strip()
+    if not text:
+        return False
+    if text in named_repos:
+        return True
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        return False
+    for root in code_roots:
+        root_text = str(root or "").strip()
+        if not root_text:
+            continue
+        root_path = Path(root_text).expanduser()
+        try:
+            candidate.resolve().relative_to(root_path.resolve())
+        except (OSError, ValueError):
+            continue
+        return True
+    return False
+
+
+def peek_reusable_review(
+    evidence_key: str,
+    patch_text: str,
+    *,
+    creator: str,
+    code_roots: Sequence[str],
+    repos: Sequence[str],
+    branches: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    """同一创建人、同一补丁、同一仓库分支已有评审时返回它。不读本次报告。"""
+    evidence = str(evidence_key or "").strip()
+    creator_text = str(creator or "").strip()
+    patch_sha = hashlib.sha256(str(patch_text or "").encode("utf-8")).hexdigest()
+    branch_set = {str(item).strip() for item in branches if str(item).strip()}
+    if not evidence or not creator_text or not str(patch_text or "").strip() or not branch_set:
+        return None
+    for row in reversed(_read_index()):
+        if str(row.get("evidence_key") or "") != evidence:
+            continue
+        if not row.get("conclusion_reusable") or not row.get("has_patch"):
+            continue
+        if str(row.get("patch_sha256") or "") != patch_sha:
+            continue
+        review = row.get("review") if isinstance(row.get("review"), dict) else {}
+        if str(review.get("creator") or "").strip() != creator_text:
+            continue
+        if str(review.get("branch") or "").strip() not in branch_set:
+            continue
+        if not _review_repo_selected(str(review.get("repo") or ""), code_roots, repos):
+            continue
+        if str(review.get("review_url") or "").strip():
+            return dict(review)
+    return None
+
+
+def settle_deferred_checkout(
+    replay_hit: Optional[Dict[str, Any]],
+    code_roots: Sequence[str],
+) -> bool:
+    """能复用评审就留下已套用的补丁，否则把推迟的复位现在做掉。"""
+    if os.environ.get("BD_SA_DEFER_DIRTY_RESET") != "1":
+        os.environ.pop("BD_SA_KEEP_APPLIED_PATCH", None)
+        return False
+    review = None
+    if isinstance(replay_hit, dict) and str(replay_hit.get("level") or "") == "conclusion":
+        review = peek_reusable_review(
+            str(replay_hit.get("evidence_key") or ""),
+            str(replay_hit.get("patch_text") or ""),
+            creator=str(os.environ.get("BD_SA_REVIEW_CREATOR") or ""),
+            code_roots=code_roots,
+            repos=_env_json_list("BD_SA_REVIEW_REPOS"),
+            branches=_env_json_list("BD_SA_REVIEW_BRANCHES"),
+        )
+    if review is not None:
+        os.environ["BD_SA_KEEP_APPLIED_PATCH"] = "1"
+        return True
+    os.environ.pop("BD_SA_KEEP_APPLIED_PATCH", None)
+    os.environ["BD_SA_DEFER_DIRTY_RESET"] = "0"
+    from services.git_worktree_manager import discard_deferred_checkout
+
+    discard_deferred_checkout(code_roots)
+    return False
 
 
 def find_reusable_review(

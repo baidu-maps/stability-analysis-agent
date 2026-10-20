@@ -3497,6 +3497,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--reuse-source-cache",
+        dest="reuse_source_cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "是否复用同一仓库、分支、提交的源码检出（默认开启）。"
+            "命中后不再重新检出子模块，改码直接落在这份工作区上。"
+            "与分析缓冲相互独立。使用 --no-reuse-source-cache 关闭"
+        ),
+    )
+    p.add_argument(
         "--llm-mode",
         dest="llm_mode",
         choices=["fixed", "auto"],
@@ -4958,6 +4969,7 @@ def _build_run_request_record(
         "apply_ai_fixes": bool(getattr(args, "apply_ai_fixes", True)),
         "bypass_repair_gate": bool(getattr(args, "bypass_repair_gate", True)),
         "reuse_crash_cache": bool(getattr(args, "reuse_crash_cache", True)),
+        "reuse_source_cache": bool(getattr(args, "reuse_source_cache", True)),
         "backup_original_sources": bool(getattr(args, "backup_original_sources", True)),
         "source_origin": str(getattr(args, "source_origin", None) or ""),
         "commit_policy": str(getattr(args, "commit_policy", None) or ""),
@@ -5209,6 +5221,8 @@ def _build_replay_argv_from_record(record: Dict[str, Any]) -> Tuple[List[str], L
         argv += ["--no-bypass-repair-gate"]
     if not bool(record.get("reuse_crash_cache", True)):
         argv += ["--no-reuse-crash-cache"]
+    if not bool(record.get("reuse_source_cache", True)):
+        argv += ["--no-reuse-source-cache"]
     if not bool(record.get("backup_original_sources", True)):
         argv += ["--no-backup-original-sources"]
     if bool(record.get("optimized", False)):
@@ -6590,6 +6604,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         "apply_ai_fixes": bool(args.apply_ai_fixes),
         "bypass_repair_gate": bool(getattr(args, "bypass_repair_gate", True)),
         "reuse_crash_cache": bool(getattr(args, "reuse_crash_cache", True)),
+        "reuse_source_cache": bool(getattr(args, "reuse_source_cache", True)),
         "source_identity": dict(request_record.get("source_identity") or {}),
         "force_disassembly": bool(getattr(args, "force_disassembly", False)),
         "force_anr_analysis": bool(getattr(args, "force_anr_analysis", False)),
@@ -6671,6 +6686,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
 
         problem["max_agent_rounds"] = _resolve_max_rounds(problem)
     _apply_analysis_timeouts_to_problem(problem, args)
+    replay_hit = None
     if bool(getattr(args, "reuse_crash_cache", True)):
         try:
             from services.crash_replay_cache import lookup_crash_replay
@@ -6694,6 +6710,12 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
             if _replay_source:
                 _replay_notice = "%s，来源 %s" % (_replay_notice, _replay_source)
             print(_replay_notice, file=sys.stderr, flush=True)
+    from services.crash_replay_cache import settle_deferred_checkout
+
+    settle_deferred_checkout(
+        replay_hit if isinstance(replay_hit, dict) else None,
+        code_roots,
+    )
     _prepare_analysis_acceleration(problem, code_roots, scope)
 
     registry = ToolAndWorkflowRegistry()
@@ -6957,6 +6979,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
                 patch_text=str(replay.get("patch_text") or ""),
                 previous_apply=replay.get("apply_record") if isinstance(replay.get("apply_record"), dict) else None,
                 report_dir=report_dir,
+                reuse_source_cache=bool(getattr(args, "reuse_source_cache", True)),
             )
             apply_fix_duration_ms = int(round((time.perf_counter() - _replay_started) * 1000))
         if isinstance(result, dict):

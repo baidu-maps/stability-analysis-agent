@@ -96,6 +96,7 @@ def _prepare_http_run_body(body: Dict[str, Any]) -> Dict[str, Any]:
         "generate_reproduction_by_llm",
         "bypass_repair_gate",
         "reuse_crash_cache",
+        "reuse_source_cache",
     ):
         if field_name in payload and payload[field_name] is not None and not isinstance(payload[field_name], bool):
             raise DaemonHttpError(
@@ -955,6 +956,7 @@ def _health_package_info() -> Dict[str, Any]:
         "cli_apply_ai_fixes": cli_apply_default,
         "http_bypass_repair_gate": True,
         "http_reuse_crash_cache": True,
+        "http_reuse_source_cache": True,
     }
     return payload
 
@@ -971,6 +973,7 @@ def _run_fingerprint(body: Dict[str, Any]) -> str:
         "apply_ai_fixes": body.get("apply_ai_fixes"),
         "bypass_repair_gate": body.get("bypass_repair_gate"),
         "reuse_crash_cache": body.get("reuse_crash_cache"),
+        "reuse_source_cache": body.get("reuse_source_cache"),
         "output_format": body.get("output_format"),
         "external_agent_evaluation": body.get("external_agent_evaluation", False),
     }
@@ -1315,6 +1318,12 @@ def _build_cli_cmd(req: RunRequest) -> Tuple[list, Optional[str]]:
     ):
         cmd += [
             "--reuse-crash-cache" if req.reuse_crash_cache else "--no-reuse-crash-cache"
+        ]
+    if bool(getattr(req, "reuse_source_cache", True)) != bool(
+        getattr(defaults, "reuse_source_cache", True)
+    ):
+        cmd += [
+            "--reuse-source-cache" if req.reuse_source_cache else "--no-reuse-source-cache"
         ]
     if bool(getattr(req, "backup_original_sources", True)) != bool(
         getattr(defaults, "backup_original_sources", True)

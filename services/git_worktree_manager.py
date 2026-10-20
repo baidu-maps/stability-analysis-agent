@@ -320,6 +320,77 @@ def _workspace_name(repository: Path, index: int) -> str:
     return f"{index:02d}_{safe_name}_{digest}"
 
 
+def _apply_in_place_requested() -> bool:
+    """企业源码缓冲要求改码落在已准备的检出上，而不是再挂一份 worktree。"""
+    raw = str(os.environ.get("BD_SA_APPLY_IN_PLACE") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def discard_deferred_checkout(code_roots: Sequence[str]) -> None:
+    """本次不能复用评审时，把推迟复位的共享检出回到干净基线。"""
+    import sys
+
+    print("[source-cache] 本次不能复用评审，复位源码工作区", file=sys.stderr, flush=True)
+    seen = set()
+    for raw in code_roots:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        root = Path(text).expanduser().resolve()
+        if root in seen or not (root / ".git").exists():
+            continue
+        seen.add(root)
+        repository = _repository_for(root)
+        _run_git(repository, ["reset", "--hard", "HEAD"])
+        _run_git(repository, ["clean", "-fd"])
+        _run_git(repository, ["submodule", "update", "--init", "--recursive", "--force"])
+        _run_git(
+            repository,
+            ["submodule", "foreach", "--recursive", "git reset --hard HEAD && git clean -fd"],
+        )
+
+
+def adopt_prepared_checkout(
+    run_id: str,
+    code_roots: Sequence[str],
+) -> IsolatedCodeWorkspace:
+    """把已经准备好的源码检出当作本次改码目录。
+
+    不再 ``worktree add``。已检出的子模块用它自己的目录，补丁直接打在上面。
+    """
+    original_roots = [
+        str(Path(root).expanduser().resolve()) for root in code_roots if str(root).strip()
+    ]
+    if not original_roots:
+        raise WorktreeIsolationError("code_roots is empty")
+    repositories: List[RepositoryWorktree] = []
+    seen = set()
+    for raw_root in original_roots:
+        repository = _repository_for(Path(raw_root))
+        if repository in seen:
+            continue
+        seen.add(repository)
+        commit = _run_git(repository, ["rev-parse", "HEAD"])
+        repositories.append(RepositoryWorktree(repository, repository, commit))
+        for relative in _checked_out_submodules(repository):
+            source = (repository / relative).resolve()
+            if not source.is_dir() or source in seen:
+                continue
+            try:
+                sub_commit = _run_git(source, ["rev-parse", "HEAD"])
+            except WorktreeIsolationError:
+                continue
+            seen.add(source)
+            repositories.append(RepositoryWorktree(source, source, sub_commit))
+    return IsolatedCodeWorkspace(
+        run_id=run_id,
+        root=Path(original_roots[0]).resolve(),
+        original_code_roots=original_roots,
+        isolated_code_roots=list(original_roots),
+        repositories=repositories,
+    )
+
+
 def prepare_isolated_workspace(
     run_id: str,
     code_roots: Sequence[str],
@@ -495,6 +566,9 @@ def sync_verified_files_back(
                 destination = None
             break
         if destination is None or not source.is_file():
+            continue
+        if source == destination:
+            copied.append(str(destination))
             continue
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)

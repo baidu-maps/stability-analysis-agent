@@ -97,6 +97,8 @@ class RunRequest:
     bypass_repair_gate: bool = True
     # 默认复用相同崩溃的分析缓冲；传 false / --no-reuse-crash-cache 关闭
     reuse_crash_cache: bool = True
+    # 默认复用同一仓库、分支、提交的源码检出；传 false / --no-reuse-source-cache 关闭
+    reuse_source_cache: bool = True
     backup_original_sources: bool = True
 
     force_disassembly: bool = False
