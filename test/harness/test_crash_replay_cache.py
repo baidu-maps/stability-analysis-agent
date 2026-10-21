@@ -9,6 +9,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from services.crash_replay_cache import (
     attach_review,
@@ -16,6 +17,7 @@ from services.crash_replay_cache import (
     lookup_crash_replay,
     peek_reusable_review,
     remember_crash_replay,
+    replay_cached_fix,
     settle_deferred_checkout,
 )
 
@@ -307,6 +309,81 @@ class CrashReplayCacheTests(unittest.TestCase):
             self.assertFalse(settle_deferred_checkout(hit, ["/data/engine-dev"]))
         discard.assert_called_once()
         self.assertNotEqual(os.environ.get("BD_SA_KEEP_APPLIED_PATCH"), "1")
+
+    def test_reused_source_keeps_patch_without_current_apply(self) -> None:
+        """共享检出已有补丁、本次没有 08 时，仍继承补丁和评审。"""
+        source = Path(self._tmpdir.name) / "source"
+        _write_report(source)
+        remember_crash_replay(source, _request())
+        attach_review(
+            source,
+            {
+                "review_url": "http://icode.example/reviews/1",
+                "creator": "liuhong_cd",
+                "repo": "baidu/mapclient/engine-dev",
+                "branch": "v20.15.0",
+                "commit": "b935229",
+            },
+        )
+        current = Path(self._tmpdir.name) / "current"
+        _write_report(current)
+        (current / "08_apply_ai_fixes.json").unlink()
+        (current / "09_ai_fix.patch").unlink()
+        request = _request()
+        request["crash_replay"] = {
+            "level": "conclusion",
+            "source_report": str(source),
+        }
+        remember_crash_replay(current, request)
+        cache = json.loads((current / "12_crash_replay_cache.json").read_text(encoding="utf-8"))
+        source_cache = json.loads((source / "12_crash_replay_cache.json").read_text(encoding="utf-8"))
+        self.assertEqual(cache["patch_sha256"], source_cache["patch_sha256"])
+        self.assertTrue(cache["has_patch"])
+        self.assertTrue(cache["apply_success"])
+        review = cache["review"]
+        self.assertEqual(review["review_url"], "http://icode.example/reviews/1")
+        self.assertEqual(review["creator"], "liuhong_cd")
+        self.assertEqual(review["repo"], "baidu/mapclient/engine-dev")
+        self.assertEqual(review["branch"], "v20.15.0")
+        self.assertEqual(review["commit"], "b935229")
+
+    def test_keep_applied_patch_writes_apply_artifact(self) -> None:
+        """补丁已在工作区时，把上次改动文件写成成功的 08。"""
+        report = Path(self._tmpdir.name) / "kept"
+        report.mkdir()
+        previous = {
+            "success": True,
+            "applied": [{"status": "applied", "file": "GridLayer.cpp"}],
+        }
+        os.environ["BD_SA_KEEP_APPLIED_PATCH"] = "1"
+        try:
+            with patch(
+                "services.git_worktree_manager._apply_in_place_requested",
+                return_value=True,
+            ), patch(
+                "services.git_worktree_manager.adopt_prepared_checkout",
+                return_value=object(),
+            ), patch(
+                "services.git_worktree_manager.write_workspace_artifacts",
+            ):
+                result = replay_cached_fix(
+                    run_id="run-1",
+                    code_roots=["/tmp/src"],
+                    patch_text="diff --git a/GridLayer.cpp b/GridLayer.cpp\n",
+                    previous_apply=previous,
+                    report_dir=report,
+                    reuse_source_cache=True,
+                )
+        finally:
+            os.environ.pop("BD_SA_KEEP_APPLIED_PATCH", None)
+        self.assertTrue(result["success"])
+        self.assertTrue(result["kept_applied_patch"])
+        self.assertEqual(result["applied"][0]["file"], "GridLayer.cpp")
+        written = json.loads((report / "08_apply_ai_fixes.json").read_text(encoding="utf-8"))
+        self.assertTrue(written["success"])
+        self.assertTrue(written["kept_applied_patch"])
+        self.assertEqual(written["applied"][0]["status"], "applied")
+        self.assertEqual(written["applied"][0]["file"], "GridLayer.cpp")
 
 
 if __name__ == "__main__":

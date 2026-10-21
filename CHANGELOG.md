@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.6.3] - 2026-10-21
+
+### Fixed
+
+- 源码检出复用后，共享工作区里补丁还在、本次不再写 `08_apply_ai_fixes.json` 时，分析缓冲仍继承来源的补丁哈希、改码成功标记和评审链接，不再把「已改码」记成没有补丁。保留已应用补丁时补写成功的 `08_apply_ai_fixes.json`，供 HTTP `fixes_applied` 读取。
+
 ## [1.6.2] - 2026-10-20
 
 ### Added

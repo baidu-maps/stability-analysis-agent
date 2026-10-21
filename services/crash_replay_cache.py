@@ -155,6 +155,35 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _review_fields(review: Any) -> Dict[str, str]:
+    """评审记录至少保留链接、创建者和仓库定位。"""
+    payload = review if isinstance(review, dict) else {}
+    return {
+        "review_url": str(payload.get("review_url") or ""),
+        "creator": str(payload.get("creator") or ""),
+        "repo": str(payload.get("repo") or ""),
+        "branch": str(payload.get("branch") or ""),
+        "commit": str(payload.get("commit") or ""),
+    }
+
+
+def _source_patch_ready(source_cache: Optional[Dict[str, Any]]) -> bool:
+    """复用来源已经记过补丁，并且有补丁哈希。"""
+    if not isinstance(source_cache, dict):
+        return False
+    if not source_cache.get("has_patch"):
+        return False
+    return bool(str(source_cache.get("patch_sha256") or "").strip())
+
+
+def _write_apply_artifact(report_dir: Path, record: Dict[str, Any]) -> None:
+    """把改码结果写成 ``08_apply_ai_fixes.json``。"""
+    root = Path(report_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(record, ensure_ascii=False, indent=2) + "\n"
+    (root / "08_apply_ai_fixes.json").write_text(text, encoding="utf-8")
+
+
 def _conclusion_ok(report_dir: Path, apply_payload: Optional[Dict[str, Any]]) -> bool:
     """上次有可读结论，且改码记录不是失败。"""
     final_output = report_dir / "final_output.md"
@@ -192,10 +221,27 @@ def remember_crash_replay(
     review = existing.get("review") if isinstance(existing.get("review"), dict) else {}
     noted = request.get("crash_replay") if isinstance(request.get("crash_replay"), dict) else {}
     reused_from = str(noted.get("source_report") or existing.get("reused_from") or "")
-    if reused_from and isinstance(apply_payload, dict) and apply_payload.get("success"):
-        source_cache = _load_json(Path(reused_from) / CACHE_NAME)
-        if isinstance(source_cache, dict) and str(source_cache.get("patch_sha256") or "").strip():
-            patch_sha = str(source_cache.get("patch_sha256") or "")
+    source_cache: Optional[Dict[str, Any]] = None
+    if reused_from:
+        loaded_source = _load_json(Path(reused_from) / CACHE_NAME)
+        if isinstance(loaded_source, dict):
+            source_cache = loaded_source
+    current_apply_ok = bool(isinstance(apply_payload, dict) and apply_payload.get("success"))
+    source_sha = str((source_cache or {}).get("patch_sha256") or "").strip()
+    source_ready = isinstance(source_cache, dict) and _source_patch_ready(source_cache)
+    # 共享检出里补丁还在、本次不再写 08 时，不能把「已改码」记成没有补丁。
+    if source_ready and not current_apply_ok:
+        patch_sha = source_sha
+        has_patch = True
+        apply_success = bool(source_cache.get("apply_success"))
+    else:
+        if current_apply_ok and source_sha:
+            patch_sha = source_sha
+        has_patch = bool(patch_sha) and current_apply_ok
+        apply_success = current_apply_ok
+    current_review_url = str(review.get("review_url") or "").strip()
+    if source_ready and not current_review_url:
+        review = _review_fields(source_cache.get("review"))
     record = {
         "schema_version": 1,
         "reusable": bool(evidence_ok),
@@ -204,8 +250,8 @@ def remember_crash_replay(
         "evidence": material,
         "llm": model,
         "patch_sha256": patch_sha,
-        "has_patch": bool(patch_sha) and bool(isinstance(apply_payload, dict) and apply_payload.get("success")),
-        "apply_success": bool(isinstance(apply_payload, dict) and apply_payload.get("success")),
+        "has_patch": has_patch,
+        "apply_success": apply_success,
         "conclusion_reusable": bool(conclusion_ok),
         "reused_from": reused_from,
         "review": review,
@@ -389,6 +435,8 @@ def replay_cached_fix(
         record["success"] = True
         record["kept_applied_patch"] = True
         record["replay_error"] = ""
+        # 不再重放时调用方可能不落盘；HTTP 的 fixes_applied 只看这份 08。
+        _write_apply_artifact(Path(report_dir), record)
         return record
     print("[crash-replay] 复用上次代码修改", file=sys.stderr, flush=True)
     applied = False
