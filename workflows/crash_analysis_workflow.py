@@ -29,6 +29,10 @@ from tools.thread_display import (
     format_prompt_thread_identity,
     format_prompt_thread_role_flags,
 )
+from tools.log_symbol_passthrough import (
+    enterprise_skip_symbol_resolve_enabled,
+    resolved_stack_from_log_symbols,
+)
 from tools.code_context_errors import (
     code_context_has_failure,
     code_context_has_usable_code,
@@ -425,26 +429,23 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 except Exception as maps_exc:
                     logger.debug("memory_maps extraction skipped: %s", maps_exc)
 
-            # Step 3: 堆栈符号化
-            with PhaseSpinner("堆栈符号化", step=2, total_steps=total_steps) as _resolve_spinner:
-                logger.info(f"[{self.definition.name}] Step 2: Resolving symbols...")
-                cached_resolved = replay_evidence.get("resolved_stack")
-                if isinstance(cached_resolved, dict):
-                    print("[crash-replay] 复用堆栈地址", file=sys.stderr, flush=True)
-                    resolved = cached_resolved
-                else:
-                    resolved = context.execute_tool("add2line_resolver", {
-                        "crash_json": json.dumps(parse_result),
-                        "library_dir": library_dir
-                    })
-                if not isinstance(resolved, dict):
-                    resolved = {}
+            # Step 3: 堆栈符号化。企业 iOS 不调用地址解析，直接沿用日志符号。
+            if enterprise_skip_symbol_resolve_enabled():
+                print(
+                    "[enterprise] 已判定为 iOS：跳过堆栈地址解析，按日志中的符号继续分析",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                logger.info(
+                    "[%s] Step 2: skip address resolve; use symbols already in the log",
+                    self.definition.name,
+                )
+                resolved = resolved_stack_from_log_symbols(parse_result)
                 if not resolved_stack_has_usable_resolution(resolved):
                     logger.info(
-                        "[%s] resolved_stack has no usable symbols; stopping pipeline.",
+                        "[%s] log symbols have no usable frames; stopping pipeline.",
                         self.definition.name,
                     )
-                    _resolve_spinner.set_partial_failure()
                     return self._return_skipped_no_usable_resolve(
                         parse_result,
                         resolved,
@@ -453,13 +454,41 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         memory_maps=memory_maps_data,
                         context=context,
                     )
+            else:
+                with PhaseSpinner("堆栈符号化", step=2, total_steps=total_steps) as _resolve_spinner:
+                    logger.info(f"[{self.definition.name}] Step 2: Resolving symbols...")
+                    cached_resolved = replay_evidence.get("resolved_stack")
+                    if isinstance(cached_resolved, dict):
+                        print("[crash-replay] 复用堆栈地址", file=sys.stderr, flush=True)
+                        resolved = cached_resolved
+                    else:
+                        resolved = context.execute_tool("add2line_resolver", {
+                            "crash_json": json.dumps(parse_result),
+                            "library_dir": library_dir
+                        })
+                    if not isinstance(resolved, dict):
+                        resolved = {}
+                    if not resolved_stack_has_usable_resolution(resolved):
+                        logger.info(
+                            "[%s] resolved_stack has no usable symbols; stopping pipeline.",
+                            self.definition.name,
+                        )
+                        _resolve_spinner.set_partial_failure()
+                        return self._return_skipped_no_usable_resolve(
+                            parse_result,
+                            resolved,
+                            scope,
+                            problem,
+                            memory_maps=memory_maps_data,
+                            context=context,
+                        )
 
-                self._ingest_stage_evidence(
-                    context,
-                    parse_result=parse_result,
-                    resolved=resolved,
-                    memory_maps=memory_maps_data,
-                )
+            self._ingest_stage_evidence(
+                context,
+                parse_result=parse_result,
+                resolved=resolved,
+                memory_maps=memory_maps_data,
+            )
 
             # Step 4a: 崩溃诊断（依赖 01+02 maps+03 符号化；含 DeterministicAnalyzer）
             crash_diagnosis: Dict[str, Any] = {}

@@ -27,6 +27,7 @@ from tools.crash_parser.stack_lines import (
     _try_parse_ios_macos_stack_line,
     _try_parse_ios_pre_parsed_stack_line,
     _try_parse_ios_symbol_only_stack_line,
+    _try_parse_ios_unnumbered_module_line,
 )
 from tools.crash_parser.types import StackFrame
 
@@ -107,7 +108,12 @@ def extract_stack_frames(
             "libace_napi.z.so",
         }
 
-        if base_lower.startswith(system_prefixes) or name in system_exact or base in system_exact:
+        if (
+            base_lower.startswith("libsystem_")
+            or base_lower.startswith(system_prefixes)
+            or name in system_exact
+            or base in system_exact
+        ):
             return "system"
         if name in platform_exact or base in platform_exact:
             return "system"
@@ -307,6 +313,31 @@ def extract_stack_frames(
                 ))
             except Exception as e:
                 logger.warning(f"解析iOS/ObjC栈帧时出错: {e}")
+            continue
+
+        unnumbered = _try_parse_ios_unnumbered_module_line(line)
+        if unnumbered:
+            try:
+                module, address, function, offset = unnumbered
+                if function and ("-[" in function or "+[" in function):
+                    layer = "objc"
+                    language = "objc"
+                else:
+                    layer = "native"
+                    language = "cpp"
+                stack_frames.append(StackFrame(
+                    frame_number=len(stack_frames),
+                    address=address or "",
+                    function=function,
+                    module=module,
+                    offset=offset,
+                    library_type=_classify_library(module),
+                    layer=layer,
+                    language=language,
+                    raw_log_line=raw_log_line,
+                ))
+            except Exception as e:
+                logger.warning(f"解析无帧号 iOS 栈帧时出错: {e}")
             continue
 
         # Android Java：at com.pkg.Class.method(File.java:12) / (Native method)

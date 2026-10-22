@@ -121,6 +121,10 @@ def parse_crash_core(
         "cmdline:",
         "fault addr",
         "signal ",
+        "exc_bad_access",
+        "exc_bad_instruction",
+        "exc_crash",
+        "exc_breakpoint",
     ]
     has_header_hint = any(m in content_lower for m in header_markers)
     if _android_stack_sample_hint(content):

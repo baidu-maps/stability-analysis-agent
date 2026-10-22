@@ -44,6 +44,25 @@ def _try_parse_ios_pre_parsed_stack_line(line: str) -> Optional[Tuple[str, str, 
 _IOS_STACK_PREFIX_RE = re.compile(r"^\s*\d+\s+(\S+)\s+(0x[0-9a-fA-F]+)\s+(.+)$")
 
 
+# 无帧号的缩写栈：``map_plugin  0x10ae3b7c8  walk_navi::CRoute::GetLegSize``
+_IOS_UNNUMBERED_MODULE_RE = re.compile(
+    r"^\s*([A-Za-z_][\w.+-]*)\s+(0x[0-9a-fA-F]{4,})\s+(\S.*?)\s*$"
+)
+
+
+def _try_parse_ios_unnumbered_module_line(line: str) -> Optional[Tuple[str, str, str, str]]:
+    """解析没有帧号的「模块 0x地址 符号」行。返回 (module, address, function, offset)。"""
+    match = _IOS_UNNUMBERED_MODULE_RE.match(line)
+    if not match:
+        return None
+    module, address, rest = match.group(1), match.group(2), match.group(3).strip()
+    offset_match = re.search(r"\s+\+\s+(\d+)(?:\s*\*\(.+\))?\s*$", rest)
+    if offset_match:
+        function = rest[: offset_match.start()].strip()
+        return module, address, function, offset_match.group(1)
+    return module, address, rest, "0"
+
+
 def _try_parse_ios_macos_stack_line(line: str) -> Optional[Tuple[str, str, str, str]]:
     """
     解析 Xcode/iOS 风格栈行。返回 (module, address, function, offset) 或 None。

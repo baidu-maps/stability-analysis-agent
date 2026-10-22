@@ -108,6 +108,27 @@ def _detect_ios_mach_tool_export(content: str) -> bool:
     return True
 
 
+_IOS_UNNUMBERED_FRAME_RE = re.compile(
+    r"(?m)^\s*[A-Za-z_][\w.+-]*\s+0x[0-9a-fA-F]{4,}\s+\S+"
+)
+
+
+def _detect_ios_abbreviated_symbolized_stack(content: str) -> bool:
+    """iCafe / 手工粘贴的缩写 iOS 栈：无帧号，带 EXC_ 或 libsystem_。"""
+    if not content:
+        return False
+    if re.search(r"Hardware Model:\s*Mac", content, re.IGNORECASE):
+        return False
+    if _detect_harmony_native_stack(content):
+        return False
+    if len(_IOS_UNNUMBERED_FRAME_RE.findall(content)) < 2:
+        return False
+    lowered = content.lower()
+    if "libsystem_" in lowered:
+        return True
+    return re.search(r"\bEXC_[A-Z0-9_]+\b", content) is not None
+
+
 def _detect_ios_pre_parsed_symbolized_crash(content: str) -> bool:
     """
     已符号化的精简 iOS 崩溃导出（如去哪儿 Crash.txt）：
@@ -189,6 +210,9 @@ def detect_os_type(content: str) -> str:
         return "ios"
 
     if _detect_ios_pre_parsed_symbolized_crash(content):
+        return "ios"
+
+    if _detect_ios_abbreviated_symbolized_stack(content):
         return "ios"
 
     if looks_like_cpp_qualified_stack(content):

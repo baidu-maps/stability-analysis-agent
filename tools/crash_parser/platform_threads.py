@@ -16,6 +16,7 @@ from tools.crash_parser.ios_scoping import (
     _ios_crashed_thread_block,
     _ios_extract_crashed_thread_index,
     _ios_thread_count_from_banner,
+    split_ios_colon_named_threads,
 )
 from tools.crash_parser.stack_extract import _extract_frames_for_crash_segment, extract_stack_frames
 from tools.crash_parser.types import CrashParseOptions, ThreadStack, _thread_layer_summary
@@ -189,8 +190,35 @@ def parse_threads_ios(
     debug: bool,
     opts: CrashParseOptions,
 ) -> ParseThreadsResult:
-    """Apple iOS：只解析 Crashed Thread（无该行时取 Thread 0）。"""
+    """Apple iOS：只解析 Crashed Thread（无该行时取 Thread 0）。
+
+    ``Thread: 名字`` 的缩写栈会拆成多线程：第一个标题前的栈是崩溃线程。
+    """
     crash_seg_req = max(1, int(opts.crash_segment_index))
+    named_blocks = split_ios_colon_named_threads(content)
+    if named_blocks:
+        threads: List[ThreadStack] = []
+        crash_assigned = False
+        for name, block, start_line in named_blocks:
+            frames, _, _, _ = _extract_frames_for_crash_segment(
+                block, debug, crash_seg_req, global_line_start=start_line,
+            )
+            if not frames:
+                continue
+            is_crash = not crash_assigned
+            crash_assigned = True
+            threads.append(ThreadStack(
+                tid=None,
+                name=name or None,
+                thread_index=None,
+                is_crash_thread=is_crash,
+                is_main_thread=None,
+                frames=frames,
+                **_thread_layer_summary(frames),
+            ))
+        total_frames = sum(len(item.frames) for item in threads)
+        return threads, len(threads) or None, 1, total_frames
+
     thread_count_total_val = _ios_apple_thread_block_count(content)
     banner_n = _ios_thread_count_from_banner(content)
     if banner_n is not None:

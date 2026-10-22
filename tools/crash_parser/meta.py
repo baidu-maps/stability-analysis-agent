@@ -22,6 +22,7 @@ from tools.crash_parser.format_detect import (
     _detect_apple_ios_freeze_report,
     _detect_apple_ios_truncated_crash,
     _detect_harmony_native_stack,
+    _detect_ios_abbreviated_symbolized_stack,
     _detect_ios_mach_tool_export,
     _detect_ios_pre_parsed_symbolized_crash,
     detect_os_type,
@@ -518,6 +519,8 @@ def extract_meta_info(content: str) -> MetaInfo:
         elif _detect_ios_mach_tool_export(content):
             os_type = "ios"
         elif _detect_ios_pre_parsed_symbolized_crash(content):
+            os_type = "ios"
+        elif _detect_ios_abbreviated_symbolized_stack(content):
             os_type = "ios"
         elif looks_like_cpp_qualified_stack(content):
             os_type = "ios"

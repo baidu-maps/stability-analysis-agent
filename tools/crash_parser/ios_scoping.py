@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import re
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 def _ios_apple_thread_block_count(content: str) -> int:
     """统计「Thread N:」「Thread N Crashed:」「Thread N Deadlock:」等线程栈块数量。"""
@@ -106,6 +106,37 @@ def _ios_crashed_thread_block(content: str) -> Optional[Tuple[str, int]]:
             break
     block = "\n".join(lines[start_idx:end_idx])
     return block, start_idx + 1
+
+
+_IOS_COLON_THREAD_RE = re.compile(r"^Thread:\s*(\S.*?)\s*$", re.IGNORECASE)
+
+
+def split_ios_colon_named_threads(content: str) -> Optional[List[Tuple[str, str, int]]]:
+    """按 ``Thread: 名字`` 拆缩写栈。返回 (name, block, start_line) 列表。
+
+    第一个标题之前的正文是崩溃栈，name 为空。没有这种标题时返回 None。
+    ``Thread 0:`` 这类带序号的 Apple 线程头不在此列。
+    """
+    lines = content.splitlines()
+    headers = []
+    for index, line in enumerate(lines):
+        match = _IOS_COLON_THREAD_RE.match(line.strip())
+        if not match:
+            continue
+        name = match.group(1).strip()
+        if re.match(r"^\d+\b", name):
+            continue
+        headers.append((index, name))
+    if not headers:
+        return None
+    blocks = []
+    first_header = headers[0][0]
+    if first_header > 0:
+        blocks.append(("", "\n".join(lines[:first_header]), 1))
+    for position, (index, name) in enumerate(headers):
+        end = headers[position + 1][0] if position + 1 < len(headers) else len(lines)
+        blocks.append((name, "\n".join(lines[index:end]), index + 1))
+    return blocks
 
 
 def _ios_extract_crashed_thread_index(content: str) -> Optional[int]:

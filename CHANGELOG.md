@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.6.4] - 2026-10-22
+
+### Added
+
+- 识别 iCafe / 手工粘贴的缩写 iOS 栈：无帧号、带 `EXC_` 或 `libsystem_`，并按 `Thread: 名字` 拆线程。日志里已有函数名时，企业进程可跳过地址解析，直接把这些符号交给后续分析。
+- 新增单测 `test/agent_py_tool/test_ios_abbreviated_symbolized_stack.py`。
+
+### Changed
+
+- 分析缓冲：日志、源码提交、符号目录和闭源 Agent 版本一致时复用解析与源码定位。只生成提示词的结果可供之后的全流程接着调用大模型。只有两次都是全流程且提示词参数一致时，才复用结论和补丁。
+
 ## [1.6.3] - 2026-10-21
 
 ### Fixed

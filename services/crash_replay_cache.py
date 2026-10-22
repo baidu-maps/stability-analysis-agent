@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""同一崩溃的分析缓冲：证据一致时复用最近一次成功结论，不比较大模型。"""
+"""同一崩溃的分析缓冲：证据一致时复用定位结果；结论只在全流程参数一致时复用。"""
 
 from __future__ import annotations
 
@@ -13,6 +13,24 @@ from typing import Any, Dict, List, Optional, Sequence
 
 CACHE_NAME = "12_crash_replay_cache.json"
 EVIDENCE_PARAM_KEYS = (
+    "scope",
+    "prompt_mode",
+    "agent_loop",
+    "max_agent_rounds",
+    "max_context_requests_per_round",
+    "domain_knowledge",
+    "knowledge_pack_id",
+)
+_EVIDENCE_IDENTITY_KEYS = (
+    "log_sha256",
+    "base_commit",
+    "source_origin",
+    "library_dir",
+    "enterprise_version",
+    "domain_knowledge",
+    "knowledge_pack_id",
+)
+_CONCLUSION_PARAM_KEYS = (
     "scope",
     "prompt_mode",
     "agent_loop",
@@ -240,8 +258,9 @@ def remember_crash_replay(
         has_patch = bool(patch_sha) and current_apply_ok
         apply_success = current_apply_ok
     current_review_url = str(review.get("review_url") or "").strip()
+    # 只继承补丁。评审链接和创建人属于上次推送人，不抄到这次报告上。
     if source_ready and not current_review_url:
-        review = _review_fields(source_cache.get("review"))
+        review = {}
     record = {
         "schema_version": 1,
         "reusable": bool(evidence_ok),
@@ -308,8 +327,39 @@ def _conclusion_text(report_dir: Path) -> str:
         return ""
 
 
+def _evidence_identity(material: Dict[str, Any]) -> Dict[str, Any]:
+    """定位结果是否可复用。范围和模型轮数不参与。"""
+    return {key: material.get(key) for key in _EVIDENCE_IDENTITY_KEYS}
+
+
+def _cached_evidence_material(source: Path) -> Optional[Dict[str, Any]]:
+    """读报告里记下的证据材料。旧索引只有哈希时返回 None。"""
+    record = _load_json(source / CACHE_NAME)
+    if not isinstance(record, dict):
+        return None
+    material = record.get("evidence")
+    return material if isinstance(material, dict) else None
+
+
+def _same_evidence(requested: Dict[str, Any], cached: Dict[str, Any]) -> bool:
+    """日志、源码提交、符号目录和企业版本一致即可复用定位。"""
+    return _evidence_identity(requested) == _evidence_identity(cached)
+
+
+def _conclusion_compatible(requested: Dict[str, Any], cached: Dict[str, Any]) -> bool:
+    """只有两次都是全流程，且提示词参数一致，才复用结论。"""
+    if str(requested.get("scope") or "") != "full":
+        return False
+    if str(cached.get("scope") or "") != "full":
+        return False
+    for key in _CONCLUSION_PARAM_KEYS:
+        if requested.get(key) != cached.get(key):
+            return False
+    return True
+
+
 def lookup_crash_replay(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """按证据找可复用报告。跳过失败，用最近一次成功结论。"""
+    """按证据找可复用报告。全流程可接上一次只生成提示词的定位结果。"""
     if not isinstance(request, dict):
         return None
     material = evidence_material(request)
@@ -319,15 +369,24 @@ def lookup_crash_replay(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     evidence_hit: Optional[Dict[str, Any]] = None
     conclusion_hit: Optional[Dict[str, Any]] = None
     for row in reversed(_read_index()):
-        if str(row.get("evidence_key") or "") != evidence_key:
-            continue
         source = Path(str(row.get("report_dir") or ""))
+        cached_material = _cached_evidence_material(source)
+        if cached_material is None:
+            if str(row.get("evidence_key") or "") != evidence_key:
+                continue
+            cached_material = material
+        elif not _same_evidence(material, cached_material):
+            continue
         evidence = _load_ready_evidence(source)
         if evidence is None:
             continue
         if evidence_hit is None:
             evidence_hit = {"row": row, "source": source, "evidence": evidence}
-        if conclusion_hit is None and bool(row.get("conclusion_reusable")):
+        conclusion_ok = bool(row.get("conclusion_reusable")) and _conclusion_compatible(
+            material,
+            cached_material,
+        )
+        if conclusion_hit is None and conclusion_ok:
             analysis = _conclusion_text(source)
             if analysis.strip():
                 conclusion_hit = {
@@ -585,7 +644,10 @@ def find_reusable_review(
     repo: str,
     branch: str,
 ) -> Optional[Dict[str, Any]]:
-    """同分析缓冲、同补丁、同仓库分支、同创建者时返回已有评审。不看大模型。"""
+    """同补丁、同仓库分支、且创建人就是本次推送人时，才返回已有评审。
+
+    不看大模型。别的创建人留下的链接不能命中，旧评审也不在这里改写。
+    """
     current = _load_json(Path(report_dir) / CACHE_NAME)
     if not isinstance(current, dict) or not current.get("reusable"):
         return None

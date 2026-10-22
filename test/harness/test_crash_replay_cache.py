@@ -29,6 +29,8 @@ def _request(
     enterprise: str = "1.5.5",
     core: str = "1.5.5",
     git_commit: str = "404f0a9",
+    scope: str = "full",
+    rounds: int = 3,
 ) -> dict:
     """构造一份最小运行记录。"""
     return {
@@ -36,10 +38,10 @@ def _request(
         "source_identity": {"base_commit": "50b78d74f1900d8ff197a0fdd8998eba411ed1de", "source_origin": "icafe"},
         "paths": {"library_dir": "/data/symbols"},
         "effective_parameters": {
-            "scope": "full",
+            "scope": scope,
             "prompt_mode": "analysis",
             "agent_loop": "context_loop",
-            "max_agent_rounds": 3,
+            "max_agent_rounds": rounds,
             "max_context_requests_per_round": 8,
             "domain_knowledge": True,
             "knowledge_pack_id": "",
@@ -165,6 +167,37 @@ class CrashReplayCacheTests(unittest.TestCase):
         remember_crash_replay(source, _request(core="1.5.5"))
         hit = lookup_crash_replay(_request(core="1.5.6"))
         self.assertEqual(hit["level"], "conclusion")
+
+    def test_full_reuses_prompt_only_evidence(self) -> None:
+        """全流程复用只生成提示词的定位结果，不把它当成结论。"""
+        source = Path(self._tmpdir.name) / "prompt-only"
+        _write_report(source)
+        (source / "final_output.md").write_text("", encoding="utf-8")
+        (source / "01_crash_log_parser.json").write_text(
+            '{"parse_status": "ok"}\n',
+            encoding="utf-8",
+        )
+        remember_crash_replay(source, _request(scope="gen_prompt_only", rounds=1))
+        hit = lookup_crash_replay(_request(scope="full", rounds=5))
+        self.assertEqual(hit["level"], "evidence")
+        self.assertEqual(hit["evidence"]["parse_result"]["parse_status"], "ok")
+        self.assertNotIn("analysis", hit)
+
+    def test_narrower_scope_does_not_reuse_full_conclusion(self) -> None:
+        """只生成提示词不套用全流程的大模型结论。"""
+        source = Path(self._tmpdir.name) / "full-run"
+        _write_report(source)
+        remember_crash_replay(source, _request(scope="full", rounds=5))
+        hit = lookup_crash_replay(_request(scope="gen_prompt_only", rounds=1))
+        self.assertEqual(hit["level"], "evidence")
+
+    def test_different_rounds_reuse_evidence_not_conclusion(self) -> None:
+        """轮数不同时仍复用定位，但不复用上次结论。"""
+        source = Path(self._tmpdir.name) / "full-run"
+        _write_report(source)
+        remember_crash_replay(source, _request(scope="full", rounds=3))
+        hit = lookup_crash_replay(_request(scope="full", rounds=5))
+        self.assertEqual(hit["level"], "evidence")
 
     def test_failed_apply_is_not_a_conclusion(self) -> None:
         """改码失败的运行不能当作可直接应用的结论。"""
@@ -310,15 +343,15 @@ class CrashReplayCacheTests(unittest.TestCase):
         discard.assert_called_once()
         self.assertNotEqual(os.environ.get("BD_SA_KEEP_APPLIED_PATCH"), "1")
 
-    def test_reused_source_keeps_patch_without_current_apply(self) -> None:
-        """共享检出已有补丁、本次没有 08 时，仍继承补丁和评审。"""
+    def test_reused_source_keeps_patch_but_not_another_creators_review(self) -> None:
+        """共享检出已有补丁时继承补丁，不继承别人的评审链接和创建人。"""
         source = Path(self._tmpdir.name) / "source"
         _write_report(source)
         remember_crash_replay(source, _request())
         attach_review(
             source,
             {
-                "review_url": "http://icode.example/reviews/1",
+                "review_url": "http://icode.example/+/122909085",
                 "creator": "liuhong_cd",
                 "repo": "baidu/mapclient/engine-dev",
                 "branch": "v20.15.0",
@@ -340,12 +373,58 @@ class CrashReplayCacheTests(unittest.TestCase):
         self.assertEqual(cache["patch_sha256"], source_cache["patch_sha256"])
         self.assertTrue(cache["has_patch"])
         self.assertTrue(cache["apply_success"])
-        review = cache["review"]
-        self.assertEqual(review["review_url"], "http://icode.example/reviews/1")
-        self.assertEqual(review["creator"], "liuhong_cd")
-        self.assertEqual(review["repo"], "baidu/mapclient/engine-dev")
-        self.assertEqual(review["branch"], "v20.15.0")
-        self.assertEqual(review["commit"], "b935229")
+        self.assertFalse(str((cache.get("review") or {}).get("review_url") or "").strip())
+        self.assertNotEqual((cache.get("review") or {}).get("creator"), "liuhong_cd")
+        self.assertIsNone(
+            find_reusable_review(
+                current,
+                creator="hexiaojing",
+                repo="baidu/mapclient/engine-dev",
+                branch="v20.15.0",
+            )
+        )
+        self.assertEqual(
+            find_reusable_review(
+                current,
+                creator="liuhong_cd",
+                repo="baidu/mapclient/engine-dev",
+                branch="v20.15.0",
+            )["review_url"],
+            "http://icode.example/+/122909085",
+        )
+
+    def test_same_creator_reuses_own_review_only(self) -> None:
+        """同一人再次触发命中自己上次的评审，换一个人则不命中。"""
+        first = Path(self._tmpdir.name) / "first"
+        _write_report(first)
+        remember_crash_replay(first, _request())
+        attach_review(
+            first,
+            {
+                "review_url": "http://icode.example/+/122909085",
+                "creator": "hexiaojing",
+                "repo": "baidu/mapclient/engine-dev",
+                "branch": "v20.15.0",
+                "commit": "abc",
+            },
+        )
+        again = Path(self._tmpdir.name) / "again"
+        _write_report(again)
+        remember_crash_replay(again, _request())
+        own = find_reusable_review(
+            again,
+            creator="hexiaojing",
+            repo="baidu/mapclient/engine-dev",
+            branch="v20.15.0",
+        )
+        other = find_reusable_review(
+            again,
+            creator="liuhong_cd",
+            repo="baidu/mapclient/engine-dev",
+            branch="v20.15.0",
+        )
+        self.assertEqual(own["review_url"], "http://icode.example/+/122909085")
+        self.assertIsNone(other)
 
     def test_keep_applied_patch_writes_apply_artifact(self) -> None:
         """补丁已在工作区时，把上次改动文件写成成功的 08。"""
