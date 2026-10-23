@@ -295,12 +295,14 @@ class CrashAnalysisData:
 
 def _normalize_code_roots_arg(code_root: Union[str, List[str], None]) -> List[str]:
     """将 CLI/调用方传入的单根或多根参数规范为去重后的绝对路径列表。"""
+    from services.repo_scan_limits import collapse_nested_roots
+
     if code_root is None:
         return []
     if isinstance(code_root, str):
         if not str(code_root).strip():
             return []
-        return [str(Path(code_root).resolve())]
+        return collapse_nested_roots([str(Path(code_root).resolve())], require_dir=False)
     out: List[str] = []
     seen: set[str] = set()
     for p in code_root:
@@ -310,7 +312,7 @@ def _normalize_code_roots_arg(code_root: Union[str, List[str], None]) -> List[st
         if a not in seen:
             seen.add(a)
             out.append(a)
-    return out
+    return collapse_nested_roots(out, require_dir=False)
 
 
 def _file_under_any_project_root(path: Path, code_roots_abs: List[str]) -> bool:
@@ -4156,6 +4158,33 @@ class CodeContentProvider:
         except Exception:
             pass
 
+    def _release_location_memory(self) -> None:
+        """定位结束后丢掉可重建的源码缓存，避免全文留到 AI 阶段。"""
+        self._release_scan_caches()
+        locator = getattr(self, "_locator", None)
+        ctx = getattr(locator, "ctx", None) if locator is not None else None
+        cache = getattr(ctx, "_file_content_cache", None) if ctx is not None else None
+        if isinstance(cache, dict):
+            cache.clear()
+            ctx._file_content_cache_bytes = 0
+
+    def _thread_cpp_parser(self):
+        """每个 worker 使用自己的 tree-sitter parser。共享 parser 不是线程安全的。"""
+        import threading
+
+        local = getattr(self, "_ts_thread_parsers", None)
+        if local is None:
+            local = threading.local()
+            self._ts_thread_parsers = local
+        parser = getattr(local, "parser", None)
+        if parser is None and _ts_get_parser is not None:
+            try:
+                parser = _ts_get_parser("cpp")
+                local.parser = parser
+            except Exception:
+                parser = None
+        return parser or self._ts_parser
+
     def _find_call_chain_functions_tree_sitter(
         self,
         crash_function_name: str,
@@ -4236,9 +4265,10 @@ class CodeContentProvider:
         # 确定并行 worker 数量
         max_workers = self.max_workers
         if max_workers is None:
-            # 自动：使用 CPU 核心数，上限 8
+            # 自动：上限 2。8 路同时解析会把多份源码和 AST 叠在同一个进程里。
             import multiprocessing
-            max_workers = min(multiprocessing.cpu_count(), 8)
+            from services.repo_scan_limits import TREE_SITTER_MAX_WORKERS
+            max_workers = min(multiprocessing.cpu_count(), TREE_SITTER_MAX_WORKERS)
 
         # 判断是否启用并行（文件数 >= 阈值且非禁用）
         use_parallel = total_files >= self.parallel_threshold and max_workers > 0
@@ -4338,6 +4368,7 @@ class CodeContentProvider:
             """扫描单个文件，查找调用目标函数的函数"""
             file_path, cr = file_info
             local_results = []
+            parser = self._thread_cpp_parser()
             try:
                 source_text = self._read_file_cached(file_path)
                 if not source_text or not source_text.strip():
@@ -4346,7 +4377,7 @@ class CodeContentProvider:
                 if simple_function_name not in source_text:
                     return []
                 source_bytes = source_text.encode("utf-8", errors="ignore")
-                tree = self._ts_parser.parse(source_bytes)
+                tree = parser.parse(source_bytes)
                 root_node = tree.root_node
             except Exception:
                 return []
@@ -11711,6 +11742,8 @@ class CodeContentProvider:
                 "code_roots": _normalize_code_roots_arg(code_root),
                 "code_parser_backend": self.code_parser_backend
             }, ensure_ascii=False, indent=2)
+        finally:
+            self._release_location_memory()
 
 # 测试代码
 if __name__ == "__main__":

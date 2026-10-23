@@ -51,6 +51,16 @@ class CrashRepoMapTests(unittest.TestCase):
             self.assertTrue(entries)
             self.assertTrue(any(entry.is_test and "test_reference" in entry.ranking_reasons for entry in entries))
 
+    def test_references_stay_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            names = " ".join(f"identifier{i}();" for i in range(200))
+            (root / "wide.cpp").write_text(f"void run() {{ {names} }}\n", encoding="utf-8")
+            snapshot = CrashRepoMap([str(root)], cache_dir=str(root / "cache")).build()
+            references = snapshot.files[0]["references"]
+            self.assertLessEqual(len(references), 32)
+            self.assertNotIn("text", snapshot.files[0])
+
 
 if __name__ == "__main__":
     unittest.main()

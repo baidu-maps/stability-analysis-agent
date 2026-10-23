@@ -15,6 +15,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from services.repo_scan_limits import (
+    MAX_EDGES_PER_FILE,
+    MAX_INDEX_FILES,
+    MAX_REFERENCES_PER_FILE,
+    MAX_SOURCE_BYTES,
+    MAX_SYMBOL_FANOUT,
+    collapse_nested_roots,
+    merge_priority_paths,
+    prefer_terms_lower,
+    remember_priority_path,
+)
+
 
 SUPPORTED_EXTENSIONS = frozenset({
     ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
@@ -116,7 +128,7 @@ class CrashRepoMap:
         *,
         cache_dir: Optional[str] = None,
         exclude_dirs: Optional[Iterable[str]] = None,
-        max_files: int = 20000,
+        max_files: int = MAX_INDEX_FILES,
     ) -> None:
         self.code_roots = self._normalize_roots(code_roots or [])
         self.exclude_dirs = set(DEFAULT_EXCLUDE_DIRS) | {str(x) for x in (exclude_dirs or [])}
@@ -126,7 +138,7 @@ class CrashRepoMap:
         else:
             cache_base = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
             self.cache_dir = cache_base / "stability-analysis-agent" / "crash-repo-map"
-        self.cache_path = self.cache_dir / f"{_fingerprint(self.code_roots)}.json"
+        self.cache_path = self.cache_dir / f"{_fingerprint(self.code_roots)}-v2.json"
         self.snapshot = RepoMapSnapshot(roots=list(self.code_roots))
         self.cache_hit = False
 
@@ -143,26 +155,45 @@ class CrashRepoMap:
                 continue
             seen.add(value)
             result.append(value)
-        return result
+        return collapse_nested_roots(result)
 
-    def _iter_files(self) -> List[str]:
-        files: List[str] = []
+    def _iter_files(self, prefer_terms: Optional[Sequence[str]] = None) -> List[str]:
+        terms = prefer_terms_lower(prefer_terms)
+        matched: List[str] = []
+        extras: List[str] = []
+        seen: Set[str] = set()
         for root in self.code_roots:
             for dirpath, dirnames, filenames in os.walk(root):
                 dirnames[:] = [item for item in dirnames if item not in self.exclude_dirs and not item.startswith(".")]
                 for name in filenames:
                     if Path(name).suffix.lower() not in SUPPORTED_EXTENSIONS:
                         continue
-                    files.append(str((Path(dirpath) / name).resolve()))
-                    if len(files) >= self.max_files:
-                        return sorted(files)
-        return sorted(set(files))
+                    path = str((Path(dirpath) / name).resolve())
+                    if path in seen:
+                        continue
+                    seen.add(path)
+                    remember_priority_path(matched, extras, path, terms, self.max_files)
+        return merge_priority_paths(matched, extras, self.max_files)
 
     @staticmethod
     def _parse_file(path: str) -> Dict[str, Any]:
         try:
-            text = Path(path).read_text(encoding="utf-8", errors="replace")
             stat = Path(path).stat()
+        except OSError:
+            return {}
+        mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)))
+        is_test = bool(re.search(r"(?:^|/)(?:test|tests|testing|unittest)(?:/|$)", path.lower()))
+        if int(stat.st_size) > MAX_SOURCE_BYTES:
+            return {
+                "path": path,
+                "mtime_ns": mtime_ns,
+                "size": int(stat.st_size),
+                "symbols": [],
+                "references": [],
+                "is_test": is_test,
+            }
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
         except OSError:
             return {}
         defs: List[Dict[str, Any]] = []
@@ -176,17 +207,24 @@ class CrashRepoMap:
                     seen.add(key)
                     defs.append({"name": name, "line": line, "kind": kind})
         defined = {item["name"] for item in defs}
-        tokens = {
-            token for token in _IDENTIFIER.findall(text)
-            if token not in _KEYWORDS and token not in defined and len(token) > 1
-        }
+        references: List[str] = []
+        for token in _IDENTIFIER.findall(text):
+            if token in _KEYWORDS or token in defined or len(token) <= 1:
+                continue
+            if "::" not in token and not token.startswith("m_") and len(token) < 8:
+                continue
+            if token in references:
+                continue
+            references.append(token)
+            if len(references) >= MAX_REFERENCES_PER_FILE:
+                break
         return {
             "path": path,
-            "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+            "mtime_ns": mtime_ns,
             "size": int(stat.st_size),
             "symbols": defs,
-            "references": sorted(tokens),
-            "is_test": bool(re.search(r"(?:^|/)(?:test|tests|testing|unittest)(?:/|$)", path.lower())),
+            "references": references,
+            "is_test": is_test,
         }
 
     def _load_cache(self) -> Dict[str, Any]:
@@ -196,13 +234,17 @@ class CrashRepoMap:
         except (OSError, ValueError):
             return {}
 
-    def build(self, code_roots: Optional[Sequence[str]] = None) -> RepoMapSnapshot:
+    def build(
+        self,
+        code_roots: Optional[Sequence[str]] = None,
+        prefer_terms: Optional[Sequence[str]] = None,
+    ) -> RepoMapSnapshot:
         if code_roots is not None:
             self.code_roots = self._normalize_roots(code_roots)
         cached = self._load_cache()
         cached_files = cached.get("files") if isinstance(cached.get("files"), dict) else {}
         file_rows: List[Dict[str, Any]] = []
-        for path in self._iter_files():
+        for path in self._iter_files(prefer_terms):
             old = cached_files.get(path) if isinstance(cached_files, dict) else None
             try:
                 stat = Path(path).stat()
@@ -211,6 +253,9 @@ class CrashRepoMap:
                 continue
             if isinstance(old, dict) and old.get("signature") == signature and isinstance(old.get("data"), dict):
                 data = dict(old["data"])
+                refs = [str(item) for item in (data.get("references") or [])]
+                data["references"] = refs[:MAX_REFERENCES_PER_FILE]
+                data.pop("text", None)
                 self.cache_hit = True
             else:
                 data = self._parse_file(path)
@@ -229,10 +274,14 @@ class CrashRepoMap:
         for item in files:
             weights: Dict[str, int] = {}
             for reference in item.get("references") or []:
-                for target in symbol_files.get(str(reference), set()):
+                targets = symbol_files.get(str(reference), set())
+                if len(targets) > MAX_SYMBOL_FANOUT:
+                    continue
+                for target in targets:
                     if target != item["path"]:
                         weights[target] = weights.get(target, 0) + 1
-            for target, weight in sorted(weights.items(), key=lambda pair: (-pair[1], pair[0])):
+            ranked_targets = sorted(weights.items(), key=lambda pair: (-pair[1], pair[0]))
+            for target, weight in ranked_targets[:MAX_EDGES_PER_FILE]:
                 edges.append({"source": item["path"], "target": target, "weight": weight})
         compact_files = [
             {

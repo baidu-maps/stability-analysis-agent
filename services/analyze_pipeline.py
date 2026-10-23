@@ -22,6 +22,7 @@ from services.context_engine import (
     resolve_max_agent_rounds,
 )
 from services.crash_repo_map import CrashRepoMap, render_repo_map
+from services.repo_scan_limits import collapse_nested_roots
 from services.code_evidence_index import CodeEvidenceIndex
 from services.crash_evidence_retriever import CrashEvidenceRetriever
 from services.investigation_controller import InvestigationController
@@ -171,11 +172,25 @@ def run_analyze_context_loop(
     investigation_controller = InvestigationController()
     context_config = getattr(context, "config", {}) if context is not None else {}
     max_chars = int(context_config.get("evidence_max_chars", 24000) or 24000) if isinstance(context_config, dict) else 24000
-    code_roots = list(prepare.get("code_roots") or []) if isinstance(prepare, dict) else []
+    code_roots = collapse_nested_roots(
+        list(prepare.get("code_roots") or []) if isinstance(prepare, dict) else []
+    )
+    prefer_terms: List[str] = []
+    resolved_for_scope = prepare.get("resolved_stack") if isinstance(prepare, dict) else None
+    if isinstance(resolved_for_scope, dict):
+        scope_blob = json.dumps(resolved_for_scope, ensure_ascii=False, default=str)
+        for found in re.findall(
+            r"(?:^|[\"'])((?:/|[A-Za-z]:[\\/])[^\"']+\.(?:c|cc|cpp|cxx|h|hpp|m|mm|swift))",
+            scope_blob,
+        ):
+            prefer_terms.append(Path(found).name)
+            parent_name = Path(found).parent.name
+            if parent_name and parent_name not in {".", ""}:
+                prefer_terms.append(parent_name)
     if code_roots and not (isinstance(problem, dict) and problem.get("disable_repo_map")):
         try:
             repo_map = CrashRepoMap(code_roots)
-            snapshot = repo_map.build()
+            snapshot = repo_map.build(prefer_terms=prefer_terms)
             anchors: Dict[str, Any] = {
                 "stack_files": [],
                 "stack_symbols": [],
@@ -209,7 +224,11 @@ def run_analyze_context_loop(
                 revision, _ = workspace_revisions(code_roots)
             except Exception:
                 pass
-            index_snapshot = evidence_index.update(code_roots, revision=revision)
+            index_snapshot = evidence_index.update(
+                code_roots,
+                revision=revision,
+                prefer_terms=prefer_terms,
+            )
             evidence_retriever = CrashEvidenceRetriever(
                 evidence_index,
                 repo_map=snapshot,

@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import threading
 import time
@@ -41,22 +42,20 @@ _SUPPORTED_SOURCE_EXTENSIONS = {
 
 
 class CtagsFunctionIndex:
-    """In-memory function index built from ctags -R output."""
+    """On-disk function index built from ctags output.
+
+    Lookups go through sqlite. The symbol table is not kept as a Python dict,
+    so a cold index of engine-dev does not stay resident for the rest of the run.
+    """
 
     def __init__(self, code_roots: List[str]) -> None:
-        roots: List[str] = []
-        seen = set()
-        for raw in code_roots or []:
-            if not raw:
-                continue
-            ap = os.path.abspath(raw)
-            if ap in seen or not os.path.isdir(ap):
-                continue
-            seen.add(ap)
-            roots.append(ap)
-        self.code_roots = roots
+        from services.repo_scan_limits import collapse_nested_roots
+
+        self.code_roots = collapse_nested_roots(code_roots or [])
         self._ready = False
-        self._name_to_locs: Dict[str, List[Tuple[str, int]]] = {}
+        self._conn: Optional[sqlite3.Connection] = None
+        self._db_path: Optional[str] = None
+        self._symbol_count = 0
         self._build_sync()
 
     @staticmethod
@@ -248,11 +247,53 @@ class CtagsFunctionIndex:
             os.path.join(cache_dir, f"{key}.meta.json"),
         )
 
-    def _index_cache_path(self) -> str:
-        """已解析索引的 JSON 缓存路径（避免每次加载都 resolve 行号）。"""
+    def _index_db_path(self) -> str:
+        """sqlite 查询索引路径。符号留在磁盘上，不把整表载入进程。"""
         key = self._cache_key()
-        cache_dir = self._cache_dir()
-        return os.path.join(cache_dir, f"{key}.index.json")
+        return os.path.join(self._cache_dir(), f"{key}.index.sqlite")
+
+    def _open_db(self, path: Optional[str]) -> None:
+        """打开或复用 sqlite。``path`` 为空时使用内存库，供单测直接灌 tags。"""
+        if self._conn is not None and self._db_path == path:
+            return
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except sqlite3.Error:
+                pass
+            self._conn = None
+        self._db_path = path
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self._conn = sqlite3.connect(path, check_same_thread=False)
+        else:
+            self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=OFF")
+        self._conn.execute("PRAGMA synchronous=OFF")
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS symbols ("
+            "name TEXT NOT NULL, simple_name TEXT NOT NULL, "
+            "file TEXT NOT NULL, line INTEGER NOT NULL, "
+            "UNIQUE(name, file, line))"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_symbols_simple ON symbols(simple_name)"
+        )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name)")
+
+    @staticmethod
+    def _simple_name(name: str) -> str:
+        if "::" in name:
+            return name.rsplit("::", 1)[-1]
+        if "." in name:
+            return name.rsplit(".", 1)[-1]
+        return name
+
+    def _count_symbols(self) -> int:
+        if self._conn is None:
+            return 0
+        row = self._conn.execute("SELECT COUNT(*) FROM symbols").fetchone()
+        return int(row[0] if row else 0)
 
     def _load_from_cache(self) -> bool:
         tags_path, meta_path = self._cache_paths()
@@ -270,61 +311,31 @@ class CtagsFunctionIndex:
                 newest_root_mtime = max(os.path.getmtime(r) for r in self.code_roots)
                 if float(meta.get("built_at", 0)) < newest_root_mtime:
                     return False
-            # 优先从已解析索引 JSON 加载（跳过 _resolve_line_from_tag）
-            index_path = self._index_cache_path()
-            if os.path.isfile(index_path):
-                idx_mtime = os.path.getmtime(index_path)
-                tags_mtime = os.path.getmtime(tags_path)
-                if idx_mtime >= tags_mtime:
-                    if self._load_from_index_json(index_path):
-                        return True
-            # fallback: 解析原始 tags 文件（慢路径）
-            with open(tags_path, "r", encoding="utf-8", errors="ignore") as f:
-                self._parse_tags_stream(f)
-            # 保存已解析索引以加速下次加载
-            self._save_index_json()
+            db_path = self._index_db_path()
+            tags_mtime = os.path.getmtime(tags_path)
+            if os.path.isfile(db_path) and os.path.getmtime(db_path) >= tags_mtime:
+                self._open_db(db_path)
+                self._symbol_count = self._count_symbols()
+                self._ready = True
+                logger.info(
+                    "已打开 ctags sqlite 索引（%d 符号，roots=%s）",
+                    self._symbol_count,
+                    len(self.code_roots),
+                )
+                return True
+            self._open_db(db_path)
+            with open(tags_path, "r", encoding="utf-8", errors="ignore") as handle:
+                self._parse_tags_stream(handle)
             self._ready = True
             logger.info(
-                "已从缓存加载 ctags 函数索引（%d 符号，roots=%s）",
-                len(self._name_to_locs),
+                "已从 tags 文件建立 sqlite 函数索引（%d 符号，roots=%s）",
+                self._symbol_count,
                 len(self.code_roots),
             )
             return True
         except Exception as exc:
             logger.debug("加载 ctags 缓存失败: %s", exc)
             return False
-
-    def _load_from_index_json(self, index_path: str) -> bool:
-        """从已解析的 JSON 索引直接加载（快路径，跳过 _resolve_line_from_tag）。"""
-        try:
-            with open(index_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            mapping: Dict[str, List[Tuple[str, int]]] = {}
-            # pop 渐进消费：避免 data 与 mapping 双份并存导致瞬态内存翻倍。
-            for name in list(data.keys()):
-                locs = data.pop(name)
-                mapping[name] = [(loc[0], loc[1]) for loc in locs]
-            self._name_to_locs = mapping
-            self._ready = True
-            logger.info(
-                "已从索引 JSON 快速加载 ctags 函数索引（%d 符号，roots=%s）",
-                len(self._name_to_locs),
-                len(self.code_roots),
-            )
-            return True
-        except Exception as exc:
-            logger.debug("加载索引 JSON 失败: %s", exc)
-            return False
-
-    def _save_index_json(self) -> None:
-        """将已解析的索引保存为 JSON，下次加载可跳过 _resolve_line_from_tag。"""
-        index_path = self._index_cache_path()
-        try:
-            data = {name: locs for name, locs in self._name_to_locs.items()}
-            with open(index_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-        except Exception as exc:
-            logger.debug("保存索引 JSON 失败: %s", exc)
 
     def _save_build_meta(self) -> None:
         """只写 meta.json；tags 文件由 ctags -f 直接落在缓存路径，无需读出再回写。"""
@@ -364,14 +375,14 @@ class CtagsFunctionIndex:
             # 流式逐行解析 tags 文件：多 repo 大仓的 tags 可达 GB 级，
             # 整文件 read() + splitlines() 会造成约 3-4 倍瞬时内存峰值。
             # 缓存命中路径（_load_from_cache）本就走文件句柄，这里保持一致。
+            self._open_db(self._index_db_path())
             with open(tags_path, "r", encoding="utf-8", errors="ignore") as handle:
                 self._parse_tags_stream(handle)
-            self._save_build_meta()  # tags 文件由 ctags -f 直接产出，只补写 meta
-            self._save_index_json()  # 保存已解析索引，下次加载跳过 resolve
+            self._save_build_meta()
             self._ready = True
             logger.info(
                 "ctags 函数索引构建完成（%d 符号，roots=%s，ctags=%s）",
-                len(self._name_to_locs),
+                self._symbol_count,
                 len(self.code_roots),
                 ctags,
             )
@@ -383,7 +394,24 @@ class CtagsFunctionIndex:
             self._ready = True
 
     def _parse_tags_stream(self, lines) -> None:
-        mapping: Dict[str, List[Tuple[str, int]]] = {}
+        """把 tags 流写入 sqlite。调用方不再持有 name -> locations 字典。"""
+        if self._conn is None:
+            self._open_db(self._db_path)
+        conn = self._conn
+        if conn is None:
+            return
+        conn.execute("DELETE FROM symbols")
+        batch: List[Tuple[str, str, str, int]] = []
+
+        def _flush() -> None:
+            if not batch:
+                return
+            conn.executemany(
+                "INSERT OR IGNORE INTO symbols(name, simple_name, file, line) VALUES (?, ?, ?, ?)",
+                batch,
+            )
+            batch.clear()
+
         for raw in lines:
             line = raw.strip() if isinstance(raw, str) else str(raw).strip()
             if not line or line.startswith("!"):
@@ -415,49 +443,53 @@ class CtagsFunctionIndex:
                 line_no = self._resolve_line_from_tag(file_path, pattern, name)
             if line_no is None or line_no <= 0:
                 continue
-            bucket = mapping.setdefault(name, [])
-            loc = (file_path, line_no)
-            if loc not in bucket:
-                bucket.append(loc)
-        self._name_to_locs = mapping
+            batch.append((name, self._simple_name(name), file_path, int(line_no)))
+            if len(batch) >= 1000:
+                _flush()
+        _flush()
+        conn.commit()
+        self._symbol_count = self._count_symbols()
 
     def is_ready(self) -> bool:
         return self._ready
 
     def lookup(self, simple_name: str, code_roots: Optional[List[str]] = None) -> Optional[Tuple[str, int]]:
+        """按符号名查询一个定义位置。先走索引列，未命中再做有限的限定名匹配。"""
         name = str(simple_name or "").strip()
-        if not name or not self._name_to_locs:
+        if not name or self._conn is None:
             return None
+        rows = self._conn.execute(
+            "SELECT file, line FROM symbols WHERE simple_name = ? OR name = ?",
+            (name, name),
+        ).fetchall()
+        if not rows:
+            rows = self._conn.execute(
+                "SELECT file, line FROM symbols WHERE name LIKE ? LIMIT 50",
+                (f"%::{name}%",),
+            ).fetchall()
         roots_abs = [os.path.abspath(r) for r in (code_roots or self.code_roots) if r]
-        candidates: List[Tuple[str, int]] = []
 
         def _under_root(path: str) -> bool:
             try:
-                ap = os.path.abspath(path)
+                absolute = os.path.abspath(path)
             except OSError:
                 return False
             for root in roots_abs:
                 try:
-                    common = os.path.commonpath([ap, root])
+                    common = os.path.commonpath([absolute, root])
                 except ValueError:
                     continue
                 if common == root:
                     return True
             return not roots_abs
 
-        for key, locs in self._name_to_locs.items():
-            if key == name or key.endswith(f"::{name}") or key.endswith(f".{name}"):
-                candidates.extend(locs)
-            elif f"::{name}" in key:
-                candidates.extend(locs)
-        if not candidates and name in self._name_to_locs:
-            candidates = list(self._name_to_locs[name])
-        filtered = [(p, ln) for p, ln in candidates if _under_root(p)]
+        candidates = [(str(path), int(line_no)) for path, line_no in rows if path and line_no]
+        filtered = [(path, line_no) for path, line_no in candidates if _under_root(path)]
         if not filtered:
             filtered = candidates
         if not filtered:
             return None
-        filtered.sort(key=lambda x: (len(x[0]), x[0]))
+        filtered.sort(key=lambda item: (len(item[0]), item[0]))
         return filtered[0]
 
 
@@ -467,7 +499,9 @@ _CTYPES_WARM_THREADS: Dict[Tuple[str, ...], threading.Thread] = {}
 
 
 def get_ctags_index_for_roots(code_roots: List[str]) -> Optional[CtagsFunctionIndex]:
-    key = tuple(sorted(os.path.abspath(r) for r in (code_roots or []) if r and os.path.isdir(os.path.abspath(r))))
+    from services.repo_scan_limits import collapse_nested_roots
+
+    key = tuple(collapse_nested_roots(code_roots or []))
     if not key:
         return None
     with _CTYPES_LOCK:
@@ -482,7 +516,9 @@ def get_ctags_index_for_roots(code_roots: List[str]) -> Optional[CtagsFunctionIn
 def warm_ctags_index_for_roots(code_roots: List[str]) -> None:
     """Build ctags index in a background thread (no-op if already cached/ready)."""
 
-    key = tuple(sorted(os.path.abspath(r) for r in (code_roots or []) if r and os.path.isdir(os.path.abspath(r))))
+    from services.repo_scan_limits import collapse_nested_roots
+
+    key = tuple(collapse_nested_roots(code_roots or []))
     if not key:
         return
 

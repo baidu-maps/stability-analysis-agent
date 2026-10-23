@@ -23,6 +23,7 @@ class ContinueRetrievalTests(unittest.TestCase):
             third = index.update([tmp], revision="r2")
             self.assertNotEqual(first_fp, third.files[0]["fingerprint"])
             self.assertTrue(index.search("caller", mode="symbol"))
+            self.assertNotIn("text", index._files[str(path.resolve())])
 
     def test_retriever_returns_provenance_and_deduplicates(self):
         with tempfile.TemporaryDirectory() as tmp:

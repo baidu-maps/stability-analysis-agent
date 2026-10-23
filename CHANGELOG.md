@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.6.6] - 2026-10-22
+
+### Changed
+
+- 源码扫描加上限：单文件不超过 1MB，索引文件不超过 8000，单文件引用、调用边和符号扇出分别设上限，tree-sitter 最多 2 个进程。嵌套在已扫描根目录里的子模块检出不再扫第二次，崩溃栈附近的路径优先进入索引。
+
 ## [1.6.4] - 2026-10-22
 
 ### Added
