@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # Harmony / Android /proc-style maps:
 #   6590d64000-659183d000 r-xp 00363000 /data/.../lib.so
@@ -26,13 +26,16 @@ _MAPS_SECTION_RE = re.compile(
     r"|\Z)"
 )
 
-# Apple Binary Images (subset): 0x100000000 - 0x1000fffff libmylib.dylib ...
+# Apple Binary Images:
+#   0x10444c000 - 0x108b7bfff EDJDriver arm64  /path/EDJDriver
+#   0x0 - 0xffffffffffffffff ??? unknown-arch  ???   （占位，覆盖全地址空间，必须丢弃）
 _BINARY_IMAGES_RE = re.compile(
     r"(?ims)^Binary Images:\s*\n(.*?)(?=^=======|\Z)"
 )
 _BINARY_IMAGE_LINE_RE = re.compile(
-    r"^\s*(0x[0-9a-fA-F]+)\s*-\s*(0x[0-9a-fA-F]+)\s+\S*\s+(.+?)(?:\s+<|\s+\(|$)"
+    r"^\s*(0x[0-9a-fA-F]+)\s*-\s*(0x[0-9a-fA-F]+)\s+(\S+)\s+(\S+)\s*(.*)$"
 )
+_BINARY_IMAGE_PATH_RE = re.compile(r"(/[^\s]+)")
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,36 @@ class MapEntry:
 
     def file_offset_for_va(self, va: int) -> int:
         return (va - self.start) + self.file_offset
+
+
+def _is_placeholder_binary_image(name: str, arch: str, start: int, end: int) -> bool:
+    """Apple 报告里的 ``??? unknown-arch`` 会盖住全部地址，不能当真实映射。"""
+    if name in {"???", "??"} or arch.lower() in {"unknown-arch", "unknown"}:
+        return True
+    if start == 0 and end >= 0xFFFFFFFFFFFFFFFF:
+        return True
+    return False
+
+
+def _apple_image_path(name: str, rest: str) -> str:
+    """从 Binary Images 行剩余部分取出绝对路径；没有路径时用镜像名。"""
+    found = _BINARY_IMAGE_PATH_RE.search(rest or "")
+    if found:
+        return found.group(1)
+    return name
+
+
+def load_base_by_basename(entries: List[MapEntry]) -> Dict[str, str]:
+    """每个模块名取最低装载地址。"""
+    bases: Dict[str, int] = {}
+    for entry in entries:
+        name = entry.basename
+        if not name or name in {"???", "unknown-arch"}:
+            continue
+        previous = bases.get(name)
+        if previous is None or entry.start < previous:
+            bases[name] = entry.start
+    return {name: f"0x{start:x}" for name, start in bases.items()}
 
 
 def extract_maps_blob(content: str) -> str:
@@ -112,20 +145,24 @@ def parse_memory_maps(content: str) -> List[MapEntry]:
             continue
         bm = _BINARY_IMAGE_LINE_RE.match(line)
         if bm:
-            start_s, end_s, path = bm.groups()
+            start_s, end_s, image_name, arch, rest = bm.groups()
             try:
                 start = int(start_s, 16)
                 end = int(end_s, 16)
             except ValueError:
                 continue
-            path = (path or "").strip()
+            # 区间是闭开区间；Apple 行的结束地址是最后一个字节，需要 +1。
+            if end < 0xFFFFFFFFFFFFFFFF:
+                end += 1
+            if _is_placeholder_binary_image(image_name, arch, start, end):
+                continue
             entries.append(
                 MapEntry(
                     start=start,
                     end=end,
                     perms="r-x",
                     file_offset=0,
-                    path=path,
+                    path=_apple_image_path(image_name, rest),
                 )
             )
     return entries

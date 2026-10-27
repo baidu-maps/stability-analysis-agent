@@ -70,7 +70,12 @@ def detect_raw_log_sections(content: str) -> List[str]:
         "backtrace",
         "backtrace:" in lower
         or bool(re.search(r"(?m)^Fault thread info:", content))
-        or bool(re.search(r"(?m)^#\d+\s+pc\s+", content)),
+        or bool(re.search(r"(?m)^#\d+\s+pc\s+", content))
+        or bool(re.search(r"(?m)^Thread\s+\d+\s+Crashed:", content)),
+    )
+    _add(
+        "termination",
+        "termination reason:" in lower or bool(re.search(r'(?m)^"termination"\s*:', content)),
     )
     _add("build_id", "build id:" in lower or "buildid:" in lower)
     _add("submitter_stack", "submitterstacktrace" in lower.replace(" ", ""))

@@ -10,6 +10,8 @@ from typing import Optional
 
 from tools.crash_parser.abort_message import (
     extract_abort_message,
+    is_apple_jetsam_termination,
+    is_apple_watchdog_termination,
     is_heap_allocator_abort,
     thread_type_from_name,
 )
@@ -251,6 +253,16 @@ def extract_crash_info(content: str) -> CrashInfo:
             crash_reason = "native crash (stack sample)"
         primary_language = primary_language or "cpp"
 
+    sig_upper = (signal or "").upper()
+    if "SIGKILL" in sig_upper or "SIGKILL" in (exception_type or "").upper():
+        term_blob = f"{abort_message or ''}\n{header_scope}"
+        if is_apple_jetsam_termination(term_blob):
+            crash_reason = "jetsam"
+            category = "oom"
+        elif is_apple_watchdog_termination(term_blob):
+            crash_reason = "watchdog termination"
+            category = "watchdog"
+
     if exception_type is None:
         exception_patterns = [
             r'exception:\s*([^\n\r]+)',
@@ -278,6 +290,10 @@ def extract_crash_info(content: str) -> CrashInfo:
             r'fault address:\s*([0-9a-fA-F]{8,16})',
             # Android logcat / tombstone：``fault addr 0xa0``
             r'fault\s+addr\s+(0x[0-9a-fA-F]{1,16})\b',
+            # iOS：``Exception Codes: KERN_INVALID_ADDRESS at 0x...`` / ``KERN_PROTECTION_FAILURE at 0x...``
+            r'KERN_[A-Z_]+\s+at\s+(0x[0-9a-fA-F]{1,16})\b',
+            # iOS CrashDoctor：``dereference garbage pointer 0x6d0``
+            r'(?:garbage\s+pointer|dereference[^\n0x]*)\s+(0x[0-9a-fA-F]{1,16})\b',
         ]
 
         for pattern in address_patterns:
@@ -327,9 +343,13 @@ def extract_meta_info(content: str) -> MetaInfo:
         if cmdline_m:
             process_name = cmdline_m.group(1).strip()
 
-    # 提取时间戳
+    # 提取时间戳。Apple 报告是 ``Date/Time:``。
     timestamp = None
-    timestamp_match = re.search(r'^(?:时间|Timestamp):\s*([^\n\r]+)$', header_scope, re.IGNORECASE | re.MULTILINE)
+    timestamp_match = re.search(
+        r'^(?:时间|Timestamp|Date/Time):\s*([^\n\r]+)$',
+        header_scope,
+        re.IGNORECASE | re.MULTILINE,
+    )
     if timestamp_match:
         timestamp = timestamp_match.group(1).strip()
     
@@ -347,6 +367,15 @@ def extract_meta_info(content: str) -> MetaInfo:
         )
         if pid_dbg:
             process_id = pid_dbg.group(1)
+    if process_id is None:
+        # Apple: ``Process: EDJDriver [12691]``
+        apple_pid = re.search(
+            r'^Process:\s*[^\[\n]+\[(\d+)\]',
+            header_scope,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if apple_pid:
+            process_id = apple_pid.group(1)
     
     # 提取编译器信息
     compiler = None
@@ -458,21 +487,29 @@ def extract_meta_info(content: str) -> MetaInfo:
     
     # 增强的应用版本提取
     app_version = None
-    app_version_patterns = [
-        r'^Version:\s*([0-9.]+)$',
-        r'^version[:\s]+([0-9.]+)$',
-        r'^ver[:\s]+([0-9.]+)$',
-        r'^build[:\s]+([0-9.]+)$',
-        r'^app[:\s]+([0-9.]+)$',
-        # Android tombstone / bugreport：``Package: com.foo v123 (1.2.3)`` 取括号内版本
-        r'^\s*Package:\s+\S+\s+v\d+\s+\(([^)]+)\)',
-    ]
-    
-    for pattern in app_version_patterns:
-        version_match = re.search(pattern, header_scope, re.IGNORECASE | re.MULTILINE)
-        if version_match:
-            app_version = version_match.group(1)
-            break
+    # Apple: ``Version: 5.5.2 (123)``；Harmony 常见 ``Version:3.4.7``
+    apple_version = re.search(
+        r'^Version:\s*([0-9]+(?:\.[0-9]+)*)(?:\s*\(([^)]+)\))?\s*$',
+        header_scope,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if apple_version:
+        app_version = apple_version.group(1)
+        if apple_version.group(2):
+            app_version = f"{app_version} ({apple_version.group(2).strip()})"
+    if app_version is None:
+        app_version_patterns = [
+            r'^ver[:\s]+([0-9.]+)$',
+            r'^build[:\s]+([0-9.]+)$',
+            r'^app[:\s]+([0-9.]+)$',
+            # Android tombstone / bugreport：``Package: com.foo v123 (1.2.3)`` 取括号内版本
+            r'^\s*Package:\s+\S+\s+v\d+\s+\(([^)]+)\)',
+        ]
+        for pattern in app_version_patterns:
+            version_match = re.search(pattern, header_scope, re.IGNORECASE | re.MULTILINE)
+            if version_match:
+                app_version = version_match.group(1)
+                break
     
     # 增强的设备型号提取
     device_model = None
@@ -547,6 +584,23 @@ def extract_meta_info(content: str) -> MetaInfo:
         if arch_match:
             arch = arch_match.group(1).strip() if arch_match.lastindex else arch_match.group(0)
             break
+
+    if not arch:
+        # Apple: ``Code Type: ARM-64 (Native)``
+        code_type = re.search(
+            r'^Code Type:\s*([A-Za-z0-9._-]+)',
+            header_scope,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if code_type:
+            raw_arch = code_type.group(1).strip()
+            arch_alias = {
+                "ARM-64": "arm64",
+                "ARM64": "arm64",
+                "X86-64": "x86_64",
+                "X86_64": "x86_64",
+            }
+            arch = arch_alias.get(raw_arch.upper(), raw_arch)
     
     # 如果没找到，从模块路径或堆栈信息中推断
     if not arch:

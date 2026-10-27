@@ -16,6 +16,7 @@ from tools.crash_parser.ios_scoping import (
     _ios_crashed_thread_block,
     _ios_extract_crashed_thread_index,
     _ios_thread_count_from_banner,
+    apple_crash_thread_identity,
     split_ios_colon_named_threads,
 )
 from tools.crash_parser.stack_extract import _extract_frames_for_crash_segment, extract_stack_frames
@@ -232,16 +233,17 @@ def parse_threads_ios(
         global_line_start = 1
 
     ios_thread_index = _ios_extract_crashed_thread_index(content)
+    thread_name, is_main = apple_crash_thread_identity(content, ios_thread_index)
     stack_frames, crash_backtrace_count, _, _ = _extract_frames_for_crash_segment(
         scope_content, debug, crash_seg_req, global_line_start=global_line_start,
     )
     threads = [
         ThreadStack(
             tid=None,
-            name=None,
+            name=thread_name,
             thread_index=ios_thread_index,
             is_crash_thread=True,
-            is_main_thread=None,
+            is_main_thread=is_main,
             frames=stack_frames,
             **_thread_layer_summary(stack_frames),
         )

@@ -213,8 +213,10 @@ class WorkflowContext:
             messages = [{"role": "user", "content": prompt}]
         started_at = datetime.datetime.now().astimezone().isoformat()
         started_perf = time.perf_counter()
+        count_against_budget = bool(kwargs.pop("count_against_budget", True))
         try:
-            self.trace.budget.consume("llm")
+            if count_against_budget:
+                self.trace.budget.consume("llm")
             response = self.llm.chat(messages, **kwargs)
         except Exception as exc:
             self._record_execution_event(

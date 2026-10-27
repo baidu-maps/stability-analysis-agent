@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 # 旧逻辑再降到 2048 后第三次才放行，同一份提示被完整生成三遍。
 ANALYSIS_OUTPUT_TOKEN_FLOOR = 12288
 ANALYSIS_OUTPUT_TOKEN_RAISE = 16384
+# 思考型模型的思考与正文共用 max_tokens；网关报 max_tokens 截断时直接升到这一档。
+ANALYSIS_OUTPUT_TOKEN_CEILING = 32000
+_TRUNCATED_STOP_REASONS = frozenset({"max_tokens", "length"})
+_COMPLETE_STOP_REASONS = frozenset({"end_turn", "stop", "stop_sequence"})
 _previous_prompt_chars: Optional[int] = None
 
 
@@ -124,6 +128,28 @@ def output_looks_truncated(completion_tokens: int, max_tokens: Optional[int]) ->
     if produced > requested:
         return False
     return produced >= requested * 0.95
+
+
+def response_stop_reason(response: Any) -> str:
+    """读取适配器记录的结束原因，统一为小写。"""
+    metadata = getattr(response, "metadata", None) or {}
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("stop_reason") or "").strip().lower()
+
+
+def response_text_chars(response: Any) -> int:
+    """正文去掉首尾空白后的字符数，空响应为 0。"""
+    if response is None:
+        return 0
+    return len(str(getattr(response, "content", "") or "").strip())
+
+
+def escalated_token_attempts(max_tokens: Optional[int]) -> List[Optional[int]]:
+    """网关报截断后剩余的尝试档位；已在最高档时返回空列表。"""
+    if max_tokens is not None and int(max_tokens) >= ANALYSIS_OUTPUT_TOKEN_CEILING:
+        return []
+    return [ANALYSIS_OUTPUT_TOKEN_CEILING]
 
 
 def resolve_analysis_prompt_cap(problem: Optional[Dict[str, Any]]) -> Optional[int]:
@@ -256,6 +282,23 @@ def _prepare_router_for_round(
         logger.debug("LLM re_resolve skipped: %s", exc)
 
 
+def resolve_initial_analysis_effort(context: Any, problem: Optional[Dict[str, Any]]) -> Optional[str]:
+    """分析轮的初始 effort：配置优先；自动改码时思考型接口默认 low。"""
+    llm = getattr(context, "llm", None)
+    if not bool(getattr(llm, "supports_effort", False)):
+        return None
+    configured = str(getattr(llm, "effort", "") or "").strip().lower()
+    if not configured:
+        config = getattr(llm, "config", None)
+        if isinstance(config, dict):
+            configured = str(config.get("effort") or "").strip().lower()
+    if configured:
+        return configured
+    if isinstance(problem, dict) and problem.get("apply_ai_fixes"):
+        return "low"
+    return None
+
+
 def call_analyze_llm_with_retries(
     context: Any,
     prompt: str,
@@ -264,6 +307,7 @@ def call_analyze_llm_with_retries(
     round_index: int = 0,
     stage: str = "analysis",
 ) -> Tuple[Any, str]:
+    """分析轮 LLM 调用：截断时升档/降 effort，重试不计 llm 预算。"""
     prompt_cap = resolve_analysis_prompt_cap(problem)
     prompt_used = prompt
     if prompt_cap and len(prompt_used) > prompt_cap:
@@ -298,20 +342,57 @@ def call_analyze_llm_with_retries(
     same_model_retries_left = 1
     while endpoint_switches < max_endpoint_attempts:
         llm_response = None
+        best_response = None
         last_llm_exc = None
         call_started = time.perf_counter()
-        for attempt_index, max_tokens in enumerate(token_attempts, start=1):
+        attempts = list(token_attempts)
+        attempt_index = 0
+        effort: Optional[str] = resolve_initial_analysis_effort(context, problem)
+        while attempt_index < len(attempts):
+            max_tokens = attempts[attempt_index]
+            attempt_index += 1
+            call_kwargs: Dict[str, Any] = {"temperature": 0}
+            if max_tokens is not None:
+                call_kwargs["max_tokens"] = max_tokens
+            if effort:
+                call_kwargs["effort"] = effort
+            if attempt_index > 1:
+                call_kwargs["count_against_budget"] = False
             try:
-                if max_tokens is None:
-                    logger.info("LLM attempt %s: default max_tokens", attempt_index)
-                    llm_response = context.call_llm(prompt_used, temperature=0)
-                else:
-                    logger.info("LLM attempt %s: max_tokens=%s", attempt_index, max_tokens)
-                    llm_response = context.call_llm(
-                        prompt_used,
-                        max_tokens=max_tokens,
-                        temperature=0,
-                    )
+                logger.info(
+                    "LLM attempt %s: max_tokens=%s effort=%s",
+                    attempt_index,
+                    max_tokens if max_tokens is not None else "default",
+                    effort or "default",
+                )
+                llm_response = context.call_llm(prompt_used, **call_kwargs)
+                if llm_response is not None and response_text_chars(llm_response) >= response_text_chars(
+                    best_response
+                ):
+                    best_response = llm_response
+                stop_reason = response_stop_reason(llm_response)
+                if stop_reason in _TRUNCATED_STOP_REASONS:
+                    # 网关按生成时长截断时加大 max_tokens 无效，支持 effort 的接口改为压低思考量重试。
+                    supports_effort = bool(getattr(getattr(context, "llm", None), "supports_effort", False))
+                    next_effort = "low" if supports_effort else effort
+                    remaining = escalated_token_attempts(max_tokens)
+                    if not remaining and next_effort != effort:
+                        remaining = [max_tokens]
+                    if remaining:
+                        logger.warning(
+                            "LLM stop_reason=%s (text_chars=%s, max_tokens=%s), retrying with max_tokens=%s effort=%s",
+                            stop_reason,
+                            response_text_chars(llm_response),
+                            max_tokens if max_tokens is not None else "default",
+                            remaining[0],
+                            next_effort or "default",
+                        )
+                        effort = next_effort
+                        attempts = attempts[:attempt_index] + remaining
+                        continue
+                    break
+                if stop_reason in _COMPLETE_STOP_REASONS:
+                    break
                 if max_tokens is not None and llm_response is not None:
                     usage = getattr(llm_response, "usage", None) or {}
                     completion_tokens = usage.get("completion_tokens", 0) or 0
@@ -331,6 +412,8 @@ def call_analyze_llm_with_retries(
                     max_tokens if max_tokens is not None else "default",
                     exc,
                 )
+        if response_text_chars(best_response) > response_text_chars(llm_response):
+            llm_response = best_response
         duration_ms = int(round((time.perf_counter() - call_started) * 1000))
         if llm_response is not None:
             gateway = gateway_failure_from_response(llm_response)

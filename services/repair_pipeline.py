@@ -40,6 +40,7 @@ from services.verification import (
     validate_approval,
 )
 from services.repair_edit_loop import (
+    RepairEditRoundResult,
     classify_verification_failure,
     resolve_max_repair_edit_rounds,
     run_repair_edit_round,
@@ -450,6 +451,103 @@ def _finalize_repair_decide(
     return out
 
 
+def _absorb_applied_records(deps: RepairActionDeps, action_context: Dict[str, Any],
+                            records: List[Dict[str, Any]]) -> None:
+    """Append extra applied edits so diff inspection, rollback and review see them."""
+    if not records:
+        return
+    applied = deps.applied_fix_result if isinstance(deps.applied_fix_result, dict) else {}
+    rows = applied.get("applied") if isinstance(applied.get("applied"), list) else []
+    applied["applied"] = list(rows) + [dict(item) for item in records]
+    deps.applied_fix_result = applied
+    deps.changed_files = changed_files_from_applied_result(applied)
+    if "changed_files" in action_context:
+        action_context["changed_files"] = list(deps.changed_files)
+
+
+def _safe_static_edit_round(
+    *,
+    deps: RepairActionDeps,
+    verification_result: Dict[str, Any],
+    report_dir: Path,
+    trace: Any = None,
+) -> RepairEditRoundResult:
+    """Run one compile-error revision round; failures become a failed round instead of an exception."""
+    try:
+        return run_repair_edit_round(
+            deps=deps,
+            round_index=0,
+            verification_result=verification_result,
+            failure_class="compile_error",
+            report_dir=report_dir,
+            trace=trace,
+        )
+    except Exception as exc:  # pragma: no cover - defensive: rollback must still happen
+        return RepairEditRoundResult(
+            success=False, error=f"static check revision failed: {exc}", failure_class="compile_error",
+        )
+
+
+def _run_patch_static_gate(
+    *,
+    deps: RepairActionDeps,
+    action_context: Dict[str, Any],
+    code_roots: List[str],
+    report_dir: Path,
+    trace: Any = None,
+) -> Dict[str, Any]:
+    """Statically check the applied patch; repair headers, give the model one fix round."""
+    from services.patch_static_check import format_static_issues, run_patch_static_check
+
+    roots = list(deps.code_roots or code_roots)
+    report = run_patch_static_check(deps.applied_fix_result, code_roots=roots, report_dir=report_dir)
+    _absorb_applied_records(deps, action_context, report.get("auto_fixes") or [])
+    rounds: List[Dict[str, Any]] = []
+    problem = deps.request_record if isinstance(deps.request_record, dict) else {}
+    if report.get("status") == "failed" and resolve_max_repair_edit_rounds(problem) > 0:
+        previous_rows = list((deps.applied_fix_result or {}).get("applied") or [])
+        edit_out = _safe_static_edit_round(
+            deps=deps,
+            verification_result={
+                "status": "failed",
+                "tool": "patch_static_check",
+                "error": str(report.get("summary") or ""),
+                "stderr": format_static_issues(report),
+                "recovery": {
+                    "reason": (
+                        "只修订出问题的函数；缺少的宏、类型、静态变量或函数前置声明，"
+                        "请写在该函数 replacement_code 的函数定义之前，并保证它们在首次使用前出现"
+                    ),
+                },
+            },
+            report_dir=report_dir,
+            trace=trace,
+        )
+        rounds.append(edit_out.to_dict())
+        revised = edit_out.applied_fix_result if isinstance(edit_out.applied_fix_result, dict) else None
+        if revised is not None:
+            merged = dict(deps.applied_fix_result or {})
+            merged["applied"] = previous_rows
+            merged["fix_plan"] = revised.get("fix_plan") or merged.get("fix_plan")
+            deps.applied_fix_result = merged
+            _absorb_applied_records(deps, action_context, list(revised.get("applied") or []))
+        if edit_out.success:
+            report = run_patch_static_check(deps.applied_fix_result, code_roots=roots, report_dir=report_dir)
+            _absorb_applied_records(deps, action_context, report.get("auto_fixes") or [])
+    report["edit_rounds"] = rounds
+    _write_json_object(report_dir / "08_patch_static_check.json", report)
+    if trace is not None:
+        trace.emit(
+            "repair.static_check",
+            kind="verification",
+            name="patch_static_check",
+            status=str(report.get("status") or ""),
+            issues=len(report.get("issues") or []),
+            auto_fixes=len(report.get("auto_fixes") or []),
+        )
+    return report
+
+
 def _continue_repair_after_apply_patch(
     out: RepairPipelineResult,
     *,
@@ -484,6 +582,47 @@ def _continue_repair_after_apply_patch(
             out.result_updates["unisolated_approval"] = unisolated_approval
         if isolated_workspace is not None:
             write_workspace_artifacts(isolated_workspace, report_dir)
+        return _finalize_repair_decide(
+            out, report_dir=report_dir, trace=trace, runtime_state=runtime_state,
+        )
+
+    static_report = _run_patch_static_gate(
+        deps=deps, action_context=action_context, code_roots=code_roots, report_dir=report_dir, trace=trace,
+    )
+    out.applied_fix_result = deps.applied_fix_result
+    out.applied_fix_result["static_check"] = {
+        key: static_report.get(key) for key in ("status", "summary", "issues", "warnings", "auto_fixes")
+    }
+    if static_report.get("status") == "failed":
+        rollback = actions.execute(
+            "rollback",
+            {**action_context, "artifact_dir": str(report_dir / "artifacts")},
+            approval=workspace_action_approval,
+        )
+        out.applied_fix_result = deps.applied_fix_result
+        out.applied_fix_result["success"] = False
+        out.applied_fix_result["skipped_reason"] = "patch static check failed"
+        out.applied_fix_result["error"] = str(static_report.get("summary") or "patch static check failed")
+        out.verification_result = {
+            "status": "static_check_failed",
+            "adoptable": False,
+            "static_check": static_report,
+            "effectiveness_verification": {"enabled": False, "status": "skipped"},
+            "error": "补丁静态检查未通过（必然编译失败），已回滚",
+            "rollback": rollback,
+        }
+        out.result_updates = {
+            "status": "error",
+            "completion_reason": "static_check_failed",
+            "review_required": True,
+            "applied_ai_fixes": out.applied_fix_result,
+            "verification": out.verification_result,
+        }
+        if unisolated_approval is not None:
+            out.result_updates["unisolated_approval"] = unisolated_approval
+        if isolated_workspace is not None:
+            write_workspace_artifacts(isolated_workspace, report_dir)
+        _write_json_object(report_dir / "09_verification.json", out.verification_result)
         return _finalize_repair_decide(
             out, report_dir=report_dir, trace=trace, runtime_state=runtime_state,
         )

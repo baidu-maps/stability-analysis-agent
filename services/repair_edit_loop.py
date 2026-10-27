@@ -106,7 +106,15 @@ def revise_fix_plan_with_llm(
     if analysis_text.strip():
         prompt += "\n\n## 原始分析摘要\n" + analysis_text.strip()[:4000]
     try:
-        response = llm_adapter.invoke(prompt) if hasattr(llm_adapter, "invoke") else llm_adapter(prompt)
+        if hasattr(llm_adapter, "chat"):
+            call_kwargs: Dict[str, Any] = {"temperature": 0, "max_tokens": 16384}
+            if getattr(llm_adapter, "supports_effort", False):
+                call_kwargs["effort"] = "low"
+            response = llm_adapter.chat([{"role": "user", "content": prompt}], **call_kwargs)
+        elif hasattr(llm_adapter, "invoke"):
+            response = llm_adapter.invoke(prompt)
+        else:
+            response = llm_adapter(prompt)
         content = str(getattr(response, "content", response) or "")
     except Exception as exc:
         return None, f"llm revision failed: {exc}"
@@ -182,7 +190,7 @@ def run_repair_edit_round(
     out.fix_plan = revised_plan
     code_context = result.get("code_context") if isinstance(result.get("code_context"), dict) else {}
     candidate_nodes = extract_candidate_nodes(code_context)
-    fixer = CodeFixer(llm=getattr(deps, "llm_adapter", None))
+    fixer = CodeFixer(getattr(deps, "llm_adapter", None))
     fix_result = fixer.apply_fix_plan(
         revised_plan,
         candidate_nodes,

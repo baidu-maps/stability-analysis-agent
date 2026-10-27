@@ -226,11 +226,17 @@ class RepairPlan:
                 invalid.append({"index": index, "error": "edit file path is missing or unsafe"})
                 continue
             edit_type = str(raw.get("edit_type") or "function_replacement").strip()
-            if edit_type not in {"function_replacement", "include_directive", "member_declaration"}:
+            if edit_type not in {"function_replacement", "include_directive", "member_declaration", "symbol_insertion"}:
                 invalid.append({"index": index, "error": f"unsupported edit_type: {edit_type}"})
                 continue
             if edit_type == "include_directive":
                 valid_body = bool(str(raw.get("include") or "").strip())
+            elif edit_type == "symbol_insertion":
+                placement = str(raw.get("placement") or "").strip()
+                valid_body = bool(str(raw.get("code") or "").strip()) and (
+                    placement == "head"
+                    or (placement == "before_function" and bool(str(raw.get("anchor_function") or "").strip()))
+                )
             elif edit_type == "member_declaration":
                 valid_body = bool(str(raw.get("old_text") or "").strip() and str(raw.get("new_text") or "").strip())
             else:

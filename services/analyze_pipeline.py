@@ -303,6 +303,7 @@ def run_analyze_context_loop(
         evidence_retriever=evidence_retriever,
         investigation_controller=investigation_controller,
         verification_profile=verification_profile,
+        apply_ai_fixes=bool(problem_value.get("apply_ai_fixes")),
     )
     # Persist retrieval metadata for replay and diagnostics.  This is additive
     # and intentionally does not alter round_0/06_ai_prompt.md.

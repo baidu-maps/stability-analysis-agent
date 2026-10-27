@@ -133,7 +133,8 @@ class AgentContextLoopTests(unittest.TestCase):
         )
         self.assertEqual(out.analysis_text, "unused")
         self.assertEqual(len(out.rounds), 2)
-        self.assertEqual(out.termination_reason, "invalid_schema")
+        self.assertEqual(out.termination_reason, "model_final")
+        self.assertEqual(out.context_session.get("status"), "degraded")
         events = [item.get("event") for item in trace.events]
         self.assertIn("agent.schema_degraded", events)
 
@@ -510,6 +511,27 @@ class AgentContextLoopTests(unittest.TestCase):
         self.assertEqual([item["status"] for item in function_entry["attempts"]], ["success", "duplicate"])
         self.assertEqual(rejected_entry["status"], "rejected")
 
+    def test_ledger_keeps_resolved_function_file(self):
+        """function 请求没带路径时，账本记下解析到的源文件。"""
+        registry = ContextResolverRegistry([
+            CallableContextResolver(
+                "function",
+                lambda request: {
+                    "request": request,
+                    "success": True,
+                    "file": "/repo/ios/BMKSignalHandler.m",
+                },
+            )
+        ])
+        engine = ContextEngine(ContextEngineConfig(), registry)
+        engine.resolve_requests(
+            [{"type": "function", "symbol": "bmk_signal_exception_handler"}],
+            round_index=0,
+        )
+        entry = engine.session.request_ledger[0]
+        self.assertEqual(entry["file"], "/repo/ios/BMKSignalHandler.m")
+        self.assertEqual(entry["status"], "success")
+
     def test_duplicate_failed_request_remains_lookup_exhausted(self):
         registry = ContextResolverRegistry([
             CallableContextResolver(
@@ -676,6 +698,14 @@ class AgentContextLoopTests(unittest.TestCase):
         self.assertIn("已发送源码索引", packed)
         self.assertIn("CGridLayer::CancelTask", packed)
         self.assertNotIn("keep_me", packed)
+        self.assertNotIn("修复代码", packed)
+        with_fix = ContextEngine._fold_prior_analysis(
+            prompt,
+            "上一轮只写了修复步骤。",
+            apply_ai_fixes=True,
+        )
+        self.assertIn("修复代码", with_fix)
+        self.assertIn("完整定义", with_fix)
 
     def test_analysis_retry_does_not_resend_a_full_answer(self):
         """输出超过请求上限说明网关没截断，不能把同一份提示再打一遍。"""
@@ -706,6 +736,139 @@ class AgentContextLoopTests(unittest.TestCase):
         self.assertNotIn("较上一轮", lines[0])
         self.assertIn("较上一轮 0%", lines[1])
         reset_llm_send_baseline()
+
+    def test_empty_final_round_falls_back_to_last_analysis(self):
+        """终局轮只有思考没有正文时，沿用上一轮分析并按 model_final 收尾。"""
+        degraded = {"context_requests": [], "invalid_context_requests": [], "degraded": True}
+        hooks, _, engine = self._hooks(parse_result=degraded, llm_texts=["根因：信号处理里 ObjC 死锁", "", ""])
+        trace = RunTrace("ctx-loop-empty-final")
+        out = run_agent_context_loop(
+            config=ContextLoopConfig(max_rounds=3, agent_loop_mode="context_loop"),
+            hooks=hooks,
+            initial_prompt="start",
+            trace=trace,
+            context_engine=engine,
+        )
+        self.assertEqual(out.analysis_text, "根因：信号处理里 ObjC 死锁")
+        self.assertEqual(out.termination_reason, "model_final")
+        self.assertIn("agent.empty_final_fallback", [e.get("event") for e in trace.events])
+
+    def test_stop_reason_truncation_escalates_and_keeps_best_text(self):
+        """网关报 max_tokens 截断时直接升到最高档，最后保留正文最长的那次回答。"""
+        from services.analyze_llm import ANALYSIS_OUTPUT_TOKEN_CEILING, call_analyze_llm_with_retries
+
+        replies = [
+            SimpleNamespace(content="", usage={"completion_tokens": 2894}, metadata={"stop_reason": "max_tokens"}),
+            SimpleNamespace(
+                content="半截报告", usage={"completion_tokens": 10493}, metadata={"stop_reason": "max_tokens"}
+            ),
+        ]
+        seen = []
+
+        def call_llm(prompt, **kwargs):
+            seen.append(kwargs.get("max_tokens"))
+            return replies[len(seen) - 1]
+
+        context = SimpleNamespace(call_llm=call_llm, llm=SimpleNamespace(max_tokens=4096))
+        response, _ = call_analyze_llm_with_retries(context, "prompt", {})
+        reset_llm_send_baseline()
+        self.assertEqual(seen, [12288, ANALYSIS_OUTPUT_TOKEN_CEILING])
+        self.assertEqual(response.content, "半截报告")
+
+    def test_stop_reason_truncation_lowers_effort_when_supported(self):
+        """支持 effort 的接口截断后改为 effort=low 重试，最高档仍截断就收下结果。"""
+        from services.analyze_llm import ANALYSIS_OUTPUT_TOKEN_CEILING, call_analyze_llm_with_retries
+
+        seen = []
+
+        def call_llm(prompt, **kwargs):
+            seen.append((kwargs.get("max_tokens"), kwargs.get("effort")))
+            text = "" if len(seen) == 1 else "完整报告"
+            usage = {"completion_tokens": 100}
+            return SimpleNamespace(content=text, usage=usage, metadata={"stop_reason": "max_tokens"})
+
+        llm = SimpleNamespace(max_tokens=4096, supports_effort=True)
+        context = SimpleNamespace(call_llm=call_llm, llm=llm)
+        response, _ = call_analyze_llm_with_retries(context, "prompt", {})
+        reset_llm_send_baseline()
+        self.assertEqual(seen, [(12288, None), (ANALYSIS_OUTPUT_TOKEN_CEILING, "low")])
+        self.assertEqual(response.content, "完整报告")
+
+    def test_apply_ai_fixes_presets_low_effort_and_skips_retry_budget(self):
+        """自动改码首轮默认 effort=low；截断重试带 count_against_budget=False。"""
+        from services.analyze_llm import (
+            ANALYSIS_OUTPUT_TOKEN_CEILING,
+            call_analyze_llm_with_retries,
+            resolve_initial_analysis_effort,
+        )
+
+        llm = SimpleNamespace(max_tokens=4096, supports_effort=True)
+        context = SimpleNamespace(llm=llm)
+        self.assertEqual(resolve_initial_analysis_effort(context, {"apply_ai_fixes": True}), "low")
+        self.assertIsNone(resolve_initial_analysis_effort(context, {}))
+        llm.effort = "medium"
+        self.assertEqual(resolve_initial_analysis_effort(context, {"apply_ai_fixes": True}), "medium")
+        llm.effort = ""
+
+        seen = []
+
+        def call_llm(prompt, **kwargs):
+            seen.append(dict(kwargs))
+            text = "" if len(seen) == 1 else "完整报告"
+            return SimpleNamespace(
+                content=text,
+                usage={"completion_tokens": 100},
+                metadata={"stop_reason": "max_tokens"},
+            )
+
+        context.call_llm = call_llm
+        response, _ = call_analyze_llm_with_retries(context, "prompt", {"apply_ai_fixes": True})
+        reset_llm_send_baseline()
+        self.assertEqual(response.content, "完整报告")
+        self.assertEqual(seen[0].get("effort"), "low")
+        self.assertNotIn("count_against_budget", seen[0])
+        self.assertEqual(seen[1].get("effort"), "low")
+        self.assertEqual(seen[1].get("count_against_budget"), False)
+        self.assertEqual(seen[1].get("max_tokens"), ANALYSIS_OUTPUT_TOKEN_CEILING)
+
+    def test_complete_stop_reason_accepts_answer_without_retry(self):
+        """stop_reason 为 end_turn 时即使输出接近上限也不重发。"""
+        from services.analyze_llm import call_analyze_llm_with_retries
+
+        seen = []
+
+        def call_llm(prompt, **kwargs):
+            seen.append(kwargs.get("max_tokens"))
+            usage = {"completion_tokens": 12200}
+            return SimpleNamespace(content="完整", usage=usage, metadata={"stop_reason": "end_turn"})
+
+        context = SimpleNamespace(call_llm=call_llm, llm=SimpleNamespace(max_tokens=4096))
+        response, _ = call_analyze_llm_with_retries(context, "prompt", {})
+        reset_llm_send_baseline()
+        self.assertEqual(seen, [12288])
+        self.assertEqual(response.content, "完整")
+
+    def test_anthropic_thinking_only_response_reports_truncation(self):
+        """网关只回思考且正文为字面量引号时，正文按空处理并带出 stop_reason。"""
+        import json
+
+        from tool_system.llm.llm_adapter import DirectLLMAdapter
+
+        adapter = DirectLLMAdapter.__new__(DirectLLMAdapter)
+        adapter.config = {"provider": "baidu_one_api"}
+        adapter._request_format = "anthropic_messages_compatible"
+        raw = json.dumps(
+            {
+                "content": [{"type": "text", "text": '""'}, {"type": "thinking", "thinking": "x" * 50}],
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": 10, "output_tokens": 2894},
+            }
+        )
+        response = adapter._parse_anthropic_response(raw)
+        self.assertEqual(response.content, "")
+        self.assertEqual(response.metadata["stop_reason"], "max_tokens")
+        self.assertEqual(response.metadata["thinking_chars"], 50)
+        self.assertTrue(adapter.supports_effort)
 
 
 if __name__ == "__main__":

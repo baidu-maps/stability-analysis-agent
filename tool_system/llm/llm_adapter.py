@@ -21,6 +21,13 @@ from tool_system.llm.http_ssl import urllib_urlopen
 logger = logging.getLogger(__name__)
 
 
+def _normalize_anthropic_text(text: str) -> str:
+    """网关在只有思考时会返回字面量 ``""`` 作为正文，按空正文处理。"""
+    if text.strip() in {'""', "''"}:
+        return ""
+    return text
+
+
 @dataclass
 class LLMResponse:
     """统一响应格式"""
@@ -182,6 +189,11 @@ class DirectLLMAdapter(BaseLLMAdapter):
             return
         self._init_client(config)
 
+    @property
+    def supports_effort(self) -> bool:
+        """Anthropic Messages 支持 ``output_config.effort``，用于压缩思考型模型的思考量。"""
+        return self._request_format == "anthropic_messages_compatible"
+
     def _init_client(self, config: Dict[str, Any]):
         """初始化 LLM 客户端"""
         # 根据不同的 provider 初始化不同的客户端
@@ -318,6 +330,9 @@ class DirectLLMAdapter(BaseLLMAdapter):
             body["max_tokens"] = max(body["max_tokens"], 32000)
         if system_parts:
             body["system"] = "\n\n".join(system_parts)
+        effort = str(kwargs.get("effort") or self.config.get("effort") or "").strip().lower()
+        if effort:
+            body["output_config"] = {"effort": effort}
         if kwargs.get("temperature") is not None:
             body["temperature"] = float(kwargs["temperature"])
         elif self.temperature is not None:
@@ -371,6 +386,7 @@ class DirectLLMAdapter(BaseLLMAdapter):
         content_parts: List[str] = []
         thinking_parts: List[str] = []
         usage_dict = None
+        stop_reason = ""
         try:
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="ignore").rstrip("\n\r")
@@ -393,6 +409,9 @@ class DirectLLMAdapter(BaseLLMAdapter):
                     elif delta_type == "thinking_delta":
                         thinking_parts.append(delta.get("thinking", ""))
                 elif event_type == "message_delta":
+                    delta = event.get("delta") or {}
+                    if isinstance(delta, dict) and delta.get("stop_reason"):
+                        stop_reason = str(delta.get("stop_reason"))
                     usage_info = event.get("usage")
                     if isinstance(usage_info, dict):
                         usage_dict = {
@@ -403,6 +422,8 @@ class DirectLLMAdapter(BaseLLMAdapter):
                 elif "choices" in event:
                     choices = event.get("choices", [])
                     if choices and isinstance(choices[0], dict):
+                        if choices[0].get("finish_reason"):
+                            stop_reason = str(choices[0].get("finish_reason"))
                         delta = choices[0].get("delta", {})
                         text = delta.get("content", "")
                         if text:
@@ -416,7 +437,7 @@ class DirectLLMAdapter(BaseLLMAdapter):
                         }
         finally:
             resp.close()
-        content = "".join(content_parts)
+        content = _normalize_anthropic_text("".join(content_parts))
         if not content.strip() and thinking_parts:
             # thinking 模型的 text 为空说明 max_tokens 被 thinking 消耗殆尽，
             # 不能用 thinking 内容替代（它是内部推理，非结构化输出）。
@@ -429,7 +450,12 @@ class DirectLLMAdapter(BaseLLMAdapter):
         return LLMResponse(
             content=content,
             usage=usage_dict,
-            metadata={"provider": self.config.get("provider", "openai"), "request_format": self._request_format},
+            metadata={
+                "provider": self.config.get("provider", "openai"),
+                "request_format": self._request_format,
+                "stop_reason": stop_reason,
+                "thinking_chars": len("".join(thinking_parts)),
+            },
         )
 
     def _parse_anthropic_response(self, raw: str) -> LLMResponse:
@@ -442,17 +468,23 @@ class DirectLLMAdapter(BaseLLMAdapter):
 
         content = ""
         usage_dict = None
+        stop_reason = ""
+        thinking_chars = 0
         if isinstance(data, dict):
+            stop_reason = str(data.get("stop_reason") or "")
             blocks = data.get("content")
             if isinstance(blocks, list):
                 parts: List[str] = []
                 for block in blocks:
                     if isinstance(block, dict) and block.get("type") == "text":
                         parts.append(str(block.get("text") or ""))
-                content = "".join(parts)
+                    elif isinstance(block, dict) and block.get("type") == "thinking":
+                        thinking_chars += len(str(block.get("thinking") or ""))
+                content = _normalize_anthropic_text("".join(parts))
             if not content and isinstance(data.get("choices"), list) and data["choices"]:
                 ch0 = data["choices"][0]
                 if isinstance(ch0, dict):
+                    stop_reason = stop_reason or str(ch0.get("finish_reason") or "")
                     msg = ch0.get("message") or {}
                     if isinstance(msg, dict):
                         content = str(msg.get("content") or "")
@@ -463,11 +495,22 @@ class DirectLLMAdapter(BaseLLMAdapter):
                     "prompt_tokens": usage_info.get("input_tokens", 0) or usage_info.get("prompt_tokens", 0),
                     "completion_tokens": usage_info.get("output_tokens", 0) or usage_info.get("completion_tokens", 0),
                 }
+        if not content.strip() and thinking_chars:
+            logger.warning(
+                "[LLM] text output is empty (stop_reason=%s, thinking used %d chars)",
+                stop_reason or "unknown",
+                thinking_chars,
+            )
 
         return LLMResponse(
             content=content,
             usage=usage_dict,
-            metadata={"provider": self.config.get("provider", "openai"), "request_format": self._request_format},
+            metadata={
+                "provider": self.config.get("provider", "openai"),
+                "request_format": self._request_format,
+                "stop_reason": stop_reason,
+                "thinking_chars": thinking_chars,
+            },
         )
 
     def _openai_responses_http_chat(self, messages: List[Dict[str, str]], **kwargs) -> LLMResponse:

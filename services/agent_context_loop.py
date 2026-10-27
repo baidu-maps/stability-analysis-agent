@@ -76,6 +76,7 @@ def run_agent_context_loop(
     )
     force_final_reason: Optional[str] = None
     previous_analysis = ""
+    last_nonempty_analysis = ""
     last_prompt_used = stable_prompt
     last_response: Any = None
     write_path_revision_used = False
@@ -238,6 +239,8 @@ def run_agent_context_loop(
             raise
 
         previous_analysis = str(getattr(response, "content", "") or "")
+        if previous_analysis.strip():
+            last_nonempty_analysis = previous_analysis
         last_response = response
         last_prompt_used = prompt_used
         parsed = context_engine.parse_decision(previous_analysis)
@@ -287,14 +290,26 @@ def run_agent_context_loop(
             context_engine.add_turn(turn)
             finish_reason = force_final_reason
             degraded = force_final_reason == "invalid_schema"
-            # After a schema miss, a coherent final analysis should still be treated as
-            # model_final so repair_pipeline is not blocked solely by invalid_schema.
-            if (
+            if not previous_analysis.strip() and last_nonempty_analysis.strip():
+                # 终局轮正文为空（思考耗尽输出预算）时沿用最近一轮分析，修复阶段再补全代码。
+                previous_analysis = last_nonempty_analysis
+                finish_reason = "model_final"
+                degraded = True
+                if trace is not None:
+                    trace.emit(
+                        "agent.empty_final_fallback",
+                        kind="agent",
+                        name="context_loop",
+                        status="degraded",
+                        round_index=round_index,
+                        fallback_chars=len(previous_analysis),
+                    )
+            elif (
                 force_final_reason == "invalid_schema"
-                and bool(parsed.get("has_control_contract"))
                 and not bool(parsed.get("requested_more"))
-                and str(previous_analysis or "").strip()
+                and previous_analysis.strip()
             ):
+                # 终局正文已写出、只是控制 JSON 缺失或被截断时，不因 invalid_schema 拦住修复。
                 finish_reason = "model_final"
                 degraded = True
             context_engine.finish(finish_reason, degraded=degraded)
@@ -340,7 +355,7 @@ def run_agent_context_loop(
                 stable_prompt,
                 is_final_round=True,
                 early_final_reason="invalid_schema",
-                prior_analysis=previous_analysis,
+                prior_analysis=previous_analysis or last_nonempty_analysis,
             )
             continue
         if not requested_more:
@@ -364,7 +379,7 @@ def run_agent_context_loop(
                 stable_prompt,
                 is_final_round=True,
                 early_final_reason="invalid_schema",
-                prior_analysis=previous_analysis,
+                prior_analysis=previous_analysis or last_nonempty_analysis,
             )
             continue
 

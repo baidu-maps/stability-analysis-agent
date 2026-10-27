@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import replace
 from typing import List, Optional
 
 from tools.crash_parser.android import _android_stack_sample_hint
 from tools.crash_parser.abort_message import thread_type_from_name
 from tools.crash_parser.format_detect import detect_os_type
+from tools.crash_parser.memory_maps import load_base_by_basename, parse_memory_maps
 from tools.crash_parser.log_sections import detect_raw_log_sections, extract_build_ids
 from tools.crash_parser.meta import extract_crash_info, extract_meta_info
 from tools.crash_parser.platform_threads import (
@@ -89,11 +91,28 @@ def parse_crash_core(
     for mod, base in {**(reg_module_bases or {}), **(bt_bases or {})}.items():
         if mod and base and mod not in merged_bases:
             merged_bases[mod] = base
+    image_bases = load_base_by_basename(parse_memory_maps(content))
+    for thread in threads:
+        if not thread.is_crash_thread:
+            continue
+        for frame in thread.frames:
+            mod = os.path.basename(str(frame.module or ""))
+            base = image_bases.get(mod)
+            if mod and base and mod not in merged_bases:
+                merged_bases[mod] = base
+
+    crash_thread = next((item for item in threads if item.is_crash_thread), None)
+    crash_thread_name = crash_thread.name if crash_thread and crash_thread.name else None
+    crash_thread_id = None
+    if crash_thread is not None and crash_thread.thread_index is not None:
+        crash_thread_id = str(crash_thread.thread_index)
 
     meta_info = replace(
         meta_info,
         thread_count_total=thread_count_total_val,
         thread_count_extracted=len(threads),
+        crash_thread_name=crash_thread_name or meta_info.crash_thread_name,
+        crash_thread_id=crash_thread_id or meta_info.crash_thread_id,
         library_dir_frame_filter_applied=lib_filter_applied if lib_filter_applied else None,
         frames_removed_by_library_dir_filter=(
             removed_by_lib_filter if lib_filter_applied else None

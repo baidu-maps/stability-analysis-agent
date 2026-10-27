@@ -252,9 +252,11 @@ def analyze_registers(
 
     if null_regs:
         result.has_null = True
-        result.evidence_notes.append(
-            f"寄存器 {', '.join(null_regs[:5])} 为 NULL → 空指针来源线索"
-        )
+        # 没有 fault address 时，0 寄存器只是现场值（例如 SIGKILL 停在 syscall），不能当成空指针。
+        if crash_addr_val is not None:
+            result.evidence_notes.append(
+                f"寄存器 {', '.join(null_regs[:5])} 为 NULL → 空指针来源线索"
+            )
     if uaf_regs:
         result.has_uaf_pattern = True
         result.evidence_notes.append(
@@ -451,7 +453,10 @@ def _mark_stack_regs_heuristic(address_map: Dict[str, Dict[str, Any]]) -> None:
         info = address_map.get(name)
         if not isinstance(info, dict):
             continue
-        if info.get("kind") in (None, "unknown"):
+        # Binary Images 不含栈页，sp/fp 会先被标成 unmapped。
+        if info.get("kind") in (None, "unknown") or (
+            info.get("kind") == "unmapped" and info.get("mapped") is False
+        ):
             info["kind"] = "stack"
             info.setdefault("source", "register_name_heuristic")
 

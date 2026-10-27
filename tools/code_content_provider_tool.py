@@ -10921,8 +10921,18 @@ class CodeContentProvider:
             is_rescue_frame = crash_frame.get("crash_location_source") == "from_log_deduce"
             rescue_reason = crash_frame.get("rescue_reason") if is_rescue_frame else None
 
-            if not all([address, resolved_function, resolved_file, resolved_line]):
+            if not resolved_function:
                 raise ValueError("崩溃帧信息不完整")
+
+            if not all([address, resolved_file, resolved_line]):
+                # iOS「日志内已符号化」(log_symbolicated_passthrough) 等场景只有函数名，
+                # 缺 address/file:line 属正常；按符号名兜底继续，避免阻断后续分析与改码。
+                is_rescue_frame = True
+                if not rescue_reason:
+                    rescue_reason = "symbol_only_function_locate"
+                extraction_warnings.append(
+                    "崩溃帧仅有符号名（缺 address/file:line），已按符号名兜底继续分析"
+                )
 
             crash_local_source = self._resolve_local_source_path(
                 resolved_file, code_roots_abs_strs

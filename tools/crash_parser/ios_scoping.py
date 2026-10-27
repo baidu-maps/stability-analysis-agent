@@ -140,14 +140,75 @@ def split_ios_colon_named_threads(content: str) -> Optional[List[Tuple[str, str,
 
 
 def _ios_extract_crashed_thread_index(content: str) -> Optional[int]:
-    """
-    提取 Apple 报告中的崩溃线程序号（Thread N 中的 N）。
-    仅用于输出线程元信息，不影响实际栈块裁剪逻辑。
-    """
+    """提取 Apple 报告中的崩溃线程序号（Thread N 中的 N）。"""
     m = re.search(r"^\s*Crashed Thread:\s*(\d+)\s*$", content, re.MULTILINE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(?m)^Thread\s+(\d+)\s+Crashed:\s*$", content)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(?m)^Triggered by Thread:\s*(\d+)\b", content)
     if m:
         return int(m.group(1))
     dm = re.search(r"(?m)^Thread\s+(\d+)\s+Deadlock:\s*$", content)
     if dm:
         return int(dm.group(1))
     return None
+
+
+_IOS_THREAD_NAME_RE = re.compile(
+    r"(?m)^Thread\s+(\d+)\s+name:\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+_IOS_TRIGGERED_THREAD_RE = re.compile(
+    r"(?m)^Triggered by Thread:\s*(\d+)\s+(.+?)\s*$",
+    re.IGNORECASE,
+)
+_IOS_QUEUE_SPLIT_RE = re.compile(r"\s*,?\s*Dispatch queue:\s*", re.IGNORECASE)
+
+
+def _split_apple_thread_name(raw: str) -> tuple:
+    """拆开 ``名字 Dispatch queue: ...``，返回 (name, queue)。"""
+    parts = _IOS_QUEUE_SPLIT_RE.split(raw.strip(), maxsplit=1)
+    name = parts[0].strip(" ,")
+    queue = parts[1].strip() if len(parts) > 1 else ""
+    return name, queue
+
+
+def _apple_is_main_queue(name: str, queue: str) -> Optional[bool]:
+    """队列含 main-thread 时为主线程；没有队列信息则返回 None。"""
+    if queue:
+        return "main-thread" in queue.lower()
+    if name.lower() in {"main", "main-thread", "ui"}:
+        return True
+    return None
+
+
+def apple_crash_thread_identity(content: str, thread_index: Optional[int]):
+    """返回崩溃线程的 (name, is_main)。
+
+    优先 ``Thread N name:``，否则用 ``Triggered by Thread:``。
+    """
+    named = []
+    for match in _IOS_THREAD_NAME_RE.finditer(content or ""):
+        index = int(match.group(1))
+        name, queue = _split_apple_thread_name(match.group(2))
+        if name:
+            named.append((index, name, queue))
+    chosen = None
+    if thread_index is not None:
+        chosen = next((item for item in named if item[0] == thread_index), None)
+    if chosen is None and named:
+        chosen = named[0]
+    if chosen is not None:
+        _index, name, queue = chosen
+        return name, _apple_is_main_queue(name, queue)
+    triggered = _IOS_TRIGGERED_THREAD_RE.search(content or "")
+    if not triggered:
+        return None, None
+    if thread_index is not None and int(triggered.group(1)) != thread_index:
+        return None, None
+    name, queue = _split_apple_thread_name(triggered.group(2))
+    if not name:
+        return None, None
+    return name, _apple_is_main_queue(name, queue)

@@ -9,9 +9,14 @@ import re
 from tools._stack_symbol_utils import looks_like_cpp_qualified_stack
 from tools.crash_parser.stack_lines import _IOS_PREPARSED_STACK_RE
 
-_IOS_OS_VERSION_RE = re.compile(r"^\s*OS Version:\s*iOS\b", re.MULTILINE | re.IGNORECASE)
+_IOS_OS_VERSION_RE = re.compile(
+    r"^\s*OS Version:\s*(?:iPhone OS|iPadOS|iOS)\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+# iPhone18,1 在 iPhone 后没有词边界，不能用 iPhone\b。
 _IOS_HW_MODEL_RE = re.compile(
-    r"^\s*Hardware Model:\s*(iPhone|iPad|iPod)\b", re.MULTILINE | re.IGNORECASE
+    r"^\s*Hardware Model:\s*(iPhone|iPad|iPod)[\w,]*",
+    re.MULTILINE | re.IGNORECASE,
 )
 _HARMONY_NATIVE_PC_LINE_RE = re.compile(
     r"(?m)^\s*(?:native:\s*)?#\d+\s+pc\s+[0-9a-fA-Fx]+\s+\S+",

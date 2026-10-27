@@ -75,7 +75,12 @@ def _fault_thread_name(data: Mapping[str, Any]) -> str:
     if isinstance(threads, Mapping):
         threads = list(threads.values())
     for thread in threads:
-        if isinstance(thread, Mapping) and (thread.get("crashed") or thread.get("is_fault") or thread.get("fault")):
+        if isinstance(thread, Mapping) and (
+            thread.get("crashed")
+            or thread.get("is_crash_thread")
+            or thread.get("is_fault")
+            or thread.get("fault")
+        ):
             return str(thread.get("name") or thread.get("thread_name") or "")
     if threads and isinstance(threads[0], Mapping):
         return str(threads[0].get("name") or threads[0].get("thread_name") or "")
@@ -196,6 +201,19 @@ def match_cpp_fault_modes(evidence: Mapping[str, Any]) -> List[Dict[str, Any]]:
     frames_text = " ".join(str(frame) for frame in evidence.get("native_frames") or []).lower()
     last_fatal = str(evidence.get("last_fatal_message") or "")
     raw = str(evidence.get("raw_content") or "")
+    if _is_watchdog_sigkill(signal, last_fatal):
+        matches.append({
+            "id": "CPP-FM-16",
+            "name": "看门狗终止",
+            "level": "termination",
+            "owner": "Native",
+            "confidence": 0.9,
+            "evidence": [last_fatal or "SIGKILL watchdog"],
+            "guidance": [
+                "进程是被看门狗杀掉的，不是空指针解引用。"
+                "看崩溃线程里第一帧业务代码，以及它为什么没能在时限内退出。",
+            ],
+        })
     if is_heap_allocator_abort(last_fatal, raw, frames_text):
         matches.append({
             "id": "CPP-FM-15",
@@ -241,9 +259,22 @@ def match_cpp_fault_modes(evidence: Mapping[str, Any]) -> List[Dict[str, Any]]:
     return sorted(dedup.values(), key=lambda item: (-item["confidence"], item["id"]))
 
 
+def _is_watchdog_sigkill(signal: str, last_fatal: str) -> bool:
+    """SIGKILL 且终止原因是看门狗时，没有 fault address 是正常的。"""
+    if signal != "SIGKILL":
+        return False
+    return bool(re.search(
+        r"Failed to terminate gracefully|WatchdogEvent|Namespace\s+FRONTBOARD|\bwatchdog termination\b",
+        last_fatal or "",
+        re.IGNORECASE,
+    ))
+
+
 def _follow_up(evidence: Mapping[str, Any], modes: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     checks: List[Dict[str, Any]] = []
-    if not evidence.get("fault_address"):
+    last_fatal = str(evidence.get("last_fatal_message") or "")
+    watchdog_kill = _is_watchdog_sigkill(str(evidence.get("signal") or ""), last_fatal)
+    if not evidence.get("fault_address") and not watchdog_kill:
         checks.append({"id": "extract_fault_address", "required": True, "reason": "缺少 fault address，无法完成地址语义分析"})
     if not evidence.get("native_frames"):
         checks.append({"id": "symbolicate_native_stack", "required": True, "reason": "缺少 Native 调用栈或符号化结果"})

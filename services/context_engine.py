@@ -328,7 +328,7 @@ class RequestLedger:
             "key": self.key(request),
             "type": str(request.get("type") or "function"),
             "symbol": str(request.get("symbol") or ""),
-            "file": str(request.get("file") or ""),
+            "file": str(resolution.get("file") or request.get("file") or ""),
             "line_number": int(request.get("line_number") or request.get("line") or 0),
             "status": status,
             "round": int(round_index),
@@ -398,6 +398,7 @@ class ContextEngine:
         evidence_retriever: Any = None,
         investigation_controller: Any = None,
         verification_profile: Any = None,
+        apply_ai_fixes: bool = False,
     ):
         self.config = config
         self.resolvers = resolver_registry
@@ -407,6 +408,7 @@ class ContextEngine:
         self.trace = trace
         self.evidence_retriever = evidence_retriever
         self.investigation_controller = investigation_controller
+        self.apply_ai_fixes = bool(apply_ai_fixes)
         self.ledger = RequestLedger()
         self.session = ContextSession(mode="context_loop")
         if verification_profile is not None:
@@ -1301,16 +1303,28 @@ class ContextEngine:
         return text[:start] + "\n".join(lines).rstrip() + "\n" + text[end:]
 
     @classmethod
-    def _fold_prior_analysis(cls, text: str, prior_analysis: str) -> str:
+    def _fold_prior_analysis(
+        cls,
+        text: str,
+        prior_analysis: str,
+        *,
+        apply_ai_fixes: bool = False,
+    ) -> str:
         """后续轮只追加新证据和上一轮分析，不再重发函数全文。"""
         folded = cls._index_function_source(text)
         memory = (
             "\n\n## 上一轮分析（工作记忆，请延续）\n"
             "下面是上一轮已经写过的分析。本轮只根据新增反馈修正，"
-            "不要推翻已用源码引用确认的事实，也不要要求重新粘贴已经看过的函数全文。\n\n"
-            + str(prior_analysis or "").strip()
-            + "\n"
+            "不要推翻已用源码引用确认的事实。\n"
+            "分析正文不必重贴已经看过的函数全文。\n"
         )
+        if apply_ai_fixes:
+            memory += (
+                "若本轮输出最终报告且 `next_action.kind` 为 `propose_fix`，"
+                "「修复代码」仍须写出每个待改函数的完整定义；"
+                "不能只延续上一轮的步骤说明。\n"
+            )
+        memory += "\n" + str(prior_analysis or "").strip() + "\n"
         return folded.rstrip() + memory
 
     def build_prompt(
@@ -1327,7 +1341,11 @@ class ContextEngine:
         evidence_delta = list(evidence_delta)
         stable_context = str(stable_context or "")
         if str(prior_analysis or "").strip():
-            stable_context = self._fold_prior_analysis(stable_context, prior_analysis)
+            stable_context = self._fold_prior_analysis(
+                stable_context,
+                prior_analysis,
+                apply_ai_fixes=self.apply_ai_fixes,
+            )
         else:
             stable_context = self._slim_unanchored_function_source(stable_context)
         if not evidence_delta and self.observation_store is not None and hasattr(self.observation_store, "markdown"):
@@ -1361,6 +1379,7 @@ class ContextEngine:
             early_final_reason=early_final_reason,
             include_json_reminder=True,
             investigation_state=investigation_state,
+            apply_ai_fixes=self.apply_ai_fixes,
         )["content"])
         stable_limit = max(0, max_chars - len(control_only) - 64)
         bounded_stable = self._compress_stable_context(str(stable_context or ""), stable_limit)
@@ -1378,6 +1397,7 @@ class ContextEngine:
                 early_final_reason=early_final_reason,
                 include_json_reminder=True,
                 investigation_state=investigation_state,
+                apply_ai_fixes=self.apply_ai_fixes,
             )["content"])
 
         base_prompt = _assemble([])

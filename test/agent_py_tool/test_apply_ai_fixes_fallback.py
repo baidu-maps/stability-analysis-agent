@@ -9,8 +9,11 @@ from pathlib import Path
 
 from services.code_fixer import (
     CodeFixer,
+    _complete_missing_repair_code,
     extract_candidate_nodes,
     graph_auto_fix_allowed,
+    promote_read_file_function_candidates,
+    _attach_missing_symbols,
     _collect_allowed_member_names,
     _contains_placeholder_code,
     _normalize_code_for_equivalence,
@@ -23,8 +26,10 @@ from services.code_fixer import (
     _select_required_targets,
     _validate_and_fix_member_references,
     _validate_method_calls_in_replacement,
+    is_forbidden_patch,
 )
 from tools.code_content_provider_tool import CodeContentProvider, CrashFunction
+from tools.fix_code_applier_tool import FixCodeApplierTool
 from tools.fix_code_extractor_tool import FixCodeExtractorTool
 
 
@@ -476,6 +481,23 @@ void Cancel() {
 
             self.assertTrue(result.success, result.to_dict())
             self.assertIn("this == nullptr", src.read_text(encoding="utf-8"))
+
+    def test_nullptr_guard_only_body_is_forbidden_but_real_logic_is_not(self):
+        """仅 this==nullptr 早返回的假修复仍拦截；后面还有真实逻辑则放行。"""
+        only = (
+            "bool DemoTask::IsDone() const {\n"
+            "    if (this == nullptr) { return false; }\n"
+            "    return false;\n"
+            "}\n"
+        )
+        real = (
+            "bool DemoTask::IsDone() const {\n"
+            "    if (this == nullptr) { return false; }\n"
+            "    return m_state == Complete || m_state == Canceled;\n"
+            "}\n"
+        )
+        self.assertIsNotNone(is_forbidden_patch("bool DemoTask::IsDone() const", only))
+        self.assertIsNone(is_forbidden_patch("bool DemoTask::IsDone() const", real))
 
     def test_extractor_keeps_model_code_without_semantic_filtering(self):
         analysis_text = """
@@ -1101,6 +1123,714 @@ DemoMapOperator::~DemoMapOperator()
         joined = "\n".join(str(e.get("replacement_code") or "") for e in edits)
         self.assertIn("GetMapStatus", joined)
         self.assertIn("~DemoMapOperator", joined)
+
+    def test_objc_fence_names_c_function_and_read_file_candidate(self):
+        """未符号化的 iOS 帧：ObjC 围栏里的 C 函数可从已读源码变成候选。"""
+        source = (
+            "__attribute__((visibility(\"hidden\"))) "
+            "void bmk_signal_exception_handler(int signal, siginfo_t *info, void *context) {\n"
+            "    suspend_all();\n"
+            "    look_up();\n"
+            "}\n"
+            "void other(void) {\n"
+            "    bmk_signal_exception_handler(1, 0, 0);\n"
+            "}\n"
+        )
+        analysis = (
+            "根因在信号处理器。\n"
+            "```objc\n"
+            "static void bmk_signal_exception_handler(int sig, siginfo_t *info, void *context) {\n"
+            "    struct sigaction previous;\n"
+            "    record(sig);\n"
+            "}\n"
+            "```\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sdk = root / "sdk"
+            sdk.mkdir()
+            header = sdk / "BMKSignalHandler.m"
+            header.write_text(source, encoding="utf-8")
+            decoy = root / "Other.m"
+            decoy.write_text(source, encoding="utf-8")
+            code_context = {"graph": {"nodes": [], "edges": []}}
+            session = {
+                "request_ledger": [
+                    {"type": "read_file", "status": "success", "file": str(header)},
+                    {"type": "read_file", "status": "success", "file": str(decoy)},
+                    {"type": "grep", "status": "success", "file": "", "symbol": "sigaction"},
+                ]
+            }
+            nodes = promote_read_file_function_candidates(
+                code_context,
+                analysis_text=analysis,
+                context_session=session,
+                code_roots=[str(sdk)],
+            )
+            self.assertEqual(len(nodes), 1)
+            self.assertEqual(nodes[0]["origin"], "read_file")
+            self.assertIn("bmk_signal_exception_handler", nodes[0]["signature"])
+            self.assertTrue(str(nodes[0]["file"]).endswith("BMKSignalHandler.m"))
+            self.assertIn("suspend_all", "\n".join(nodes[0]["snippet"]))
+            summary = code_context["graph"]["evidence_summary"]
+            self.assertTrue(summary["auto_fix_allowed"])
+            self.assertEqual(summary["allow_reason"], "read_file_cited_function")
+            allowed, reason = graph_auto_fix_allowed(code_context)
+            self.assertTrue(allowed)
+            self.assertEqual(reason, "")
+            extracted = extract_candidate_nodes(code_context)
+            self.assertEqual(len(extracted), 1)
+
+    def test_function_request_promotes_existing_function(self):
+        """账本 type=function 且带路径时，也能补出可替换候选。"""
+        source = (
+            "__attribute__((visibility(\"hidden\"))) "
+            "void bmk_signal_exception_handler(int signal, siginfo_t *info, void *context) {\n"
+            "    suspend_all();\n"
+            "}\n"
+        )
+        analysis = (
+            "```objc\n"
+            "static void bmk_signal_exception_handler(int sig, siginfo_t *info, void *context) {\n"
+            "    if (bmk_previousSignalHandler) {\n"
+            "        bmk_previousSignalHandler(sig, info, context);\n"
+            "    }\n"
+            "}\n"
+            "```\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "BMKSignalHandler.m"
+            path.write_text(source, encoding="utf-8")
+            code_context = {"graph": {"nodes": [], "edges": []}}
+            nodes = promote_read_file_function_candidates(
+                code_context,
+                analysis_text=analysis,
+                context_session={
+                    "request_ledger": [{
+                        "type": "function",
+                        "status": "success",
+                        "symbol": "bmk_signal_exception_handler",
+                        "file": str(path),
+                    }],
+                },
+                code_roots=[tmp],
+            )
+            self.assertEqual(len(nodes), 1)
+            self.assertIn("bmk_signal_exception_handler", nodes[0]["signature"])
+            self.assertIn("suspend_all", "\n".join(nodes[0]["snippet"]))
+
+    def test_function_resolved_context_promotes_without_ledger_file(self):
+        """function 账本没写路径时，从 resolved_context 取到的文件也能补候选。"""
+        source = (
+            "void bmk_signal_exception_handler(int signal, siginfo_t *info, void *context) {\n"
+            "    suspend_all();\n"
+            "}\n"
+        )
+        analysis = (
+            "```objc\n"
+            "void bmk_signal_exception_handler(int signal, siginfo_t *info, void *context) {\n"
+            "    if (bmk_previousSignalHandler) {\n"
+            "        bmk_previousSignalHandler(signal, info, context);\n"
+            "    }\n"
+            "}\n"
+            "```\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "BMKSignalHandler.m"
+            path.write_text(source, encoding="utf-8")
+            code_context = {"graph": {"nodes": [], "edges": []}}
+            session = {
+                "request_ledger": [{
+                    "type": "function",
+                    "status": "success",
+                    "symbol": "bmk_signal_exception_handler",
+                    "file": "",
+                }],
+                "rounds": [{
+                    "round_index": 0,
+                    "resolved_context": [{
+                        "success": True,
+                        "file": str(path),
+                        "request": {
+                            "type": "function",
+                            "symbol": "bmk_signal_exception_handler",
+                        },
+                    }],
+                }],
+            }
+            nodes = promote_read_file_function_candidates(
+                code_context,
+                analysis_text=analysis,
+                context_session=session,
+                code_roots=[tmp],
+            )
+            self.assertEqual(len(nodes), 1)
+            self.assertEqual(nodes[0]["file"], str(path.resolve()))
+
+            class _NoLLM:
+                def chat(self, messages, tools=None, **kwargs):
+                    raise RuntimeError("must not call the LLM")
+
+            def _execute(name, data):
+                if name == "fix_code_extractor":
+                    return FixCodeExtractorTool().execute(data)
+                if name == "fix_code_applier":
+                    return FixCodeApplierTool().execute(data)
+                raise AssertionError(name)
+
+            result = CodeFixer(llm_adapter=_NoLLM()).generate_and_apply(
+                {
+                    "analysis": analysis,
+                    "code_context": {},
+                    "parse_result": {},
+                    "context_session": session,
+                },
+                [tmp],
+                backup_original_sources=False,
+                tool_executor=_execute,
+            )
+            self.assertTrue(result.success, result.error)
+            written = path.read_text(encoding="utf-8")
+            self.assertNotIn("suspend_all", written)
+            self.assertIn("bmk_previousSignalHandler", written)
+
+    def test_read_file_candidates_do_not_override_explicit_block(self):
+        """证据摘要已经禁止改码时，补候选不能把结论改成允许。"""
+        source = (
+            "void bmk_signal_exception_handler(int signal) {\n"
+            "    return;\n"
+            "}\n"
+        )
+        analysis = (
+            "```objc\n"
+            "void bmk_signal_exception_handler(int signal) {\n"
+            "    return;\n"
+            "}\n"
+            "```\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "Handler.m"
+            path.write_text(source, encoding="utf-8")
+            code_context = {
+                "graph": {
+                    "nodes": [],
+                    "evidence_summary": {
+                        "auto_fix_allowed": False,
+                        "auto_fix_block_reason": "图证据不足，已禁止自动改码",
+                    },
+                }
+            }
+            nodes = promote_read_file_function_candidates(
+                code_context,
+                analysis_text=analysis,
+                context_session={
+                    "request_ledger": [
+                        {"type": "read_file", "status": "success", "file": str(path)},
+                    ]
+                },
+                code_roots=[tmp],
+            )
+            self.assertEqual(len(nodes), 1)
+            self.assertFalse(code_context["graph"]["evidence_summary"]["auto_fix_allowed"])
+            allowed, reason = graph_auto_fix_allowed(code_context)
+            self.assertFalse(allowed)
+            self.assertIn("禁止", reason)
+
+    def test_relative_read_file_path_promotes_existing_function(self):
+        """账本里的仓库相对路径也要能落到 code root 下的源文件。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "ios" / "BMKSignalHandler.m"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "void bmk_signal_exception_handler(int signal) {\n"
+                "    old();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            analysis = (
+                "```objc\n"
+                "static void bmk_signal_exception_handler(int signal) {\n"
+                "    record(signal);\n"
+                "}\n"
+                "```\n"
+            )
+            code_context = {}
+            nodes = promote_read_file_function_candidates(
+                code_context,
+                analysis_text=analysis,
+                context_session={
+                    "request_ledger": [{
+                        "type": "read_file",
+                        "status": "success",
+                        "file": "ios/BMKSignalHandler.m",
+                    }],
+                },
+                code_roots=[str(root)],
+            )
+            self.assertEqual(len(nodes), 1)
+            self.assertEqual(nodes[0]["file"], str(path.resolve()))
+
+    def test_prose_analysis_is_completed_into_a_function_replacement(self):
+        """只有步骤说明时，补一次完整函数后再落盘，并且不拼出 void static void。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "BMKSignalHandler.m"
+            path.write_text(
+                "__attribute__((visibility(\"hidden\"))) "
+                "void bmk_signal_exception_handler(int signal, siginfo_t *info, void *context) {\n"
+                "    old();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            analysis = (
+                "根本修复：信号 handler 不要挂起线程，也不要发 ObjC 消息。\n"
+                "目标文件 ios/BMKCrashLibrary/BMKSignalHandler.m。\n"
+                '{"next_action": {"kind": "propose_fix"}}\n'
+            )
+
+            class _Response:
+                def __init__(self, content):
+                    self.content = content
+
+            class _LLM:
+                def __init__(self):
+                    self.calls = 0
+
+                def chat(self, messages, tools=None, **kwargs):
+                    self.calls += 1
+                    self.assert_prompt = messages[0]["content"]
+                    return _Response(
+                        "```objc\n"
+                        "static void bmk_signal_exception_handler"
+                        "(int sig, siginfo_t *info, void *ctx) {\n"
+                        "    record(sig);\n"
+                        "}\n"
+                        "```\n"
+                    )
+
+            llm = _LLM()
+            session = {
+                "request_ledger": [{
+                    "type": "read_file",
+                    "status": "success",
+                    "file": str(path),
+                }],
+            }
+            completed = _complete_missing_repair_code(
+                llm,
+                analysis,
+                context_session=session,
+                code_roots=[str(root)],
+            )
+            self.assertEqual(llm.calls, 1)
+            self.assertIn("static void bmk_signal_exception_handler", completed)
+            def _execute(name, data):
+                if name == "fix_code_extractor":
+                    return FixCodeExtractorTool().execute(data)
+                if name == "fix_code_applier":
+                    return FixCodeApplierTool().execute(data)
+                raise AssertionError(name)
+
+            fixer = CodeFixer(llm_adapter=llm)
+            result = fixer.generate_and_apply(
+                {
+                    "analysis": analysis,
+                    "code_context": {},
+                    "parse_result": {},
+                    "context_session": session,
+                },
+                [str(root)],
+                backup_original_sources=False,
+                tool_executor=_execute,
+            )
+            self.assertTrue(result.success, result.error)
+            written = path.read_text(encoding="utf-8")
+            self.assertNotIn("void static void", written)
+            self.assertNotIn("__attribute__", written)
+            self.assertIn("static void bmk_signal_exception_handler", written)
+            self.assertIn("record(sig)", written)
+
+    def test_attribute_prefix_is_replaced_with_new_signature(self):
+        """完整新签名要盖掉原来的属性宏和返回类型，不能拼成 void static void。"""
+        source = (
+            "/// crash回调\n"
+            "__attribute__((visibility(\"hidden\"))) "
+            "void bmk_signal_exception_handler(int signal, siginfo_t *info, void *context) {\n"
+            "    old();\n"
+            "}\n"
+        )
+        replacement = (
+            "static void bmk_signal_exception_handler(int sig, siginfo_t *info, void *ctx) {\n"
+            "    record(sig);\n"
+            "}\n"
+        )
+        updated, _old = CodeFixer.replace_function_block(
+            source,
+            "bmk_signal_exception_handler()",
+            replacement,
+        )
+        self.assertNotIn("void static void", updated)
+        self.assertNotIn("__attribute__", updated)
+        self.assertIn("static void bmk_signal_exception_handler", updated)
+        self.assertEqual(updated.count("bmk_signal_exception_handler"), 1)
+        self.assertIn("/// crash回调", updated)
+
+    def test_new_symbols_are_inserted_before_first_replaced_function(self):
+        """围栏里的新静态变量和新函数独立插到最先被替换函数的文档注释之前。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "BMKSignalHandler.m"
+            path.write_text(
+                "/// crash回调\n"
+                "__attribute__((visibility(\"hidden\"))) "
+                "void bmk_signal_exception_handler(int signal, siginfo_t *info, void *context) {\n"
+                "    old();\n"
+                "}\n"
+                "\n"
+                "__attribute__((visibility(\"hidden\"))) void bmk_signal_register(int signal) {\n"
+                "    old_reg();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            analysis = (
+                "```objc\n"
+                "static int bmk_crash_fd = -1;\n"
+                "static void bmk_chain_previous(int sig) {\n"
+                "    return;\n"
+                "}\n"
+                "static void bmk_signal_exception_handler(int sig, siginfo_t *info, void *ctx) {\n"
+                "    bmk_chain_previous(sig);\n"
+                "}\n"
+                "static void bmk_signal_register(int sig) {\n"
+                "    return;\n"
+                "}\n"
+                "```\n"
+            )
+            handler_snippet = [
+                "void bmk_signal_exception_handler(int signal, siginfo_t *info, void *context) {",
+                "    old();",
+                "}",
+            ]
+            register_snippet = [
+                "void bmk_signal_register(int signal) {",
+                "    old_reg();",
+                "}",
+            ]
+            fix_plan = {
+                "summary": "test",
+                "edits": [
+                    {
+                        "file": str(path),
+                        "function_signature": "bmk_signal_register()",
+                        "replacement_code": (
+                            "static void bmk_signal_register(int sig) {\n"
+                            "    return;\n"
+                            "}\n"
+                        ),
+                    },
+                    {
+                        "file": str(path),
+                        "function_signature": "bmk_signal_exception_handler()",
+                        "replacement_code": (
+                            "static void bmk_signal_exception_handler"
+                            "(int sig, siginfo_t *info, void *ctx) {\n"
+                            "    bmk_chain_previous(sig);\n"
+                            "}\n"
+                        ),
+                    },
+                ],
+            }
+            _attach_missing_symbols(fix_plan, analysis)
+            handler = fix_plan["edits"][1]["replacement_code"]
+            self.assertNotIn("bmk_crash_fd", handler)
+            self.assertNotIn("static void bmk_chain_previous", handler)
+            self.assertNotIn("bmk_crash_fd", fix_plan["edits"][0]["replacement_code"])
+            insertions = [item for item in fix_plan["edits"] if item.get("edit_type") == "symbol_insertion"]
+            self.assertEqual(len(insertions), 1)
+            self.assertEqual(insertions[0]["placement"], "before_function")
+            self.assertEqual(insertions[0]["anchor_function"], "bmk_signal_exception_handler")
+            self.assertIn("static int bmk_crash_fd = -1;", insertions[0]["code"])
+            self.assertIn("bmk_chain_previous", insertions[0]["code"])
+            nodes = [
+                {
+                    "type": "function",
+                    "file": str(path),
+                    "signature": "bmk_signal_exception_handler()",
+                    "snippet": handler_snippet,
+                },
+                {
+                    "type": "function",
+                    "file": str(path),
+                    "signature": "bmk_signal_register()",
+                    "snippet": register_snippet,
+                },
+            ]
+            result = CodeFixer(llm_adapter=None).apply_fix_plan(
+                fix_plan,
+                nodes,
+                [str(root)],
+                backup_original_sources=False,
+                code_context={"graph": {"nodes": nodes}},
+            )
+            self.assertTrue(result.success, result.to_dict())
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("void static void", text)
+            self.assertNotIn("__attribute__", text)
+            self.assertEqual(text.count("bmk_crash_fd"), 1)
+            self.assertEqual(text.count("static void bmk_chain_previous"), 1)
+            self.assertLess(text.find("bmk_crash_fd"), text.find("/// crash回调"))
+            self.assertLess(text.find("bmk_chain_previous"), text.find("/// crash回调"))
+            self.assertLess(text.find("/// crash回调"), text.find("static void bmk_signal_exception_handler"))
+
+    def test_attribute_prefixed_function_replacement_is_extracted(self):
+        """__attribute__ 前缀不能把函数名识别成属性宏。"""
+        analysis = (
+            "```objc\n"
+            "__attribute__((visibility(\"hidden\"))) void bmk_signal_register(int sig) {\n"
+            "    install(sig);\n"
+            "}\n"
+            "```\n"
+        )
+        replacement = _extract_replacement_from_analysis(analysis, "bmk_signal_register()")
+        self.assertIn("install(sig)", replacement or "")
+
+    def test_read_file_origin_allows_fix_without_call_edge(self):
+        """没有崩溃行调用边时，已读函数节点本身可以放行。"""
+        code_context = {
+            "graph": {
+                "nodes": [
+                    {
+                        "origin": "read_file",
+                        "file": "/tmp/BMKSignalHandler.m",
+                        "signature": "bmk_signal_exception_handler()",
+                        "snippet": [
+                            "void bmk_signal_exception_handler(int signal) {",
+                            "    return;",
+                            "}",
+                        ],
+                    }
+                ],
+                "edges": [],
+            }
+        }
+        allowed, reason = graph_auto_fix_allowed(code_context)
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "")
+
+    def test_empty_paren_signature_replaces_definition_not_call_site(self):
+        """签名写 foo()、定义写 foo(void) 时，替换落在定义上而不是函数体里的调用语句。"""
+        source = (
+            "void bmk_remove(void) {\n"
+            "    old_remove();\n"
+            "}\n"
+            "\n"
+            "void bmk_handler(int sig) {\n"
+            "    bmk_remove();\n"
+            "    tail();\n"
+            "}\n"
+        )
+        patched, old_block = CodeFixer.replace_function_block(
+            source,
+            "bmk_remove()",
+            "void bmk_remove(void) {\n    new_remove();\n}",
+        )
+        self.assertIn("old_remove();", old_block or "")
+        self.assertIn("new_remove();", patched)
+        self.assertIn("    bmk_remove();\n    tail();", patched)
+
+    def test_call_statement_before_if_block_is_not_extracted_as_definition(self):
+        """后一个围栏里 foo(x); 紧跟 if {...} 时，仍取前一个围栏里 foo 的真实定义。"""
+        analysis = (
+            "```objc\n"
+            "void bmk_unregister(int signal) {\n"
+            "    restore(signal);\n"
+            "}\n"
+            "```\n"
+            "```objc\n"
+            "void bmk_handler(int signal) {\n"
+            "    bmk_unregister(signal);\n"
+            "    if (previous) {\n"
+            "        forward(signal);\n"
+            "    }\n"
+            "}\n"
+            "```\n"
+        )
+        replacement = _extract_replacement_from_analysis(analysis, "bmk_unregister()")
+        self.assertIn("restore(signal);", replacement or "")
+        self.assertNotIn("forward(signal);", replacement or "")
+
+    def test_missing_symbols_follow_their_file_heading(self):
+        """前置宏、typedef 和静态变量只进标题所属的文件，另一文件的函数不当作新符号。"""
+        analysis = (
+            "## 修复代码\n"
+            "### `BMKSignalHandler.m`\n"
+            "```objc\n"
+            "#include <fcntl.h>\n"
+            "#define BMK_MAX 64\n"
+            "typedef struct {\n"
+            "    int frames[BMK_MAX];\n"
+            "} bmk_record_t;\n"
+            "static bmk_record_t bmk_g_record; // 静态缓冲\n"
+            "static uintptr_t bmk_g_ranges[3][2];\n"
+            "void bmk_handler(int sig) {\n"
+            "    bmk_g_record.frames[0] = sig;\n"
+            "}\n"
+            "```\n"
+            "### `BMKUncaughtExceptionHandler.m`\n"
+            "```objc\n"
+            "void bmk_remove(void) {\n"
+            "    NSSetUncaughtExceptionHandler(NULL);\n"
+            "}\n"
+            "```\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            signal_file = root / "BMKSignalHandler.m"
+            signal_file.write_text("void bmk_handler(int sig) {\n    old();\n}\n", encoding="utf-8")
+            oc_file = root / "BMKUncaughtExceptionHandler.m"
+            oc_file.write_text("void bmk_remove(void) {\n    old();\n}\n", encoding="utf-8")
+            fix_plan = {
+                "edits": [
+                    {
+                        "file": str(signal_file),
+                        "function_signature": "bmk_handler()",
+                        "replacement_code": "void bmk_handler(int sig) {\n    bmk_g_record.frames[0] = sig;\n}\n",
+                    },
+                    {
+                        "file": str(oc_file),
+                        "function_signature": "bmk_remove()",
+                        "replacement_code": "void bmk_remove(void) {\n    NSSetUncaughtExceptionHandler(NULL);\n}\n",
+                    },
+                ],
+            }
+            _attach_missing_symbols(fix_plan, analysis)
+            handler = fix_plan["edits"][0]["replacement_code"]
+            self.assertNotIn("#include <fcntl.h>", handler)
+            self.assertNotIn("bmk_record_t", handler)
+            self.assertNotIn("bmk_remove", handler)
+            self.assertNotIn("bmk_record_t", fix_plan["edits"][1]["replacement_code"])
+            insertions = [item for item in fix_plan["edits"] if item.get("edit_type") == "symbol_insertion"]
+            self.assertEqual({item["placement"] for item in insertions}, {"head", "before_function"})
+            head = next(item["code"] for item in insertions if item["placement"] == "head")
+            body = next(item["code"] for item in insertions if item["placement"] == "before_function")
+            self.assertIn("#include <fcntl.h>", head)
+            self.assertIn("#define BMK_MAX 64", head)
+            self.assertIn("} bmk_record_t;", body)
+            self.assertIn("bmk_g_record; //", body)
+            self.assertIn("[3][2];", body)
+            self.assertNotIn("bmk_remove", body)
+
+            plain_plan = {
+                "edits": [
+                    dict(fix_plan["edits"][0]),
+                    dict(fix_plan["edits"][1]),
+                ],
+            }
+            plain_lines = analysis.replace("### `BMKSignalHandler.m`", "BMKSignalHandler.m").replace(
+                "### `BMKUncaughtExceptionHandler.m`", "**BMKUncaughtExceptionHandler.m**："
+            )
+            _attach_missing_symbols(plain_plan, plain_lines)
+            plain_inserts = [item for item in plain_plan["edits"] if item.get("edit_type") == "symbol_insertion"]
+            self.assertEqual({item["placement"] for item in plain_inserts}, {"head", "before_function"})
+            body_plain = next(
+                item["code"] for item in plain_inserts if item["placement"] == "before_function"
+            )
+            self.assertIn("} bmk_record_t;", body_plain)
+
+            result = CodeFixer(llm_adapter=None).apply_fix_plan(
+                fix_plan,
+                [
+                    {"type": "function", "file": str(signal_file), "signature": "bmk_handler()",
+                     "snippet": ["void bmk_handler(int sig) {", "    old();", "}"]},
+                    {"type": "function", "file": str(oc_file), "signature": "bmk_remove()",
+                     "snippet": ["void bmk_remove(void) {", "    old();", "}"]},
+                ],
+                [str(root)],
+                backup_original_sources=False,
+            )
+            self.assertTrue(result.success, result.to_dict())
+            signal_text = signal_file.read_text(encoding="utf-8")
+            self.assertLess(signal_text.find("#include <fcntl.h>"), signal_text.find("void bmk_handler"))
+            self.assertLess(signal_text.find("bmk_g_ranges[3][2]"), signal_text.find("void bmk_handler"))
+            self.assertNotIn("bmk_record_t", oc_file.read_text(encoding="utf-8"))
+
+            plain_lines = analysis.replace("### `BMKSignalHandler.m`", "BMKSignalHandler.m").replace(
+                "### `BMKUncaughtExceptionHandler.m`", "**BMKUncaughtExceptionHandler.m**："
+            )
+            again = {
+                "edits": [
+                    {
+                        "file": str(signal_file),
+                        "function_signature": "bmk_handler()",
+                        "replacement_code": "void bmk_handler(int sig) {\n    bmk_g_record.frames[0] = sig;\n}\n",
+                    },
+                    {
+                        "file": str(oc_file),
+                        "function_signature": "bmk_remove()",
+                        "replacement_code": (
+                            "void bmk_remove(void) {\n    NSSetUncaughtExceptionHandler(NULL);\n}\n"
+                        ),
+                    },
+                ],
+            }
+            _attach_missing_symbols(again, plain_lines)
+            self.assertEqual(
+                [item.get("edit_type") for item in again["edits"] if item.get("edit_type") == "symbol_insertion"],
+                [],
+            )
+
+    def test_header_symbols_go_to_import_area(self):
+        """#include/#define 插到已有 import 之后，静态变量仍停在函数文档注释前。"""
+        analysis = (
+            "## 修复代码\n"
+            "BMKSignalHandler.m\n"
+            "```objc\n"
+            "#include <fcntl.h>\n"
+            "#define BMK_ALT 8\n"
+            "#define BMK_FD_COUNT ((int)(sizeof(bmk_g_fd) / sizeof(int)))\n"
+            "static int bmk_g_fd = -1;\n"
+            "void bmk_handler(int sig) {\n"
+            "    (void)sig;\n"
+            "}\n"
+            "```\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "BMKSignalHandler.m"
+            path.write_text(
+                "#import \"BMKSignalHandler.h\"\n"
+                "#include <signal.h>\n"
+                "\n"
+                "/// 处理信号\n"
+                "void bmk_handler(int sig) {\n"
+                "    old();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            fix_plan = {
+                "edits": [{
+                    "file": str(path),
+                    "function_signature": "bmk_handler()",
+                    "replacement_code": "void bmk_handler(int sig) {\n    (void)sig;\n}\n",
+                }],
+            }
+            _attach_missing_symbols(fix_plan, analysis)
+            result = CodeFixer(llm_adapter=None).apply_fix_plan(
+                fix_plan,
+                [{"type": "function", "file": str(path), "signature": "bmk_handler()",
+                  "snippet": ["void bmk_handler(int sig) {", "    old();", "}"]}],
+                [str(root)],
+                backup_original_sources=False,
+            )
+            self.assertTrue(result.success, result.to_dict())
+            text = path.read_text(encoding="utf-8")
+            self.assertLess(text.find("#include <signal.h>"), text.find("#include <fcntl.h>"))
+            self.assertLess(text.find("#include <fcntl.h>"), text.find("#define BMK_ALT 8"))
+            self.assertLess(text.find("#define BMK_ALT 8"), text.find("#define BMK_FD_COUNT"))
+            self.assertLess(text.find("#define BMK_FD_COUNT"), text.find("static int bmk_g_fd"))
+            self.assertLess(text.find("static int bmk_g_fd"), text.find("/// 处理信号"))
+            self.assertLess(text.find("/// 处理信号"), text.find("void bmk_handler"))
 
 
 if __name__ == "__main__":

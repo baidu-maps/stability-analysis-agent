@@ -138,8 +138,69 @@ def _build_anr_prompt(
         lines.append("## 输出格式")
         lines.extend(build_round0_must_provide_lines(agent_loop=agent_loop))
         lines.append("")
-        lines.extend(build_round0_output_format_lines(agent_loop=agent_loop))
+        lines.extend(build_round0_output_format_lines(
+            agent_loop=agent_loop,
+            apply_ai_fixes=bool((problem or {}).get("apply_ai_fixes")),
+        ))
+    knowledge = _anr_domain_knowledge_section(
+        parse_result,
+        resolved_stack,
+        problem,
+    )
+    if knowledge:
+        lines.extend(["", knowledge])
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _anr_domain_knowledge_section(
+    parse_result: Dict[str, Any],
+    resolved_stack: Dict[str, Any],
+    problem: Optional[Dict[str, Any]],
+) -> str:
+    """按崩溃栈检索领域知识，拼进 ANR 提示词。"""
+    if isinstance(problem, dict) and problem.get("enable_domain_knowledge", True) is False:
+        return ""
+    try:
+        from knowledge_plane import retrieve_knowledge
+    except Exception:
+        return ""
+    explicit = None
+    pack_id = ""
+    max_hits = 4
+    max_chars = 4500
+    if isinstance(problem, dict):
+        raw_dirs = problem.get("knowledge_pack_dirs")
+        if isinstance(raw_dirs, str) and raw_dirs.strip():
+            explicit = [raw_dirs]
+        elif isinstance(raw_dirs, list):
+            explicit = [str(item) for item in raw_dirs if str(item).strip()]
+        pack_id = str(problem.get("knowledge_pack_id") or "")
+        try:
+            max_hits = int(problem.get("knowledge_max_hits") or 4)
+            max_chars = int(problem.get("knowledge_max_chars") or 4500)
+        except (TypeError, ValueError):
+            max_hits, max_chars = 4, 4500
+    try:
+        found = retrieve_knowledge(
+            parse_result=parse_result if isinstance(parse_result, dict) else {},
+            resolved_stack=resolved_stack if isinstance(resolved_stack, dict) else {},
+            code_context={},
+            pack_dirs=explicit,
+            pack_id=pack_id,
+            max_hits=max_hits,
+            max_chars=max_chars,
+        )
+    except Exception:
+        logger.info("ANR domain knowledge retrieval skipped", exc_info=True)
+        return ""
+    text = str(found.get("knowledge_context") or "").strip()
+    if not text:
+        return ""
+    return (
+        "## 代码库领域知识\n"
+        "这些条目按本次崩溃符号检索得到。与泛化概览冲突时，以点名了崩溃函数的条目为准。\n"
+        + text
+    )
 
 
 class AnrFreezeAnalysisWorkflow(BaseWorkflow):

@@ -343,6 +343,21 @@ def signatures_match(candidate_sig: str, target_sig: str) -> bool:
     return bool(sa and sb and sa == sb)
 
 
+def _nullptr_guard_only_body(replacement_code: str) -> bool:
+    """函数体去掉 this/nullptr 早返回后，是否只剩空返回或什么都没有。"""
+    stripped = re.sub(
+        r"if\s*\(\s*(?:this\s*[!=]=\s*(?:nullptr|NULL|0)|(?:nullptr|NULL|0)\s*[!=]=\s*this|!\s*this)\s*\)\s*\{[^}]*\}",
+        "",
+        str(replacement_code or ""),
+    )
+    body = re.sub(r"^[^{]*\{", "", stripped, count=1)
+    body = body.rsplit("}", 1)[0] if "}" in body else body
+    statements = [item.strip() for item in re.split(r"[;\n]", body) if item.strip() and not item.strip().startswith(("//", "/*", "*"))]
+    if not statements:
+        return True
+    return all(re.match(r"return\s*(?:false|true|nullptr|NULL|0)?\s*$", item) for item in statements)
+
+
 def is_forbidden_patch(signature: str, replacement_code: str, uaf_nullptr_guard_policy: str = "strict") -> Optional[str]:
     """拒绝无效/症状级补丁（通用模式，非业务硬编码）。"""
     code = str(replacement_code or "")
@@ -356,7 +371,7 @@ def is_forbidden_patch(signature: str, replacement_code: str, uaf_nullptr_guard_
             "::" in sig and not sig.strip().startswith("static")
         ):
             policy = uaf_nullptr_guard_policy
-            if policy in ("strict", "balanced"):
+            if policy in ("strict", "balanced") and _nullptr_guard_only_body(code):
                 return "成员函数内 this/nullptr 防护不能作为 UAF 根因修复（policy={})".format(policy)
     live_copy_err = _forbidden_live_container_copy_patch(signature, code)
     if live_copy_err:
@@ -1167,13 +1182,20 @@ def _extract_candidate_nodes_from_crash_summary(code_context: Dict[str, Any]) ->
         signature = str(cs.get("function") or "").strip()
     if not file_path or not signature:
         return []
+    clean_sig = signature.rstrip("{").rstrip()
     try:
         line_no = int(cs.get("crash_line_number") or 0)
     except (TypeError, ValueError):
         line_no = 0
     path = Path(file_path)
     if not path.is_file() or line_no <= 0:
-        return []
+        return [{
+            "file": str(path),
+            "signature": clean_sig,
+            "snippet": [clean_sig],
+            "snippet_start_line": line_no or None,
+            "snippet_end_line": line_no or None,
+        }]
     try:
         lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
     except OSError:
@@ -1203,7 +1225,7 @@ def _extract_candidate_nodes_from_crash_summary(code_context: Dict[str, Any]) ->
     return [
         {
             "file": str(path.resolve()),
-            "signature": signature.rstrip("{").rstrip(),
+            "signature": clean_sig,
             "snippet": snippet,
             "snippet_start_line": def_idx + 1,
             "snippet_end_line": def_idx + len(snippet),
@@ -1246,6 +1268,9 @@ def graph_auto_fix_allowed(code_context: Dict[str, Any]) -> Tuple[bool, str]:
         if summ.get("auto_fix_allowed"):
             return True, ""
         return False, str(summ.get("auto_fix_block_reason") or "图证据不足，已禁止自动改码")
+    # 未符号化的崩溃行没有调用边。分析点名、且正文来自已读源码时允许改码。
+    if _graph_has_read_file_candidates(code_context):
+        return True, ""
     edges = graph.get("edges", []) if isinstance(graph, dict) else []
     if not isinstance(edges, list):
         return False, "无图边信息，已禁止自动改码"
@@ -1347,7 +1372,7 @@ def _extract_required_function_names_from_analysis(analysis_text: str) -> List[s
 
     # 独立 Class::method / Class::~Class 完整函数围栏（跳过 class/struct 骨架）
     for block in _extract_code_blocks(fix_text):
-        if re.search(r"^\s*(?:class|struct)\s+\w+", block, re.MULTILINE):
+        if _is_type_skeleton_block(block):
             continue
         for m in re.finditer(
             r"(?:^|\n)\s*(?:[\w:*&<>,\s]+?\s+)?"
@@ -1360,6 +1385,7 @@ def _extract_required_function_names_from_analysis(analysis_text: str) -> List[s
             if "::" not in leaf and not leaf.startswith("~"):
                 continue
             _append_unique_name(names, leaf + "()")
+        _append_c_function_names(names, block)
     return names
 
 
@@ -1748,8 +1774,902 @@ def _upsert_fix_plan_edit(fix_plan: Dict[str, Any], edit: Dict[str, Any]) -> Dic
     return {"summary": str(fix_plan.get("summary", "")), "edits": out}
 
 
+_CODE_FENCE_RE = re.compile(
+    r"^```(?:cpp|c\+\+|cc|cxx|objc|objective-c|objectivec|mm|m|c|h)?\s*$",
+    re.I,
+)
+_C_FUNCTION_DEF_RE = re.compile(
+    r"(?:^|\n)[ \t]*(?:__attribute__\s*\(\(.*?\)\)\s*)*"
+    r"(?:(?:static|inline|extern)[ \t]+)*"
+    r"(?:[A-Za-z_][\w]*[ \t*]+)+"
+    r"([A-Za-z_]\w*)[ \t]*\([^;{]*\)[ \t]*\{"
+)
+_SKIP_C_FUNCTION_NAMES = frozenset({
+    "if", "else", "for", "while", "switch", "do", "catch", "try",
+    "sizeof", "return", "defined",
+})
+
+
+def _is_type_skeleton_block(block: str) -> bool:
+    """首条有效代码是 class/struct 骨架时，整块不当作函数定义。"""
+    for raw in str(block or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("//", "/*", "*", "#")):
+            continue
+        return bool(re.match(r"(?:typedef\s+)?(?:class|struct)\s+\w+", line))
+    return False
+
+
+def _append_c_function_names(names: List[str], block: str) -> None:
+    """从修复围栏里的 C/ObjC 函数定义补进目标函数名。"""
+    for match in _C_FUNCTION_DEF_RE.finditer(str(block or "")):
+        leaf = match.group(1)
+        if leaf in _SKIP_C_FUNCTION_NAMES or len(leaf) < 3:
+            continue
+        _append_unique_name(names, leaf + "()")
+
+
+def _strip_leading_attributes(text: str) -> str:
+    """去掉开头的 __attribute__((...))，避免把属性宏当成函数名。"""
+    stripped = str(text or "").lstrip()
+    while True:
+        match = re.match(r"__attribute__\s*\(", stripped)
+        if not match:
+            return stripped
+        start = match.end() - 1
+        depth = 0
+        end = -1
+        for index in range(start, len(stripped)):
+            char = stripped[index]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    end = index
+                    break
+        if end < 0:
+            return stripped
+        stripped = stripped[end + 1:].lstrip()
+
+
+def _declaration_cut_index(source: str, name_index: int) -> int:
+    """从函数名退到声明起点，带上同一行的返回类型和紧邻的属性行。"""
+    if name_index < 0 or name_index > len(source):
+        return name_index
+    line_start = source.rfind("\n", 0, name_index) + 1
+    if ";" in source[line_start:name_index]:
+        return name_index
+    cut = line_start
+    while cut > 0:
+        prev_end = cut - 1
+        prev_start = source.rfind("\n", 0, prev_end) + 1
+        prev = source[prev_start:cut].strip()
+        if not prev or prev.startswith(("//", "/*", "*", "#")):
+            break
+        if prev.endswith((";", "}", "{")):
+            break
+        if "(" in prev and not prev.startswith("__attribute__") and not prev.startswith("template"):
+            break
+        cut = prev_start
+    return cut
+
+
+def _expand_block_to_declaration(source: str, old_block: str, func_name: str) -> str:
+    """把已定位的函数块向前扩到声明起点，吃掉残留的属性宏和返回类型。"""
+    if not old_block or not func_name:
+        return old_block
+    index = source.find(old_block)
+    if index < 0:
+        return old_block
+    name_at = source.find(func_name, index)
+    if name_at < 0 or name_at > index + max(400, len(func_name) + 80):
+        name_at = index
+    cut = _declaration_cut_index(source, name_at)
+    if cut > index:
+        return old_block
+    return source[cut:index + len(old_block)]
+
+
+def _static_decl_name(line: str) -> str:
+    """取文件级静态声明里的变量名。"""
+    head = re.sub(r"=.*$", "", str(line or "").strip()).rstrip()
+    head = re.sub(r";\s*$", "", head).rstrip()
+    match = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*$", head)
+    return match.group(1) if match else ""
+
+
+_TOP_LEVEL_DECL_START_RE = re.compile(r"^(?:static|extern|typedef|struct|enum|union)\b")
+
+
+def _strip_trailing_comment(line: str) -> str:
+    """去掉行尾 // 或 /* */ 注释，用于判断声明是否以分号结束。"""
+    text = re.sub(r"/\*.*?\*/\s*$", "", str(line or "")).rstrip()
+    in_string = False
+    for index, char in enumerate(text):
+        if char == '"' and (index == 0 or text[index - 1] != "\\"):
+            in_string = not in_string
+        elif not in_string and text.startswith("//", index):
+            return text[:index].rstrip()
+    return text
+
+
+def _top_level_decl_name(statement: str) -> str:
+    """取文件级声明的符号名：typedef/struct 取末尾别名或标签，变量取等号前的名字。"""
+    flat = " ".join(_strip_trailing_comment(x) for x in statement.splitlines()).strip()
+    if flat.startswith(("typedef", "struct", "enum", "union")) and "}" in flat:
+        tail = flat.rsplit("}", 1)[1]
+        match = re.search(r"([A-Za-z_]\w*)\s*;\s*$", tail)
+        if match:
+            return match.group(1)
+        tag = re.match(r"^(?:typedef\s+)?(?:struct|enum|union)\s+([A-Za-z_]\w*)", flat)
+        return tag.group(1) if tag else ""
+    if flat.startswith("typedef"):
+        match = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*;\s*$", flat)
+        return match.group(1) if match else ""
+    head = re.split(r"=|\{", flat, 1)[0]
+    if "(" in head:
+        return ""
+    return _static_decl_name(head)
+
+
+def _preamble_items_outside_functions(
+    block: str,
+    function_spans: List[Tuple[int, int, str, str]],
+    source: str,
+) -> List[Tuple[int, str, str]]:
+    """收集围栏里函数之外、源码还没有的 include、宏、类型和文件级变量。"""
+    items: List[Tuple[int, str, str]] = []
+    lines = block.splitlines(keepends=True)
+    offsets: List[int] = []
+    total = 0
+    for raw in lines:
+        offsets.append(total)
+        total += len(raw)
+    index = 0
+    while index < len(lines):
+        line_at = offsets[index]
+        raw = lines[index]
+        stripped = raw.strip()
+        if any(start <= line_at < end for start, end, _name, _func in function_spans):
+            index += 1
+            continue
+        if re.match(r"^#\s*(?:include|import)\b", stripped):
+            normalized = re.sub(r"\s+", " ", stripped)
+            if normalized not in re.sub(r"[ \t]+", " ", source):
+                items.append((line_at, normalized, stripped))
+            index += 1
+            continue
+        define = re.match(r"^#\s*define\s+([A-Za-z_]\w*)", stripped)
+        if define:
+            parts = [raw.rstrip("\n")]
+            while parts[-1].rstrip().endswith("\\") and index + 1 < len(lines):
+                index += 1
+                parts.append(lines[index].rstrip("\n"))
+            if not re.search(rf"#\s*define\s+{re.escape(define.group(1))}\b", source):
+                items.append((line_at, "#define " + define.group(1), "\n".join(parts).strip()))
+            index += 1
+            continue
+        if not _TOP_LEVEL_DECL_START_RE.match(stripped):
+            index += 1
+            continue
+        parts = [raw.rstrip("\n")]
+        depth = stripped.count("{") - stripped.count("}")
+        while index + 1 < len(lines) and len(parts) < 200:
+            if depth <= 0 and _strip_trailing_comment(parts[-1]).endswith(";"):
+                break
+            index += 1
+            parts.append(lines[index].rstrip("\n"))
+            depth += lines[index].count("{") - lines[index].count("}")
+        index += 1
+        statement = "\n".join(parts).strip()
+        if not _strip_trailing_comment(statement.splitlines()[-1]).endswith(";"):
+            continue
+        name = _top_level_decl_name(statement)
+        if not name or re.search(rf"\b{re.escape(name)}\b", source):
+            continue
+        items.append((line_at, name, statement))
+    return items
+
+
+def _join_symbol_texts(texts: List[str]) -> str:
+    """单行符号紧挨着排，多行符号之间空一行。"""
+    joined = ""
+    for index, text in enumerate(texts):
+        if index:
+            compact = "\n" not in text and "\n" not in texts[index - 1]
+            joined += "\n" if compact else "\n\n"
+        joined += text
+    return joined
+
+
+def _is_import_area_text(text: str) -> bool:
+    """#include/#import 和只含常量的 #define 进文件头部；引用了其它符号的宏跟变量走。"""
+    stripped = str(text or "").lstrip()
+    if re.match(r"#\s*(?:include|import)\b", stripped):
+        return True
+    define = re.match(r"#\s*define\s+([A-Za-z_]\w*)\b(.*)$", stripped, re.S)
+    if not define:
+        return False
+    idents = set(re.findall(r"[A-Za-z_]\w*", define.group(2)))
+    idents.discard(define.group(1))
+    idents -= {"sizeof", "defined", "alignof", "typeof", "__typeof__"}
+    return not idents
+
+
+def _missing_symbol_groups(
+    analysis_text: str,
+    source: str,
+    replaced_names: Set[str],
+    *,
+    file_name: str = "",
+    single_file: bool = True,
+) -> Tuple[str, str]:
+    """把缺失符号分成 (头部段, 符号段)：include/常量宏进头部，其余按围栏顺序进符号段。"""
+    head: List[str] = []
+    body: List[str] = []
+    for text in _missing_symbol_texts(
+        analysis_text, source, replaced_names, file_name=file_name, single_file=single_file,
+    ):
+        (head if _is_import_area_text(text) else body).append(text)
+    return _join_symbol_texts(head), _join_symbol_texts(body)
+
+
+def _missing_symbol_texts(
+    analysis_text: str,
+    source: str,
+    replaced_names: Set[str],
+    *,
+    file_name: str = "",
+    single_file: bool = True,
+) -> List[str]:
+    """收集分析围栏里源码还没有的 include、宏、类型、文件级变量和新函数。
+
+    按围栏前的文件名标题只取本文件的围栏；没有文件名时，只取含本文件被替换函数的围栏，
+    单文件修复时全部采用。
+    """
+    ordered: List[str] = []
+    seen: Set[str] = set()
+    hinted = _extract_code_blocks_with_file_hint(analysis_text)
+    if not hinted:
+        hinted = [("", block) for block in _extract_code_blocks(analysis_text)]
+    target_name = Path(file_name).name.lower() if file_name else ""
+    for hint, block in hinted:
+        if hint and target_name and hint.lower() != target_name:
+            continue
+        if not hint and not single_file and not any(
+            _source_defines_function(block, name) for name in replaced_names
+        ):
+            continue
+        function_spans: List[Tuple[int, int, str, str]] = []
+        for match in _C_FUNCTION_DEF_RE.finditer(block):
+            func = _extract_function_block_from_code(block, match.start(1))
+            if not func:
+                continue
+            at = block.find(func, match.start())
+            if at < 0:
+                at = match.start()
+            function_spans.append((at, at + len(func), match.group(1), func.strip()))
+        pieces: List[Tuple[int, str, str]] = []
+        for start, _end, name, func in function_spans:
+            if name in replaced_names or name in _SKIP_C_FUNCTION_NAMES:
+                continue
+            if _source_defines_function(source, name):
+                continue
+            pieces.append((start, name, func))
+        pieces.extend(_preamble_items_outside_functions(block, function_spans, source))
+        for _start, key, text in sorted(pieces, key=lambda item: item[0]):
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(text)
+    return ordered
+
+
+def _is_function_definition_at(source: str, index: int) -> bool:
+    """index 起第一个参数表闭合后先遇到 ``{``，且中间没有多出的 ``)``，才是函数定义而非调用。"""
+    open_at = source.find("(", max(0, index))
+    if open_at < 0:
+        return False
+    depth = 0
+    close_at = -1
+    for pos in range(open_at, min(len(source), open_at + 4000)):
+        char = source[pos]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                close_at = pos
+                break
+    if close_at < 0:
+        return False
+    depth = 0
+    for pos in range(close_at + 1, min(len(source), close_at + 800)):
+        char = source[pos]
+        if char == "{":
+            return depth == 0
+        if char in ";,":
+            return False
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    return False
+
+
+def _first_function_definition_index(source: str, func_name: str) -> int:
+    """函数名在源码中第一次以定义形式出现的位置；没有时返回 -1。"""
+    if not func_name:
+        return -1
+    for match in re.finditer(rf"(?<![\w.>]){re.escape(func_name)}\s*\(", source):
+        if _is_function_definition_at(source, match.start()):
+            return match.start()
+    return -1
+
+
+def _definition_index(source: str, func_name: str) -> int:
+    """返回函数定义在源码中的位置；找不到时给一个靠后的序号。"""
+    for match in re.finditer(rf"\b{re.escape(func_name)}\s*\(", source):
+        line_start = source.rfind("\n", 0, match.start()) + 1
+        prefix = source[line_start:match.start()].rstrip()
+        if not prefix or prefix.endswith(("=", ",", "(", ">", ".", ":")) or ";" in prefix:
+            continue
+        rest = source[match.end():match.end() + 800]
+        brace = rest.find("{")
+        semi = rest.find(";")
+        if brace < 0 or (semi >= 0 and semi < brace):
+            continue
+        return match.start()
+    return 10 ** 9
+
+
+def _symbol_insertion_key(edit: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """去重键：同一文件、同一落点、同一段代码只插一次。"""
+    return (
+        str(edit.get("file") or ""),
+        str(edit.get("placement") or ""),
+        str(edit.get("anchor_function") or ""),
+        str(edit.get("code") or "").strip(),
+    )
+
+
+def _filter_header_block(source: str, block: str, planned_includes: Set[str]) -> str:
+    """去掉源码或已有 include 编辑里已经出现的头部行。"""
+    normalized = re.sub(r"[ \t]+", " ", source)
+    kept: List[str] = []
+    for raw in str(block or "").splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped in planned_includes:
+            continue
+        if re.sub(r"\s+", " ", stripped) in normalized:
+            continue
+        kept.append(stripped)
+    return _join_symbol_texts(kept)
+
+
+def _filter_body_block(source: str, block: str) -> str:
+    """整段符号已经在源码里时不再插入。"""
+    text = str(block or "").strip()
+    if not text:
+        return ""
+    if re.sub(r"\s+", " ", text) in re.sub(r"\s+", " ", source):
+        return ""
+    return text
+
+
+def _attach_missing_symbols(fix_plan: Dict[str, Any], analysis_text: str) -> None:
+    """把围栏里缺失的 include/宏和文件级符号做成独立插入，不挂到函数替换上。"""
+    edits = fix_plan.get("edits") if isinstance(fix_plan, dict) else None
+    if not isinstance(edits, list):
+        return
+    by_file: Dict[str, List[Dict[str, Any]]] = {}
+    for edit in edits:
+        if not isinstance(edit, dict):
+            continue
+        if str(edit.get("edit_type") or "function_replacement") != "function_replacement":
+            continue
+        path = str(edit.get("file") or "").strip()
+        if path:
+            by_file.setdefault(path, []).append(edit)
+    existing = {
+        _symbol_insertion_key(item)
+        for item in edits
+        if isinstance(item, dict) and item.get("edit_type") == "symbol_insertion"
+    }
+    planned_includes = {
+        str(item.get("include") or "").strip()
+        for item in edits
+        if isinstance(item, dict) and item.get("edit_type") == "include_directive"
+    }
+    extra: List[Dict[str, Any]] = []
+    for path, file_edits in by_file.items():
+        file_path = Path(path)
+        if not file_path.is_file():
+            continue
+        try:
+            source, _encoding = _try_read_source_raw(file_path)
+        except Exception:
+            continue
+        replaced: Set[str] = set()
+        ranked: List[Tuple[int, Dict[str, Any]]] = []
+        for edit in file_edits:
+            simple = _extract_simple_function_name(str(edit.get("function_signature") or ""))
+            if simple:
+                replaced.add(simple)
+            ranked.append((_definition_index(source, simple) if simple else 10 ** 9, edit))
+        head, body = _missing_symbol_groups(
+            analysis_text,
+            source,
+            replaced,
+            file_name=path,
+            single_file=len(by_file) == 1,
+        )
+        head = _filter_header_block(source, head, planned_includes)
+        body = _filter_body_block(source, body)
+        ranked.sort(key=lambda item: item[0])
+        anchor = ""
+        if ranked:
+            anchor = _extract_simple_function_name(str(ranked[0][1].get("function_signature") or ""))
+        if head:
+            item = {
+                "file": path,
+                "edit_type": "symbol_insertion",
+                "placement": "head",
+                "code": head,
+                "reason": "independent_file_header",
+            }
+            key = _symbol_insertion_key(item)
+            if key not in existing:
+                extra.append(item)
+                existing.add(key)
+        if body and anchor:
+            item = {
+                "file": path,
+                "edit_type": "symbol_insertion",
+                "placement": "before_function",
+                "anchor_function": anchor,
+                "code": body,
+                "reason": "independent_file_symbols",
+            }
+            key = _symbol_insertion_key(item)
+            if key not in existing:
+                extra.append(item)
+                existing.add(key)
+    if extra:
+        edits.extend(extra)
+
+
+def _import_area_insert_offset(source: str) -> int:
+    """插到最后一个 #include/#import 之后；没有时插到文件头注释/include guard 之后。"""
+    last_end = -1
+    for match in re.finditer(r"^[ \t]*#[ \t]*(?:include|import)\b[^\n]*\n?", source, re.M):
+        last_end = match.end()
+    if last_end >= 0:
+        return last_end
+    offset = 0
+    while offset < len(source):
+        if source.startswith(("\n", "\r"), offset):
+            offset += 1
+            continue
+        line_end = source.find("\n", offset)
+        line_end = len(source) if line_end < 0 else line_end + 1
+        stripped = source[offset:line_end].strip()
+        if not stripped or stripped.startswith(("//", "/*", "*", "*/")):
+            offset = line_end
+            continue
+        if re.match(r"#\s*(?:ifndef|if\s+!defined|pragma\s+once)\b", stripped):
+            offset = line_end
+            continue
+        if re.match(r"#\s*define\s+\w+_H(?:PP)?\b", stripped, re.I):
+            offset = line_end
+            continue
+        return offset
+    return offset
+
+
+def _doc_comment_start(source: str, pos: int) -> int:
+    """从函数声明起点回退到紧贴着的文档注释第一行。"""
+    while pos > 0:
+        prev_start = source.rfind("\n", 0, pos - 1) + 1
+        line = source[prev_start:pos].strip()
+        if not line:
+            break
+        if line.startswith(("///", "//", "/*", "*", "*/")):
+            pos = prev_start
+            continue
+        break
+    return pos
+
+
+def _before_function_insert_offset(source: str, func_name: str) -> int:
+    """插到锚点函数原文档注释之前；找不到函数时返回 -1。"""
+    name_at = _first_function_definition_index(source, func_name)
+    if name_at < 0:
+        name_at = _definition_index(source, func_name)
+        if name_at >= 10 ** 9:
+            return -1
+    return _doc_comment_start(source, _declaration_cut_index(source, name_at))
+
+
+def _insert_source_block(source: str, offset: int, block: str) -> str:
+    """在 ``offset`` 插入一段文件级代码，并保证前后各有换行。"""
+    text = str(block or "").strip("\n")
+    if not text or offset < 0 or offset > len(source):
+        return source
+    prefix = "" if offset == 0 or source[:offset].endswith("\n") else "\n"
+    suffix = "\n" if offset < len(source) and source[offset] == "\n" else "\n\n"
+    return source[:offset] + prefix + text + suffix + source[offset:]
+
+
+def _apply_symbol_insertion_edit(
+    edit: Dict[str, Any],
+    code_roots: List[str],
+    report_dir: Optional[Path],
+    backup_original_sources: bool,
+    edit_id: str,
+) -> Dict[str, Any]:
+    """把独立的头部或函数前符号写进文件。"""
+    file_path = Path(str(edit.get("file") or "")).resolve()
+    placement = str(edit.get("placement") or "").strip()
+    code = str(edit.get("code") or "").strip()
+    record: Dict[str, Any] = {
+        "edit_id": edit_id,
+        "file": str(file_path),
+        "edit_type": "symbol_insertion",
+        "placement": placement,
+        "function_signature": str(edit.get("anchor_function") or ""),
+        "reason": str(edit.get("reason") or ""),
+        "status": "skipped",
+    }
+    if not _is_within_code_roots(file_path, code_roots):
+        record["error"] = "目标文件不在 code_root 范围内"
+        return record
+    if not file_path.is_file():
+        record["error"] = "目标文件不存在"
+        return record
+    if not code:
+        record["error"] = "symbol_insertion 代码为空"
+        return record
+    try:
+        original, file_encoding = _try_read_source_raw(file_path)
+    except (UnicodeDecodeError, LookupError, OSError):
+        record["error"] = "目标文件编码无法识别（非 UTF-8/GBK）"
+        return record
+    if placement == "head":
+        block = _filter_header_block(original, code, set())
+        offset = _import_area_insert_offset(original)
+    elif placement == "before_function":
+        block = _filter_body_block(original, code)
+        offset = _before_function_insert_offset(original, str(edit.get("anchor_function") or ""))
+    else:
+        record["error"] = f"不支持的 symbol_insertion placement: {placement}"
+        return record
+    if not block:
+        record["error"] = "符号已存在，无需修改"
+        return record
+    if offset < 0:
+        record["error"] = "找不到 symbol_insertion 的锚点函数"
+        return record
+    eol = _source_newline_style(original)
+    new_source = _convert_newlines(_insert_source_block(original, offset, block), eol)
+    try:
+        _write_text_raw(file_path, new_source, encoding=file_encoding)
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        _write_text_raw(file_path, new_source, encoding="utf-8")
+    if report_dir is not None and backup_original_sources:
+        backup_root = report_dir / "original_sources"
+        containing_root = _find_containing_code_root(file_path, code_roots)
+        if containing_root:
+            backup_path = backup_root / file_path.relative_to(containing_root)
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            if not backup_path.exists():
+                _write_text_raw(backup_path, original, encoding="utf-8")
+            record["backup_path"] = str(backup_path)
+    record["status"] = "applied"
+    record["replaced_preview"] = block
+    return record
+
+
+def _source_defines_function(source: str, func_name: str) -> bool:
+    """源码里是否有该函数的定义，而不是调用或赋值。"""
+    name = str(func_name or "").strip()
+    if not name:
+        return False
+    for match in re.finditer(rf"\b{re.escape(name)}\s*\(", source):
+        line_start = source.rfind("\n", 0, match.start()) + 1
+        prefix = source[line_start:match.start()].rstrip()
+        if not prefix:
+            prev_end = line_start - 1
+            prev_start = source.rfind("\n", 0, max(0, prev_end - 1)) + 1
+            prefix = source[prev_start:prev_end].strip()
+        if not prefix or prefix.endswith(("=", ",", "(", ">", ".", ":")):
+            continue
+        if ";" in prefix:
+            continue
+        rest = source[match.end():match.end() + 800]
+        brace = rest.find("{")
+        semi = rest.find(";")
+        if brace < 0 or (semi >= 0 and semi < brace):
+            continue
+        return True
+    return False
+
+
+def _resolve_session_read_path(raw: str, code_roots: List[str]) -> Optional[Path]:
+    """把账本里的绝对路径或相对 code root 的路径解析成真实文件。"""
+    text = str(raw or "").strip()
+    if not text or not code_roots:
+        return None
+    path = Path(text)
+    candidates = [path] if path.is_absolute() else [Path(root) / path for root in code_roots]
+    for candidate in candidates:
+        try:
+            if not candidate.is_file() or not _is_within_code_roots(candidate, code_roots):
+                continue
+            return candidate.resolve()
+        except OSError:
+            continue
+    return None
+
+
+_SOURCE_SESSION_TYPES = frozenset({"read_file", "function"})
+
+
+def _session_source_file_hints(context_session: Dict[str, Any]) -> List[str]:
+    """账本和已解析上下文里成功拿到的源码路径。"""
+    hints: List[str] = []
+    for item in context_session.get("request_ledger") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or item.get("kind") or "")
+        if kind not in _SOURCE_SESSION_TYPES:
+            continue
+        if str(item.get("status") or "") not in ("success", "ok"):
+            continue
+        text = str(item.get("file") or "").strip()
+        if text:
+            hints.append(text)
+    for rnd in context_session.get("rounds") or []:
+        if not isinstance(rnd, dict):
+            continue
+        for item in rnd.get("resolved_context") or []:
+            if not isinstance(item, dict) or not item.get("success"):
+                continue
+            request = item.get("request") if isinstance(item.get("request"), dict) else {}
+            kind = str(request.get("type") or item.get("type") or "")
+            if kind not in _SOURCE_SESSION_TYPES:
+                continue
+            text = str(item.get("file") or request.get("file") or "").strip()
+            if text:
+                hints.append(text)
+    return hints
+
+
+def _read_files_from_session(
+    context_session: Optional[Dict[str, Any]],
+    code_roots: List[str],
+) -> List[Path]:
+    """取出本轮成功读过或按函数定位到的、且落在 code root 内的源码路径。"""
+    if not isinstance(context_session, dict) or not code_roots:
+        return []
+    found: List[Path] = []
+    seen = set()
+    for raw in _session_source_file_hints(context_session):
+        resolved = _resolve_session_read_path(raw, code_roots)
+        if resolved is None or resolved in seen:
+            continue
+        seen.add(resolved)
+        found.append(resolved)
+    return found
+
+
+def _graph_has_read_file_candidates(code_context: Dict[str, Any]) -> bool:
+    """图节点是否来自已读源码补齐，而不是崩溃行定位。"""
+    graph = code_context.get("graph") if isinstance(code_context, dict) else {}
+    nodes = graph.get("nodes") if isinstance(graph, dict) else None
+    if not isinstance(nodes, list):
+        return False
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("origin") != "read_file":
+            continue
+        snippet = node.get("snippet")
+        if node.get("file") and node.get("signature") and isinstance(snippet, list) and snippet:
+            return True
+    return False
+
+
+def _candidate_node_from_defined_source(
+    path: Path,
+    source: str,
+    signature: str,
+) -> Optional[Dict[str, Any]]:
+    """从已读源码切出与签名对应的完整函数，不使用行窗兜底。"""
+    _updated, block = CodeFixer.replace_function_block(source, signature, "")
+    if not block or not _extracted_block_matches_signature(block, signature):
+        return None
+    lines = str(block).splitlines()
+    if len(lines) < 2:
+        return None
+    index = source.find(block)
+    start_line = source.count("\n", 0, index) + 1 if index >= 0 else 1
+    return {
+        "type": "function",
+        "file": str(path),
+        "signature": sanitize_function_signature(signature),
+        "snippet": lines,
+        "snippet_start_line": start_line,
+        "snippet_end_line": start_line + len(lines) - 1,
+        "origin": "read_file",
+    }
+
+
+_REPAIR_COMPLETION_SOURCE_BUDGET = 24000
+
+
+def _analysis_mentions_path(analysis_text: str, path: Path) -> bool:
+    """分析正文或 target_files 是否点到了这个源文件。"""
+    text = str(analysis_text or "")
+    if path.name in text or str(path) in text:
+        return True
+    return any(part and part in text for part in path.parts[-3:])
+
+
+def _select_repair_source_files(analysis_text: str, files: List[Path]) -> List[Path]:
+    """优先送分析点名的已读源码，控制补全请求的体积。"""
+    ranked = sorted(
+        files,
+        key=lambda path: (
+            0 if _analysis_mentions_path(analysis_text, path) else 1,
+            str(path),
+        ),
+    )
+    chosen: List[Path] = []
+    used = 0
+    for path in ranked:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        mentioned = _analysis_mentions_path(analysis_text, path)
+        if size > _REPAIR_COMPLETION_SOURCE_BUDGET and not mentioned:
+            continue
+        if used >= _REPAIR_COMPLETION_SOURCE_BUDGET and not mentioned:
+            break
+        chosen.append(path)
+        used += min(size, _REPAIR_COMPLETION_SOURCE_BUDGET)
+        if len(chosen) >= 4:
+            break
+    return chosen
+
+
+def _complete_missing_repair_code(
+    llm: Any,
+    analysis_text: str,
+    *,
+    context_session: Optional[Dict[str, Any]],
+    code_roots: List[str],
+) -> str:
+    """分析只有步骤说明时，补一次只产出完整函数的改码请求。"""
+    if llm is None or not hasattr(llm, "chat"):
+        return ""
+    files = _select_repair_source_files(
+        analysis_text,
+        _read_files_from_session(context_session, code_roots),
+    )
+    if not files:
+        return ""
+    source_parts: List[str] = []
+    for path in files:
+        try:
+            source, _encoding = _try_read_source_raw(path)
+        except Exception:
+            continue
+        clipped = source if len(source) <= 12000 else source[:12000]
+        source_parts.append(f"### {path.name}\n```\n{clipped}\n```")
+    if not source_parts:
+        return ""
+    advice = str(analysis_text or "")[-6000:]
+    prompt = (
+        "下面是崩溃分析，以及已经读过的源码。请只输出「修复代码」。\n"
+        "每个要修改的、源码中已经存在的函数，各给一个完整定义，放在独立围栏里。\n"
+        "`.m` / `.mm` 用 objc，`.c` 用 c，`.cpp` 用 cpp。\n"
+        "新增的文件级 static 和源码中没有的 helper，放在第一个被替换函数的同一围栏之前。\n"
+        "函数名必须是源码里已有的名字。可以把 `__attribute__((visibility(\"hidden\")))` "
+        "换成 `static void`。\n"
+        "若根因是信号上下文死锁，替换函数不得再调用挂起线程、ObjC 消息、malloc、"
+        "NSThread、callStackSymbols、callStackReturnAddresses。\n"
+        "崩溃 PC 从 ucontext 读取；地址范围在注册时算好；崩溃记录用预先打开的 fd 加 write。\n"
+        "只删掉挂起调用、把这些调用留在 handler 里，不能当作最终修复。\n"
+        "禁止省略号和步骤说明。不要输出解释。\n\n"
+        "## 分析\n"
+        f"{advice}\n\n"
+        "## 已读源码\n"
+        + "\n\n".join(source_parts)
+    )
+    call_kwargs: Dict[str, Any] = {"temperature": 0, "max_tokens": 16384}
+    if getattr(llm, "supports_effort", False):
+        # 只要求输出函数，思考型模型默认思考量会耗尽输出预算导致正文为空。
+        call_kwargs["effort"] = "low"
+    try:
+        response = llm.chat([{"role": "user", "content": prompt}], **call_kwargs)
+    except Exception as exc:
+        logger.warning("[CodeFixer] 补全修复代码失败: %s", exc)
+        return ""
+    content = str(getattr(response, "content", "") or "").strip()
+    if not content:
+        return ""
+    if not _extract_required_function_names_from_analysis(content):
+        return ""
+    return "## 修复代码\n\n" + content
+
+
+def promote_read_file_function_candidates(
+    code_context: Dict[str, Any],
+    *,
+    analysis_text: str,
+    context_session: Optional[Dict[str, Any]],
+    code_roots: List[str],
+) -> List[Dict[str, Any]]:
+    """崩溃行没有符号时，用分析点名且已经读过的函数补候选节点。
+
+    watchdog/ANR 流程不跑 code_content_provider，code_context 会是空的。
+    这里收 request_ledger 里读成功或按 function 定位到的文件，并且源码里真有该函数定义。
+    已有证据摘要明确禁止自动改码时，不改写该结论。
+    """
+    if not isinstance(code_context, dict):
+        return []
+    graph = code_context.get("graph")
+    if not isinstance(graph, dict):
+        graph = {}
+        code_context["graph"] = graph
+    existing = graph.get("nodes")
+    if isinstance(existing, list) and any(
+        isinstance(node, dict) and isinstance(node.get("snippet"), list) and node.get("snippet")
+        for node in existing
+    ):
+        return []
+    names = _extract_required_function_names_from_analysis(analysis_text)
+    files = _read_files_from_session(context_session, code_roots)
+    if not names or not files:
+        return []
+    built: List[Dict[str, Any]] = []
+    seen = set()
+    for path in files:
+        try:
+            source, _encoding = _try_read_source_raw(path)
+        except Exception:
+            continue
+        for name in names:
+            simple = _extract_simple_function_name(name)
+            if not simple or not _source_defines_function(source, simple):
+                continue
+            key = (str(path), simple)
+            if key in seen:
+                continue
+            signature = name if "(" in str(name) else f"{simple}()"
+            node = _candidate_node_from_defined_source(path, source, signature)
+            if not node:
+                continue
+            seen.add(key)
+            built.append(node)
+    if not built:
+        return []
+    graph["nodes"] = built
+    summary = graph.get("evidence_summary")
+    if not isinstance(summary, dict):
+        graph["evidence_summary"] = {
+            "auto_fix_allowed": True,
+            "auto_fix_block_reason": None,
+            "allow_reason": "read_file_cited_function",
+        }
+    return built
+
+
 def _extract_code_blocks(analysis_text: str) -> List[str]:
-    """从 analysis_text 中提取 C++ 代码围栏块；若无围栏则尝试后备提取。"""
+    """从 analysis_text 中提取 C/C++/ObjC 代码围栏；若无围栏则尝试后备提取。"""
     blocks: List[str] = []
     lines = str(analysis_text or "").splitlines()
     in_block = False
@@ -1757,7 +2677,7 @@ def _extract_code_blocks(analysis_text: str) -> List[str]:
     for line in lines:
         stripped = line.strip()
         if not in_block:
-            if re.match(r"^```(?:cpp|c\+\+|cc|cxx)?\s*$", stripped, re.I):
+            if _CODE_FENCE_RE.match(stripped):
                 in_block = True
                 cur = []
             continue
@@ -1777,6 +2697,48 @@ def _extract_code_blocks(analysis_text: str) -> List[str]:
     if not blocks:
         blocks = _extract_unfenced_code_blocks(analysis_text)
     return blocks
+
+
+_FILE_HINT_RE = re.compile(r"([A-Za-z_][\w+\-]*\.(?:mm|m|cc|cpp|cxx|c|hpp|hh|h|java|kt|swift|ets|ts))\b")
+
+
+def _extract_code_blocks_with_file_hint(analysis_text: str) -> List[Tuple[str, str]]:
+    """提取代码围栏及其所属文件名；文件名取围栏前最近一个带文件名的 Markdown 标题。"""
+    result: List[Tuple[str, str]] = []
+    hint = ""
+    in_block = False
+    cur: List[str] = []
+    for line in str(analysis_text or "").splitlines():
+        stripped = line.strip()
+        if not in_block:
+            if stripped.startswith("#"):
+                match = _FILE_HINT_RE.search(stripped)
+                hint = match.group(1) if match else ""
+                continue
+            match = _FILE_HINT_RE.search(stripped)
+            if match:
+                rest = stripped.replace(match.group(1), "")
+                rest = re.sub(r"[`*_:：\s]|文件|修改|路径", "", rest)
+                if not rest:
+                    hint = match.group(1)
+                    continue
+            if _CODE_FENCE_RE.match(stripped):
+                in_block = True
+                cur = []
+            continue
+        if stripped.startswith("```"):
+            block = "\n".join(cur).strip("\n")
+            if block:
+                result.append((hint, block))
+            in_block = False
+            cur = []
+            continue
+        cur.append(line)
+    if in_block and cur:
+        block = "\n".join(cur).strip("\n")
+        if block:
+            result.append((hint, block))
+    return result
 
 
 def _extract_unfenced_code_blocks(analysis_text: str) -> List[str]:
@@ -1849,6 +2811,9 @@ def _extract_function_block_from_code(code_text: str, start_index: int) -> Optio
         line_start = 0
     else:
         line_start += 1
+    # 匹配起点可能落在调用语句的分号之后，块又从行首截取，会把 foo(x); 加后面的 if {...} 当成 foo 的定义。
+    if ";" in code_text[line_start:brace_index]:
+        return None
     prefix_start = _find_template_prefix_start(code_text, line_start)
     if prefix_start is not None:
         line_start = prefix_start
@@ -1905,7 +2870,7 @@ def _find_template_prefix_start(code_text: str, line_start: int) -> Optional[int
 
 def _extract_block_signature(block: str) -> str:
     """从函数代码块提取函数签名文本（到形参列表结束及尾部限定符，空白已规范化）。"""
-    text = str(block or "").strip()
+    text = _strip_leading_attributes(str(block or "").strip())
     if not text:
         return ""
     open_idx = _parameter_list_open_index(text)
@@ -1962,6 +2927,11 @@ def _replacement_signature_compatible(target_signature: str, replacement_code: s
     ``T*`` vs ``T *``、换行折行等格式差异一律视为兼容。参数类型被改写时不在此拦截
     （避免模型排版导致误拒）；跨类同名仍拒绝。
     """
+    # 新符号可以排在目标函数前面；只要替换文本里有目标函数的定义即可。
+    target_simple = _extract_simple_function_name(target_signature)
+    target_owner, _target_func = _extract_owner_and_name(target_signature)
+    if target_simple and not target_owner and _source_defines_function(replacement_code, target_simple):
+        return True
     block_sig = _extract_block_signature(replacement_code)
     if not block_sig:
         return False
@@ -2069,9 +3039,9 @@ def _extract_replacement_from_analysis(
             pattern = re.compile(rf"\b{re.escape(simple_name)}\s*\(", re.M)
             for m in pattern.finditer(code):
                 block = _extract_function_block_from_code(code, m.start())
-                if (
-                    block
-                    and _extract_simple_function_name(block) == simple_name
+                if block and (
+                    _extract_simple_function_name(block) == simple_name
+                    or _source_defines_function(block, simple_name)
                 ):
                     return sanitize_replacement_code(block, target_signature)
     return None
@@ -2585,7 +3555,8 @@ class CodeFixer:
             for code in blocks:
                 # class/struct 骨架（常含 // ... 占位）不能整块替换；跳过该围栏，
                 # 继续扫描后续独立的 Class::method 完整函数围栏。
-                if re.search(r"^\s*(?:class|struct)\s+\w+", code, re.MULTILINE):
+                # 函数体内的 struct sigaction 不算骨架。
+                if _is_type_skeleton_block(code):
                     continue
                 # 尝试找到完整的函数定义
                 func_pattern = re.compile(
@@ -2701,6 +3672,36 @@ class CodeFixer:
                 error="缺少 analysis/code_context，无法应用 AI 修复",
             )
         candidate_nodes = extract_candidate_nodes(code_context)
+        session = result.get("context_session")
+        session_dict = session if isinstance(session, dict) else None
+        if not candidate_nodes:
+            promoted = promote_read_file_function_candidates(
+                code_context,
+                analysis_text=analysis_text,
+                context_session=session_dict,
+                code_roots=list(code_roots or []),
+            )
+            if promoted:
+                logger.info("[CodeFixer] 从已读源码补齐候选函数 %s 个", len(promoted))
+            candidate_nodes = extract_candidate_nodes(code_context)
+        if not candidate_nodes:
+            completed = _complete_missing_repair_code(
+                self._llm,
+                analysis_text,
+                context_session=session_dict,
+                code_roots=list(code_roots or []),
+            )
+            if completed:
+                analysis_text = analysis_text.rstrip() + "\n\n" + completed
+                result["analysis"] = analysis_text
+                logger.info("[CodeFixer] 分析未给出完整函数，已补一次修复代码")
+                promote_read_file_function_candidates(
+                    code_context,
+                    analysis_text=analysis_text,
+                    context_session=session_dict,
+                    code_roots=list(code_roots or []),
+                )
+                candidate_nodes = extract_candidate_nodes(code_context)
         if not candidate_nodes:
             return FixResult(
                 success=False,
@@ -2760,6 +3761,7 @@ class CodeFixer:
                     schema_violations=schema_violations,
                 )
             fix_plan = repair_plan.to_dict()
+            _attach_missing_symbols(fix_plan, analysis_text)
             missing_required = (
                 extract_out.get("missing_required", [])
                 if isinstance(extract_out.get("missing_required"), list)
@@ -3024,6 +4026,12 @@ class CodeFixer:
                 applied.append(record)
                 continue
 
+            if edit_type == "symbol_insertion":
+                applied.append(_apply_symbol_insertion_edit(
+                    edit, code_roots, report_dir, backup_original_sources, edit_id,
+                ))
+                continue
+
             # ========== 函数替换（默认类型）==========
             file_path = Path(str(edit.get("file", ""))).resolve()
             signature = sanitize_function_signature(str(edit.get("function_signature", "")))
@@ -3188,6 +4196,9 @@ class CodeFixer:
             eol = _source_newline_style(original)
             replacement_code = _adapt_replacement_indent(replacement_code, old_block or "")
             replacement_code = _align_leading_newline(old_block or "", replacement_code)
+            simple_name = _extract_simple_function_name(signature)
+            if simple_name and old_block and _source_defines_function(replacement_code, simple_name):
+                old_block = _expand_block_to_declaration(original, old_block, simple_name)
             replace_at = original.find(old_block or "")
             if replace_at >= 0:
                 replacement_code = _ensure_newline_before_replacement(
@@ -3305,6 +4316,12 @@ class CodeFixer:
                 sig_index = idx_candidates[0]
         if sig_index < 0:
             return source, None
+        # 签名写成 foo() 而源码定义是 foo(void) 时，精确匹配会落到调用语句上，改用真正的定义位置。
+        simple_name = _extract_simple_function_name(signature)
+        if simple_name and not _is_function_definition_at(source, sig_index):
+            definition_at = _first_function_definition_index(source, simple_name)
+            if definition_at >= 0:
+                sig_index = definition_at
         # 最终验证：确保匹配位置是函数定义，而非初始化列表中的成员初始化
         # 初始化列表特征：同行前面含 ':' 或 ',' 后跟若干 ident(expr) 模式
         _init_line_start = source.rfind("\n", 0, sig_index)
@@ -3315,18 +4332,25 @@ class CodeFixer:
             or re.search(r"[:,]\s*\w+\s*\([^)]*\)\s*,?\s*$", _init_prefix)
         ):
             return source, None
-        # 向前回退到函数声明的起始位置（包含返回值类型）
-        line_start = source.rfind("\n", 0, sig_index)
-        line_start = line_start + 1 if line_start >= 0 else 0
-        prefix_before_sig = source[line_start:sig_index]
-        if prefix_before_sig.strip() and ";" not in prefix_before_sig:
-            prefix_text = prefix_before_sig.strip()
-            replacement_stripped = replacement_code.lstrip()
-            if replacement_stripped.startswith(prefix_text):
-                first_non_ws = line_start
-                while first_non_ws < sig_index and source[first_non_ws] in (" ", "\t"):
-                    first_non_ws += 1
-                sig_index = first_non_ws
+        # 新代码自带完整定义时，切点退到声明起点，避免留下原来的属性宏和返回类型。
+        func_name_for_cut = _extract_simple_function_name(signature)
+        replacement_defines = bool(
+            func_name_for_cut and _source_defines_function(replacement_code, func_name_for_cut)
+        )
+        if replacement_defines:
+            sig_index = _declaration_cut_index(source, sig_index)
+        else:
+            line_start = source.rfind("\n", 0, sig_index)
+            line_start = line_start + 1 if line_start >= 0 else 0
+            prefix_before_sig = source[line_start:sig_index]
+            if prefix_before_sig.strip() and ";" not in prefix_before_sig:
+                prefix_text = prefix_before_sig.strip()
+                replacement_stripped = replacement_code.lstrip()
+                if replacement_stripped.startswith(prefix_text):
+                    first_non_ws = line_start
+                    while first_non_ws < sig_index and source[first_non_ws] in (" ", "\t"):
+                        first_non_ws += 1
+                    sig_index = first_non_ws
         brace_start = source.find("{", sig_index)
         if brace_start < 0:
             return source, None

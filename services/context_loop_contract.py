@@ -19,6 +19,7 @@ __all__ = [
     "parse_agent_decision",
     "build_round0_must_provide_lines",
     "build_round0_output_format_lines",
+    "build_repair_code_requirement_lines",
     "build_round_task_section",
     "build_investigation_state_section",
     "build_json_format_reminder",
@@ -69,11 +70,36 @@ def build_round0_must_provide_lines(*, agent_loop: str) -> List[str]:
     return lines
 
 
-def build_round0_output_format_lines(*, agent_loop: str) -> List[str]:
+def build_repair_code_requirement_lines() -> List[str]:
+    """自动改码时，模型必须给出可落盘的完整函数。"""
+    return [
+        "### 修复代码（自动改码时必填）",
+        "若末尾 JSON 的 `next_action.kind` 为 `propose_fix`，必须另起「修复代码」。",
+        "`propose_fix` 只打开改码阶段。这一阶段只写入「修复代码」里的完整函数定义。",
+        "只写 `propose_fix` 或只写修复步骤，不会写文件，也不会创建评审。",
+        "每个要修改的、源码中已经存在的函数，各给一个完整定义（签名加完整函数体），放在独立代码围栏里。",
+        "每个围栏前必须单独一行写源文件名，例如：### `BMKSignalHandler.m`；两个文件不要放进同一个围栏。",
+        "围栏语言与源文件一致：`.m` / `.mm` 用 `objc`，`.c` 用 `c`，`.cpp` / `.cc` / `.h` 用 `cpp`。",
+        "新增的文件级 `static` 变量和源码中尚不存在的 helper，写在同一围栏内、放在第一个被替换函数之前。",
+        "函数名必须与源码中已有定义一致。可以把 `__attribute__((visibility(\"hidden\")))` 与原来的返回类型",
+        "改成 `static void` 这类新签名；写入时会从旧声明头整段替换，不要在新函数前保留旧的属性行。",
+        "若根因是信号上下文中的死锁或卡死，替换函数不得再调用分析点名的非 async-signal-safe 接口：",
+        "挂起其他线程、ObjC 消息、malloc、NSThread、callStackSymbols、callStackReturnAddresses。",
+        "崩溃 PC 从 ucontext 读取；地址范围在注册时算好；崩溃记录用预先打开的 fd 加 write。",
+        "只删掉挂起调用、把上述调用留在信号 handler 里，不能当作最终修复。",
+        "禁止用 `...`、`// ...`、`省略`、`其他逻辑保持不变` 代替函数体。修复建议里的步骤说明不会被写入文件。",
+    ]
+
+
+def build_round0_output_format_lines(
+    *,
+    agent_loop: str,
+    apply_ai_fixes: bool = False,
+) -> List[str]:
     """Lines under '## 输出格式' for context_loop mode."""
     if agent_loop != "context_loop":
         return []
-    return [
+    lines = [
         "### 情况 A：还需要 Agent 补充上下文时",
         "只输出以下内容，不要输出最终结论、修复方案或代码：",
         "",
@@ -159,17 +185,50 @@ def build_round0_output_format_lines(*, agent_loop: str) -> List[str]:
         "```",
         "",
         "### 情况 B：不再需要 Agent 补充上下文时",
-        "输出完整崩溃分析报告，并在末尾输出 `agent_can_fetch_more=false` JSON：",
-        "若证据充分且希望进入自动改码，可额外附带 "
-        '`"next_action": {"kind": "propose_fix"}`（Markdown 示例代码不能代替该字段）。',
-        "",
+        "输出完整崩溃分析报告，并在末尾输出 `agent_can_fetch_more=false` JSON。",
+        "证据充分且要自动改码时，JSON 增加 "
+        '`"next_action": {"kind": "propose_fix"}`。',
+        "`propose_fix` 只打开改码阶段，不能代替完整函数。"
+        "没有完整函数就不会写文件，也不会创建评审。",
     ]
+    if apply_ai_fixes:
+        lines.append("")
+        lines.extend(build_repair_code_requirement_lines())
+    lines.append("")
+    return lines
+
+
+def _append_apply_fix_task_lines(lines: List[str]) -> None:
+    """把自动改码的完整函数要求放到本轮任务末尾。"""
+    lines.append(
+        "- 若输出最终分析且 `next_action.kind` 为 `propose_fix`，必须写「修复代码」。"
+    )
+    lines.append(
+        "- 每个要改的已有函数各给一个完整定义，围栏与源文件一致"
+        "（`.m` 用 `objc`，`.c` 用 `c`，`.cpp` 用 `cpp`）。"
+        "每个围栏前必须有文件名标题，例如：### `BMKSignalHandler.m`。"
+    )
+    lines.append(
+        "- 新增文件级 static 和源码中没有的 helper 放在同一围栏、第一个被替换函数之前。"
+    )
+    lines.append(
+        "- 函数名必须是源码里已有的名字。"
+        " `__attribute__((visibility(\"hidden\")))` 可以换成 `static void`，写入时从旧声明头整段替换。"
+    )
+    lines.append("- 只写修复步骤不会写文件，也不会创建评审。")
+    lines.append(
+        "- 信号上下文死锁不得保留 ObjC、malloc、挂起线程和 callStackSymbols。"
+    )
+    lines.append(
+        "- 崩溃 PC 从 ucontext 读取，记录用预先打开的 fd 和 write；只删 suspend 不能当作最终修复。"
+    )
 
 
 def build_round_task_section(
     *,
     is_final_round: bool,
     early_final_reason: Optional[str] = None,
+    apply_ai_fixes: bool = False,
 ) -> str:
     """Per-round task block injected before the crash analysis task section."""
     lines: List[str] = ["## 本轮任务"]
@@ -193,9 +252,9 @@ def build_round_task_section(
             )
             lines.append("- 本轮必须直接输出最终分析；不得再请求 Agent 补充上下文。")
             lines.append(
-                "- Markdown 中的「修复建议/示例代码」只供人阅读；若认为可自动改码，请在末尾 JSON 中增加 "
+                "- 若要自动改码，末尾 JSON 增加 "
                 '`"next_action": {"kind": "propose_fix", "reason": "..."}`，'
-                "不要把示例代码块当成已经完成的补丁协议。"
+                "并在「修复代码」给出完整函数定义。只写步骤不会写文件，也不会创建评审。"
             )
         else:
             lines.append("- 当前已经达到允许的最大多轮次数，本轮必须输出最终分析。")
@@ -223,6 +282,8 @@ def build_round_task_section(
             "- 只有当「其它代码上下文」中的新增源码直接引出新的高价值函数、字段或引用时，"
             "才继续提出下一轮 `context_requests`。"
         )
+    if apply_ai_fixes:
+        _append_apply_fix_task_lines(lines)
     return "\n".join(lines)
 
 
@@ -267,24 +328,38 @@ def build_investigation_state_section(state: Optional[Dict[str, Any]] = None) ->
     return "\n".join(lines)
 
 
-def build_json_format_reminder(*, is_final_round: bool = False) -> str:
+def build_json_format_reminder(
+    *,
+    is_final_round: bool = False,
+    apply_ai_fixes: bool = False,
+) -> str:
     """Compact JSON contract reminder appended to every loop-round prompt."""
     if is_final_round:
-        return (
+        text = (
             "## 输出契约（续轮提醒）\n"
             "本轮为最终轮：末尾必须输出 "
             '`{"agent_can_fetch_more": false, "context_requests": []}`。'
         )
-    return (
-        "## 输出契约（续轮提醒）\n"
-        "若仍需 Agent 补充上下文，末尾输出 JSON（`agent_can_fetch_more` 必须为 boolean）：\n"
-        "```json\n"
-        '{"agent_can_fetch_more": true, "context_requests": [{"type": "function", '
-        '"symbol": "Class::Method", "reason": "...", "priority": "high"}]}\n'
-        "```\n"
-        "若证据已足够，输出完整分析并在末尾输出 "
-        '`{"agent_can_fetch_more": false, "context_requests": []}`。'
-    )
+    else:
+        text = (
+            "## 输出契约（续轮提醒）\n"
+            "若仍需 Agent 补充上下文，末尾输出 JSON（`agent_can_fetch_more` 必须为 boolean）：\n"
+            "```json\n"
+            '{"agent_can_fetch_more": true, "context_requests": [{"type": "function", '
+            '"symbol": "Class::Method", "reason": "...", "priority": "high"}]}\n'
+            "```\n"
+            "若证据已足够，输出完整分析并在末尾输出 "
+            '`{"agent_can_fetch_more": false, "context_requests": []}`。'
+        )
+    if apply_ai_fixes:
+        text += (
+            "\n若 `next_action.kind` 为 `propose_fix`，正文必须有「修复代码」："
+            "每个待改的已有函数一个完整定义，围栏与源文件一致（`.m` 用 objc）。"
+            "没有完整函数就不会写文件，也不会创建评审。"
+            "信号上下文死锁不得保留 ObjC、malloc、挂起线程和 callStackSymbols；"
+            "崩溃记录用预先打开的 fd 和 write。"
+        )
+    return text
 
 
 def prompt_has_json_contract(prompt: str) -> bool:
@@ -353,6 +428,7 @@ def assemble_loop_prompt(
     early_final_reason: Optional[str] = None,
     include_json_reminder: bool = True,
     investigation_state: Optional[Dict[str, Any]] = None,
+    apply_ai_fixes: bool = False,
 ) -> Dict[str, Any]:
     """Assemble a context-loop follow-up prompt from base prompt + evidence + task + reminder."""
     extra_md = ""
@@ -367,13 +443,20 @@ def assemble_loop_prompt(
     task_section = build_round_task_section(
         is_final_round=is_final_round,
         early_final_reason=early_final_reason,
+        apply_ai_fixes=apply_ai_fixes,
     )
     body = _append_section_before_markers(body, task_section, ("# 崩溃分析任务", "## 本轮任务"))
     if include_json_reminder and not prompt_has_json_contract(body):
-        reminder = build_json_format_reminder(is_final_round=is_final_round)
+        reminder = build_json_format_reminder(
+            is_final_round=is_final_round,
+            apply_ai_fixes=apply_ai_fixes,
+        )
         body = _append_section_before_markers(body, reminder, ("# 崩溃分析任务", "## 本轮任务", "## 输出契约"))
     elif include_json_reminder:
-        reminder = build_json_format_reminder(is_final_round=is_final_round)
+        reminder = build_json_format_reminder(
+            is_final_round=is_final_round,
+            apply_ai_fixes=apply_ai_fixes,
+        )
         body = body.rstrip() + "\n\n" + reminder
     return {
         "content": body,

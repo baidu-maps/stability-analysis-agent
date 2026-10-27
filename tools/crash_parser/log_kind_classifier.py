@@ -53,7 +53,16 @@ _CRASH_SIGNAL_RE = re.compile(
 
 _JAVA_FATAL_RE = re.compile(r"FATAL\s+EXCEPTION", re.IGNORECASE)
 _APPFREEZE_RE = re.compile(r"appfreeze|AppFreeze", re.IGNORECASE)
-_WATCHDOG_RE = re.compile(r"\bwatchdog\b|RBSAssertionReliability", re.IGNORECASE)
+_WATCHDOG_RE = re.compile(
+    r"\bwatchdog\b|WatchdogEvent\s*:|Failed to terminate gracefully|"
+    r"RBSAssertionReliability|Namespace\s+FRONTBOARD",
+    re.IGNORECASE,
+)
+# SIGKILL / EXC_CRASH (SIGKILL) 本身就是看门狗的杀进程手段，不是另一次内存访问崩溃。
+_FAULTING_SIGNAL_RE = re.compile(
+    r"SIG(?:SEGV|ABRT|BUS|ILL|FPE|TRAP)|EXC_BAD_ACCESS|Fatal\s+signal",
+    re.IGNORECASE,
+)
 _ANR_KW_RE = re.compile(r"\bANR\b|am_anr(?:_info)?\b", re.IGNORECASE)
 
 # 强 OOM 杀进程 / 明确 OOM 异常
@@ -172,6 +181,9 @@ def classify_log_kind(content: str) -> LogKindResult:
             pass
 
     if anr_family and has_crash_signal:
+        if family_kind == LOG_KIND_WATCHDOG and not _FAULTING_SIGNAL_RE.search(head):
+            reasons.append("sigkill_is_watchdog_termination")
+            return LogKindResult(LOG_KIND_WATCHDOG, family_conf, reasons)
         reasons.append("crash_signal_with_anr_family")
         return LogKindResult(LOG_KIND_MIXED_ANR_CRASH, min(0.95, family_conf + 0.05), reasons)
 

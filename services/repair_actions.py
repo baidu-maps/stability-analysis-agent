@@ -105,7 +105,9 @@ def changed_files_from_applied_result(applied: Optional[Dict[str, Any]]) -> List
     return [
         str(item.get("file"))
         for item in rows
-        if isinstance(item, dict) and item.get("status") == "applied" and item.get("file")
+        if isinstance(item, dict)
+        and item.get("file")
+        and str(item.get("status") or "applied") == "applied"
     ]
 
 

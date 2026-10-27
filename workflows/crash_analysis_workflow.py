@@ -3951,10 +3951,14 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     "- 只有输出 `agent_can_fetch_more=false` 时，才允许输出完整分析报告和修复或排查建议。"
                 )
                 lines.append(
-                    "- Markdown「修复代码」示例只供人阅读；若希望自动写码，须在 JSON 中声明 "
+                    "- 若希望自动写码，须在 JSON 中声明 "
                     '`"next_action": {"kind": "propose_fix"}`，'
-                    "并由后续改码管道生成可应用编辑（示例代码块不等于已改码）。"
+                    "并在「修复代码」给出完整函数定义。示例代码不会被自动扩写成补丁。"
                 )
+                if isinstance(problem, dict) and problem.get("apply_ai_fixes"):
+                    from services.context_loop_contract import build_repair_code_requirement_lines
+
+                    lines.extend(build_repair_code_requirement_lines())
             lines.append(
                 "- 当前是偏分析模式：不强制输出修复代码；"
                 "证据不足时只给分析方法、排查路径和人工确认点；"

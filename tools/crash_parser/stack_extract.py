@@ -33,6 +33,84 @@ from tools.crash_parser.types import StackFrame
 
 logger = logging.getLogger(__name__)
 
+_APPLE_SYSTEM_BASENAMES = {
+    "dyld",
+    "corefoundation",
+    "foundation",
+    "uikitcore",
+    "cfnetwork",
+    "graphicsservices",
+    "quartzcore",
+    "coregraphics",
+    "javascriptcore",
+    "coretext",
+    "security",
+    "libobjc.a.dylib",
+    "libobjcmsgsend.dylib",
+    "libdispatch.dylib",
+    "libdyld.dylib",
+}
+
+
+def _classify_library(module: Optional[str]) -> str:
+    """把栈帧模块标成 system / app / unknown。"""
+    if not module:
+        return "unknown"
+    name = module.strip()
+    base = name
+    if ".so." in base:
+        base = base.split(".so.")[0] + ".so"
+    base_lower = base.lower()
+
+    system_prefixes = (
+        "libc.so", "libm.so", "libstdc++", "libdl.so",
+        "libunwind.so", "liblog.so", "ld-musl-aarch64.so",
+        "libsqlite.so",
+        "libsystem_", "libobjc", "libdispatch", "libdyld", "libswift",
+    )
+    system_exact = {
+        "ld-musl-aarch64.so.1",
+        "libffrt.so",
+        "libeventhandler.z.so",
+        "libhicollie.z.so",
+        "libipc_core.z.so",
+        "libipc_common.z.so",
+        "libhdc_register.z.so",
+        "libappspawn_ace.z.so",
+        "appspawn",
+    }
+    platform_exact = {
+        "libark_jsruntime.so",
+        "libace_napi.z.so",
+    }
+
+    if (
+        base_lower.startswith(system_prefixes)
+        or name in system_exact
+        or base in system_exact
+        or base_lower in _APPLE_SYSTEM_BASENAMES
+    ):
+        return "system"
+    if name in platform_exact or base in platform_exact:
+        return "system"
+    return "app"
+
+
+def _frame_layer_language(function: Optional[str]) -> Tuple[str, str]:
+    """ObjC selector 与 objc_* 运行时标 objc，其余 native/cpp。"""
+    text = (function or "").strip()
+    if "-[" in text or "+[" in text:
+        return "objc", "objc"
+    lowered = text.lower()
+    if (
+        lowered.startswith("objc_")
+        or "_objc_" in lowered
+        or lowered in {"uiapplicationmain", "gseventrunmodal"}
+    ):
+        return "objc", "objc"
+    return "native", "cpp"
+
+
 def _extract_frames_for_crash_segment(
     scope_content: str,
     debug: bool,
@@ -77,47 +155,6 @@ def extract_stack_frames(
 
     if debug:
         logger.info("开始提取堆栈帧...")
-
-    def _classify_library(module: Optional[str]) -> str:
-        if not module:
-            return "unknown"
-        name = module.strip()
-        base = name
-        if ".so." in base:
-            base = base.split(".so.")[0] + ".so"
-        base_lower = base.lower()
-
-        system_prefixes = (
-            "libc.so", "libm.so", "libstdc++", "libdl.so",
-            "libunwind.so", "liblog.so", "ld-musl-aarch64.so",
-            "libsqlite.so",
-        )
-        system_exact = {
-            "ld-musl-aarch64.so.1",
-            "libffrt.so",
-            "libeventhandler.z.so",
-            "libhicollie.z.so",
-            "libipc_core.z.so",
-            "libipc_common.z.so",
-            "libhdc_register.z.so",
-            "libappspawn_ace.z.so",
-            "appspawn",
-        }
-        platform_exact = {
-            "libark_jsruntime.so",
-            "libace_napi.z.so",
-        }
-
-        if (
-            base_lower.startswith("libsystem_")
-            or base_lower.startswith(system_prefixes)
-            or name in system_exact
-            or base in system_exact
-        ):
-            return "system"
-        if name in platform_exact or base in platform_exact:
-            return "system"
-        return "app"
 
     def _extract_module_name(module_path: str) -> str:
         """
@@ -260,12 +297,7 @@ def extract_stack_frames(
                 module, address, function, offset, frame_num = pre_parsed
                 if function and isinstance(function, str) and re.fullmatch(r"0x[0-9a-fA-F]+", function.strip()):
                     function = None
-                if function and ("-[" in function or "+[" in function):
-                    layer = "objc"
-                    language = "objc"
-                else:
-                    layer = "native"
-                    language = "cpp"
+                layer, language = _frame_layer_language(function)
                 stack_frames.append(StackFrame(
                     frame_number=frame_num,
                     address=address or "",
@@ -293,13 +325,8 @@ def extract_stack_frames(
                 # 其中「0x18afca000」是 image base，不是函数名。为避免污染语义，将其归一化为 None。
                 if function and isinstance(function, str) and re.fullmatch(r"0x[0-9a-fA-F]+", function.strip()):
                     function = None
-                # 仅 ObjC selector（-[Class sel] / +[Class sel]）标 objc；Last Exception 也可能是 C++/系统库
-                if function and ("-[" in function or "+[" in function):
-                    layer = "objc"
-                    language = "objc"
-                else:
-                    layer = "native"
-                    language = "cpp"
+                # ObjC selector 与 objc_* 运行时标 objc；其余系统 C 帧仍是 native/cpp
+                layer, language = _frame_layer_language(function)
                 stack_frames.append(StackFrame(
                     frame_number=len(stack_frames),
                     address=address or "",
@@ -319,12 +346,7 @@ def extract_stack_frames(
         if unnumbered:
             try:
                 module, address, function, offset = unnumbered
-                if function and ("-[" in function or "+[" in function):
-                    layer = "objc"
-                    language = "objc"
-                else:
-                    layer = "native"
-                    language = "cpp"
+                layer, language = _frame_layer_language(function)
                 stack_frames.append(StackFrame(
                     frame_number=len(stack_frames),
                     address=address or "",
