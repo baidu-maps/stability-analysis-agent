@@ -114,12 +114,18 @@ def collect_workspace_diff(workspace: IsolatedCodeWorkspace) -> Dict[str, object
     changed_contents: Dict[str, str] = {}
     for item in workspace.repositories:
         nested = _nested_worktree_paths(item, workspace.repositories)
+        if nested and _worktree_is_submodule_container(item.worktree, nested):
+            continue
         # Preserve the two-column porcelain status prefix.  Using the common
         # stripped Git helper here removes the leading space for modifications
         # and shifts the parsed path by one character.
         status_proc = subprocess.run(
             ["git", "-C", str(item.worktree), "status", "--porcelain=v1", "--untracked-files=all"],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
         )
         if status_proc.returncode != 0:
             raise WorktreeIsolationError((status_proc.stderr or status_proc.stdout or "git status failed").strip())
@@ -136,7 +142,11 @@ def collect_workspace_diff(workspace: IsolatedCodeWorkspace) -> Dict[str, object
                 changed_contents[str(path)] = path.read_text(encoding="utf-8", errors="replace")
             old = subprocess.run(
                 ["git", "-C", str(item.worktree), "show", f"{item.base_commit}:{relative}"],
-                capture_output=True, text=True, check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
             )
             if old.returncode == 0:
                 original_contents[str(path)] = old.stdout
@@ -198,6 +208,33 @@ def head_commits_for_code_roots(code_roots: Sequence[str]) -> List[str]:
     )
 
 
+def collect_needed_source_paths(result: object) -> List[str]:
+    """从分析图和上下文台账收集即将改码的源文件，供隔离 worktree 做精简检出。"""
+    payload = result if isinstance(result, dict) else {}
+    paths: List[str] = []
+    seen = set()
+
+    def _add(raw: object) -> None:
+        text = str(raw or "").strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        paths.append(text)
+
+    code_context = payload.get("code_context") if isinstance(payload.get("code_context"), dict) else {}
+    graph = code_context.get("graph") if isinstance(code_context.get("graph"), dict) else {}
+    for node in graph.get("nodes") or []:
+        if isinstance(node, dict):
+            _add(node.get("file"))
+    summary = code_context.get("crash_summary") if isinstance(code_context.get("crash_summary"), dict) else {}
+    _add(summary.get("file") or summary.get("resolved_file"))
+    session = payload.get("context_session") if isinstance(payload.get("context_session"), dict) else {}
+    for item in session.get("request_ledger") or []:
+        if isinstance(item, dict):
+            _add(item.get("file"))
+    return paths
+
+
 def default_worktree_root() -> Path:
     """Root for per-run isolated fix worktrees.
 
@@ -216,6 +253,8 @@ def _run_git(repository: Path, args: Sequence[str]) -> str:
         ["git", "-C", str(repository), *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if proc.returncode != 0:
@@ -293,6 +332,18 @@ def _attach_checked_out_submodules(
         destination.parent.mkdir(parents=True, exist_ok=True)
         _run_git(submodule, ["worktree", "add", "--detach", str(destination), commit])
         created.append(RepositoryWorktree(submodule, destination, commit))
+
+
+def _worktree_is_submodule_container(worktree: Path, nested: Sequence[str]) -> bool:
+    """父仓库未检出文件、只挂了子模块时，不要对它做整树 diff。"""
+    if not nested:
+        return False
+    try:
+        names = {entry.name for entry in worktree.iterdir() if entry.name != ".git"}
+    except OSError:
+        return False
+    nested_top = {Path(item).parts[0] for item in nested if Path(item).parts}
+    return bool(names) and names <= nested_top
 
 
 def _nested_worktree_paths(
@@ -391,11 +442,90 @@ def adopt_prepared_checkout(
     )
 
 
+def _needed_relpaths(repository: Path, needed_paths: Optional[Sequence[str]]) -> Optional[List[str]]:
+    """把绝对路径收成相对当前仓库的 posix 路径；未提供则返回 None。"""
+    if needed_paths is None:
+        return None
+    rels: List[str] = []
+    for raw in needed_paths:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = Path(text).expanduser().resolve()
+        try:
+            rels.append(path.relative_to(repository).as_posix())
+        except ValueError:
+            continue
+    return rels
+
+
+def _parent_paths_outside_submodules(relpaths: Sequence[str], submodule_rels: Sequence[str]) -> List[str]:
+    """筛出不属于任何已检子模块的父仓库路径。"""
+    out: List[str] = []
+    for rel in relpaths:
+        if any(rel == sub or rel.startswith(sub + "/") for sub in submodule_rels):
+            continue
+        out.append(rel)
+    return out
+
+
+def _add_detached_worktree(
+    repository: Path,
+    worktree: Path,
+    base_commit: str,
+    *,
+    skip_parent_checkout: bool,
+) -> None:
+    """创建 detached worktree；改码只落在子模块时跳过父仓库文件检出。"""
+    args = ["worktree", "add", "--detach"]
+    if skip_parent_checkout:
+        args.append("--no-checkout")
+    args.extend([str(worktree), base_commit])
+    _run_git(repository, args)
+
+
+def _attach_needed_submodules(
+    repository: Path,
+    worktree: Path,
+    created: List[RepositoryWorktree],
+    *,
+    needed_rels: Optional[Sequence[str]],
+) -> None:
+    """挂上已检出子模块；有 needed_paths 时只挂包含这些文件的子模块。"""
+    if needed_rels is None:
+        _attach_checked_out_submodules(repository, worktree, created)
+        return
+    wanted = {
+        rel
+        for rel in _checked_out_submodules(repository)
+        if any(path == rel or path.startswith(rel + "/") for path in needed_rels)
+    }
+    if not wanted:
+        return
+    for relative in _checked_out_submodules(repository):
+        if relative not in wanted:
+            continue
+        source = (repository / relative).resolve()
+        if not source.is_dir():
+            continue
+        try:
+            submodule = Path(_run_git(source, ["rev-parse", "--show-toplevel"])).resolve()
+            commit = _run_git(source, ["rev-parse", "HEAD"])
+        except WorktreeIsolationError:
+            continue
+        destination = worktree / relative
+        _remove_empty_dir(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _run_git(submodule, ["worktree", "add", "--detach", str(destination), commit])
+        created.append(RepositoryWorktree(submodule, destination, commit))
+
+
 def prepare_isolated_workspace(
     run_id: str,
     code_roots: Sequence[str],
     *,
     workspace_base: Optional[Path] = None,
+    needed_paths: Optional[Sequence[str]] = None,
 ) -> IsolatedCodeWorkspace:
     """Create detached worktrees and map each code root into its run workspace."""
     original_roots = [str(Path(root).expanduser().resolve()) for root in code_roots if str(root).strip()]
@@ -431,9 +561,20 @@ def prepare_isolated_workspace(
         for index, repository in enumerate(roots_by_repo, start=1):
             base_commit = _run_git(repository, ["rev-parse", "HEAD"])
             worktree = run_root / _workspace_name(repository, index)
-            _run_git(
+            needed_rels = _needed_relpaths(repository, needed_paths)
+            submodule_rels = _checked_out_submodules(repository)
+            # 空列表表示“想精简但还不知道文件”：只跳过父仓库文件，仍挂全部已检子模块。
+            skip_parent = bool(
+                needed_rels is not None
+                and submodule_rels
+                and not _parent_paths_outside_submodules(needed_rels or [], submodule_rels)
+            )
+            attach_rels = needed_rels if needed_rels else None
+            _add_detached_worktree(
                 repository,
-                ["worktree", "add", "--detach", str(worktree), base_commit],
+                worktree,
+                base_commit,
+                skip_parent_checkout=skip_parent,
             )
             created.append(
                 RepositoryWorktree(
@@ -443,7 +584,12 @@ def prepare_isolated_workspace(
                 )
             )
             worktree_by_repo[repository] = worktree
-            _attach_checked_out_submodules(repository, worktree, created)
+            _attach_needed_submodules(
+                repository,
+                worktree,
+                created,
+                needed_rels=attach_rels,
+            )
     except Exception:
         for item in reversed(created):
             subprocess.run(
@@ -485,8 +631,11 @@ def write_workspace_artifacts(
 
     patch_parts: List[str] = []
     for item in workspace.repositories:
+        nested = _nested_worktree_paths(item, workspace.repositories)
+        if nested and _worktree_is_submodule_container(item.worktree, nested):
+            continue
         diff_cmd = ["diff", "--binary", "--no-ext-diff", item.base_commit]
-        if _nested_worktree_paths(item, workspace.repositories):
+        if nested:
             diff_cmd.append("--ignore-submodules=all")
         diff_cmd.append("--")
         patch = _run_git(item.worktree, diff_cmd)

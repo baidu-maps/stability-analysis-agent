@@ -1014,6 +1014,44 @@ class TestCodeContentProviderV2(unittest.TestCase):
         self.assertEqual(se, 11)
         self.assertEqual(refined_snippet[0], cf.snippet[0])
 
+    def test_complete_crash_snippet_allows_auto_fix_without_graph_edges(self) -> None:
+        """崩溃函数正文已完整时，即使没有图边也允许对该函数改码。"""
+        crash_id = "func|/tmp/style_theme.cpp|VVoid CVStyleScene::Unload()"
+        nodes = [{
+            "id": crash_id,
+            "type": "function",
+            "signature": "VVoid CVStyleScene::Unload()",
+            "snippet": [
+                "VVoid CVStyleScene::Unload()",
+                "{",
+                "    V_free(it->second);",
+                "}",
+            ],
+        }]
+        provider = CodeContentProvider()
+        self.assertTrue(provider._crash_node_has_complete_snippet(nodes, crash_id))
+        summary = provider._build_graph_evidence_summary(
+            [],
+            crash_id,
+            crash_snippet_complete=True,
+        )
+        self.assertTrue(summary["auto_fix_allowed"])
+        self.assertTrue(summary["crash_function_snippet_complete"])
+        self.assertIsNone(summary["auto_fix_block_reason"])
+
+    def test_timeout_placeholder_snippet_does_not_allow_auto_fix(self) -> None:
+        """超时占位文本不能当作完整崩溃函数源码。"""
+        crash_id = "func|/tmp/style_theme.cpp|VVoid CVStyleScene::Unload()"
+        nodes = [{
+            "id": crash_id,
+            "snippet": ["（代码上下文整阶段超时，未完成源码提取）"],
+        }]
+        provider = CodeContentProvider()
+        self.assertFalse(provider._crash_node_has_complete_snippet(nodes, crash_id))
+        summary = provider._build_graph_evidence_summary([], crash_id)
+        self.assertFalse(summary["auto_fix_allowed"])
+        self.assertIn("完整可替换函数体", summary["auto_fix_block_reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

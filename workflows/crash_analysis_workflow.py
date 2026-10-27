@@ -3735,9 +3735,11 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             if isinstance(evidence_summary, dict) and evidence_summary.get("auto_fix_allowed") is False:
                 lines.append("")
                 lines.append(
-                    "**重要**：当前图证据不满足自动改码条件（auto_fix_allowed=false）。"
-                    "请勿在「需要修改的函数」中列出仅因栈序关联（calls_stack_order）而怀疑的函数；"
-                    "不得对崩溃点函数做 this==nullptr 类防护；应给出需人工验证的调查步骤。"
+                    "**重要**：当前图边不足（auto_fix_allowed=false）。"
+                    "请勿把仅因栈序关联（calls_stack_order）、且上文没有完整函数体的函数列入必改；"
+                    "不得对崩溃点函数做 this==nullptr 类防护。"
+                    "若上文已给出崩溃函数完整函数体，必须对该函数输出最小修复；"
+                    "不要因为缺少偏移行号或图边而把必改列表留空。"
                 )
             lines.append("")
             lines.append("## 输出格式")
@@ -3839,6 +3841,8 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             lines.append(
                 "- 如果当前上下文不足以输出某个函数的完整可替换代码，必须不要把该函数列入“需要修改的函数（必改）”；"
                 "应放到“无法生成完整修复代码/需人工处理”或「建议修改的函数」并说明缺少哪些上下文。"
+                "例外：领域知识点名且出现在崩溃栈上的函数，若上文没有完整函数体，必须先 `context_requests`"
+                "（type=function）补齐，禁止写入「需人工处理」后结束。"
             )
             lines.append(
                 "- 仅当上文「函数源码」「崩溃行关键源码」「同文件旁路候选源码」中已给出该函数完整函数体，"
@@ -3860,9 +3864,9 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             if isinstance(evidence_summary, dict) and evidence_summary.get("auto_fix_allowed") is False:
                 lines.append("")
                 lines.append(
-                    "**重要**：当前图证据不足以支持直接产出补丁。"
-                    "请勿把仅因栈序关联而出现的函数写成确定修改点；"
-                    "不得对崩溃点函数做 this==nullptr 类防护；应给出需人工验证的调查步骤。"
+                    "**重要**：当前图边不足，不要把仅栈序关联且没有完整函数体的函数写成确定修改点；"
+                    "不得对崩溃点函数做 this==nullptr 类防护。"
+                    "若上文已给出崩溃函数完整函数体，仍须对该函数输出最小修复。"
                 )
             lines.append("")
             lines.append("## 输出格式")

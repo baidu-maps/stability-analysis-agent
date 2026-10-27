@@ -7865,11 +7865,36 @@ class CodeContentProvider:
         return start_1, end_idx + 1
 
     @staticmethod
+    def _crash_node_has_complete_snippet(nodes_list: List[Any], crash_node_id: str) -> bool:
+        """崩溃节点是否已带完整可替换函数体（超时占位不算）。"""
+        cf_norm = str(crash_node_id or "").rstrip().rstrip("{").rstrip()
+        if not cf_norm:
+            return False
+        for node in nodes_list or []:
+            if not isinstance(node, dict):
+                continue
+            nid = str(node.get("id") or "").rstrip().rstrip("{").rstrip()
+            if nid != cf_norm and cf_norm not in nid and nid not in cf_norm:
+                continue
+            snippet = node.get("snippet") or []
+            if isinstance(snippet, str):
+                joined = snippet
+            elif isinstance(snippet, list):
+                joined = "\n".join(str(item) for item in snippet)
+            else:
+                continue
+            if "未完成源码提取" in joined or "整阶段超时" in joined:
+                return False
+            return "{" in joined and "}" in joined
+        return False
+
+    @staticmethod
     def _build_graph_evidence_summary(
         edges_list: List[Any],
         crash_node_id: str,
         *,
         expanded_members: Optional[Sequence[str]] = None,
+        crash_snippet_complete: bool = False,
     ) -> Dict[str, Any]:
         """汇总图边类型，供 prompt 与自动改码门禁使用（通用规则，非业务硬编码）。"""
         cf_norm = str(crash_node_id or "").rstrip().rstrip("{").rstrip()
@@ -7933,7 +7958,13 @@ class CodeContentProvider:
             if expanded_bare and edge_var in expanded_bare and fid != cf_norm:
                 expanded_write_found = True
 
-        auto_ok = bool(has_stack_verified or has_direct or has_to_crash or sv_write_upstream)
+        auto_ok = bool(
+            has_stack_verified
+            or has_direct
+            or has_to_crash
+            or sv_write_upstream
+            or crash_snippet_complete
+        )
         block_reason = ""
         if not auto_ok:
             parts: List[str] = []
@@ -7943,6 +7974,8 @@ class CodeContentProvider:
                 parts.append("无 calls_direct / calls_stack_verified / calls_to_crash_site")
             if not sv_write_upstream:
                 parts.append("无崩溃点外共享变量写路径")
+            if not crash_snippet_complete:
+                parts.append("崩溃函数没有完整可替换函数体")
             block_reason = (
                 "；".join(parts)
                 + "。仅允许输出调查假设，禁止自动改码。"
@@ -7961,6 +7994,7 @@ class CodeContentProvider:
             "container_copy_write_path_incomplete": container_write_incomplete,
             "auto_fix_allowed": auto_ok,
             "auto_fix_block_reason": block_reason or None,
+            "crash_function_snippet_complete": bool(crash_snippet_complete),
         }
 
     def _format_graph_edges_empty_reason(
@@ -10128,6 +10162,7 @@ class CodeContentProvider:
             edges_list,
             crash_nid,
             expanded_members=expand_members,
+            crash_snippet_complete=self._crash_node_has_complete_snippet(nodes_list, crash_nid),
         )
         result_dict["graph"] = graph_dict
         code_context_options = {

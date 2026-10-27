@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from services.git_worktree_manager import (
     WorktreeIsolationError,
+    collect_workspace_diff,
     prepare_isolated_workspace,
     write_workspace_artifacts,
 )
@@ -144,6 +145,75 @@ class GitWorktreeIsolationTests(unittest.TestCase):
             self.assertIn("render.cpp", patch)
             self.assertIn("+void clear() { return 1; }", patch)
             self.assertNotIn("Subproject commit", patch)
+
+    def test_needed_paths_skip_parent_checkout(self) -> None:
+        """改码文件都在子模块里时，父仓库不再检出无关大文件。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vendor_src = root / "vendor-src"
+            self._init_repo(vendor_src)
+            (vendor_src / "render.cpp").write_text("void clear() { return; }\n", encoding="utf-8")
+            _git(vendor_src, "add", "render.cpp")
+            _git(vendor_src, "commit", "-m", "vendor")
+
+            super_repo = root / "super"
+            self._init_repo(super_repo)
+            (super_repo / "README").write_text("root\n", encoding="utf-8")
+            (super_repo / "HUGE.bin").write_text("x" * 1024, encoding="utf-8")
+            _git(super_repo, "add", "README", "HUGE.bin")
+            _git(super_repo, "commit", "-m", "root")
+            _git(super_repo, "submodule", "add", str(vendor_src), "vendor")
+            _git(super_repo, "commit", "-m", "add submodule")
+
+            needed = [str((super_repo / "vendor" / "render.cpp").resolve())]
+            workspace = prepare_isolated_workspace(
+                "run-sparse",
+                [str(super_repo)],
+                workspace_base=root / "worktrees",
+                needed_paths=needed,
+            )
+            isolated_root = Path(workspace.isolated_code_roots[0])
+            self.assertTrue((isolated_root / "vendor" / "render.cpp").is_file())
+            self.assertFalse((isolated_root / "HUGE.bin").exists())
+            self.assertFalse((isolated_root / "README").exists())
+
+    def test_empty_needed_paths_still_skip_parent_files(self) -> None:
+        """还不知道具体文件时，父仓库仍不检出，但要挂上全部已检子模块。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vendor_src = root / "vendor-src"
+            self._init_repo(vendor_src)
+            (vendor_src / "render.cpp").write_text("void clear() { return; }\n", encoding="utf-8")
+            _git(vendor_src, "add", "render.cpp")
+            _git(vendor_src, "commit", "-m", "vendor")
+
+            super_repo = root / "super"
+            self._init_repo(super_repo)
+            (super_repo / "README").write_text("root\n", encoding="utf-8")
+            (super_repo / "HUGE.bin").write_bytes(b"\xb9" * 1024)
+            _git(super_repo, "add", "README", "HUGE.bin")
+            _git(super_repo, "commit", "-m", "root")
+            _git(super_repo, "submodule", "add", str(vendor_src), "vendor")
+            _git(super_repo, "commit", "-m", "add submodule")
+
+            workspace = prepare_isolated_workspace(
+                "run-empty-needed",
+                [str(super_repo)],
+                workspace_base=root / "worktrees",
+                needed_paths=[],
+            )
+            isolated_root = Path(workspace.isolated_code_roots[0])
+            self.assertTrue((isolated_root / "vendor" / "render.cpp").is_file())
+            self.assertFalse((isolated_root / "HUGE.bin").exists())
+            artifacts = write_workspace_artifacts(workspace, root / "report")
+            self.assertTrue(Path(str(artifacts["manifest_path"])).is_file())
+            self.assertIsNone(artifacts["patch_path"])
+            isolated_file = isolated_root / "vendor" / "render.cpp"
+            isolated_file.write_text("void clear() { return; }\n// patched\n", encoding="utf-8")
+            diff = collect_workspace_diff(workspace)
+            self.assertTrue(any("render.cpp" in path for path in diff["changed_files"]))
+            self.assertFalse(any("HUGE.bin" in path for path in diff["changed_files"]))
+            self.assertIn("patched", str(diff.get("diff_text") or ""))
 
     def test_non_git_directory_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

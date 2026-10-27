@@ -234,19 +234,30 @@ def _document_score(
     return score, matched
 
 
-def _excerpt(body: str, matched: Sequence[str], max_chars: int = 900) -> str:
+def _excerpt(
+    body: str,
+    matched: Sequence[str],
+    max_chars: int = 900,
+    *,
+    from_start: bool = False,
+) -> str:
+    """截取文档片段。Playbook 从文首取，避免最小修复约束落在 900 字窗口外。"""
     compact = "\n".join(line.rstrip() for line in body.strip().splitlines())
-    lowered = compact.lower()
-    positions = [
-        lowered.find(str(term).lower())
-        for term in matched
-        if str(term).strip() and lowered.find(str(term).lower()) >= 0
-    ]
-    start = max(0, (min(positions) if positions else 0) - 180)
-    excerpt = compact[start : start + max_chars].strip()
+    limit = max(200, int(max_chars or 900))
+    if from_start or not matched:
+        start = 0
+    else:
+        lowered = compact.lower()
+        positions = [
+            lowered.find(str(term).lower())
+            for term in matched
+            if str(term).strip() and lowered.find(str(term).lower()) >= 0
+        ]
+        start = max(0, (min(positions) if positions else 0) - 180)
+    excerpt = compact[start : start + limit].strip()
     if start > 0:
         excerpt = "…" + excerpt
-    if start + max_chars < len(compact):
+    if start + limit < len(compact):
         excerpt += "…"
     return excerpt
 
@@ -308,6 +319,9 @@ def retrieve_knowledge(
         score, matched = _document_score(metadata, body, query_lower, terms)
         if score <= 0:
             continue
+        provenance = str(metadata.get("source_type") or "curated_playbook")
+        pack_budget = manifest.get("prompt_budget") if isinstance(manifest.get("prompt_budget"), dict) else {}
+        excerpt_budget = int(pack_budget.get("max_chars") or max_chars or _DEFAULT_MAX_CHARS)
         hits.append(
             {
                 "layer": str(metadata.get("kb_layer") or "code"),
@@ -316,10 +330,15 @@ def retrieve_knowledge(
                 "path": str(path.relative_to(pack_root)),
                 "title": str(metadata.get("title") or path.stem),
                 "confidence": str(metadata.get("confidence") or "medium"),
-                "provenance": str(metadata.get("source_type") or "curated_playbook"),
+                "provenance": provenance,
                 "score": round(score, 3),
                 "matched_terms": matched,
-                "excerpt": _excerpt(body, matched),
+                "excerpt": _excerpt(
+                    body,
+                    matched,
+                    max_chars=excerpt_budget,
+                    from_start=provenance == "curated_playbook",
+                ),
                 "metadata": metadata,
             }
         )

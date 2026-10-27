@@ -1260,13 +1260,71 @@ def extract_candidate_nodes(code_context: Dict[str, Any]) -> List[Dict[str, Any]
     return _extract_candidate_nodes_from_crash_summary(code_context)
 
 
+def _stack_mentions_function(graph: Dict[str, Any], node: Dict[str, Any]) -> bool:
+    """节点签名是否出现在崩溃栈符号化列表里。"""
+    blob = " ".join(
+        str(node.get(key) or "")
+        for key in ("signature", "id")
+    )
+    match = re.search(
+        r"((?:~?[A-Za-z_][A-Za-z0-9_]*::)+~?[A-Za-z_][A-Za-z0-9_]*)",
+        blob,
+    )
+    needle = match.group(1) if match else ""
+    if not needle:
+        return False
+    for frame in graph.get("stack_function_symbols") or []:
+        text = str((frame or {}).get("function") if isinstance(frame, dict) else frame or "")
+        if needle in text:
+            return True
+    return False
+
+
+def _crash_function_snippet_complete(code_context: Dict[str, Any]) -> bool:
+    """崩溃函数节点已有完整函数体时，即使图边为空也允许改码。"""
+    graph = code_context.get("graph", {}) if isinstance(code_context, dict) else {}
+    summ = graph.get("evidence_summary") if isinstance(graph, dict) else None
+    if isinstance(summ, dict) and summ.get("crash_function_snippet_complete"):
+        return True
+    crash = code_context.get("crash_summary", {}) if isinstance(code_context, dict) else {}
+    node_id = str(crash.get("node_id") or "").rstrip().rstrip("{").rstrip()
+    nodes = graph.get("nodes") if isinstance(graph, dict) else []
+    if not isinstance(nodes, list):
+        return False
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        nid = str(node.get("id") or "").rstrip().rstrip("{").rstrip()
+        tags = str(node.get("source_tag") or node.get("label") or "")
+        on_stack = _stack_mentions_function(graph if isinstance(graph, dict) else {}, node)
+        if node_id:
+            if nid != node_id and not nid.startswith(node_id) and "崩溃" not in tags and not on_stack:
+                continue
+        elif "崩溃" not in tags and not on_stack:
+            continue
+        snippet = node.get("snippet")
+        if isinstance(snippet, str):
+            joined = snippet
+        elif isinstance(snippet, list):
+            joined = "\n".join(str(item) for item in snippet)
+        else:
+            continue
+        if "未完成源码提取" in joined or "整阶段超时" in joined:
+            continue
+        if "{" in joined and "}" in joined:
+            return True
+    return False
+
+
 def graph_auto_fix_allowed(code_context: Dict[str, Any]) -> Tuple[bool, str]:
     """依据图证据摘要判断是否允许自动改码（通用规则）。"""
     graph = code_context.get("graph", {}) if isinstance(code_context, dict) else {}
     summ = graph.get("evidence_summary") if isinstance(graph, dict) else None
+    if isinstance(summ, dict) and summ.get("auto_fix_allowed"):
+        return True, ""
+    if _crash_function_snippet_complete(code_context):
+        return True, ""
     if isinstance(summ, dict):
-        if summ.get("auto_fix_allowed"):
-            return True, ""
         return False, str(summ.get("auto_fix_block_reason") or "图证据不足，已禁止自动改码")
     # 未符号化的崩溃行没有调用边。分析点名、且正文来自已读源码时允许改码。
     if _graph_has_read_file_candidates(code_context):

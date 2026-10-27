@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 from services.git_worktree_manager import (
     IsolatedCodeWorkspace,
     WorktreeIsolationError,
+    collect_needed_source_paths,
     map_result_paths,
     head_commits_for_code_roots,
     adopt_prepared_checkout,
@@ -1090,6 +1091,7 @@ def run_repair_pipeline(
                 isolated_workspace = prepare_isolated_workspace(
                     str(run_id or uuid.uuid4().hex),
                     code_roots,
+                    needed_paths=collect_needed_source_paths(result),
                 )
             fix_code_roots = isolated_workspace.isolated_code_roots
             fix_result_input = map_result_paths(isolated_workspace, result)

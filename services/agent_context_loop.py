@@ -74,6 +74,19 @@ def run_agent_context_loop(
         if config.agent_loop_mode == "context_loop"
         else stable_prompt
     )
+    if config.agent_loop_mode == "context_loop":
+        try:
+            from services.knowledge_required_context import prefetch_missing_knowledge_functions
+
+            next_prompt = prefetch_missing_knowledge_functions(
+                context_engine,
+                stable_prompt=stable_prompt,
+                assembled_prompt=next_prompt,
+            )
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).info("knowledge prefetch skipped: %s", exc)
     force_final_reason: Optional[str] = None
     previous_analysis = ""
     last_nonempty_analysis = ""
@@ -81,6 +94,7 @@ def run_agent_context_loop(
     last_response: Any = None
     write_path_revision_used = False
     fix_format_revision_used = False
+    knowledge_revision_used = False
 
     def _schedule_revision(
         round_index: int,
@@ -122,6 +136,56 @@ def run_agent_context_loop(
             if extra_trace:
                 payload.update(extra_trace)
             trace.emit(trace_event, **payload)
+
+    def _try_knowledge_function_revision(
+        round_index: int,
+        analysis_text: str,
+        turn_obj: ContextTurn,
+    ) -> bool:
+        """首轮仍缺领域知识点名的栈函数体时，强制补齐后再终局。"""
+        nonlocal knowledge_revision_used, next_prompt, force_final_reason
+        del analysis_text
+        if knowledge_revision_used or config.agent_loop_mode != "context_loop":
+            return False
+        if round_index >= max_rounds - 1:
+            return False
+        from services.knowledge_required_context import (
+            build_prefetch_requests,
+            inject_resolved_function_sources,
+            missing_knowledge_stack_functions,
+        )
+
+        missing = missing_knowledge_stack_functions(str(last_prompt_used or next_prompt))
+        if not missing:
+            return False
+        resolved = context_engine.resolve_requests(
+            build_prefetch_requests(missing),
+            round_index=round_index + 1,
+        )
+        injected = inject_resolved_function_sources(str(last_prompt_used or next_prompt), resolved)
+        if injected == str(last_prompt_used or next_prompt):
+            return False
+        knowledge_revision_used = True
+        context_engine.add_turn(turn_obj)
+        hooks.on_round_complete(round_index, turn_obj.to_dict())
+        force_final_reason = None
+        names = "、".join(missing)
+        next_prompt = (
+            injected.rstrip()
+            + "\n\n## 系统续轮\n"
+            + f"已补齐领域知识点名的栈函数：{names}。"
+            + "请把这些函数一并写入必改，不要只写进需人工处理。\n"
+        )
+        if trace is not None:
+            trace.emit(
+                "agent.knowledge_function_revision",
+                kind="agent",
+                name="context_loop",
+                status="continue",
+                round_index=round_index,
+                missing_signatures=list(missing)[:8],
+            )
+        return True
 
     def _try_write_path_revision(round_index: int, analysis_text: str, turn_obj: ContextTurn) -> bool:
         """写路径保活已在 prompt 且分析认定竞态，但缺写侧完整补丁时，强制续一轮。"""
@@ -176,7 +240,9 @@ def run_agent_context_loop(
         return True
 
     def _try_post_final_revisions(round_index: int, analysis_text: str, turn_obj: ContextTurn) -> bool:
-        """终局前依次尝试写路径完整性与修复格式续轮。"""
+        """终局前依次尝试知识栈函数、写路径完整性与修复格式续轮。"""
+        if _try_knowledge_function_revision(round_index, analysis_text, turn_obj):
+            return True
         if _try_write_path_revision(round_index, analysis_text, turn_obj):
             return True
         return _try_fix_format_revision(round_index, analysis_text, turn_obj)

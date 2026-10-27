@@ -155,6 +155,58 @@ CGridLayer::CancelTask walks the loading task lists.
         self.assertEqual(result["pack_id"], "demo")
         self.assertIn("Render thread lifecycle", result["knowledge_context"])
 
+    def test_playbook_excerpt_keeps_leading_minimal_fix(self):
+        """curated_playbook 从文首截取，最小修复约束不能被 900 字窗口切掉。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pack = root / "demo"
+            (pack / "crash-pattern").mkdir(parents=True)
+            (pack / "pack.yaml").write_text(
+                json.dumps(
+                    {
+                        "id": "demo",
+                        "display_name": "Test Engine",
+                        "match": {"stack_hints": ["CVStyleScene::Unload"]},
+                        "content_globs": ["**/*.md"],
+                        "prompt_budget": {"max_chars": 3600},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            padding = "\n".join(f"padding line {index} about Unload teardown" for index in range(80))
+            (pack / "crash-pattern" / "style.md").write_text(
+                "---\n"
+                "title: Unload teardown\n"
+                "kb_layer: crash\n"
+                "confidence: high\n"
+                "source_type: curated_playbook\n"
+                "symbols: [CVStyleScene::Unload, CVStyle::~CVStyle]\n"
+                "---\n\n"
+                "# Unload teardown\n\n"
+                "## 本次只做最小修复\n\n"
+                "1. `CVStyleScene::Unload` 用 `CVArray<StyleMapType*, StyleMapType*>`。\n"
+                "2. `CVStyle::~CVStyle` 改 `m_themeLock->WLock()`。\n"
+                "若上文没有 `CVStyle::~CVStyle` 完整函数体，先 context_requests。\n\n"
+                f"{padding}\n",
+                encoding="utf-8",
+            )
+            result = retrieve_knowledge(
+                parse_result={"signal": "SIGSEGV"},
+                resolved_stack={
+                    "resolved_threads": [{
+                        "frames": [{"function": "CVStyleScene::Unload() +648"}],
+                    }]
+                },
+                code_context={},
+                pack_dirs=[str(root)],
+                max_chars=3600,
+            )
+        text = str(result.get("knowledge_context") or "")
+        self.assertIn("最小修复", text)
+        self.assertIn("WLock", text)
+        self.assertIn("CVArray<StyleMapType*, StyleMapType*>", text)
+        self.assertIn("context_requests", text)
+
 
 if __name__ == "__main__":
     unittest.main()

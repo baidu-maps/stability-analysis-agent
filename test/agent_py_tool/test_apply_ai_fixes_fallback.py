@@ -63,6 +63,60 @@ class TestApplyAiFixesFallback(unittest.TestCase):
         self.assertTrue(allowed)
         self.assertEqual(reason, "")
 
+    def test_complete_crash_snippet_overrides_cached_auto_fix_block(self):
+        """定位缓存里的 auto_fix_allowed=false 不能挡住已有完整崩溃函数体的改码。"""
+        code_context = {
+            "crash_summary": {"node_id": "func|/tmp/style_theme.cpp|VVoid CVStyleScene::Unload()"},
+            "graph": {
+                "nodes": [
+                    {
+                        "id": "func|/tmp/style_theme.cpp|VVoid CVStyleScene::Unload()",
+                        "type": "function",
+                        "signature": "VVoid CVStyleScene::Unload()",
+                        "file": "/tmp/style_theme.cpp",
+                        "snippet": [
+                            "VVoid CVStyleScene::Unload()",
+                            "{",
+                            "    V_free(it->second);",
+                            "}",
+                        ],
+                    }
+                ],
+                "edges": [],
+                "evidence_summary": {
+                    "auto_fix_allowed": False,
+                    "auto_fix_block_reason": "无 calls_direct；无崩溃点外共享变量写路径。仅允许输出调查假设，禁止自动改码。",
+                },
+            },
+        }
+        allowed, reason = graph_auto_fix_allowed(code_context)
+        self.assertTrue(allowed, reason)
+        self.assertEqual(reason, "")
+
+    def test_stack_symbol_complete_snippet_allows_auto_fix(self):
+        """超时图只有崩溃函数节点时，用栈符号认定可改码。"""
+        code_context = {
+            "graph": {
+                "nodes": [
+                    {
+                        "id": "func|/tmp/style_theme.cpp|VVoid CVStyleScene::Unload()",
+                        "type": "function",
+                        "signature": "VVoid CVStyleScene::Unload()",
+                        "snippet": ["VVoid CVStyleScene::Unload()", "{", "    V_free(p);", "}"],
+                    }
+                ],
+                "stack_function_symbols": [
+                    {"function": "_baidu_framework::CVStyleScene::Unload() +648"},
+                ],
+                "evidence_summary": {
+                    "auto_fix_allowed": False,
+                    "auto_fix_block_reason": "无 calls_direct / calls_stack_verified / calls_to_crash_site；无崩溃点外共享变量写路径。仅允许输出调查假设，禁止自动改码。",
+                },
+            }
+        }
+        allowed, reason = graph_auto_fix_allowed(code_context)
+        self.assertTrue(allowed, reason)
+
     def test_crash_func_snippet_usable_rejects_timeout_placeholder(self):
         provider = CodeContentProvider()
         if not hasattr(provider, "_crash_func_snippet_usable"):
