@@ -88,6 +88,18 @@ def workspace_revision(workspace: IsolatedCodeWorkspace) -> str:
     """Content revision including each detached worktree's uncommitted diff."""
     payload = []
     for item in workspace.repositories:
+        nested = _nested_worktree_paths(item, workspace.repositories)
+        if nested and _worktree_is_submodule_container(item.worktree, nested):
+            payload.append(
+                {
+                    "worktree": str(item.worktree.resolve()),
+                    "head": _run_git(item.worktree, ["rev-parse", "HEAD"]),
+                    "diff_hash": "",
+                    "untracked": [],
+                    "skipped": "submodule_container",
+                }
+            )
+            continue
         head = _run_git(item.worktree, ["rev-parse", "HEAD"])
         diff = _run_git(item.worktree, ["diff", "--binary", "--no-ext-diff", "HEAD", "--"])
         untracked = _run_git(item.worktree, ["ls-files", "--others", "--exclude-standard"])

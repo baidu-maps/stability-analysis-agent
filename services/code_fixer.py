@@ -308,6 +308,14 @@ def edit_allowed_by_prompt_complete_body(
     for item in allowed_sigs:
         if signatures_match(item, signature):
             return None
+    # 分析后补进图里的完整函数体（如领域知识点名的析构）同样允许写入。
+    for node in extract_candidate_nodes(code_context):
+        node_sig = str(node.get("signature") or "")
+        snippet = node.get("snippet")
+        if not signatures_match(node_sig, signature):
+            continue
+        if isinstance(snippet, list) and len(snippet) >= 2:
+            return None
     return "目标函数未在提示词中给出完整函数体，已拒绝写入"
 
 
@@ -1362,11 +1370,32 @@ def graph_auto_fix_allowed(code_context: Dict[str, Any]) -> Tuple[bool, str]:
     return False, "仅栈序关联或证据不足，已禁止自动改码"
 
 
+_SKIP_REQUIRED_NAMES = frozenset(
+    {
+        "default",
+        "case",
+        "if",
+        "else",
+        "for",
+        "while",
+        "switch",
+        "do",
+        "catch",
+        "try",
+        "return",
+    }
+)
+
+
 def _append_unique_name(names: List[str], raw: str) -> None:
     """向名单追加去空白后的函数名（就地去重）。"""
     name = str(raw or "").strip()
-    if name and name not in names:
-        names.append(name)
+    if not name or name in names:
+        return
+    simple = _extract_simple_function_name(name)
+    if name.lower() in _SKIP_REQUIRED_NAMES or str(simple or "").lower() in _SKIP_REQUIRED_NAMES:
+        return
+    names.append(name)
 
 
 def _extract_required_function_names_from_analysis(analysis_text: str) -> List[str]:
@@ -2470,6 +2499,24 @@ def _resolve_session_read_path(raw: str, code_roots: List[str]) -> Optional[Path
             return candidate.resolve()
         except OSError:
             continue
+    # 预取常定位到版本缓存绝对路径；隔离工作区要用同一相对后缀重定向。
+    parts = path.parts
+    mapped: List[Tuple[int, Path]] = []
+    for index in range(1, len(parts)):
+        relative = Path(*parts[index:])
+        if relative.is_absolute() or len(relative.parts) < 2:
+            continue
+        for root in code_roots:
+            candidate = Path(root) / relative
+            try:
+                if not candidate.is_file() or not _is_within_code_roots(candidate, code_roots):
+                    continue
+                mapped.append((len(relative.parts), candidate.resolve()))
+            except OSError:
+                continue
+    if mapped:
+        mapped.sort(key=lambda item: item[0], reverse=True)
+        return mapped[0][1]
     return None
 
 
@@ -2504,6 +2551,32 @@ def _session_source_file_hints(context_session: Dict[str, Any]) -> List[str]:
             if text:
                 hints.append(text)
     return hints
+
+
+def _locate_required_source_files(names: List[str], code_roots: List[str]) -> List[Path]:
+    """用定位器按必改符号找源文件，并把缓存绝对路径映射回当前 code root。"""
+    if not names or not code_roots:
+        return []
+    try:
+        from services.code_locator import CodeLocatorService, LocatorConfig
+    except Exception:
+        return []
+    locator = CodeLocatorService(LocatorConfig(max_code_length=0))
+    found: List[Path] = []
+    seen = set()
+    for name in names:
+        try:
+            hit = locator.find_function_definition_for_symbol(str(name), list(code_roots))
+        except Exception:
+            continue
+        if not hit:
+            continue
+        resolved = _resolve_session_read_path(str(hit[0]), code_roots)
+        if resolved is None or resolved in seen:
+            continue
+        seen.add(resolved)
+        found.append(resolved)
+    return found
 
 
 def _read_files_from_session(
@@ -2684,15 +2757,24 @@ def promote_read_file_function_candidates(
         graph = {}
         code_context["graph"] = graph
     existing = graph.get("nodes")
-    if isinstance(existing, list) and any(
-        isinstance(node, dict) and isinstance(node.get("snippet"), list) and node.get("snippet")
-        for node in existing
-    ):
-        return []
+    if not isinstance(existing, list):
+        existing = []
+        graph["nodes"] = existing
     names = _extract_required_function_names_from_analysis(analysis_text)
     files = _read_files_from_session(context_session, code_roots)
+    for path in _locate_required_source_files(names, code_roots):
+        if path not in files:
+            files.append(path)
     if not names or not files:
         return []
+    existing_keys = set()
+    for node in existing:
+        if not isinstance(node, dict):
+            continue
+        sig = str(node.get("signature") or "")
+        simple = _extract_simple_function_name(sig)
+        if simple:
+            existing_keys.add(simple)
     built: List[Dict[str, Any]] = []
     seen = set()
     for path in files:
@@ -2702,12 +2784,15 @@ def promote_read_file_function_candidates(
             continue
         for name in names:
             simple = _extract_simple_function_name(name)
-            if not simple or not _source_defines_function(source, simple):
+            if not simple or simple in existing_keys:
                 continue
             key = (str(path), simple)
             if key in seen:
                 continue
             signature = name if "(" in str(name) else f"{simple}()"
+            # 析构名 `~CVStyle` 过不了词边界探测，直接按签名切函数体。
+            if "~" not in str(name) and not _source_defines_function(source, simple):
+                continue
             node = _candidate_node_from_defined_source(path, source, signature)
             if not node:
                 continue
@@ -2715,7 +2800,7 @@ def promote_read_file_function_candidates(
             built.append(node)
     if not built:
         return []
-    graph["nodes"] = built
+    graph["nodes"] = list(existing) + built
     summary = graph.get("evidence_summary")
     if not isinstance(summary, dict):
         graph["evidence_summary"] = {
@@ -3729,19 +3814,17 @@ class CodeFixer:
                 success=False,
                 error="缺少 analysis/code_context，无法应用 AI 修复",
             )
-        candidate_nodes = extract_candidate_nodes(code_context)
         session = result.get("context_session")
         session_dict = session if isinstance(session, dict) else None
-        if not candidate_nodes:
-            promoted = promote_read_file_function_candidates(
-                code_context,
-                analysis_text=analysis_text,
-                context_session=session_dict,
-                code_roots=list(code_roots or []),
-            )
-            if promoted:
-                logger.info("[CodeFixer] 从已读源码补齐候选函数 %s 个", len(promoted))
-            candidate_nodes = extract_candidate_nodes(code_context)
+        promoted = promote_read_file_function_candidates(
+            code_context,
+            analysis_text=analysis_text,
+            context_session=session_dict,
+            code_roots=list(code_roots or []),
+        )
+        if promoted:
+            logger.info("[CodeFixer] 从已读源码补齐候选函数 %s 个", len(promoted))
+        candidate_nodes = extract_candidate_nodes(code_context)
         if not candidate_nodes:
             completed = _complete_missing_repair_code(
                 self._llm,

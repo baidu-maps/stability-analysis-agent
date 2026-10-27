@@ -6970,7 +6970,8 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
     replay = problem.get("_crash_replay") if isinstance(problem, dict) else None
     replay_level = str(replay.get("level") or "") if isinstance(replay, dict) else ""
     if replay_level == "conclusion":
-        if bool(args.apply_ai_fixes) and str(replay.get("patch_text") or "").strip():
+        replay_patch = str(replay.get("patch_text") or "").strip() if isinstance(replay, dict) else ""
+        if bool(args.apply_ai_fixes) and replay_patch:
             from services.crash_replay_cache import replay_cached_fix
 
             _replay_started = time.perf_counter()
@@ -6983,6 +6984,29 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
                 reuse_source_cache=bool(getattr(args, "reuse_source_cache", True)),
             )
             apply_fix_duration_ms = int(round((time.perf_counter() - _replay_started) * 1000))
+        elif should_run_repair_pipeline(
+            apply_ai_fixes=bool(args.apply_ai_fixes),
+            result=result if isinstance(result, dict) else {},
+            scope=scope,
+            bypass_repair_gate=bool(getattr(args, "bypass_repair_gate", True)),
+        ):
+            print("[crash-replay] 上次改码未覆盖必改函数，重新落盘", file=sys.stderr, flush=True)
+            repair_out = runtime.run_repair_and_verify(
+                result=result,
+                code_roots=code_roots,
+                report_dir=report_dir,
+                run_id=str(request_record.get("run_id") or ""),
+                verification_config=verification_config if isinstance(verification_config, dict) else None,
+                llm_adapter=llm_adapter,
+                backup_original_sources=bool(args.backup_original_sources),
+                uaf_nullptr_guard_policy=_effective_uaf_nullptr_guard_policy,
+                request_record=request_record,
+                post_fix_diagnosis=False,
+            )
+            result = repair_out.get("result", result)
+            applied_fix_result = repair_out.get("applied_fix_result")
+            verification_result = repair_out.get("verification_result")
+            apply_fix_duration_ms = repair_out.get("apply_fix_duration_ms")
         if isinstance(result, dict):
             runtime._finalize_decision(result)
             runtime._transition(

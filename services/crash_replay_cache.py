@@ -411,6 +411,84 @@ def lookup_crash_replay(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _load_replay_context_session(source: Path) -> Dict[str, Any]:
+    """沿 reused_from 找到带 request_ledger 的 session，避免空报告把预取路径丢掉。"""
+    current = Path(source)
+    seen = set()
+    last: Dict[str, Any] = {}
+    for _ in range(6):
+        key = str(current.resolve())
+        if key in seen:
+            break
+        seen.add(key)
+        session = _load_json(current / "context_session.json")
+        if isinstance(session, dict):
+            last = session
+            if session.get("request_ledger"):
+                return session
+        cache = _load_json(current / CACHE_NAME) or {}
+        reused = str(cache.get("reused_from") or "").strip()
+        if not reused:
+            break
+        current = Path(reused)
+    return last
+
+
+def _required_fix_names_with_fences(analysis: str) -> List[str]:
+    """分析必改且已给出完整函数围栏的目标，才作为补丁完整性标准。"""
+    try:
+        from services.code_fixer import (
+            _extract_replacement_from_analysis,
+            _extract_required_function_names_from_analysis,
+        )
+    except Exception:
+        return []
+    names = _extract_required_function_names_from_analysis(analysis)
+    kept: List[str] = []
+    for name in names:
+        replacement = _extract_replacement_from_analysis(analysis, name)
+        if replacement and str(replacement).strip():
+            kept.append(name)
+    return kept
+
+
+def _apply_covers_required_functions(
+    analysis: str,
+    apply_record: Optional[Dict[str, Any]],
+    patch_text: str,
+) -> bool:
+    """上次补丁必须覆盖分析里已给出完整围栏的必改函数。"""
+    names = _required_fix_names_with_fences(analysis)
+    if not names:
+        return bool(str(patch_text or "").strip())
+    if not str(patch_text or "").strip() or not isinstance(apply_record, dict):
+        return False
+    try:
+        from services.code_fixer import _extract_simple_function_name
+    except Exception:
+        return False
+    applied_names = set()
+    for item in apply_record.get("applied") or []:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "applied").strip().lower()
+        if status not in {"applied", "success"}:
+            continue
+        simple = _extract_simple_function_name(str(item.get("function_signature") or ""))
+        if simple:
+            applied_names.add(simple)
+    blob = str(patch_text)
+    for name in names:
+        simple = _extract_simple_function_name(name)
+        head = str(name or "").split("(", 1)[0]
+        if simple and (simple in applied_names or simple in blob):
+            continue
+        if head and head in blob:
+            continue
+        return False
+    return True
+
+
 def _conclusion_lookup(evidence_key: str, chosen: Dict[str, Any]) -> Dict[str, Any]:
     """把最近一次成功结论装成可直接套用的命中。"""
     source = chosen["source"]
@@ -424,6 +502,10 @@ def _conclusion_lookup(evidence_key: str, chosen: Dict[str, Any]) -> Dict[str, A
             patch_text = patch_path.read_text(encoding="utf-8")
         except OSError:
             patch_text = ""
+    if not _apply_covers_required_functions(analysis, apply_record, patch_text):
+        patch_text = ""
+        apply_record = None
+    session = _load_replay_context_session(source)
     return {
         "level": "conclusion",
         "source_report": str(source),
@@ -440,6 +522,7 @@ def _conclusion_lookup(evidence_key: str, chosen: Dict[str, Any]) -> Dict[str, A
             "resolved_stack": evidence.get("resolved_stack") or {},
             "crash_diagnosis": evidence.get("crash_diagnosis") or {},
             "code_context": evidence.get("code_context") or {},
+            "context_session": session if isinstance(session, dict) else {},
             "analysis": analysis,
             "final_tip": analysis,
             "metadata": {

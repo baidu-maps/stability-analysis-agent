@@ -10,6 +10,7 @@ from pathlib import Path
 from services.code_fixer import (
     CodeFixer,
     _complete_missing_repair_code,
+    edit_allowed_by_prompt_complete_body,
     extract_candidate_nodes,
     graph_auto_fix_allowed,
     promote_read_file_function_candidates,
@@ -1347,6 +1348,151 @@ DemoMapOperator::~DemoMapOperator()
             written = path.read_text(encoding="utf-8")
             self.assertNotIn("suspend_all", written)
             self.assertIn("bmk_previousSignalHandler", written)
+
+    def test_promote_adds_destructor_when_crash_candidate_exists(self):
+        """图里已有 Unload 时，仍要把分析必改的 ~CVStyle 从缓存路径映射后落盘。"""
+        analysis = (
+            "**需要修改的函数（必改，解释本次崩溃）**\n"
+            "- `VVoid CVStyleScene::Unload()`：\n"
+            "- `CVStyle::~CVStyle()`：RLock 改 WLock\n"
+            "  - `default` 分支改为 `VDelete((MapDisStyle*)val)`。\n\n"
+            "### `style_theme.cpp`\n"
+            "```cpp\n"
+            "VVoid CVStyleScene::Unload()\n"
+            "{\n"
+            "    CVArray<StyleMapType*, StyleMapType*> levelParam;\n"
+            "    V_free(p);\n"
+            "}\n"
+            "```\n\n"
+            "### `Style.cpp`\n"
+            "```cpp\n"
+            "CVStyle::~CVStyle()\n"
+            "{\n"
+            "    m_themeLock->WLock();\n"
+            "}\n"
+            "```\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            theme = root / "engine-dev" / "src" / "style_theme.cpp"
+            style = root / "engine-dev" / "src" / "Style.cpp"
+            theme.parent.mkdir(parents=True)
+            theme.write_text(
+                "VVoid CVStyleScene::Unload()\n{\n    V_free(p);\n}\n",
+                encoding="utf-8",
+            )
+            style.write_text(
+                "CVStyle::~CVStyle()\n{\n    m_themeLock->RLock();\n}\n",
+                encoding="utf-8",
+            )
+            cache_style = (
+                "/Users/cache/workspaces/ios/7.1.0/baidu__mapclient__mapsdk-vector/"
+                "engine-dev/src/Style.cpp"
+            )
+            code_context = {
+                "graph": {
+                    "nodes": [
+                        {
+                            "id": f"func|{theme}|VVoid CVStyleScene::Unload()",
+                            "type": "function",
+                            "signature": "VVoid CVStyleScene::Unload()",
+                            "file": str(theme),
+                            "snippet": [
+                                "VVoid CVStyleScene::Unload()",
+                                "{",
+                                "    V_free(p);",
+                                "}",
+                            ],
+                        }
+                    ],
+                    "edges": [],
+                    "evidence_summary": {"auto_fix_allowed": True},
+                }
+            }
+            session = {
+                "request_ledger": [
+                    {
+                        "type": "function",
+                        "status": "success",
+                        "symbol": "CVStyle::~CVStyle",
+                        "file": cache_style,
+                    }
+                ]
+            }
+            names = _extract_required_function_names_from_analysis(analysis)
+            self.assertIn("CVStyle::~CVStyle()", names)
+            self.assertNotIn("default", names)
+            promoted = promote_read_file_function_candidates(
+                code_context,
+                analysis_text=analysis,
+                context_session=session,
+                code_roots=[str(root)],
+            )
+            self.assertEqual(len(promoted), 1)
+            self.assertIn("~CVStyle", promoted[0]["signature"])
+            self.assertEqual(promoted[0]["file"], str(style.resolve()))
+
+            class _NoLLM:
+                def chat(self, messages, tools=None, **kwargs):
+                    raise RuntimeError("must not call the LLM")
+
+            def _execute(name, data):
+                if name == "fix_code_extractor":
+                    return FixCodeExtractorTool().execute(data)
+                if name == "fix_code_applier":
+                    return FixCodeApplierTool().execute(data)
+                raise AssertionError(name)
+
+            result = CodeFixer(llm_adapter=_NoLLM()).generate_and_apply(
+                {
+                    "analysis": analysis,
+                    "code_context": code_context,
+                    "parse_result": {},
+                    "context_session": session,
+                },
+                [str(root)],
+                backup_original_sources=False,
+                tool_executor=_execute,
+            )
+            self.assertTrue(result.success, result.error)
+            applied_sigs = [item.get("function_signature") for item in result.applied]
+            self.assertTrue(any("Unload" in str(sig) for sig in applied_sigs), applied_sigs)
+            self.assertTrue(any("~CVStyle" in str(sig) for sig in applied_sigs), applied_sigs)
+            self.assertIn("WLock", style.read_text(encoding="utf-8"))
+            self.assertNotIn("RLock", style.read_text(encoding="utf-8"))
+            self.assertIn("CVArray<StyleMapType*, StyleMapType*>", theme.read_text(encoding="utf-8"))
+
+    def test_promoted_complete_body_is_allowed_despite_prompt_meta(self):
+        """首轮提示词只含 Unload 时，后补的 ~CVStyle 完整候选仍允许写入。"""
+        code_context = {
+            "diagnostics": {
+                "prompt_context_meta": {
+                    "included_complete_signatures": ["VVoid CVStyleScene::Unload()"],
+                }
+            },
+            "graph": {
+                "nodes": [
+                    {
+                        "type": "function",
+                        "signature": "CVStyle::~CVStyle()",
+                        "file": "/tmp/Style.cpp",
+                        "snippet": [
+                            "CVStyle::~CVStyle()",
+                            "{",
+                            "    m_themeLock->RLock();",
+                            "}",
+                        ],
+                    }
+                ]
+            },
+        }
+        self.assertIsNone(
+            edit_allowed_by_prompt_complete_body("CVStyle::~CVStyle()", code_context)
+        )
+        self.assertEqual(
+            edit_allowed_by_prompt_complete_body("CVStyleScene::~CVStyleScene()", code_context),
+            "目标函数未在提示词中给出完整函数体，已拒绝写入",
+        )
 
     def test_read_file_candidates_do_not_override_explicit_block(self):
         """证据摘要已经禁止改码时，补候选不能把结论改成允许。"""

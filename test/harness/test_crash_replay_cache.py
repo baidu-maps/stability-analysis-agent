@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from services.crash_replay_cache import (
+    _load_replay_context_session,
     attach_review,
     find_reusable_review,
     lookup_crash_replay,
@@ -198,6 +199,87 @@ class CrashReplayCacheTests(unittest.TestCase):
         remember_crash_replay(source, _request(scope="full", rounds=3))
         hit = lookup_crash_replay(_request(scope="full", rounds=5))
         self.assertEqual(hit["level"], "evidence")
+
+    def test_incomplete_apply_does_not_reuse_patch(self) -> None:
+        """结论可复用，但补丁没覆盖已给出围栏的必改析构时，不能直接重放。"""
+        source = Path(self._tmpdir.name) / "partial-apply"
+        _write_report(source)
+        analysis = (
+            "**需要修改的函数（必改，解释本次崩溃）**\n"
+            "- `VVoid CVStyleScene::Unload()`：\n"
+            "- `CVStyle::~CVStyle()`：RLock 改 WLock\n\n"
+            "### `style_theme.cpp`\n"
+            "```cpp\n"
+            "VVoid CVStyleScene::Unload() { V_free(p); }\n"
+            "```\n\n"
+            "### `Style.cpp`\n"
+            "```cpp\n"
+            "CVStyle::~CVStyle() { m_themeLock->WLock(); }\n"
+            "```\n"
+        )
+        (source / "final_output.md").write_text(analysis, encoding="utf-8")
+        (source / "08_apply_ai_fixes.json").write_text(
+            json.dumps(
+                {
+                    "success": True,
+                    "applied": [
+                        {
+                            "file": "style_theme.cpp",
+                            "function_signature": "VVoid CVStyleScene::Unload()",
+                            "status": "applied",
+                        },
+                        {
+                            "file": "Style.cpp",
+                            "function_signature": "CVStyle::~CVStyle()",
+                            "status": "skipped",
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (source / "09_ai_fix.patch").write_text(
+            "diff --git a/style_theme.cpp b/style_theme.cpp\n+Unload steal\n",
+            encoding="utf-8",
+        )
+        remember_crash_replay(source, _request())
+        hit = lookup_crash_replay(_request())
+        self.assertEqual(hit["level"], "conclusion")
+        self.assertEqual(str(hit.get("patch_text") or ""), "")
+        self.assertIsNone(hit.get("apply_record"))
+
+    def test_replay_session_follows_reused_from(self) -> None:
+        """空 session 的复用报告要沿着 reused_from 找回预取账本。"""
+        first = Path(self._tmpdir.name) / "with-session"
+        second = Path(self._tmpdir.name) / "empty-session"
+        _write_report(first)
+        _write_report(second)
+        (first / "context_session.json").write_text(
+            json.dumps(
+                {
+                    "request_ledger": [
+                        {
+                            "type": "function",
+                            "status": "success",
+                            "symbol": "CVStyle::~CVStyle",
+                            "file": "/cache/Style.cpp",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        remember_crash_replay(first, _request())
+        remember_crash_replay(second, _request())
+        cache = json.loads((second / "12_crash_replay_cache.json").read_text(encoding="utf-8"))
+        cache["reused_from"] = str(first)
+        (second / "12_crash_replay_cache.json").write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (second / "context_session.json").write_text("{}\n", encoding="utf-8")
+        session = _load_replay_context_session(second)
+        self.assertEqual(session["request_ledger"][0]["symbol"], "CVStyle::~CVStyle")
 
     def test_failed_apply_is_not_a_conclusion(self) -> None:
         """改码失败的运行不能当作可直接应用的结论。"""
