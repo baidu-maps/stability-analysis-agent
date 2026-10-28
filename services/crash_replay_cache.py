@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""同一崩溃的分析缓冲：证据一致时复用定位结果；结论只在全流程参数一致时复用。"""
+"""同一崩溃的分析缓冲：证据一致时复用定位结果；结论只在全流程参数一致时复用。
+
+没有可用源码的失败运行不进入可复用缓冲。查找时也会跳过已经写下的这类记录。
+"""
 
 from __future__ import annotations
 
@@ -162,6 +165,20 @@ def _usable_evidence(material: Dict[str, Any]) -> bool:
     return True
 
 
+def _report_location_failed(report_dir: Path) -> bool:
+    """定位没有可用源码时，这次运行不能复用。"""
+    summary = _load_json(report_dir / "00_run_summary.json") or {}
+    reason = str(summary.get("completion_reason") or "").strip()
+    if reason == "skipped_no_usable_code" or reason.startswith("skipped_no_usable_code"):
+        return True
+    code = _load_json(report_dir / "04b_code_content_provider.json")
+    if not isinstance(code, dict):
+        return False
+    if str(code.get("error_code") or "").strip():
+        return True
+    return False
+
+
 def _file_sha256(path: Path) -> str:
     """文件字节哈希。不存在时返回空串。"""
     try:
@@ -234,6 +251,8 @@ def remember_crash_replay(
     evidence_ok = _usable_evidence(material) and (root / "01_crash_log_parser.json").is_file()
     evidence_ok = evidence_ok and (root / "03_add2line_resolver.json").is_file()
     evidence_ok = evidence_ok and (root / "04b_code_content_provider.json").is_file()
+    if _report_location_failed(root):
+        evidence_ok = False
     conclusion_ok = evidence_ok and _conclusion_ok(root, apply_payload if isinstance(apply_payload, dict) else None)
     existing = _load_json(root / CACHE_NAME) or {}
     review = existing.get("review") if isinstance(existing.get("review"), dict) else {}
@@ -370,6 +389,8 @@ def lookup_crash_replay(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     conclusion_hit: Optional[Dict[str, Any]] = None
     for row in reversed(_read_index()):
         source = Path(str(row.get("report_dir") or ""))
+        if _report_location_failed(source):
+            continue
         cached_material = _cached_evidence_material(source)
         if cached_material is None:
             if str(row.get("evidence_key") or "") != evidence_key:

@@ -546,6 +546,56 @@ class CrashReplayCacheTests(unittest.TestCase):
         self.assertEqual(written["applied"][0]["status"], "applied")
         self.assertEqual(written["applied"][0]["file"], "GridLayer.cpp")
 
+    def test_no_usable_code_is_not_reusable(self) -> None:
+        """无可用源码的失败不进入缓冲，索引里的旧失败记录也会跳过。"""
+        source = Path(self._tmpdir.name) / "failed"
+        _write_report(source)
+        (source / "00_run_summary.json").write_text(
+            json.dumps({
+                "status": "partial",
+                "completion_reason": "skipped_no_usable_code",
+            }),
+            encoding="utf-8",
+        )
+        (source / "04b_code_content_provider.json").write_text(
+            json.dumps({"error_code": "NO_EXTRACTABLE_CONTEXT", "graph": {}}),
+            encoding="utf-8",
+        )
+        remember_crash_replay(source, _request())
+        cache = json.loads((source / "12_crash_replay_cache.json").read_text(encoding="utf-8"))
+        self.assertFalse(cache["reusable"])
+        self.assertIsNone(lookup_crash_replay(_request()))
+        self.index.write_text(
+            json.dumps({"report_dir": str(source.resolve()), "evidence_key": "stale"}) + "\n",
+            encoding="utf-8",
+        )
+        self.assertIsNone(lookup_crash_replay(_request()))
+
+    def test_poisoned_replay_does_not_hide_older_success(self) -> None:
+        """较新的无源码失败不能挡住更早的成功定位。"""
+        older = Path(self._tmpdir.name) / "older-ok"
+        _write_report(older)
+        remember_crash_replay(older, _request())
+        newer = Path(self._tmpdir.name) / "newer-fail"
+        _write_report(newer)
+        (newer / "00_run_summary.json").write_text(
+            json.dumps({
+                "status": "partial",
+                "completion_reason": "skipped_no_usable_code",
+            }),
+            encoding="utf-8",
+        )
+        remember_crash_replay(newer, _request())
+        with self.index.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "report_dir": str(newer.resolve()),
+                "evidence_key": "poison",
+                "conclusion_reusable": True,
+            }) + "\n")
+        hit = lookup_crash_replay(_request())
+        self.assertEqual(hit["level"], "conclusion")
+        self.assertEqual(Path(hit["source_report"]).resolve(), older.resolve())
+
 
 if __name__ == "__main__":
     unittest.main()

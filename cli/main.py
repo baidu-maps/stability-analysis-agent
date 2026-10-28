@@ -3385,6 +3385,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="code_roots",
         help="项目 C/C++ 源码目录（可重复指定；建议精确到工程/模块根目录，避免传整个仓库根目录）",
     )
+    p.add_argument(
+        "--scan-roots",
+        action="append",
+        dest="scan_roots",
+        help="定位阶段扫描目录（可重复）；为空时使用 --code-roots。改码仍使用 --code-roots",
+    )
     p.add_argument("--config", required=False, help="SystemConfig JSON 文件")
     p.add_argument("--source-origin", default=None, help="源码来源标识（仓库、制品或 release origin）")
     p.add_argument("--commit-policy", default=None, help="源码提交匹配策略；strict/require_match 会启用硬门禁")
@@ -6553,6 +6559,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         )
         return 1
     code_roots = _normalize_code_roots(args.code_roots)
+    scan_roots = _normalize_code_roots(getattr(args, "scan_roots", None))
     call_llm = scope == "full"
     request_record = _build_run_request_record(
         args,
@@ -6601,6 +6608,7 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         "crash_log": crash_log_content,
         "library_dir": args.library_dir,
         "code_roots": code_roots,
+        "scan_roots": scan_roots,
         "scope": scope,
         "apply_ai_fixes": bool(args.apply_ai_fixes),
         "bypass_repair_gate": bool(getattr(args, "bypass_repair_gate", True)),
@@ -6717,7 +6725,11 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         replay_hit if isinstance(replay_hit, dict) else None,
         code_roots,
     )
-    _prepare_analysis_acceleration(problem, code_roots, scope)
+    if scan_roots:
+        paths = request_record.get("paths")
+        if isinstance(paths, dict):
+            paths["scan_roots"] = list(scan_roots)
+    _prepare_analysis_acceleration(problem, scan_roots or code_roots, scope)
 
     registry = ToolAndWorkflowRegistry()
     register_all_tools_and_workflows(registry)

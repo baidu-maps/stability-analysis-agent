@@ -53,6 +53,16 @@ from tool_system.registry import ToolAndWorkflowRegistry
 
 logger = logging.getLogger(__name__)
 
+
+def location_scan_roots(problem: Dict[str, Any], code_roots: List[str]) -> List[str]:
+    """定位和补上下文只用 scan_roots；检出根留给改码。"""
+    raw = problem.get("scan_roots") if isinstance(problem, dict) else None
+    if isinstance(raw, list):
+        roots = [str(item).strip() for item in raw if str(item).strip()]
+        if roots:
+            return roots
+    return [str(item) for item in (code_roots or []) if str(item).strip()]
+
 # 尝试导入现有的 prompts
 try:
     from prompts.crash_analysis_prompt_templates import generate_crash_analysis_prompt
@@ -323,6 +333,10 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         crash_log = problem.get("crash_log", "")
         library_dir = problem.get("library_dir")
         code_roots = problem.get("code_roots", [])
+        location_roots = location_scan_roots(
+            problem,
+            code_roots if isinstance(code_roots, list) else [],
+        )
         scope = self._resolve_scope(problem)
 
         hydrated = problem.get("_hydrated_analyze")
@@ -606,20 +620,31 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             with PhaseSpinner("定位崩溃源码", step=4, total_steps=total_steps) as _ccp_spinner:
                 logger.info(f"[{self.definition.name}] Step 3: Extracting code context...")
                 cached_code = replay_evidence.get("code_context")
+                if (
+                    isinstance(cached_code, dict)
+                    and cached_code
+                    and not code_context_has_usable_code(cached_code)
+                ):
+                    print(
+                        "[crash-replay] 上次定位没有可用源码，重新定位",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    cached_code = None
                 if isinstance(cached_code, dict) and cached_code:
                     print("[crash-replay] 复用定位代码", file=sys.stderr, flush=True)
                     code_context = cached_code
                 else:
                     ccp_input: Dict[str, Any] = {
                         "resolved_stack": json.dumps(resolved),
-                        "code_roots": code_roots,
+                        "code_roots": location_roots,
                     }
                     try:
                         callsite_seed = context.execute_tool(
                             "symbol_callsite_finder",
                             {
                                 "resolved_stack": json.dumps(resolved),
-                                "code_roots": code_roots,
+                                "code_roots": location_roots,
                                 "max_results": 500,
                             },
                         )
@@ -674,7 +699,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     {
                         "resolved_stack": resolved,
                         "code_context": code_context,
-                        "code_roots": code_roots,
+                        "code_roots": location_roots,
                         "max_results": problem.get("lifecycle_search_max_results", 120)
                         if isinstance(problem, dict)
                         else 120,
@@ -957,7 +982,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                     ),
                     "_analyze_prepare": {
                         "initial_prompt": analysis_prompt,
-                        "code_roots": code_roots,
+                        "code_roots": location_roots,
                         "step": 5,
                         "total_steps": total_steps,
                         "skip_context_loop": context.llm is None,
@@ -974,7 +999,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 context=context,
                 initial_prompt=analysis_prompt,
                 problem=problem,
-                code_roots=code_roots,
+                code_roots=location_roots,
                 step=5,
                 total_steps=total_steps,
             )
@@ -3247,7 +3272,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
 
         code_roots: List[str] = []
         if isinstance(problem, dict):
-            prob_roots = problem.get("code_roots")
+            prob_roots = problem.get("scan_roots") or problem.get("code_roots")
             if isinstance(prob_roots, list):
                 code_roots.extend([str(p) for p in prob_roots if isinstance(p, str) and p.strip()])
         lines.append("")

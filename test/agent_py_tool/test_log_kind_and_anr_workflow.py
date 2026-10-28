@@ -166,6 +166,33 @@ class TestAnrFreezeWorkflowParseStack(unittest.TestCase):
         self.assertTrue(anr.get("analyzed"))
         self.assertIn("prompt_section_zh", anr)
 
+    def test_conclusion_replay_returns_cached_analysis(self):
+        from workflows.anr_freeze_workflow import AnrFreezeAnalysisWorkflow
+
+        wf = AnrFreezeAnalysisWorkflow()
+        cached = {
+            "status": "success",
+            "analysis": "结论：handler 在信号上下文死锁\n",
+            "final_tip": "结论：handler 在信号上下文死锁\n",
+        }
+        ctx = MagicMock()
+        out = wf.solve(
+            {
+                "crash_log": "watchdog timeout detected on main thread\n",
+                "scope": "full",
+                "_crash_replay": {
+                    "level": "conclusion",
+                    "source_report": "/tmp/old-report",
+                    "result": cached,
+                },
+            },
+            ctx,
+        )
+        self.assertEqual(out.get("status"), "success")
+        self.assertEqual(out.get("analysis"), cached["analysis"])
+        self.assertEqual(out.get("final_tip"), cached["final_tip"])
+        ctx.execute_tool.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from typing import Any, Dict, List, Optional
 
 from cli.phase_spinner import PhaseSpinner
@@ -252,6 +253,13 @@ class AnrFreezeAnalysisWorkflow(BaseWorkflow):
         ingest_diagnosis(store, kwargs.get("crash_diagnosis"))
 
     def solve(self, problem: Dict[str, Any], context: WorkflowContext) -> Dict[str, Any]:
+        replay = problem.get("_crash_replay") if isinstance(problem, dict) else None
+        if not isinstance(replay, dict):
+            replay = {}
+        if replay.get("level") == "conclusion" and isinstance(replay.get("result"), dict):
+            print("[crash-replay] 复用上次分析结论", file=sys.stderr, flush=True)
+            return dict(replay["result"])
+
         crash_log = problem.get("crash_log", "")
         library_dir = problem.get("library_dir")
         scope = self._resolve_scope(problem)
@@ -454,7 +462,9 @@ class AnrFreezeAnalysisWorkflow(BaseWorkflow):
                     "metadata": {"problem_type": self.definition.problem_type, "log_kind": log_kind},
                     "_analyze_prepare": {
                         "initial_prompt": final_tip,
-                        "code_roots": list(problem.get("code_roots") or []),
+                        "code_roots": list(
+                            problem.get("scan_roots") or problem.get("code_roots") or []
+                        ),
                         "step": 4,
                         "total_steps": total_steps,
                         "skip_context_loop": context.llm is None,
