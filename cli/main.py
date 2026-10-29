@@ -3636,8 +3636,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-context-requests-per-round",
         type=int,
-        default=8,
-        help="context_loop 每轮最多处理的补充上下文请求数（默认 8，硬上限 16）。",
+        default=12,
+        help="context_loop 每轮最多处理的补充上下文请求数（默认 12，硬上限 16）。",
     )
     p.add_argument(
         "--backup-original-sources",

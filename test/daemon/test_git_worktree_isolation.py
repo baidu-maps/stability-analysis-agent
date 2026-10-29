@@ -16,6 +16,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from services.git_worktree_manager import (
+    IsolatedCodeWorkspace,
+    RepositoryWorktree,
     WorktreeIsolationError,
     collect_workspace_diff,
     prepare_isolated_workspace,
@@ -214,6 +216,40 @@ class GitWorktreeIsolationTests(unittest.TestCase):
             self.assertTrue(any("render.cpp" in path for path in diff["changed_files"]))
             self.assertFalse(any("HUGE.bin" in path for path in diff["changed_files"]))
             self.assertIn("patched", str(diff.get("diff_text") or ""))
+
+    def test_untracked_nested_repository_is_not_a_patch_change(self) -> None:
+        """未跟踪的嵌套仓库不计入本次改动，普通未跟踪源文件仍然计入。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repository = self._make_repository(root)
+            nested = repository / "engine-com"
+            nested.mkdir()
+            _git(nested, "init")
+            _git(nested, "config", "user.email", "tests@example.invalid")
+            _git(nested, "config", "user.name", "Test User")
+            (nested / "README").write_text("other\n", encoding="utf-8")
+            _git(nested, "add", "README")
+            _git(nested, "commit", "-m", "nested")
+            (repository / "src" / "main.cpp").write_text(
+                "int value() { return 7; }\n",
+                encoding="utf-8",
+            )
+            (repository / "src" / "extra.cpp").write_text(
+                "int extra() { return 1; }\n",
+                encoding="utf-8",
+            )
+            head = _git(repository, "rev-parse", "HEAD")
+            workspace = IsolatedCodeWorkspace(
+                run_id="run-nested",
+                root=repository,
+                original_code_roots=[str(repository)],
+                isolated_code_roots=[str(repository)],
+                repositories=[RepositoryWorktree(repository, repository, head)],
+            )
+            changed = "\n".join(collect_workspace_diff(workspace)["changed_files"])
+            self.assertIn("main.cpp", changed)
+            self.assertIn("extra.cpp", changed)
+            self.assertNotIn("engine-com", changed)
 
     def test_non_git_directory_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

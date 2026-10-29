@@ -96,11 +96,11 @@ def resolve_max_agent_rounds(problem: Optional[Dict[str, Any]]) -> int:
     except (TypeError, ValueError):
         configured = 0
     if configured > 0:
-        return max(1, min(configured, 8))
+        return max(1, min(configured, 10))
     scope = str(value.get("scope") or "full").strip().lower()
     prompt_mode = str(value.get("prompt_mode") or "fix").strip().lower()
     if scope == "full" or prompt_mode == "analysis":
-        return 5
+        return 6
     return 1
 
 

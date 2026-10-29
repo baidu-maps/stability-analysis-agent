@@ -1053,6 +1053,149 @@ class TestCodeContentProviderV2(unittest.TestCase):
         self.assertIn("完整可替换函数体", summary["auto_fix_block_reason"])
 
 
+class HarmonyArkNapiLocationTests(unittest.TestCase):
+    """鸿蒙行号为 0 的 NAPI 函数，以及 Ark 导出名，都要进入源码定位。"""
+
+    def _write_sources(self, root: Path) -> tuple:
+        header = root / "inc" / "vi" / "vos" / "VBase.h"
+        source = root / "platform" / "Harmony" / "nativeSrc" / "napi" / "NapiMapInterface.cpp"
+        header.parent.mkdir(parents=True)
+        source.parent.mkdir(parents=True)
+        header.write_text(
+            "namespace _baidu_vi {\n"
+            "struct tagQuadrangle {\n"
+            "    tagQuadrangle() {\n"
+            "        int ready = 0;\n"
+            "        (void)ready;\n"
+            "    }\n"
+            "};\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        source.write_text(
+            "namespace _baidu_framework {\n"
+            "static int NapiMapIF_GeoPointToScreenPoint(void* env, void* info)\n"
+            "{\n"
+            "    int value = 1;\n"
+            "    return value;\n"
+            "}\n"
+            "static int NapiMapIF_TransformScreenPt(void* env, void* info)\n"
+            "{\n"
+            "    int value = 2;\n"
+            "    return value;\n"
+            "}\n"
+            "}\n"
+            "#define DECLARE_NAPI_FUNCTION(name, func) { name, func }\n"
+            "static const int kDescs[] = {\n"
+            "    DECLARE_NAPI_FUNCTION(\"NapiMapCtrl_TransformScreen\", NapiMapIF_TransformScreenPt),\n"
+            "};\n",
+            encoding="utf-8",
+        )
+        ferry = (
+            "/root/ONLINE_SERVICE/other/ferry/task_workspace/baidu/mapclient/engine-dev/"
+            "platform/Harmony/nativeSrc/napi/NapiMapInterface.cpp"
+        )
+        return header, source, ferry
+
+    def _provider(self) -> CodeContentProvider:
+        return CodeContentProvider(
+            use_ctags_index=False,
+            code_context_timeout_sec=60,
+            find_source_timeout_sec=20,
+            max_direct_callers=1,
+            max_crash_caller_search_files=8,
+            max_shared_var_related_functions=1,
+            max_symbol_only_rescues=5,
+        )
+
+    def _stack(self, header: Path, ferry: str, os_type: str) -> str:
+        payload = {
+            "os_type": os_type,
+            "resolved_threads": [{
+                "tid": "1",
+                "name": "main",
+                "is_crash_thread": True,
+                "frames": [
+                    {
+                        "address": "00000000003ea478",
+                        "resolved_function": "_baidu_vi::tagQuadrangle::tagQuadrangle()",
+                        "resolved_file": str(header),
+                        "resolved_line": 3,
+                        "module": "libapp_BaiduMapApplib.so",
+                    },
+                    {
+                        "address": "00000000003f79c4",
+                        "resolved_function": (
+                            "_baidu_framework::NapiMapIF_GeoPointToScreenPoint(void*, void*)"
+                        ),
+                        "resolved_file": ferry,
+                        "resolved_line": 0,
+                        "module": "libapp_BaiduMapApplib.so",
+                    },
+                ],
+            }],
+        }
+        return json.dumps(payload)
+
+    def test_harmony_keeps_line_zero_napi_and_ark_export(self) -> None:
+        """行号 0 的命名空间函数和 Ark 的 TransformScreen 都要抽到源码。"""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            header, _source, ferry = self._write_sources(root)
+            provider = self._provider()
+            raw = provider.code_content_provider(
+                self._stack(header, ferry, "harmonyos"),
+                [str(root)],
+                ark_napi_frames=[{
+                    "function": "NapiMapCtrl_TransformScreen",
+                    "file": "NativeAPI.js",
+                    "line": 165,
+                }],
+            )
+        data = json.loads(raw)
+        self.assertNotEqual(data.get("error_code"), "NO_EXTRACTABLE_CONTEXT", raw[:500])
+        self.assertIn("NapiMapIF_GeoPointToScreenPoint", raw)
+        self.assertIn("NapiMapIF_TransformScreenPt", raw)
+        summary = json.dumps(data.get("crash_summary") or {}, ensure_ascii=False)
+        self.assertNotIn("tagQuadrangle", summary)
+
+    def test_android_does_not_import_ark_napi_frames(self) -> None:
+        """非鸿蒙即使带了 Ark 帧，也不把 NAPI 导出名送进定位。"""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            header, _source, ferry = self._write_sources(root)
+            provider = self._provider()
+            raw = provider.code_content_provider(
+                self._stack(header, ferry, "android"),
+                [str(root)],
+                ark_napi_frames=[{
+                    "function": "NapiMapCtrl_TransformScreen",
+                    "file": "NativeAPI.js",
+                    "line": 165,
+                }],
+            )
+        self.assertNotIn("NapiMapIF_TransformScreenPt", raw)
+
+    def test_harmony_helper_reads_only_napi_names(self) -> None:
+        """平台判定之后，只收集 Ark 栈上的 Napi 导出名。"""
+        from workflows.crash_analysis_workflow import harmony_ark_napi_frames, is_harmony_analysis
+
+        parse_result = {
+            "meta_info": {"os_type": "harmonyos"},
+            "threads": [{
+                "is_crash_thread": True,
+                "frames": [
+                    {"function": "NapiMapCtrl_TransformScreen", "layer": "arkts", "line": 165},
+                    {"function": "pixelToLL", "layer": "arkts", "line": 418},
+                ],
+            }],
+        }
+        self.assertTrue(is_harmony_analysis(parse_result, {"os_type": "harmonyos"}))
+        self.assertFalse(is_harmony_analysis({"meta_info": {"os_type": "android"}}, {}))
+        names = [item["function"] for item in harmony_ark_napi_frames(parse_result)]
+        self.assertEqual(names, ["NapiMapCtrl_TransformScreen"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

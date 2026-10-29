@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -118,6 +119,11 @@ def workspace_revision(workspace: IsolatedCodeWorkspace) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _untracked_nested_repository(status_line: str, path: Path) -> bool:
+    """未跟踪且自带 .git 的目录是嵌套仓库，不是本次补丁写出的源文件。"""
+    return status_line.startswith("??") and path.is_dir() and (path / ".git").exists()
+
+
 def collect_workspace_diff(workspace: IsolatedCodeWorkspace) -> Dict[str, object]:
     """Return the authoritative changed paths and aggregate Git diff."""
     changed_files: List[str] = []
@@ -149,6 +155,8 @@ def collect_workspace_diff(workspace: IsolatedCodeWorkspace) -> Dict[str, object
             if not relative or any(relative == name or relative.startswith(name + "/") for name in nested):
                 continue
             path = (item.worktree / relative).resolve()
+            if _untracked_nested_repository(line, path):
+                continue
             changed_files.append(str(path))
             if path.is_file():
                 changed_contents[str(path)] = path.read_text(encoding="utf-8", errors="replace")
@@ -296,6 +304,43 @@ def _scoped_status(repository: Path, code_roots: Sequence[Path]) -> str:
         repository,
         ["status", "--porcelain=v1", "--untracked-files=all", "--", *pathspecs],
     )
+
+
+def _dirty_pathspecs(
+    repository: Path,
+    code_roots: Sequence[Path],
+    needed_rels: Optional[Sequence[str]],
+) -> List[str]:
+    """判脏范围：有本次要改的目标文件就只看它们，否则退回整个 code_root。"""
+    if needed_rels:
+        return list(needed_rels)
+    return [str(root.relative_to(repository)) or "." for root in code_roots]
+
+
+def _split_status_lines(repository: Path, status_text: str):
+    """把 porcelain 状态分成“已跟踪改动”与“未跟踪项”。
+
+    未跟踪的嵌套仓库和软链目录不算改动——它们不是本次补丁要写的源文件，
+    且隔离检出本来就不会包含它们（例如共享码软链 engine-com/）。
+    """
+    tracked: List[str] = []
+    untracked: List[str] = []
+    for line in status_text.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("??"):
+            relative = line[3:].strip()
+            if " -> " in relative:
+                relative = relative.split(" -> ", 1)[1]
+            path = repository / relative if relative else repository
+            if path.is_symlink():
+                continue
+            if _untracked_nested_repository(line, path.resolve()):
+                continue
+            untracked.append(line)
+        else:
+            tracked.append(line)
+    return tracked, untracked
 
 
 def _checked_out_submodules(repository: Path) -> List[str]:
@@ -553,12 +598,29 @@ def prepare_isolated_workspace(
         root_repositories.append(repository)
 
     for repository, scoped_roots in roots_by_repo.items():
-        dirty = _scoped_status(repository, scoped_roots)
-        if dirty:
-            preview = "\n".join(dirty.splitlines()[:12])
+        # 这里只做“写入安全”检查：隔离检出在 HEAD 上建立，若 code_root 里有
+        # 已跟踪文件的未提交修改，隔离结果会与开发者看到的源码不一致，必须硬挡。
+        # 源码“身份”（是否对得上崩溃二进制）由 commit_policy/base_commit 单独把关，
+        # 不在此处用“工作树是否干净”来代替。未跟踪项（含软链共享目录）不阻断。
+        needed_rels = _needed_relpaths(repository, needed_paths)
+        pathspecs = _dirty_pathspecs(repository, scoped_roots, needed_rels)
+        status_text = _run_git(
+            repository,
+            ["status", "--porcelain=v1", "--untracked-files=all", "--", *pathspecs],
+        )
+        tracked, untracked = _split_status_lines(repository, status_text)
+        if tracked:
+            preview = "\n".join(tracked[:12])
             raise WorktreeIsolationError(
-                "code_root contains uncommitted changes; commit or stash them before an isolated run: "
-                f"{repository}\n{preview}"
+                "code_root contains uncommitted changes; commit or stash them before an "
+                f"isolated run (untracked files are ignored): {repository}\n{preview}"
+            )
+        if untracked:
+            names = ", ".join(line[3:].strip() for line in untracked[:8])
+            print(
+                f"[worktree] 忽略 {len(untracked)} 个未跟踪路径（隔离检出不含它们）: {names}",
+                file=sys.stderr,
+                flush=True,
             )
 
     base = (workspace_base or default_worktree_root()).expanduser().resolve()

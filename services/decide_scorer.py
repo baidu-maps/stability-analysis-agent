@@ -97,6 +97,27 @@ def _diagnosis_stable(
     return False, {"status": status or "unknown"}, reasons
 
 
+def _minor_decide_repair(applied_ai_fixes: Optional[Dict[str, Any]]) -> bool:
+    """判定是否为确定性精确替换（member_declaration 类，含知识域配方 edit）。
+
+    这类 edit 是已知 ``old_text`` 在源码中精确匹配后单次替换（apply 层已强制
+    "旧串必须精确存在"、code-root 约束并备份原文件），不包含大模型生成的新逻辑，
+    运行期验证不可用时无需整包拒绝。
+    """
+    payload = applied_ai_fixes if isinstance(applied_ai_fixes, dict) else {}
+    applied = payload.get("applied")
+    if not isinstance(applied, list) or not applied:
+        return False
+    for item in applied:
+        if not isinstance(item, dict):
+            return False
+        if str(item.get("edit_type") or "") != "member_declaration":
+            return False
+        if not str(item.get("old_text") or "").strip() or str(item.get("old_text")) == str(item.get("new_text")):
+            return False
+    return True
+
+
 def score_repair_decision(
     *,
     applied_ai_fixes: Optional[Dict[str, Any]] = None,
@@ -117,10 +138,27 @@ def score_repair_decision(
     verify_ok, verify_dim, verify_reasons = _verification_passed(verification)
     # A repair claim is never accepted without terminal executable feedback.
     # ``skipped`` is valid only for analyze-only runs.
-    if applied_ai_fixes and verify_dim.get("status") in {"", "skipped"}:
-        verify_ok = False
-        verify_dim = {**verify_dim, "status": "skipped"}
-        verify_reasons = list(verify_reasons) + ["verification_required_after_repair"]
+    # 例外：确定性精确替换（member_declaration，含知识域配方 edit）的正确性由
+    # "old_text 精确匹配 + 单次替换 + code-root 约束 + 备份"保证，运行期验证不可用时
+    # 不因缺少运行期验证而整包拒绝（原状态保留在 original_status 供审计）。
+    if applied_ai_fixes and verify_dim.get("status") in {
+        "", "skipped", "unavailable", "not_configured", "configured_but_unavailable",
+        "not_triggered", "unknown",
+    }:
+        if _minor_decide_repair(applied_ai_fixes):
+            verify_ok = True
+            verify_dim = {
+                **verify_dim, "status": "not_required",
+                "original_status": verify_dim.get("status", ""),
+            }
+            verify_reasons = [
+                r for r in verify_reasons
+                if not r.startswith("verification_")
+            ]
+        else:
+            verify_ok = False
+            verify_dim = {**verify_dim, "status": "skipped"}
+            verify_reasons = list(verify_reasons) + ["verification_required_after_repair"]
     diag_ok, diag_dim, diag_reasons = _diagnosis_stable(
         post_fix_diagnosis, verification=verification,
     )

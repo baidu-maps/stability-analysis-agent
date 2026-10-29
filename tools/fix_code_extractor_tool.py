@@ -14,6 +14,7 @@ from services.code_fixer import (
     extract_candidate_nodes,
     _extract_include_directive_edits,
     _extract_member_declaration_edits,
+    _extract_global_declaration_edits,
     _extract_required_function_names_from_analysis,
     _ensure_owner_class_methods_in_targets,
     _select_required_targets,
@@ -114,7 +115,26 @@ class FixCodeExtractorTool(BaseTool):
             candidate_nodes=candidate_nodes,
             required_targets=required_targets,
         )
-        if not fix_plan:
+        # 声明级/头文件级的 edit（include、成员/全局限定符）不依赖函数体，
+        # 先于函数 fix_plan 的空判断计算，使“只有声明级改动”的分析也能成功。
+        extra_edits = _extract_include_directive_edits(analysis_text, code_context)
+        extra_edits.extend(_extract_member_declaration_edits(analysis_text, code_context))
+        extra_edits.extend(_extract_global_declaration_edits(analysis_text, code_context))
+        # 知识域确定性修复配方：命中即产出精确 old_text→new_text 的声明级 edit，
+        # 不依赖大模型自行推理；候选文件里无法精确定位 old_text 时自动跳过。
+        try:
+            from knowledge_plane.fix_recipe import collect_recipe_edits as _collect_recipe
+            from services.code_fixer import _collect_code_context_source_files as _cc_files
+            recipe_files = [str(p) for p in _cc_files(code_context)]
+            recipe_edits = _collect_recipe(
+                trigger_text="\n".join([analysis_text, "\n".join(recipe_files)]),
+                candidate_files=recipe_files,
+            )
+            extra_edits.extend(recipe_edits)
+        except Exception as _recipe_exc:
+            pass
+
+        if not fix_plan and not extra_edits:
             return {
                 "success": False,
                 "error": "未能从分析文本中提取到可执行 edits",
@@ -123,10 +143,10 @@ class FixCodeExtractorTool(BaseTool):
                 "extracted_count": 0,
                 "missing_required": required_targets,
             }
+        if not isinstance(fix_plan, dict):
+            fix_plan = {"edits": []}
 
         edits = fix_plan.get("edits", []) if isinstance(fix_plan, dict) else []
-        extra_edits = _extract_include_directive_edits(analysis_text, code_context)
-        extra_edits.extend(_extract_member_declaration_edits(analysis_text, code_context))
         if extra_edits:
             edits_list = edits if isinstance(edits, list) else []
             edits_list.extend(extra_edits)

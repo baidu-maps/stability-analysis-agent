@@ -5,6 +5,7 @@ They deliberately make no claim about functional correctness or Crash repair.
 """
 from __future__ import annotations
 
+import subprocess
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -19,6 +20,57 @@ CORE_SAFETY_CHECKS = (
 
 def _paths(values: Iterable[str]) -> List[str]:
     return sorted({str(Path(value).expanduser().resolve()) for value in values if str(value).strip()})
+
+
+def _git_submodule_files(repo_root: str, entry: str) -> List[str]:
+    """把父仓库里一行 ``<sub>`` gitlink 改动展开为子模块内部实际改动文件。
+
+    父仓库 ``git status`` 只会显示 `` M <submodule>``，无法反映子模块内部哪几个
+    文件被改；安全校验据此比对会出现 declared(子模块内文件) 与 actual(子模块目录)
+    不一致。这里对子模块再跑一次 porcelain，把内部改动文件按父仓库绝对路径展开。
+    不可用时安全退回原 entry，不改判定语义。
+    """
+    try:
+        sub = Path(repo_root).expanduser().resolve() / entry
+        if not sub.is_dir():
+            return []
+        proc = subprocess.run(
+            ["git", "-C", str(sub), "status", "--porcelain=v1", "--untracked-files=no"],
+            capture_output=True, text=True, check=False, timeout=20,
+        )
+    except Exception:
+        return []
+    out: List[str] = []
+    for line in (proc.stdout or "").splitlines():
+        if len(line) <= 3:
+            continue
+        rel = line[3:].strip()
+        if not rel:
+            continue
+        out.append(str((sub / rel).resolve()))
+    return out
+
+
+def _expand_submodule_links(actual: List[str], roots: List[str]) -> List[str]:
+    """把 actual 中作为父仓库子模块目录出现的条目展开为子模块内部文件路径。
+
+    父仓库 ``git status`` 只会显示 `` M <submodule>``；安全校验据此比对会出现
+    declared(子模块内文件) 与 actual(子模块目录) 不一致。这里把子模块目录条目
+    替换为子模块内部实际改动的文件绝对路径；展开失败的目录条目原样保留。
+    """
+    out: List[str] = []
+    for path in actual:
+        p = Path(path)
+        is_submodule_dir = p.is_dir() and (p / ".git").exists()
+        if not is_submodule_dir:
+            out.append(path)
+            continue
+        files = _git_submodule_files(str(p.parent), p.name)
+        if files:
+            out.extend(files)
+        else:
+            out.append(path)
+    return sorted(set(out))
 
 
 def _inside(path: str, roots: Sequence[str]) -> bool:
@@ -78,7 +130,7 @@ class SafetyVerificationRunner:
 
     def run(self, context: SafetyContext) -> Dict[str, Any]:
         declared = _paths(context.declared_changed_files)
-        actual = _paths(context.actual_changed_files)
+        actual = _expand_submodule_links(_paths(context.actual_changed_files), _paths(context.workspace_roots))
         roots = _paths(context.workspace_roots)
         results: List[SafetyCheckResult] = []
         for name in self.checks:

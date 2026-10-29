@@ -2033,5 +2033,47 @@ DemoMapOperator::~DemoMapOperator()
             self.assertLess(text.find("/// 处理信号"), text.find("void bmk_handler"))
 
 
+    def test_extract_drops_call_fragment_without_target_definition(self) -> None:
+        """调用片段不能变成目标函数的替换；完整函数定义仍然保留。"""
+        compile_sig = (
+            "bool GLRenderShader::CompileShader"
+            "(GLuint * shader, GLenum type, const GLchar* source)"
+        )
+        init_sig = (
+            "bool GLRenderShader::initWithShaderSources"
+            "(const GLchar* vShaderSrc, const GLchar* fShaderSrc, ShaderType shaderType)"
+        )
+        analysis = (
+            "```cpp\n"
+            "if (!CompileShader(&vertShader, GL_VERTEX_SHADER, vShaderSrc))\n"
+            "{\n"
+            "    glDeleteProgram(m_ProgramID);\n"
+            "    return false;\n"
+            "}\n"
+            "```\n"
+            "```cpp\n"
+            f"{init_sig}\n"
+            "{\n"
+            "    return true;\n"
+            "}\n"
+            "```\n"
+        )
+        plan = CodeFixer()._try_extract_fix_plan_from_analysis(
+            analysis,
+            [
+                {"file": "gl_render_shader.cpp", "signature": compile_sig},
+                {"file": "gl_render_shader.cpp", "signature": init_sig},
+            ],
+            [
+                {"file": "gl_render_shader.cpp", "function_signature": compile_sig},
+                {"file": "gl_render_shader.cpp", "function_signature": init_sig},
+            ],
+        )
+        self.assertIsNotNone(plan)
+        signatures = [item["function_signature"] for item in plan["edits"]]
+        self.assertNotIn(compile_sig, signatures)
+        self.assertIn(init_sig, signatures)
+
+
 if __name__ == "__main__":
     unittest.main()

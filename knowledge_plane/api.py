@@ -79,6 +79,67 @@ def _parse_scalar(value: str) -> Any:
         return value.strip("\"'")
 
 
+def _frontmatter_symbols(front: str) -> List[str]:
+    """抓取 frontmatter 里 symbols 列表（支持行内与跨行 [a, b, ...]）。"""
+    m = re.search(r"symbols:\s*\[(.*?)\]", front, re.DOTALL)
+    if m:
+        return [p.strip().strip("\"'") for p in m.group(1).split(",") if p.strip()]
+    for line in front.splitlines():
+        if line.strip().startswith("symbols:"):
+            raw = line.split(":", 1)[1].strip()
+            val = _parse_scalar(raw) if raw else []
+            if isinstance(val, list):
+                return [str(x).strip() for x in val if str(x).strip()]
+    return []
+
+
+def collect_seed_symbols(
+    stack_text: str,
+    explicit_dirs: Optional[Sequence[str]] = None,
+    *,
+    max_symbols: int = 40,
+) -> List[str]:
+    """返回与崩溃栈相关的 Pack 文档 frontmatter symbols 并集。
+
+    某文档只要有一个 symbol 出现在栈文本里即视为相关，再把它声明的全部 symbols
+    （含自由函数/全局变量，如 GetShaderValue、g_strShaderVert）作为代码定位种子，
+    用于把这些定义文件引入上下文——它们通常不在崩溃帧上。
+    """
+    stack = str(stack_text or "")
+    if not stack.strip():
+        return []
+    out: List[str] = []
+    seen: set = set()
+    try:
+        pack_dirs = resolve_pack_dirs(explicit_dirs)
+    except Exception:
+        return []
+    for pack_dir in pack_dirs:
+        try:
+            md_files = list(pack_dir.rglob("*.md"))
+        except OSError:
+            continue
+        for md in md_files:
+            try:
+                text = md.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            fm = _FRONTMATTER_RE.match(text)
+            if not fm:
+                continue
+            symbols = _frontmatter_symbols(fm.group(1))
+            if not symbols or not any(s and s in stack for s in symbols):
+                continue
+            for s in symbols:
+                s = str(s).strip()
+                if s and s not in seen:
+                    seen.add(s)
+                    out.append(s)
+                    if len(out) >= max_symbols:
+                        return out
+    return out
+
+
 def _parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
     match = _FRONTMATTER_RE.match(text)
     if not match:

@@ -1097,25 +1097,42 @@ def run_repair_pipeline(
             fix_result_input = map_result_paths(isolated_workspace, result)
             write_workspace_artifacts(isolated_workspace, report_dir)
         except WorktreeIsolationError as exc:
-            out.applied_fix_result = {
-                "success": False,
-                "applied": [],
-                "skipped_reason": "无法创建隔离 worktree",
-                "error": str(exc),
-            }
-            out.verification_result = {
-                "status": "unavailable",
-                "provider": "worktree",
-                "mode": "auto",
-                "checks": [],
-                "duration_ms": 0,
-                "error": str(exc),
-            }
-            out.result_updates = {
-                "applied_ai_fixes": out.applied_fix_result,
-                "verification": out.verification_result,
-            }
-            return out
+            # 设计#2：隔离尽力而为。无法建隔离 worktree 时（如共享码在未跟踪的软链
+            # 目录里，隔离检出本就带不全），降级为在真实工作树上原地改码，并记录原因
+            # 供评审；备份与 diff 工件由后续 apply/write_workspace_artifacts 负责。
+            try:
+                isolated_workspace = adopt_prepared_checkout(
+                    str(run_id or uuid.uuid4().hex),
+                    code_roots,
+                )
+                fix_code_roots = isolated_workspace.isolated_code_roots
+                fix_result_input = map_result_paths(isolated_workspace, result)
+                write_workspace_artifacts(isolated_workspace, report_dir)
+                out.result_updates = dict(out.result_updates or {})
+                out.result_updates["worktree_isolation_fallback"] = {
+                    "mode": "in_place",
+                    "reason": str(exc),
+                }
+            except WorktreeIsolationError as fallback_exc:
+                out.applied_fix_result = {
+                    "success": False,
+                    "applied": [],
+                    "skipped_reason": "无法创建隔离 worktree，且原地兜底失败",
+                    "error": str(fallback_exc),
+                }
+                out.verification_result = {
+                    "status": "unavailable",
+                    "provider": "worktree",
+                    "mode": "auto",
+                    "checks": [],
+                    "duration_ms": 0,
+                    "error": str(fallback_exc),
+                }
+                out.result_updates = {
+                    "applied_ai_fixes": out.applied_fix_result,
+                    "verification": out.verification_result,
+                }
+                return out
 
     state = runtime_state or RuntimeState()
     state.verification_capabilities = list(session.get("verification_capabilities") or [])

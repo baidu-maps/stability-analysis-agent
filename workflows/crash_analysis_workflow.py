@@ -63,6 +63,54 @@ def location_scan_roots(problem: Dict[str, Any], code_roots: List[str]) -> List[
             return roots
     return [str(item) for item in (code_roots or []) if str(item).strip()]
 
+
+_HARMONY_OS_TYPES = {"harmony", "harmonyos", "ohos", "openharmony"}
+_ARK_FRAME_LAYERS = {"arkts", "ark", "js", "javascript"}
+
+
+def is_harmony_analysis(parse_result: Any, resolved: Any) -> bool:
+    """日志或符号化结果里的平台是鸿蒙时返回 True。"""
+    tokens: List[str] = []
+    for blob in (parse_result, resolved):
+        if not isinstance(blob, dict):
+            continue
+        meta = blob.get("meta_info") if isinstance(blob.get("meta_info"), dict) else {}
+        for value in (blob.get("os_type"), meta.get("os_type"), meta.get("platform")):
+            text = str(value or "").strip().lower()
+            if text:
+                tokens.append(text)
+    return any(token in _HARMONY_OS_TYPES for token in tokens)
+
+
+def harmony_ark_napi_frames(parse_result: Any) -> List[Dict[str, Any]]:
+    """从崩溃线程的 Ark 栈取出 NAPI 导出名，供 native 源码定位。"""
+    if not isinstance(parse_result, dict):
+        return []
+    threads = [item for item in (parse_result.get("threads") or []) if isinstance(item, dict)]
+    crash_threads = [item for item in threads if item.get("is_crash_thread")]
+    picked: List[Dict[str, Any]] = []
+    seen = set()
+    for thread in crash_threads or threads:
+        for frame in thread.get("frames") or []:
+            if not isinstance(frame, dict):
+                continue
+            layer = str(frame.get("layer") or frame.get("language") or "").strip().lower()
+            name = str(frame.get("function") or "").strip()
+            if layer not in _ARK_FRAME_LAYERS and not name.startswith("Napi"):
+                continue
+            if not name.startswith("Napi") or name in seen:
+                continue
+            seen.add(name)
+            picked.append({
+                "function": name,
+                "file": str(frame.get("file") or ""),
+                "line": frame.get("line") or 0,
+            })
+            if len(picked) >= 4:
+                return picked
+    return picked
+
+
 # 尝试导入现有的 prompts
 try:
     from prompts.crash_analysis_prompt_templates import generate_crash_analysis_prompt
@@ -639,6 +687,10 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         "resolved_stack": json.dumps(resolved),
                         "code_roots": location_roots,
                     }
+                    if is_harmony_analysis(parse_result, resolved):
+                        ark_napi_frames = harmony_ark_napi_frames(parse_result)
+                        if ark_napi_frames:
+                            ccp_input["ark_napi_frames"] = ark_napi_frames
                     try:
                         callsite_seed = context.execute_tool(
                             "symbol_callsite_finder",
@@ -657,6 +709,56 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                             "[%s] symbol_callsite_finder skipped: %s",
                             self.definition.name,
                             seed_exc,
+                        )
+                    # 知识域种子：把命中文档 frontmatter symbols（自由函数/全局，如
+                    # GetShaderValue、g_strShaderVert）的定义文件引入定位上下文，
+                    # 弥补“被调函数不在崩溃帧”的缺口。失败不影响 04b。
+                    try:
+                        import subprocess as _sp
+                        from knowledge_plane.api import collect_seed_symbols as _css
+                        _kp_dirs = (
+                            problem.get("knowledge_pack_dirs")
+                            if isinstance(problem, dict) else None
+                        )
+                        _seed_syms = _css(json.dumps(resolved), _kp_dirs)
+                        _seed_files = []
+                        for _sym in _seed_syms:
+                            _tok = str(_sym).split("::")[-1].strip()
+                            if len(_tok) < 3:
+                                continue
+                            for _root in location_roots:
+                                try:
+                                    _res = _sp.run(
+                                        ["grep", "-rlI",
+                                         "--include=*.cpp", "--include=*.cc",
+                                         "--include=*.cxx", "--include=*.h",
+                                         "--include=*.hpp", "-e", _tok, str(_root)],
+                                        capture_output=True, text=True,
+                                        timeout=20, check=False,
+                                    )
+                                except Exception:
+                                    continue
+                                for _f in (_res.stdout or "").splitlines():
+                                    _f = _f.strip()
+                                    if _f and _f not in _seed_files:
+                                        _seed_files.append(_f)
+                                if len(_seed_files) >= 15:
+                                    break
+                            if len(_seed_files) >= 15:
+                                break
+                        if _seed_files:
+                            _existing = ccp_input.get("_candidate_callsite_files") or []
+                            ccp_input["_candidate_callsite_files"] = list(
+                                dict.fromkeys(list(_existing) + _seed_files)
+                            )
+                            logger.info(
+                                "[%s] knowledge seed added %d file(s) from %d symbol(s)",
+                                self.definition.name, len(_seed_files), len(_seed_syms),
+                            )
+                    except Exception as _seed_exc:
+                        logger.info(
+                            "[%s] knowledge seed symbols skipped: %s",
+                            self.definition.name, _seed_exc,
                         )
                     for _k in (
                         "max_sibling_member_functions",

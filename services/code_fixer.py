@@ -3146,20 +3146,38 @@ def _extract_replacement_from_analysis(
         return None
     target_signature = sanitize_function_signature(str(target_signature or "").strip())
     simple_name = _extract_simple_function_name(target_signature)
+
+    def _usable_replacement(block: Optional[str]) -> Optional[str]:
+        """丢掉调用片段；函数定义即使签名不合格也留给落盘检查。"""
+        if not block or not str(block).strip():
+            return None
+        cleaned = sanitize_replacement_code(block, target_signature)
+        if not cleaned:
+            return None
+        if _replacement_signature_compatible(target_signature, cleaned):
+            return cleaned
+        block_sig = _extract_block_signature(cleaned)
+        found_name = _extract_signature_function_name(block_sig) if block_sig else ""
+        target_name = _extract_signature_function_name(target_signature)
+        if found_name and target_name and found_name == target_name:
+            return cleaned
+        return None
+
     # Structured reports usually quote the original function before the
     # proposed repair, so the last matching definition is the useful one.
     for code in reversed(blocks):
         idx = code.find(target_signature) if target_signature else -1
         if idx >= 0:
-            block = _extract_function_block_from_code(code, idx)
-            if block:
-                return sanitize_replacement_code(block, target_signature)
+            usable = _usable_replacement(_extract_function_block_from_code(code, idx))
+            if usable:
+                return usable
         # 代码块是 class/struct 定义时，优先从类体内按方法名提取 inline 方法。
         # 这样可以避免普通函数扫描在一行多个 inline 方法/注释场景下粘连相邻方法。
         if re.search(r"^\s*(?:class|struct)\s+\w+", code, re.MULTILINE):
             inline_block = _extract_inline_method_from_class_block(code, target_signature)
-            if inline_block:
-                return sanitize_replacement_code(inline_block, target_signature)
+            usable = _usable_replacement(inline_block)
+            if usable:
+                return usable
         # 先按块内每个函数定义扫描，通过 signatures_match 做容错匹配
         func_pattern = re.compile(
             r"(?:[\w:*&<>,\s]+?\s+)?(~?\w+(?:::\w+)*)\s*\([^)]*\)"
@@ -3177,16 +3195,21 @@ def _extract_replacement_from_analysis(
                 and target_signature
                 and signatures_match(blk_sig, target_signature)
             ):
-                return sanitize_replacement_code(block, target_signature)
+                usable = _usable_replacement(block)
+                if usable:
+                    return usable
         if simple_name:
             pattern = re.compile(rf"\b{re.escape(simple_name)}\s*\(", re.M)
             for m in pattern.finditer(code):
                 block = _extract_function_block_from_code(code, m.start())
-                if block and (
+                if not block or not (
                     _extract_simple_function_name(block) == simple_name
                     or _source_defines_function(block, simple_name)
                 ):
-                    return sanitize_replacement_code(block, target_signature)
+                    continue
+                usable = _usable_replacement(block)
+                if usable:
+                    return usable
     return None
 
 
@@ -3487,6 +3510,97 @@ def _extract_member_declaration_edits(
                 seen_keys.add(key)
             edits.append(edit)
     return edits
+
+
+# 顶层/全局声明的存储限定符变更（例如把 `std::string g_x;` 改为
+# `thread_local std::string g_x;`）。这类 1 行改动不是函数体，旧提取器抓不到，
+# 这里补一条路径，复用 member_declaration 的精确 old_text→new_text 落盘分支。
+_GLOBAL_QUALIFIER_RE = re.compile(
+    r"^\s*(thread_local|static|constexpr|inline)\s+"
+    r"([A-Za-z_][\w:<>,\s\*&]*?\s+)(\w+)\s*(=[^;]*)?;",
+    re.MULTILINE,
+)
+
+
+def _collect_code_context_source_files(code_context: Any) -> List[Path]:
+    """从 code_context 里递归收集存在的源文件路径（file/file_path/path/definition_file）。"""
+    out: List[Path] = []
+    seen: Set[str] = set()
+    _FILE_KEYS = {"file", "file_path", "path", "definition_file", "source_file"}
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k in _FILE_KEYS and isinstance(v, str) and v.strip():
+                    p = v.strip()
+                    if p not in seen and p.lower().endswith((".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hh")):
+                        try:
+                            if Path(p).is_file():
+                                seen.add(p)
+                                out.append(Path(p))
+                        except OSError:
+                            pass
+                else:
+                    _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(code_context)
+    return out
+
+
+def _extract_global_declaration_edits(
+    analysis_text: str,
+    code_context: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """提取顶层声明的存储限定符变更，生成 member_declaration 类型（精确文本替换）的 edit。"""
+    edits: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    code_blocks = re.findall(r"```(?:cpp|c\+\+|cc|cxx)?\s*\n(.*?)```", analysis_text or "", re.DOTALL)
+    if not code_blocks:
+        return edits
+    wants: List["tuple[str, str]"] = []  # (qualifier, var_name)
+    for block in code_blocks:
+        for m in _GLOBAL_QUALIFIER_RE.finditer(block):
+            wants.append((m.group(1), m.group(3)))
+    if not wants:
+        return edits
+    for file_path in _collect_code_context_source_files(code_context):
+        try:
+            original_lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for qualifier, var in wants:
+            key = f"{file_path}:{var}:{qualifier}"
+            if key in seen:
+                continue
+            decl_re = re.compile(
+                r"^(\s*)([A-Za-z_][\w:<>,\s\*&]*?\s+)" + re.escape(var) + r"\s*(=[^;]*)?;\s*$"
+            )
+            for line in original_lines:
+                stripped = line.strip()
+                if not stripped or stripped.startswith(("//", "*", "#")):
+                    continue
+                if re.search(r"\b" + re.escape(qualifier) + r"\b", stripped):
+                    continue  # 已带该限定符
+                dm = decl_re.match(line)
+                if not dm:
+                    continue
+                indent = dm.group(1)
+                old_text = line.rstrip()
+                new_text = f"{indent}{qualifier} {old_text.strip()}"
+                seen.add(key)
+                edits.append({
+                    "file": str(file_path),
+                    "edit_type": "member_declaration",
+                    "old_text": old_text,
+                    "new_text": new_text,
+                    "reason": f"为全局 {var} 增加 {qualifier} 限定符",
+                })
+                break
+    return edits
+
 
 
 def _member_declaration_edits_in_header(
@@ -4188,9 +4302,11 @@ class CodeFixer:
                 "status": "skipped",
             }
             if not _signature_is_plausible_for_edit(signature):
-                record["error"] = "function_signature 无效（含宏污染或不完整）"
-                applied.append(record)
-                continue
+                # 签名含宏污染/不完整时不再直接拒绝：改为只允许“精确旧函数体匹配”
+                # 的安全落盘路径（下面禁用依赖签名的模糊匹配），匹配不到再拒绝。
+                signature_suspect = True
+            else:
+                signature_suspect = False
             if not replacement_code:
                 record["error"] = "replacement_code 为空"
                 applied.append(record)
@@ -4199,7 +4315,7 @@ class CodeFixer:
                 record["error"] = "replacement_code 无效（含孤立括号或占位符）"
                 applied.append(record)
                 continue
-            if not _replacement_signature_compatible(signature, replacement_code):
+            if not signature_suspect and not _replacement_signature_compatible(signature, replacement_code):
                 record["error"] = "replacement_code 的类名/函数名与目标签名不一致，已拒绝写入"
                 applied.append(record)
                 continue
@@ -4262,7 +4378,7 @@ class CodeFixer:
                 else:
                     old_block = snippet_text
                     new_text_content = original.replace(snippet_text, replacement_code, 1)
-            else:
+            elif not signature_suspect:
                 new_text_content, old_block = CodeFixer.replace_function_block(original, signature, replacement_code)
             if old_block is None or new_text_content == original:
                 record["error"] = "未能在源码中定位待替换函数"

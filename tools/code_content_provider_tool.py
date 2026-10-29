@@ -4726,6 +4726,134 @@ class CodeContentProvider:
             logger.debug("ctags 函数索引不可用: %s", exc)
             self._ctags_index = None
 
+    def _is_qualified_special_member(self, resolved_function: str) -> bool:
+        """方法名与类名相同（构造/析构）时返回 True。命名空间自由函数返回 False。"""
+        parsed = self._extract_cpp_qualified_parts(resolved_function)
+        if not parsed:
+            return False
+        owner, method = parsed
+        return method.lstrip("~") == owner.split("::")[-1]
+
+    def _is_header_special_member_frame(self, frame: Dict[str, Any]) -> bool:
+        """头文件里的构造/析构只作上下文，不作为优先改码帧。"""
+        path = str(frame.get("resolved_file") or "").lower()
+        if not path.endswith((".h", ".hpp", ".hh", ".hxx", ".inl", ".ipp")):
+            return False
+        name = str(frame.get("resolved_function") or frame.get("function") or "")
+        return self._is_qualified_special_member(name)
+
+    def _find_named_function_line(self, file_path: str, simple_name: str) -> Optional[int]:
+        """在已知源文件里按函数名找定义行。行号未知时用这一行打开函数体。"""
+        if not file_path or not simple_name or not os.path.isfile(file_path):
+            return None
+        pattern = re.compile(rf"(^|[^\w:]){re.escape(simple_name)}\s*\(")
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
+                lines = handle.readlines()
+        except OSError:
+            return None
+        fallback: Optional[int] = None
+        for idx, line in enumerate(lines, 1):
+            if "DECLARE_NAPI_FUNCTION" in line or not pattern.search(line):
+                continue
+            nxt = lines[idx] if idx < len(lines) else ""
+            if "{" in line or nxt.strip().startswith("{"):
+                return idx
+            if fallback is None:
+                fallback = idx
+        return fallback
+
+    def _resolve_napi_native_name(
+        self, export_name: str, code_roots: List[str]
+    ) -> Optional[Tuple[str, str]]:
+        """把 Ark 导出 NapiMapCtrl_* 解析成 DECLARE 右侧的 native 函数名。"""
+        pattern = (
+            r'DECLARE_NAPI_FUNCTION\(\s*"'
+            + re.escape(export_name)
+            + r'"\s*,\s*([A-Za-z_][A-Za-z0-9_]*)'
+        )
+        hits = self._rg_grep_lines(pattern, code_roots, max_matches=5)
+        if not hits:
+            return None
+        matched = re.search(pattern, hits[0][2])
+        if not matched:
+            return None
+        return hits[0][0], matched.group(1)
+
+    def _append_harmony_ark_napi_frames(
+        self,
+        resolved_frames: List[Dict[str, Any]],
+        add2line_data: Dict[str, Any],
+        code_roots: List[str],
+    ) -> None:
+        """鸿蒙崩溃把 Ark 栈上的 NAPI 名对应的 native 函数补进待提取帧。"""
+        os_token = str(add2line_data.get("os_type") or "").strip().lower()
+        if os_token in {"android", "ios", "macos", "linux", "windows"}:
+            return
+        exports = [
+            item for item in (getattr(self, "_ark_napi_frames", None) or [])
+            if isinstance(item, dict)
+        ]
+        if not exports or not code_roots:
+            return
+        existing = set()
+        for frame in resolved_frames:
+            if not isinstance(frame, dict):
+                continue
+            simple = self._extract_function_name_from_resolved(
+                str(frame.get("resolved_function") or frame.get("function") or "")
+            )
+            if simple:
+                existing.add(simple)
+        notes: List[str] = list(getattr(self, "_ark_napi_notes", None) or [])
+        added: List[Dict[str, Any]] = []
+        for item in exports:
+            export_name = str(item.get("function") or "").strip()
+            if not export_name.startswith("Napi"):
+                continue
+            resolved = self._resolve_napi_native_name(export_name, code_roots)
+            if not resolved:
+                notes.append(f"鸿蒙 Ark 导出 {export_name} 未在代码库找到 DECLARE_NAPI_FUNCTION")
+                continue
+            declare_file, native_name = resolved
+            if native_name in existing:
+                notes.append(f"鸿蒙 Ark 导出 {export_name} 已在 native 栈中: {native_name}")
+                continue
+            def_line = self._find_named_function_line(declare_file, native_name)
+            def_file = declare_file if def_line else ""
+            if not def_line:
+                located = self._find_function_definition_location(native_name, code_roots)
+                if not located:
+                    notes.append(f"鸿蒙 Ark 导出 {export_name} 未找到 native 实现 {native_name}")
+                    continue
+                def_file, def_line = located
+            added.append({
+                "address": f"ark:{export_name}",
+                "function": native_name,
+                "resolved_function": native_name,
+                "resolved_file": def_file,
+                "resolved_line": def_line,
+                "module": "",
+                "crash_location_source": "from_ark_napi",
+                "ark_export_name": export_name,
+            })
+            existing.add(native_name)
+            notes.append(f"鸿蒙 Ark 导出 {export_name} 对应 native {native_name}")
+        self._ark_napi_notes = notes
+        if not added:
+            return
+        resolved_frames.extend(added)
+        threads = add2line_data.get("resolved_threads")
+        if not isinstance(threads, list):
+            return
+        for thread in threads:
+            if not isinstance(thread, dict) or not thread.get("is_crash_thread"):
+                continue
+            frames = thread.get("frames")
+            if isinstance(frames, list) and frames is not resolved_frames:
+                frames.extend(added)
+            break
+
     def _find_function_definition_location(self, simple_name: str, code_roots: List[str]) -> Optional[Tuple[str, int]]:
         """在 code_roots 下按函数名查找函数定义位置，委托给 CodeLocatorService。"""
         return self._locator.find_function_definition(simple_name, code_roots)
@@ -10447,7 +10575,8 @@ class CodeContentProvider:
 
     def code_content_provider(self, add2line_json: str, code_root: Union[str, List[str], None],
                              exclude_dirs: Optional[List[str]] = None,
-                             include_subdirs: Optional[List[str]] = None) -> str:
+                             include_subdirs: Optional[List[str]] = None,
+                             ark_napi_frames: Optional[List[Dict[str, Any]]] = None) -> str:
         """
         代码内容提供工具 - 重构版本 V2
 
@@ -10460,6 +10589,10 @@ class CodeContentProvider:
         """
         try:
             logger.info("开始生成结构化崩溃分析数据...")
+            self._ark_napi_frames = [
+                item for item in (ark_napi_frames or []) if isinstance(item, dict)
+            ]
+            self._ark_napi_notes = []
             
             # 更新过滤设置（如果提供了参数）
             if exclude_dirs is not None:
@@ -10735,6 +10868,9 @@ class CodeContentProvider:
                             h["attach_target_filtered_index"] = target_filtered_idx
                 self._stack_semantic_hints = semantic_hints
                 self._stack_kept_original_indices = kept_original_indices
+                self._append_harmony_ark_napi_frames(
+                    resolved_frames, add2line_data, code_roots_abs_strs
+                )
                 stack_syms: List[Dict[str, Any]] = []
                 for filtered_i, frame in enumerate(filtered_frames, 1):
                     orig_pos = (
@@ -10761,7 +10897,7 @@ class CodeContentProvider:
                     detail="resolved_frames empty after code_root filter",
                 )
 
-            extraction_warnings: List[str] = []
+            extraction_warnings: List[str] = list(getattr(self, "_ark_napi_notes", None) or [])
             crash_func: Optional[CrashFunction] = None
             crash_frame: Optional[Dict[str, Any]] = None
             addr2line_refined_inside_function = False
@@ -10810,12 +10946,21 @@ class CodeContentProvider:
                     # 兜底：当 02 只有符号（无 file:line）时，尝试按函数名在 code_roots 中定位定义行
                     # 常见于「已符号化日志 + 未提供/不可用库目录」场景。
                     loc = None
+                    rescue_reason_kind = "symbol_only_function_locate"
                     # native-only 模式：禁用 ObjC 兜底定位，避免 selector 触发 code_root 大范围检索。
                     cpp_qualified = self._extract_cpp_qualified_parts(rf_or_raw)
+                    simple_name = self._extract_function_name_from_resolved(rf_or_raw)
+                    # 行号为 0 但文件已知：在该文件里找命名空间自由函数，构造函数仍走限定名。
+                    if rfile and simple_name and not self._is_qualified_special_member(rf_or_raw):
+                        mapped_file = self._find_source_file(rfile, code_roots_abs_strs)
+                        if mapped_file:
+                            named_line = self._find_named_function_line(mapped_file, simple_name)
+                            if named_line:
+                                loc = (mapped_file, named_line)
+                                rescue_reason_kind = "known_file_line_unknown"
                     symbol_only_rescue_attempts += 1
                     if (not loc) and cpp_qualified:
                         loc = self._find_cpp_qualified_definition_location(rf_or_raw, code_roots_abs_strs)
-                    simple_name = self._extract_function_name_from_resolved(rf_or_raw)
                     # ObjC 符号不再退化到通用按 simple_name 全仓扫描，避免误命中到无关组件。
                     # C++ 限定名同样不退化到 simple_name，防止把类名/构造函数误匹配到无关代码。
                     if (not objc_info) and (not cpp_qualified) and (not loc) and simple_name:
@@ -10840,7 +10985,7 @@ class CodeContentProvider:
                                 guessed_frame["resolved_file"] = guessed_file
                                 guessed_frame["resolved_line"] = guessed_line
                                 guessed_frame["crash_location_source"] = "from_log_deduce"
-                                guessed_frame["rescue_reason"] = "symbol_only_function_locate"
+                                guessed_frame["rescue_reason"] = rescue_reason_kind
                                 # 将兜底结果回填到当前 resolved_frames，供后续 thread_context/graph 构建复用，
                                 # 避免 03 中 warning 已定位但 nodes/call_chain 仍缺失对应函数节点。
                                 try:
@@ -10901,6 +11046,12 @@ class CodeContentProvider:
                     ordered_fi = _ordered_fi_candidates(False)
                 if not ordered_fi:
                     ordered_fi = sorted(by_fi.keys())
+                editable_fi = [
+                    fi for fi in ordered_fi
+                    if not self._is_header_special_member_frame(resolved_frames[fi])
+                ]
+                if editable_fi:
+                    ordered_fi = editable_fi
                 best_fi = ordered_fi[0]
                 best_cf, best_frame, _ = by_fi[best_fi]
                 best_cf, refined_line = self._refine_crash_func_when_addr2line_outside_snippet(
@@ -11994,6 +12145,10 @@ class CodeContentProviderTool(BaseTool):
                         "type": "array",
                         "description": "外部轻量召回得到的候选调用点文件（内部参数）",
                     },
+                    "ark_napi_frames": {
+                        "type": "array",
+                        "description": "鸿蒙 Ark 栈上的 NAPI 导出名，仅在已判定为鸿蒙后传入",
+                    },
                     "backend": {"type": "string", "description": "解析后端: tree-sitter/native", "default": "tree-sitter"},
                     "max_sibling_member_functions": {
                         "type": "integer",
@@ -12092,6 +12247,9 @@ class CodeContentProviderTool(BaseTool):
         seed_files = input_data.get("_candidate_callsite_files")
         if isinstance(seed_files, list) and seed_files:
             prov_kw["seed_callsite_files"] = [str(x) for x in seed_files if str(x).strip()]
+        ark_napi_frames = input_data.get("ark_napi_frames")
+        if not isinstance(ark_napi_frames, list):
+            ark_napi_frames = []
 
         code_index_service = input_data.get("_code_index_service")
         if code_index_service is None and code_roots:
@@ -12124,6 +12282,7 @@ class CodeContentProviderTool(BaseTool):
             # code_index_service；code_roots 的绝对路径由缓存模块按下标归一化为路径无关）。
             _determining_input = {
                 "resolved_stack": resolved_stack,
+                "ark_napi_frames": ark_napi_frames,
                 "exclude_dirs": sorted(self.exclude_dirs or []),
                 "include_subdirs": sorted(self.include_subdirs or []),
                 "knobs": {k: v for k, v in prov_kw.items() if k != "code_index_service"},
@@ -12148,6 +12307,7 @@ class CodeContentProviderTool(BaseTool):
             code_roots,
             exclude_dirs=self.exclude_dirs or None,
             include_subdirs=self.include_subdirs or None,
+            ark_napi_frames=ark_napi_frames,
         )
         try:
             parsed = _json.loads(result)
