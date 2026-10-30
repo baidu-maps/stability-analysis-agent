@@ -35,6 +35,11 @@ from services.context_observation_resolver import build_context_resolver_registr
 from services.context_source_resolver import CodeContextRequestResolver
 from services.stage_artifacts import save_analyze_round_artifact
 
+# 进入上下文循环时每轮上下文请求数的默认值。
+# 注意：与 context_engine.DEFAULT_CONTEXT_REQUESTS_PER_ROUND(=5) 存在历史分歧，尚未统一；
+# 真实运行走本入口，故生效默认为 8。统一前改动需同步评估两处与相关 harness 测试。
+PIPELINE_DEFAULT_CONTEXT_REQUESTS = 8
+
 
 def should_run_context_loop(problem: Optional[Dict[str, Any]], prepare: Dict[str, Any]) -> bool:
     if not isinstance(prepare, dict):
@@ -149,12 +154,15 @@ def run_analyze_context_loop(
     if trace is not None and getattr(getattr(trace, "budget", None), "max_llm_calls", 0) > 0:
         max_rounds = min(max_rounds, max(1, trace.budget.max_llm_calls))
     agent_loop = resolve_agent_loop(problem)
-    max_requests = 8
+    max_requests = PIPELINE_DEFAULT_CONTEXT_REQUESTS
     if isinstance(problem, dict):
         try:
-            max_requests = int(problem.get("max_context_requests_per_round") or 8)
+            max_requests = int(
+                problem.get("max_context_requests_per_round")
+                or PIPELINE_DEFAULT_CONTEXT_REQUESTS
+            )
         except (TypeError, ValueError):
-            max_requests = 8
+            max_requests = PIPELINE_DEFAULT_CONTEXT_REQUESTS
     hooks = build_analyze_context_loop_hooks(
         context,
         problem,

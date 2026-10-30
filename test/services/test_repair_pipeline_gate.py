@@ -71,6 +71,20 @@ class RepairPipelineGateTests(unittest.TestCase):
         gate = (result.get("metadata") or {}).get("source_identity_gate") or {}
         self.assertTrue(gate.get("hard_block"))
 
+    def test_fetch_more_and_insufficient_evidence_still_enter_apply(self) -> None:
+        """改码模式不因还想要上下文或证据不足而跳过落盘。"""
+        fetching = self._result()
+        fetching["analysis"] = '{"agent_can_fetch_more": true, "context_requests": []}'
+        fetching["termination_reason"] = "max_rounds"
+        self.assertTrue(
+            should_run_repair_pipeline(apply_ai_fixes=True, result=fetching, scope="full")
+        )
+        weak = self._result()
+        weak["termination_reason"] = "insufficient_evidence"
+        self.assertTrue(
+            should_run_repair_pipeline(apply_ai_fixes=True, result=weak, scope="full")
+        )
+
     def test_empty_source_identity_does_not_block_legacy_runs(self) -> None:
         result = self._result()
         result["metadata"] = {

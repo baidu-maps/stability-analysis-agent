@@ -82,12 +82,12 @@ def set_deny_local_path_fields(enabled: bool) -> None:
 def _prepare_http_run_body(body: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize and guard a POST /runs JSON object.
 
-    Missing ``apply_ai_fixes`` defaults to **False** on the HTTP path (digital-employee /
-    remote-safe). CLI ``--apply-ai-fixes`` defaults to True. See GET /health ``defaults``.
+    Missing ``apply_ai_fixes`` defaults to **True** on the HTTP path, same as CLI.
+    Pass false to analyze without writing a patch. See GET /health ``defaults``.
     """
     payload = dict(body or {})
     if "apply_ai_fixes" not in payload:
-        payload["apply_ai_fixes"] = False
+        payload["apply_ai_fixes"] = True
     for field_name in (
         "enable_runtime_verification",
         "skip_runtime_verification",
@@ -944,15 +944,14 @@ def _health_package_info() -> Dict[str, Any]:
             extra = {}
         if isinstance(extra, dict):
             payload.update(extra)
-    # HTTP intentionally defaults apply_ai_fixes=false (digital-employee safe path).
-    # CLI argparse defaults to true; callers must not assume they match.
+    # HTTP and CLI both default apply_ai_fixes=true (fix mode).
     cli_apply_default = True
     try:
         cli_apply_default = bool(getattr(_cli_analysis_defaults(), "apply_ai_fixes", True))
     except Exception:
         cli_apply_default = True
     payload["defaults"] = {
-        "http_apply_ai_fixes": False,
+        "http_apply_ai_fixes": True,
         "cli_apply_ai_fixes": cli_apply_default,
         "http_bypass_repair_gate": True,
         "http_reuse_crash_cache": True,

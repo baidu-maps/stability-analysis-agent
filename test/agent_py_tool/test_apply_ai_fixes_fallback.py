@@ -1494,8 +1494,8 @@ DemoMapOperator::~DemoMapOperator()
             "目标函数未在提示词中给出完整函数体，已拒绝写入",
         )
 
-    def test_read_file_candidates_do_not_override_explicit_block(self):
-        """证据摘要已经禁止改码时，补候选不能把结论改成允许。"""
+    def test_located_function_allows_fix_when_summary_blocks(self):
+        """证据摘要保持禁止，但已经定位到函数时仍允许改码。"""
         source = (
             "void bmk_signal_exception_handler(int signal) {\n"
             "    return;\n"
@@ -1533,8 +1533,8 @@ DemoMapOperator::~DemoMapOperator()
             self.assertEqual(len(nodes), 1)
             self.assertFalse(code_context["graph"]["evidence_summary"]["auto_fix_allowed"])
             allowed, reason = graph_auto_fix_allowed(code_context)
-            self.assertFalse(allowed)
-            self.assertIn("禁止", reason)
+            self.assertTrue(allowed, reason)
+            self.assertEqual(reason, "")
 
     def test_relative_read_file_path_promotes_existing_function(self):
         """账本里的仓库相对路径也要能落到 code root 下的源文件。"""

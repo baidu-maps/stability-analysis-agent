@@ -88,6 +88,11 @@ def build_repair_code_requirement_lines() -> List[str]:
         "崩溃 PC 从 ucontext 读取；地址范围在注册时算好；崩溃记录用预先打开的 fd 加 write。",
         "只删掉挂起调用、把上述调用留在信号 handler 里，不能当作最终修复。",
         "禁止用 `...`、`// ...`、`省略`、`其他逻辑保持不变` 代替函数体。修复建议里的步骤说明不会被写入文件。",
+        "除上面的「修复代码」Markdown 围栏外，还应额外输出一个独立的 ```json 代码块，",
+        "形如：{\"fix_edits\": [{\"file\": \"相对或源文件名\", \"function_signature\": \"完整函数签名\", "
+        "\"replacement_code\": \"完整函数定义（含签名与函数体，禁止占位）\"}]}。",
+        "该 JSON 是自动改码的权威来源（优先于 Markdown 解析），Markdown 围栏作为回退。",
+        "JSON 里的 replacement_code 必须是完整函数，禁止 `...`、`// ...`、`省略`、`其他逻辑保持不变` 等占位。",
     ]
 
 

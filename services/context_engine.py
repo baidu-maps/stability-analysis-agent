@@ -36,6 +36,20 @@ DEFAULT_OUTPUT_RESERVE_TOKENS = 8192
 PROMPT_CAPACITY_STOP = (
     "提示容量不足：契约与崩溃摘要无法完整放入模型上下文，已停止发送，避免提交残缺内容。"
 )
+
+# ── Agent 上下文循环（context loop）的轮数 / 每轮请求数阈值（集中定义，避免散落的魔数）──
+# scope=full 或 prompt_mode=analysis 时的默认轮数。
+DEFAULT_AGENT_ROUNDS = 6
+# 其它 scope 的默认轮数，同时作为显式 max_agent_rounds 的下限。
+MIN_AGENT_ROUNDS = 1
+# 显式 max_agent_rounds 的硬上限，防止轮数失控导致耗时 / 成本放大。
+MAX_AGENT_ROUNDS_HARD_CAP = 10
+# ContextEngineConfig 未显式指定时每轮上下文请求数的回退默认。
+# 注意：真实运行入口 analyze_pipeline 目前另有默认 8，两者尚未统一（见该文件注释）。
+DEFAULT_CONTEXT_REQUESTS_PER_ROUND = 5
+# 每轮上下文请求数硬上限。
+MAX_CONTEXT_REQUESTS_PER_ROUND_HARD_CAP = 16
+
 # 不在崩溃栈或写路径上的函数，超过该长度只留签名。崩溃函数本身再长也整段保留。
 _OVERSIZED_FUNCTION_CHARS = 6000
 _QUALIFIED_SYMBOL_RE = re.compile(
@@ -84,7 +98,7 @@ def resolve_agent_loop(
         return raw
     scope = str(value.get("scope") or "full").strip().lower()
     prompt_mode = str(value.get("prompt_mode") or "fix").strip().lower()
-    if scope == "full" or prompt_mode == "analysis":
+    if scope == "full" or prompt_mode in {"analysis", "fix"}:
         return "context_loop"
     return "single"
 
@@ -96,12 +110,12 @@ def resolve_max_agent_rounds(problem: Optional[Dict[str, Any]]) -> int:
     except (TypeError, ValueError):
         configured = 0
     if configured > 0:
-        return max(1, min(configured, 10))
+        return max(MIN_AGENT_ROUNDS, min(configured, MAX_AGENT_ROUNDS_HARD_CAP))
     scope = str(value.get("scope") or "full").strip().lower()
     prompt_mode = str(value.get("prompt_mode") or "fix").strip().lower()
     if scope == "full" or prompt_mode == "analysis":
-        return 6
-    return 1
+        return DEFAULT_AGENT_ROUNDS
+    return MIN_AGENT_ROUNDS
 
 
 def extract_stack_priority_classes(problem: Optional[Dict[str, Any]]) -> List[str]:
@@ -141,13 +155,17 @@ def extract_stack_priority_classes(problem: Optional[Dict[str, Any]]) -> List[st
 
 @dataclass(frozen=True)
 class ContextEngineConfig:
-    max_requests: int = 5
+    max_requests: int = DEFAULT_CONTEXT_REQUESTS_PER_ROUND
     max_chars: int = 24000
     max_tokens: int = 0
     supported_request_types: frozenset[str] = CONTEXT_REQUEST_TYPES
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "max_requests", max(1, min(int(self.max_requests), 16)))
+        object.__setattr__(
+            self,
+            "max_requests",
+            max(1, min(int(self.max_requests), MAX_CONTEXT_REQUESTS_PER_ROUND_HARD_CAP)),
+        )
         object.__setattr__(self, "max_chars", max(4000, int(self.max_chars)))
         object.__setattr__(self, "max_tokens", max(0, int(self.max_tokens)))
 

@@ -31,10 +31,10 @@ class PrepareHttpRunBodyTests(unittest.TestCase):
     def tearDown(self) -> None:
         set_deny_local_path_fields(False)
 
-    def test_missing_apply_ai_fixes_defaults_false(self) -> None:
-        """Omitted apply_ai_fixes is false on the HTTP path."""
+    def test_missing_apply_ai_fixes_defaults_true(self) -> None:
+        """Omitted apply_ai_fixes is true on the HTTP path."""
         body = _prepare_http_run_body({"crash_log_content": "tombstone"})
-        self.assertFalse(body["apply_ai_fixes"])
+        self.assertTrue(body["apply_ai_fixes"])
 
     def test_external_agent_evaluation_is_opt_in(self) -> None:
         omitted = _prepare_http_run_body({"crash_log_content": "tombstone"})
@@ -129,7 +129,7 @@ class PrepareHttpRunBodyTests(unittest.TestCase):
                 ),
             }
         )
-        self.assertFalse(body["apply_ai_fixes"])
+        self.assertTrue(body["apply_ai_fixes"])
         self.assertIn("icafe_card_id", body)
 
     def test_icafe_card_id_changes_run_fingerprint(self) -> None:

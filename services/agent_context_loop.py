@@ -1,6 +1,7 @@
 """Agent context-loop orchestration shared by crash analysis workflows."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
@@ -10,6 +11,43 @@ from services.toctou_write_completeness import (
     build_write_path_revision_feedback,
     should_revise_for_incomplete_write_fixes,
 )
+
+_SOURCE_FENCE_RE = re.compile(
+    r"```(?:cpp|c\+\+|objc|objcpp|objective-c|cc|mm|c|h|hpp|java|kt|kotlin|swift|js|ts)\b",
+    re.IGNORECASE,
+)
+_JSON_FIX_EDITS_RE = re.compile(
+    r"```json[\s\S]*?\"fix_edits\"[\s\S]*?```", re.IGNORECASE
+)
+
+
+def _analysis_has_applyable_fix(analysis_text: str) -> bool:
+    """判断分析里是否已给出可落盘补丁（权威 JSON 或源码围栏）。"""
+    text = str(analysis_text or "")
+    if _JSON_FIX_EDITS_RE.search(text):
+        return True
+    return bool(_SOURCE_FENCE_RE.search(text))
+
+
+def _fix_recovery_needed(analysis_text: str, turn_obj: ContextTurn) -> bool:
+    """模型声称要改码（propose_fix 或 修复代码）却没有可落盘补丁时为真。"""
+    next_kind = str((getattr(turn_obj, "next_action", None) or {}).get("kind") or "").strip().lower()
+    proposed = next_kind == "propose_fix" or ("修复代码" in str(analysis_text or ""))
+    if not proposed:
+        return False
+    return not _analysis_has_applyable_fix(analysis_text)
+
+
+def _build_fix_recovery_feedback() -> str:
+    """要求模型把修复重发为权威 JSON fix_edits 加每函数围栏。"""
+    return (
+        "本轮必须给出可落盘补丁，`next_action.kind` 设为 `propose_fix`，并同时输出：\n"
+        "(a) 一个独立的 ```json 块，形如 "
+        "{\"fix_edits\": [{\"file\": \"源文件名\", \"function_signature\": \"完整函数签名\", "
+        "\"replacement_code\": \"完整函数定义\"}]}，作为自动改码的权威来源；\n"
+        "(b) 每个要改的函数各用一个独立 ```cpp 围栏，围栏前单独一行写 \"### `文件名`\"。\n"
+        "函数体必须完整，签名保持与源码一致，禁止 `...`、`// ...`、`省略`、`其他逻辑保持不变` 等占位。"
+    )
 
 
 @dataclass
@@ -95,6 +133,9 @@ def run_agent_context_loop(
     write_path_revision_used = False
     fix_format_revision_used = False
     knowledge_revision_used = False
+    # TASK 3/5/6 共用的「一次额外修复回合」预算：改码模式下分析没给出可落盘补丁时，
+    # 至多再逼一轮要权威 JSON fix_edits 与每函数围栏，保证循环终止。
+    fix_recovery_revision_used = False
 
     def _schedule_revision(
         round_index: int,
@@ -239,13 +280,37 @@ def run_agent_context_loop(
         )
         return True
 
+    def _try_fix_recovery_revision(round_index: int, analysis_text: str, turn_obj: ContextTurn) -> bool:
+        """改码模式终局却无可落盘补丁时，逼一轮要权威 JSON 与每函数围栏。"""
+        nonlocal fix_recovery_revision_used
+        if fix_recovery_revision_used or config.agent_loop_mode != "context_loop":
+            return False
+        if not getattr(context_engine, "apply_ai_fixes", False):
+            return False
+        if round_index >= max_rounds - 1:
+            return False
+        if not _fix_recovery_needed(analysis_text, turn_obj):
+            return False
+        fix_recovery_revision_used = True
+        _schedule_revision(
+            round_index,
+            turn_obj,
+            kind="fix_recovery_revision",
+            source="fix_recovery",
+            feedback=_build_fix_recovery_feedback(),
+            trace_event="agent.fix_recovery_revision",
+        )
+        return True
+
     def _try_post_final_revisions(round_index: int, analysis_text: str, turn_obj: ContextTurn) -> bool:
         """终局前依次尝试知识栈函数、写路径完整性与修复格式续轮。"""
         if _try_knowledge_function_revision(round_index, analysis_text, turn_obj):
             return True
         if _try_write_path_revision(round_index, analysis_text, turn_obj):
             return True
-        return _try_fix_format_revision(round_index, analysis_text, turn_obj)
+        if _try_fix_format_revision(round_index, analysis_text, turn_obj):
+            return True
+        return _try_fix_recovery_revision(round_index, analysis_text, turn_obj)
 
     for round_index in range(max_rounds):
         if trace is not None:

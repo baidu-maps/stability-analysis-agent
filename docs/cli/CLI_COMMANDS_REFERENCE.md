@@ -145,7 +145,7 @@ LLM 配置模板见 **`configs/agent_config.local.example.json`**。实际密钥
 | 行为 | 说明 |
 |------|------|
 | 终端 / `--output-file` | 与 `--output-format` 一致，为面向阅读的摘要（markdown/json/text）。 |
-| `reports/.../` | 运行开始时先写入 `00_run_request.json` 与状态为 `running` 的 `00_run_summary.json`（`schema_version` ≥ 3 含顶层 `llm` 路由摘要：mode / selected / pool / calls / failover）；结束后更新阶段状态、耗时、错误与产物清单。主要产物编号如下（与 `--scope` 相关）： |
+| `reports/.../` | 运行开始时先写入 `00_run_request.json` 与状态为 `running` 的 `00_run_summary.json`（`schema_version` ≥ 3 含顶层 `llm` 路由摘要：mode / selected / pool / calls / failover）；结束后更新阶段状态、耗时、错误与产物清单。顶层 `fix_outcome` 给出 `apply_enabled` / `code_changed` / `no_fix_reason`，`no_fix_reason` 取值为 `no_propose_fix`、`gate_blocked`、`target_not_in_source`、`extracted_count_zero`、`missing_required`、`schema_violation`、`post_apply_check_failed`、`pipeline_skipped`、`internal_error`、`unknown`。主要产物编号如下（与 `--scope` 相关）： |
 
 **`reports` 产物编号（当前实现）**
 

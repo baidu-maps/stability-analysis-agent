@@ -36,6 +36,8 @@ class FixResult:
     error: Optional[str] = None
     fix_plan: Optional[Dict[str, Any]] = None
     skipped_reason: Optional[str] = None
+    # 显式记录「为什么没有写入代码」。取值为固定枚举，供 07/08 产物与排障消费。
+    no_fix_reason: Optional[str] = None
     summary: str = ""
     model_response_preview: str = ""
     rolled_back_files: List[str] = field(default_factory=list)
@@ -55,6 +57,8 @@ class FixResult:
             d["summary"] = self.summary
         if self.skipped_reason:
             d["skipped_reason"] = self.skipped_reason
+        if self.no_fix_reason:
+            d["no_fix_reason"] = self.no_fix_reason
         if self.model_response_preview:
             d["model_response_preview"] = self.model_response_preview
         if self.rolled_back_files:
@@ -1332,6 +1336,9 @@ def graph_auto_fix_allowed(code_context: Dict[str, Any]) -> Tuple[bool, str]:
         return True, ""
     if _crash_function_snippet_complete(code_context):
         return True, ""
+    # 已经定位到可替换函数时允许改码。图边不足只说明先改哪一个，不取消本次修复。
+    if extract_candidate_nodes(code_context):
+        return True, ""
     if isinstance(summ, dict):
         return False, str(summ.get("auto_fix_block_reason") or "图证据不足，已禁止自动改码")
     # 未符号化的崩溃行没有调用边。分析点名、且正文来自已读源码时允许改码。
@@ -1398,15 +1405,60 @@ def _append_unique_name(names: List[str], raw: str) -> None:
     names.append(name)
 
 
-def _extract_required_function_names_from_analysis(analysis_text: str) -> List[str]:
-    """从「需要修改的函数」或非正式修复段落解析目标函数名。"""
+# 容忍的「必改函数」小标题变体。只在该行像标题/标签时才作为段落起点，避免误吞叙述正文。
+_REQUIRED_FUNCTION_SECTION_CUES = (
+    "必改函数",
+    "待修改函数",
+    "需修改函数",
+    "需要修复的函数",
+    "修复代码",
+)
+
+
+def _is_required_function_section_start(line: str) -> bool:
+    """判断某行是否为「必改函数」段落起点（标题或标签行）。"""
+    s = str(line or "").strip()
+    if not s:
+        return False
+    # 旧行为：任何含「需要修改的函数」的行都视为段落起点，保持向后兼容。
+    if "需要修改的函数" in s:
+        return True
+    is_label = (
+        s.startswith("#")
+        or re.match(r"^(?:[-*]|\d+[.)])\s", s) is not None
+        or s.startswith("**")
+        or s.endswith("：")
+        or s.endswith(":")
+        or len(s) <= 16
+    )
+    if not is_label:
+        return False
+    return any(cue in s for cue in _REQUIRED_FUNCTION_SECTION_CUES)
+
+
+_PROPOSE_FIX_RE = re.compile(r"\"kind\"\s*:\s*\"propose_fix\"")
+
+
+def analysis_proposed_fix(analysis_text: str) -> bool:
+    """分析是否明确提出了改码：propose_fix、fix_edits，或必改清单里列了函数。
+
+    只看明确信号，不看代码围栏；分析里引用原始源码时不能算作提出修复。
+    """
+    text = str(analysis_text or "")
+    if _PROPOSE_FIX_RE.search(text) or "\"fix_edits\"" in text:
+        return True
+    return bool(_required_names_from_sections(text))
+
+
+def _required_names_from_sections(analysis_text: str) -> List[str]:
+    """只从「必改函数」类小节的列表项里取函数名。"""
     names: List[str] = []
     in_section = False
     for raw_line in (analysis_text or "").splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if "需要修改的函数" in line:
+        if _is_required_function_section_start(line):
             in_section = True
             continue
         if in_section and line.startswith("#### "):
@@ -1431,6 +1483,12 @@ def _extract_required_function_names_from_analysis(analysis_text: str) -> List[s
                 if paren_end >= 0:
                     name_candidate = name_candidate[: paren_end + 1]
                 _append_unique_name(names, name_candidate)
+    return names
+
+
+def _extract_required_function_names_from_analysis(analysis_text: str) -> List[str]:
+    """从「需要修改的函数」或非正式修复段落解析目标函数名。"""
+    names = _required_names_from_sections(analysis_text)
     if names:
         return names
 
@@ -2676,30 +2734,104 @@ def _select_repair_source_files(analysis_text: str, files: List[Path]) -> List[P
     return chosen
 
 
+def _refresh_located_function_snippets(code_context: Dict[str, Any]) -> int:
+    """用磁盘上的完整函数替换提示词里的签名或压缩片段。"""
+    graph = code_context.get("graph") if isinstance(code_context, dict) else None
+    nodes = graph.get("nodes") if isinstance(graph, dict) else None
+    if not isinstance(nodes, list):
+        return 0
+    updated = 0
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        path = Path(str(node.get("file") or ""))
+        signature = str(node.get("signature") or "")
+        if not signature or not path.is_file():
+            continue
+        snippet = node.get("snippet")
+        joined = "\n".join(str(line) for line in snippet) if isinstance(snippet, list) else ""
+        if "未完成源码提取" not in joined and joined.count("\n") >= 8 and "{" in joined and "}" in joined:
+            continue
+        try:
+            source, _encoding = _try_read_source_raw(path)
+        except Exception:
+            continue
+        built = _candidate_node_from_defined_source(path, source, signature)
+        if not built:
+            continue
+        new_snippet = list(built.get("snippet") or [])
+        old_len = len(snippet) if isinstance(snippet, list) else 0
+        if len(new_snippet) <= old_len and "未完成源码提取" not in joined:
+            continue
+        node["snippet"] = new_snippet
+        node["snippet_start_line"] = built.get("snippet_start_line")
+        node["snippet_end_line"] = built.get("snippet_end_line")
+        updated += 1
+    return updated
+
+
+def _function_bodies_for_repair(
+    code_context: Optional[Dict[str, Any]],
+    code_roots: List[str],
+) -> List[str]:
+    """收集已定位函数的完整函数体，供补丁回合使用。"""
+    if not isinstance(code_context, dict):
+        return []
+    sections: List[str] = []
+    used = 0
+    for node in extract_candidate_nodes(code_context):
+        path = Path(str(node.get("file") or ""))
+        signature = str(node.get("signature") or "")
+        if not signature or not path.is_file():
+            continue
+        if code_roots and not _is_within_code_roots(path, code_roots):
+            continue
+        try:
+            source, _encoding = _try_read_source_raw(path)
+        except Exception:
+            continue
+        built = _candidate_node_from_defined_source(path, source, signature)
+        body = "\n".join(built.get("snippet") or []) if built else ""
+        if not body:
+            body = "\n".join(str(line) for line in (node.get("snippet") or []))
+        if not body.strip():
+            continue
+        section = f"### {path.name} {signature}\n```cpp\n{body}\n```"
+        if sections and used + len(section) > _REPAIR_COMPLETION_SOURCE_BUDGET:
+            break
+        sections.append(section)
+        used += len(section)
+        if len(sections) >= 6:
+            break
+    return sections
+
+
 def _complete_missing_repair_code(
     llm: Any,
     analysis_text: str,
     *,
     context_session: Optional[Dict[str, Any]],
     code_roots: List[str],
+    code_context: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """分析只有步骤说明时，补一次只产出完整函数的改码请求。"""
+    """分析没有可落盘补丁时，用已定位的完整函数再请求一次修复代码。"""
     if llm is None or not hasattr(llm, "chat"):
         return ""
-    files = _select_repair_source_files(
-        analysis_text,
-        _read_files_from_session(context_session, code_roots),
-    )
-    if not files:
-        return ""
-    source_parts: List[str] = []
-    for path in files:
-        try:
-            source, _encoding = _try_read_source_raw(path)
-        except Exception:
-            continue
-        clipped = source if len(source) <= 12000 else source[:12000]
-        source_parts.append(f"### {path.name}\n```\n{clipped}\n```")
+    source_parts = _function_bodies_for_repair(code_context, code_roots)
+    if not source_parts:
+        files = _select_repair_source_files(
+            analysis_text,
+            _read_files_from_session(context_session, code_roots),
+        )
+        if not files:
+            return ""
+        for path in files:
+            try:
+                source, _encoding = _try_read_source_raw(path)
+            except Exception:
+                continue
+            clipped = source if len(source) <= 12000 else source[:12000]
+            source_parts.append(f"### {path.name}\n```\n{clipped}\n```")
     if not source_parts:
         return ""
     advice = str(analysis_text or "")[-6000:]
@@ -3161,6 +3293,23 @@ def _extract_replacement_from_analysis(
         target_name = _extract_signature_function_name(target_signature)
         if found_name and target_name and found_name == target_name:
             return cleaned
+        # 放宽：忽略命名空间/类限定与参数拼写，裸函数名一致且是真实函数定义即可。
+        # 仍拒绝类骨架与占位函数体。
+        if block_sig:
+            sig_stripped = block_sig.strip()
+            is_definition = (
+                ";" not in sig_stripped
+                and not sig_stripped.startswith("//")
+                and not sig_stripped.startswith("/*")
+            )
+            if (
+                is_definition
+                and not _is_type_skeleton_block(cleaned)
+                and not _contains_placeholder_code(cleaned)
+            ):
+                block_simple = _extract_simple_function_name(block_sig)
+                if block_simple and simple_name and block_simple == simple_name:
+                    return cleaned
         return None
 
     # Structured reports usually quote the original function before the
@@ -3919,6 +4068,7 @@ class CodeFixer:
             return FixResult(
                 success=False,
                 error="缺少 LLM 或 code_root，无法应用 AI 修复",
+                no_fix_reason="internal_error",
             )
         analysis_text = str(result.get("analysis") or "").strip()
         code_context = result.get("code_context", {}) or {}
@@ -3927,7 +4077,14 @@ class CodeFixer:
             return FixResult(
                 success=False,
                 error="缺少 analysis/code_context，无法应用 AI 修复",
+                no_fix_reason="internal_error",
             )
+        # 以模型原始分析为准：补丁回合追加的代码不改变「模型是否主动提出改码」。
+        proposed_fix = analysis_proposed_fix(analysis_text)
+
+        def _no_fix_reason(own: str) -> str:
+            """模型没有主动提出改码时，后续落盘失败都记为 no_propose_fix。"""
+            return own if proposed_fix else "no_propose_fix"
         session = result.get("context_session")
         session_dict = session if isinstance(session, dict) else None
         promoted = promote_read_file_function_candidates(
@@ -3938,6 +4095,7 @@ class CodeFixer:
         )
         if promoted:
             logger.info("[CodeFixer] 从已读源码补齐候选函数 %s 个", len(promoted))
+        _refresh_located_function_snippets(code_context)
         candidate_nodes = extract_candidate_nodes(code_context)
         if not candidate_nodes:
             completed = _complete_missing_repair_code(
@@ -3945,6 +4103,7 @@ class CodeFixer:
                 analysis_text,
                 context_session=session_dict,
                 code_roots=list(code_roots or []),
+                code_context=code_context,
             )
             if completed:
                 analysis_text = analysis_text.rstrip() + "\n\n" + completed
@@ -3961,6 +4120,7 @@ class CodeFixer:
             return FixResult(
                 success=False,
                 error="代码上下文未提供可替换的函数候选",
+                no_fix_reason=_no_fix_reason("target_not_in_source"),
             )
         allowed, block_reason = graph_auto_fix_allowed(code_context)
         if not allowed:
@@ -3968,133 +4128,185 @@ class CodeFixer:
                 success=False,
                 error=block_reason,
                 skipped_reason="evidence_gate",
+                no_fix_reason="gate_blocked",
             )
-        required_names = _extract_required_function_names_from_analysis(analysis_text)
-        required_targets = _select_required_targets(candidate_nodes, required_names)
-        required_targets = _ensure_owner_class_methods_in_targets(
-            code_context, required_names, required_targets
-        )
+        def _supplement_repair_patch() -> bool:
+            """分析抽不出可落盘补丁时，用完整函数再要一次修复代码。"""
+            nonlocal analysis_text, candidate_nodes
+            completed = _complete_missing_repair_code(
+                self._llm,
+                analysis_text,
+                context_session=session_dict,
+                code_roots=list(code_roots or []),
+                code_context=code_context,
+            )
+            if not completed:
+                return False
+            analysis_text = analysis_text.rstrip() + "\n\n" + completed
+            result["analysis"] = analysis_text
+            logger.info("[CodeFixer] 分析未给出可落盘补丁，已补一次修复代码")
+            promote_read_file_function_candidates(
+                code_context,
+                analysis_text=analysis_text,
+                context_session=session_dict,
+                code_roots=list(code_roots or []),
+            )
+            _refresh_located_function_snippets(code_context)
+            candidate_nodes = extract_candidate_nodes(code_context)
+            return bool(candidate_nodes)
 
         try:
             # 统一走工具化链路：提取工具 -> 应用工具
             from tools.fix_code_extractor_tool import FixCodeExtractorTool
             from tools.fix_code_applier_tool import FixCodeApplierTool
+            from services.agent_schema import RepairPlan
 
-            extract_out = _invoke_tool(
-                "fix_code_extractor",
-                {
-                    "analysis_text": analysis_text,
-                    "code_context": code_context,
-                    "required_targets": required_targets,
-                    "strict_required": False,
-                },
-            )
-            if not bool(extract_out.get("success")):
+            supplemented = False
+            while True:
+                required_names = _extract_required_function_names_from_analysis(analysis_text)
+                required_targets = _select_required_targets(candidate_nodes, required_names)
+                required_targets = _ensure_owner_class_methods_in_targets(
+                    code_context, required_names, required_targets
+                )
+                extract_out = _invoke_tool(
+                    "fix_code_extractor",
+                    {
+                        "analysis_text": analysis_text,
+                        "code_context": code_context,
+                        "required_targets": required_targets,
+                        "strict_required": False,
+                    },
+                )
+                if not bool(extract_out.get("success")):
+                    if not supplemented and _supplement_repair_patch():
+                        supplemented = True
+                        continue
+                    missing_required = (
+                        extract_out.get("missing_required", [])
+                        if isinstance(extract_out.get("missing_required"), list)
+                        else []
+                    )
+                    return FixResult(
+                        success=False,
+                        error=(
+                            "未能从分析输出文本中提取可执行修复代码，补丁回合也未产出可落盘函数。"
+                            "请确认要改的函数在本次检出的源码中。"
+                        ),
+                        missing_required=[x for x in missing_required if isinstance(x, dict)],
+                        no_fix_reason=_no_fix_reason(
+                            "missing_required"
+                            if [x for x in missing_required if isinstance(x, dict)]
+                            else "extracted_count_zero"
+                        ),
+                    )
+                raw_fix_plan = extract_out.get("fix_plan")
+                repair_plan, schema_violations = RepairPlan.from_mapping(raw_fix_plan)
+                if repair_plan is None:
+                    if not supplemented and _supplement_repair_patch():
+                        supplemented = True
+                        continue
+                    logger.warning("[CodeFixer] rejected malformed repair plan: %s", schema_violations)
+                    return FixResult(
+                        success=False,
+                        error="修复计划未通过严格 schema 校验，已禁止自动改码",
+                        skipped_reason="schema_violation",
+                        no_fix_reason=_no_fix_reason("schema_violation"),
+                        schema_violations=schema_violations,
+                    )
+                fix_plan = repair_plan.to_dict()
+                _attach_missing_symbols(fix_plan, analysis_text)
                 missing_required = (
                     extract_out.get("missing_required", [])
                     if isinstance(extract_out.get("missing_required"), list)
                     else []
                 )
-                return FixResult(
-                    success=False,
-                    error=(
-                        "未能从分析输出文本中提取可执行修复代码（通常对应 06_ai_gen_res.md），已跳过自动改码。"
-                        "请确保分析输出包含完整函数代码块（建议 ```cpp 围栏 + 准确函数签名）。"
-                    ),
-                    missing_required=[x for x in missing_required if isinstance(x, dict)],
+                logger.info(
+                    "[CodeFixer] 工具链提取完成: extracted=%s required=%s",
+                    extract_out.get("extracted_count", 0),
+                    extract_out.get("required_target_count", 0),
                 )
-            from services.agent_schema import RepairPlan
-
-            raw_fix_plan = extract_out.get("fix_plan")
-            repair_plan, schema_violations = RepairPlan.from_mapping(raw_fix_plan)
-            if repair_plan is None:
-                logger.warning("[CodeFixer] rejected malformed repair plan: %s", schema_violations)
-                return FixResult(
-                    success=False,
-                    error="修复计划未通过严格 schema 校验，已禁止自动改码",
-                    skipped_reason="schema_violation",
-                    schema_violations=schema_violations,
+                if report_dir is not None:
+                    try:
+                        report_dir.mkdir(parents=True, exist_ok=True)
+                        extract_debug_path = report_dir / "07b_fix_extract_debug.json.json"
+                        extract_debug_path.write_text(
+                            json.dumps(extract_out, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                    except Exception:
+                        pass
+                apply_out = _invoke_tool(
+                    "fix_code_applier",
+                    {
+                        "fix_plan": fix_plan,
+                        "code_context": code_context,
+                        "code_roots": code_roots,
+                        "required_targets": required_targets,
+                        "report_dir": str(report_dir) if report_dir is not None else "",
+                        "backup_original_sources": backup_original_sources,
+                    },
                 )
-            fix_plan = repair_plan.to_dict()
-            _attach_missing_symbols(fix_plan, analysis_text)
-            missing_required = (
-                extract_out.get("missing_required", [])
-                if isinstance(extract_out.get("missing_required"), list)
-                else []
-            )
-            logger.info(
-                "[CodeFixer] 工具链提取完成: extracted=%s required=%s",
-                extract_out.get("extracted_count", 0),
-                extract_out.get("required_target_count", 0),
-            )
-            # 调试：保存提取阶段完整输出（含 fix_plan 与覆盖率统计）
-            if report_dir is not None:
-                try:
-                    report_dir.mkdir(parents=True, exist_ok=True)
-                    extract_debug_path = report_dir / "07b_fix_extract_debug.json.json"
-                    extract_debug_path.write_text(
-                        json.dumps(extract_out, ensure_ascii=False, indent=2),
-                        encoding="utf-8",
+                apply_result = FixResult(
+                    success=bool(apply_out.get("success")),
+                    applied=apply_out.get("applied", []) if isinstance(apply_out.get("applied"), list) else [],
+                    error=str(apply_out.get("error", "") or "") or None,
+                    summary=str(apply_out.get("summary", "") or ""),
+                    edit_feedback=[
+                        item.get("match_feedback") for item in (apply_out.get("applied") or [])
+                        if isinstance(item, dict) and isinstance(item.get("match_feedback"), dict)
+                    ],
+                )
+                apply_result.missing_required = [
+                    x for x in missing_required if isinstance(x, dict)
+                ]
+                apply_result = evaluate_fix_apply_success(apply_result, code_context, fix_plan)
+                if not apply_result.success:
+                    applied_rows = apply_result.applied if isinstance(apply_result.applied, list) else []
+                    applied_any = any(
+                        isinstance(item, dict) and item.get("status") == "applied"
+                        for item in applied_rows
                     )
-                except Exception:
-                    pass
-            apply_out = _invoke_tool(
-                "fix_code_applier",
-                {
-                    "fix_plan": fix_plan,
-                    "code_context": code_context,
-                    "code_roots": code_roots,
-                    "required_targets": required_targets,
-                    "report_dir": str(report_dir) if report_dir is not None else "",
-                    "backup_original_sources": backup_original_sources,
-                },
-            )
-            apply_result = FixResult(
-                success=bool(apply_out.get("success")),
-                applied=apply_out.get("applied", []) if isinstance(apply_out.get("applied"), list) else [],
-                error=str(apply_out.get("error", "") or "") or None,
-                summary=str(apply_out.get("summary", "") or ""),
-                edit_feedback=[
-                    item.get("match_feedback") for item in (apply_out.get("applied") or [])
-                    if isinstance(item, dict) and isinstance(item.get("match_feedback"), dict)
-                ],
-            )
-            apply_result.missing_required = [
-                x for x in missing_required if isinstance(x, dict)
-            ]
-            apply_result = evaluate_fix_apply_success(apply_result, code_context, fix_plan)
-            if not apply_result.success:
-                if not apply_result.applied:
-                    edits = fix_plan.get("edits", []) if isinstance(fix_plan.get("edits"), list) else []
-                    if not edits:
-                        apply_result.error = (
-                            "AI 未返回可执行的结构化 edits（空 edits）。"
-                            "请在模型输出中确保返回严格 JSON，且 edits 至少包含 1 个包含 replacement_code 的条目。"
+                    if not applied_any and not supplemented and _supplement_repair_patch():
+                        supplemented = True
+                        continue
+                    if not apply_result.applied:
+                        edits = fix_plan.get("edits", []) if isinstance(fix_plan.get("edits"), list) else []
+                        if not edits:
+                            apply_result.error = (
+                                "AI 未返回可执行的结构化 edits（空 edits）。"
+                                "请在模型输出中确保返回严格 JSON，且 edits 至少包含 1 个包含 replacement_code 的条目。"
+                            )
+                        else:
+                            apply_result.error = (
+                                "AI 返回了 edits，但没有可应用项。"
+                                "请检查 file/function_signature 是否与 candidate_nodes 精确匹配，"
+                                "以及 replacement_code 是否为完整函数代码。"
+                            )
+                    elif not apply_result.error:
+                        first_err = next(
+                            (
+                                str(item.get("error"))
+                                for item in apply_result.applied
+                                if isinstance(item, dict) and item.get("error")
+                            ),
+                            "",
+                        ).strip()
+                        if first_err:
+                            apply_result.error = f"未应用修改: {first_err}"
+                    if not apply_result.no_fix_reason:
+                        apply_result.no_fix_reason = _no_fix_reason(
+                            "missing_required"
+                            if apply_result.missing_required
+                            else "extracted_count_zero"
                         )
-                    else:
-                        apply_result.error = (
-                            "AI 返回了 edits，但没有可应用项。"
-                            "请检查 file/function_signature 是否与 candidate_nodes 精确匹配，"
-                            "以及 replacement_code 是否为完整函数代码。"
-                        )
-                elif not apply_result.error:
-                    first_err = next(
-                        (
-                            str(item.get("error"))
-                            for item in apply_result.applied
-                            if isinstance(item, dict) and item.get("error")
-                        ),
-                        "",
-                    ).strip()
-                    if first_err:
-                        apply_result.error = f"未应用修改: {first_err}"
-            apply_result.fix_plan = fix_plan
-            apply_result.summary = str(fix_plan.get("summary", ""))
-            return apply_result
+                apply_result.fix_plan = fix_plan
+                apply_result.summary = str(fix_plan.get("summary", ""))
+                return apply_result
         except Exception as exc:
             return FixResult(
                 success=False,
                 error=f"生成或应用 AI 修复计划失败: {exc}",
+                no_fix_reason="internal_error",
             )
 
     def apply_fix_plan(

@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import hashlib
 import os
-import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -282,10 +281,13 @@ def should_run_repair_pipeline(
     Pass False to enforce confirmed+high-confidence only.
 
     Source-identity risk is recorded for reviewers and does not by itself
-    skip apply. A later extractor still no-ops when the analysis has no
-    concrete patch.
+    skip apply. ``insufficient_evidence``、``invalid_schema`` and a trailing
+    ``agent_can_fetch_more`` do not skip apply: fix mode still attempts a patch
+    from the analysis and the located source.
     """
     if not apply_ai_fixes or result.get("status") != "success" or scope != "full":
+        if apply_ai_fixes:
+            result.setdefault("metadata", {})["no_fix_reason"] = "pipeline_skipped"
         return False
     meta = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
     identity_input: Dict[str, Any] = {}
@@ -306,13 +308,9 @@ def should_run_repair_pipeline(
     if identity_input:
         result.setdefault("metadata", {})["source_identity_gate"] = identity_gate
     if meta.get("pipeline_skipped") or meta.get("llm_skipped"):
+        result.setdefault("metadata", {})["no_fix_reason"] = "pipeline_skipped"
         return False
     termination = str(result.get("termination_reason") or "").strip().lower()
-    if termination in {"insufficient_evidence", "invalid_schema"}:
-        return False
-    analysis_text = str(result.get("analysis") or "")
-    if re.search(r'"agent_can_fetch_more"\s*:\s*true', analysis_text, re.I):
-        return False
     crash_diagnosis = result.get("crash_diagnosis") if isinstance(result.get("crash_diagnosis"), dict) else {}
     if crash_diagnosis:
         from tools.diagnosis.repair_gate import evaluate_repair_gate
@@ -326,6 +324,7 @@ def should_run_repair_pipeline(
             and not bypass_repair_gate
             and termination not in {"ready_to_fix"}
         ):
+            result.setdefault("metadata", {})["no_fix_reason"] = "gate_blocked"
             return False
     return True
 

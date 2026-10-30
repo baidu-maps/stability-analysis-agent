@@ -4393,6 +4393,28 @@ def _stage_summary(
     return stages, errors
 
 
+def _fix_outcome_summary(
+    result: Dict[str, Any],
+    *,
+    apply_enabled: bool,
+    applied_fix_result: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """汇总是否改码与未改码原因，供服务端按固定模板回复。"""
+    if not apply_enabled:
+        return {"apply_enabled": False, "code_changed": False, "no_fix_reason": None}
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    if isinstance(applied_fix_result, dict):
+        if applied_fix_result.get("success"):
+            return {"apply_enabled": True, "code_changed": True, "no_fix_reason": None}
+        reason = str(applied_fix_result.get("no_fix_reason") or "").strip()
+        if not reason and applied_fix_result.get("skipped_reason"):
+            # 写入后静态检查、验证或隔离工作区失败。
+            reason = "post_apply_check_failed"
+    else:
+        reason = str(metadata.get("no_fix_reason") or "").strip()
+    return {"apply_enabled": True, "code_changed": False, "no_fix_reason": reason or "unknown"}
+
+
 def _final_run_summary(
     report_dir: Path,
     request_record: Dict[str, Any],
@@ -4480,6 +4502,11 @@ def _final_run_summary(
         "artifacts": _artifact_manifest(report_dir, scope=scope),
         "llm": _llm_summary_from_result(result, scope=scope, request_record=request_record),
         "verification": result.get("verification"),
+        "fix_outcome": _fix_outcome_summary(
+            result,
+            apply_enabled=apply_enabled,
+            applied_fix_result=applied_fix_result,
+        ),
         "diff_review": result.get("diff_review"),
         "evidence_package": metadata.get("evidence_package") or {
             "items": [], "item_count": 0, "chars": 0, "tokens": 0,
@@ -6801,7 +6828,9 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
             agent_cfg_for_llm = _load_agent_config_file()
             prompt_mode_for_route = str(problem.get("prompt_mode") or "fix")
             agent_loop_for_route = str(problem.get("agent_loop") or (
-                "context_loop" if prompt_mode_for_route == "analysis" else "single"
+                "context_loop"
+                if prompt_mode_for_route in {"analysis", "fix"}
+                else "single"
             ))
             route_ctx = RoutingContext(
                 prompt_mode=prompt_mode_for_route,
