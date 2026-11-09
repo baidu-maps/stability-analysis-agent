@@ -32,20 +32,57 @@ def _load_recipes(pack_dirs: Sequence[Path]) -> List[Dict[str, Any]]:
     return recipes
 
 
+def _find_target_file(
+    suffix: str,
+    old: str,
+    files: Sequence[str],
+    search_roots: Sequence[str],
+) -> Optional[str]:
+    """先在候选文件里找含 ``old`` 的文件，找不到再按 ``root/suffix`` 精确拼路径。
+
+    配方要改的文件（如任务组定义所在头文件）常不在崩溃帧上，不一定进入代码上下文；
+    这里只做精确拼接，不遍历仓库。
+    """
+    file_basename = suffix.rsplit("/", 1)[-1]
+    for f in files:
+        nf = f.replace("\\", "/")
+        if not nf.endswith(suffix) and not nf.endswith(file_basename):
+            continue
+        try:
+            content = Path(f).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if old in content:
+            return f
+    for root in search_roots:
+        candidate = Path(str(root)) / suffix
+        try:
+            if candidate.is_file() and old in candidate.read_text(encoding="utf-8", errors="ignore"):
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
 def collect_recipe_edits(
     trigger_text: str,
     candidate_files: Sequence[str],
     pack_dirs: Optional[Sequence[str]] = None,
+    search_roots: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """返回命中配方、且能在候选文件中精确定位 old_text 的 member_declaration edits。
 
     - ``trigger_text``：路由文本（分析文本 + 候选文件路径），用于 match.require_all。
     - ``candidate_files``：本次代码上下文里的真实源文件绝对路径列表。
-    - 只有 ``old_text`` 确实出现在某候选文件里才产出对应 edit。
+    - ``search_roots``：代码根目录；候选文件里找不到时按 ``root/file_suffix`` 精确定位。
+    - 只有 ``old_text`` 确实出现在目标文件里才产出对应 edit。
+    - 配方声明 ``exclusive: true`` 时，产出的 edit 带 ``exclusive`` 标记，
+      调用方应只落盘配方 edit，丢弃大模型自行推理的其它改动。
     """
     text = str(trigger_text or "")
     files = [str(f) for f in (candidate_files or []) if str(f).strip()]
-    if not text or not files:
+    roots = [str(r) for r in (search_roots or []) if str(r).strip()]
+    if not text or not (files or roots):
         return []
     try:
         dirs = resolve_pack_dirs(pack_dirs)
@@ -58,6 +95,7 @@ def collect_recipe_edits(
         require_all = match.get("require_all") or []
         if require_all and not all(str(tok) in text for tok in require_all):
             continue
+        exclusive = bool(recipe.get("exclusive"))
         for edit in recipe.get("edits") or []:
             if not isinstance(edit, dict):
                 continue
@@ -66,31 +104,22 @@ def collect_recipe_edits(
             new = str(edit.get("new_text") or "")
             if not suffix or not old or not new or old == new:
                 continue
-            file_basename = suffix.rsplit("/", 1)[-1]
-            target: Optional[str] = None
-            for f in files:
-                nf = f.replace("\\", "/")
-                if not nf.endswith(suffix) and not nf.endswith(file_basename):
-                    continue
-                try:
-                    content = Path(f).read_text(encoding="utf-8", errors="ignore")
-                except OSError:
-                    continue
-                if old in content:
-                    target = f
-                    break
+            target = _find_target_file(suffix, old, files, roots)
             if not target:
                 continue
             key = f"{target}::{old}"
             if key in seen:
                 continue
             seen.add(key)
-            out.append({
+            item = {
                 "file": target,
                 "edit_type": "member_declaration",
                 "old_text": old,
                 "new_text": new,
                 "reason": str(edit.get("reason") or "knowledge fix recipe"),
                 "source": "knowledge_fix_recipe",
-            })
+            }
+            if exclusive:
+                item["exclusive"] = True
+            out.append(item)
     return out

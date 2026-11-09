@@ -56,6 +56,8 @@ class CtagsFunctionIndex:
         self._conn: Optional[sqlite3.Connection] = None
         self._db_path: Optional[str] = None
         self._symbol_count = 0
+        # 缓存来自另一 worktree 时的 (旧 root, 当前 root) 路径映射
+        self._path_rebase: List[Tuple[str, str]] = []
         self._build_sync()
 
     @staticmethod
@@ -222,17 +224,64 @@ class CtagsFunctionIndex:
         identities: List[str] = []
         all_commit = True
         for root in self.code_roots:
-            commit = self._git_commit(root)
-            if commit:
-                identities.append(f"commit:{commit}")
-            else:
+            identity = self._root_identity(root)
+            if not identity.startswith("commit:"):
                 all_commit = False
-                try:
-                    mtime = int(os.path.getmtime(root))
-                except OSError:
-                    mtime = 0
-                identities.append(f"path:{os.path.abspath(root)}:mtime:{mtime}")
+            identities.append(identity)
         return sorted(identities), all_commit
+
+    def _root_identity(self, root: str) -> str:
+        """单个 root 的身份：git commit 优先，否则退回路径 + mtime。"""
+        commit = self._git_commit(root)
+        if commit:
+            return f"commit:{commit}"
+        try:
+            mtime = int(os.path.getmtime(root))
+        except OSError:
+            mtime = 0
+        return f"path:{os.path.abspath(root)}:mtime:{mtime}"
+
+    def _build_path_rebase(self, meta: Dict) -> Optional[List[Tuple[str, str]]]:
+        """缓存来自另一 worktree 时，算出 旧 root -> 当前 root 的映射。
+
+        缓存按 commit 命中，tags 里记录的却是建索引时的绝对路径；旧 worktree
+        删除后这些路径全部失效。返回 None 表示无法可靠映射，调用方应重建索引。
+        """
+        current = [os.path.abspath(r) for r in self.code_roots]
+        cached = [os.path.abspath(str(r)) for r in (meta.get("roots") or []) if r]
+        if cached == current:
+            return []
+        if len(cached) != len(current):
+            return None
+        if len(current) == 1:
+            return [(cached[0], current[0])] if cached[0] != current[0] else []
+        cached_ids = meta.get("root_identities") or []
+        if len(cached_ids) != len(cached):
+            return None
+        current_by_id: Dict[str, str] = {}
+        for root in current:
+            identity = self._root_identity(root)
+            if identity in current_by_id:
+                return None
+            current_by_id[identity] = root
+        mapping: List[Tuple[str, str]] = []
+        for old_root, identity in zip(cached, cached_ids):
+            new_root = current_by_id.get(str(identity))
+            if not new_root:
+                return None
+            if new_root != old_root:
+                mapping.append((old_root, new_root))
+        return mapping
+
+    def _rebase_path(self, path: str) -> str:
+        """把索引中的旧 worktree 路径换算到当前 root 下。"""
+        for old_root, new_root in self._path_rebase:
+            if path == old_root:
+                return new_root
+            prefix = old_root.rstrip(os.sep) + os.sep
+            if path.startswith(prefix):
+                return os.path.join(new_root, path[len(prefix):])
+        return path
 
     def _cache_key(self) -> str:
         identities, _ = self._root_identities()
@@ -305,6 +354,11 @@ class CtagsFunctionIndex:
             identities, all_commit = self._root_identities()
             if meta.get("identities") != identities:
                 return False
+            rebase = self._build_path_rebase(meta)
+            if rebase is None:
+                logger.info("ctags 缓存的 roots 无法映射到当前 roots，重建索引")
+                return False
+            self._path_rebase = rebase
             # 身份完全由 commit 决定时，内容不可变，无需再按目录 mtime 判新鲜度
             # （worktree 每次 checkout 都会刷新 mtime，会误判缓存失效导致重建）。
             if not all_commit:
@@ -344,7 +398,12 @@ class CtagsFunctionIndex:
         try:
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(
-                    {"roots": self.code_roots, "identities": identities, "built_at": time.time()},
+                    {
+                        "roots": self.code_roots,
+                        "identities": identities,
+                        "root_identities": [self._root_identity(r) for r in self.code_roots],
+                        "built_at": time.time(),
+                    },
                     f,
                     ensure_ascii=False,
                 )
@@ -483,7 +542,9 @@ class CtagsFunctionIndex:
                     return True
             return not roots_abs
 
-        candidates = [(str(path), int(line_no)) for path, line_no in rows if path and line_no]
+        candidates = [
+            (self._rebase_path(str(path)), int(line_no)) for path, line_no in rows if path and line_no
+        ]
         filtered = [(path, line_no) for path, line_no in candidates if _under_root(path)]
         if not filtered:
             filtered = candidates

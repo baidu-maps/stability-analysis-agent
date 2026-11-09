@@ -196,6 +196,7 @@ class FixCodeExtractorTool(BaseTool):
         extra_edits.extend(_extract_global_declaration_edits(analysis_text, code_context))
         # 知识域确定性修复配方：命中即产出精确 old_text→new_text 的声明级 edit，
         # 不依赖大模型自行推理；候选文件里无法精确定位 old_text 时自动跳过。
+        exclusive_recipe_edits: List[Dict[str, Any]] = []
         try:
             from knowledge_plane.fix_recipe import collect_recipe_edits as _collect_recipe
             from services.code_fixer import _collect_code_context_source_files as _cc_files
@@ -203,10 +204,22 @@ class FixCodeExtractorTool(BaseTool):
             recipe_edits = _collect_recipe(
                 trigger_text="\n".join([analysis_text, "\n".join(recipe_files)]),
                 candidate_files=recipe_files,
+                search_roots=[str(r) for r in (input_data.get("code_roots") or []) if r],
             )
             extra_edits.extend(recipe_edits)
+            exclusive_recipe_edits = [e for e in recipe_edits if e.get("exclusive")]
         except Exception as _recipe_exc:
             pass
+
+        # 配方声明 exclusive 时，根因与改法已由人工确认：只落盘配方 edit，
+        # 不再混入大模型针对其它调用方推理出的补丁。
+        if exclusive_recipe_edits:
+            fix_plan = {
+                "summary": "knowledge fix recipe (exclusive)",
+                "edits": [],
+            }
+            extra_edits = list(exclusive_recipe_edits)
+            fix_source = "knowledge_recipe"
 
         if not fix_plan and not extra_edits:
             return {

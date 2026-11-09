@@ -137,6 +137,23 @@ class TestAbortMessageAndHeapAbort(unittest.TestCase):
         fact = next(item for item in out.facts if item.fact_type == "fortify_mutex_abort")
         self.assertIn(message, fact.evidence)
 
+    def test_tombstone_signal_wins_over_earlier_logcat_signal(self) -> None:
+        """logcat 前段其它进程的 Fatal signal 不能顶替 tombstone 自己的信号。"""
+        sample = "\n".join(
+            [
+                "F libc    : Fatal signal 6 (SIGABRT), code -1 (SI_QUEUE) in tid 1148 (init), pid 1148 (init)",
+                *[f"I app     : filler line {i}" for i in range(200)],
+                "F libc    : Fatal signal 4 (SIGILL), code 1 (ILL_ILLOPC), fault addr 0x764a4d1328 in tid 18974",
+                "F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***",
+                "F DEBUG   : pid: 27826, ppid: 1712, tid: 18974, name: map-runloop  >>> com.demo <<<",
+                "F DEBUG   : signal 4 (SIGILL), code 1 (ILL_ILLOPC), fault addr 0x000000764a4d1328 (read)",
+            ]
+        )
+        info = extract_crash_info(sample)
+        self.assertEqual(info.signal, "SIGILL (ILL_ILLOPC)")
+        self.assertEqual(info.crash_reason, "illegal instruction")
+        self.assertEqual(info.crash_address, "0x764a4d1328")
+
     def test_evidence_chain_quotes_any_abort_message(self) -> None:
         """证据链保留 Abort message，不限堆分配器。"""
         message = "FORTIFY: pthread_mutex_destroy called on a destroyed mutex"

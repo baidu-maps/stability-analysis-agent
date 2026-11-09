@@ -4175,6 +4175,7 @@ class CodeFixer:
                         "code_context": code_context,
                         "required_targets": required_targets,
                         "strict_required": False,
+                        "code_roots": list(code_roots or []),
                     },
                 )
                 if not bool(extract_out.get("success")):

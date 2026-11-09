@@ -36,9 +36,37 @@ from tools.crash_parser.types import CrashInfo, MetaInfo
 
 logger = logging.getLogger(__name__)
 
+def _crash_header_scope(content: str, max_lines: int = 120) -> str:
+    """取崩溃头部扫描范围。
+
+    logcat 导出常在 debuggerd tombstone 之前混有其它进程的 ``Fatal signal`` 行。
+    ``pid: N, tid: N, name: ... >>>`` 之前出现过别的信号行时，从该 tombstone
+    的 Fatal signal 行开始取；否则保持取文件前 ``max_lines`` 行。
+    """
+    lines = content.splitlines()
+    default_scope = "\n".join(lines[:max_lines])
+    tombstone_re = re.compile(r"pid:\s*\d+,\s*tid:\s*\d+,\s*name:\s*[^\s>]+\s*>>>", re.IGNORECASE)
+    signal_re = re.compile(r"signal\s+\d+\s*\(", re.IGNORECASE)
+    for idx, line in enumerate(lines):
+        if not tombstone_re.search(line):
+            continue
+        # 回退到本次崩溃的 Fatal signal 行（或 *** 分隔行），不带入之前其它进程的日志
+        start = idx
+        for back in range(idx - 1, max(-1, idx - 21), -1):
+            if re.search(r"Fatal signal \d+", lines[back], re.IGNORECASE):
+                start = back
+                break
+            if "*** *** ***" in lines[back]:
+                start = back
+        if not any(signal_re.search(prev) for prev in lines[:start]):
+            return default_scope
+        return "\n".join(lines[start:start + max_lines])
+    return default_scope
+
+
 def extract_crash_info(content: str) -> CrashInfo:
     """提取崩溃信息"""
-    header_scope = "\n".join(content.splitlines()[:120])
+    header_scope = _crash_header_scope(content)
     content_lower = header_scope.lower()
 
     thread_type = "main"
