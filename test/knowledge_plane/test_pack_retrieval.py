@@ -207,6 +207,57 @@ CGridLayer::CancelTask walks the loading task lists.
         self.assertIn("CVArray<StyleMapType*, StyleMapType*>", text)
         self.assertIn("context_requests", text)
 
+    def test_multiline_symbols_frontmatter(self):
+        """跨行 symbols 列表必须解析成完整列表，而不是拼成一个字符串。"""
+        from knowledge_plane.api import _parse_frontmatter
+
+        meta, _ = _parse_frontmatter(
+            "---\ntitle: T\nsymbols: [A::Run, runTask,\n  B::Leave, C::Wait]\nconfidence: high\n---\nbody\n"
+        )
+        self.assertEqual(meta["symbols"], ["A::Run", "runTask", "B::Leave", "C::Wait"])
+        self.assertEqual(meta["confidence"], "high")
+
+    def test_upstream_fixed_doc_is_annotated_and_demoted(self):
+        """检出已包含 fixed_in 提交时，文档降权并注明上游已修复。"""
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pack = self._create_pack(root)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / "a.cpp").write_text("int a;\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                 "commit", "-qm", "fix"],
+                check=True,
+            )
+            head = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            doc = pack / "threading" / "render.md"
+            doc.write_text(
+                doc.read_text(encoding="utf-8").replace(
+                    "confidence: high", f"confidence: high\nfixed_in: [{head}]"
+                ),
+                encoding="utf-8",
+            )
+            kwargs = dict(
+                parse_result={"signal": "SIGSEGV"},
+                resolved_stack={"resolved_frames": [{"module": "libdemo.so", "function": "RenderEngine::Draw"}]},
+                code_context={},
+                pack_dirs=[str(root)],
+            )
+            plain = retrieve_knowledge(**kwargs)["hits"][0]
+            fixed = retrieve_knowledge(code_roots=[str(repo)], **kwargs)["hits"][0]
+            self.assertEqual(plain["upstream_fixed"], [])
+            self.assertEqual(fixed["upstream_fixed"], [head])
+            self.assertLess(fixed["score"], plain["score"])
+            self.assertIn("上游修复提交", fixed["excerpt"])
+
 
 if __name__ == "__main__":
     unittest.main()

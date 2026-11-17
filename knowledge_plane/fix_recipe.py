@@ -27,9 +27,23 @@ def _load_recipes(pack_dirs: Sequence[Path]) -> List[Dict[str, Any]]:
                 data = json.loads(fp.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if isinstance(data, dict) and isinstance(data.get("edits"), list):
+            if isinstance(data, dict) and (
+                isinstance(data.get("edits"), list) or isinstance(data.get("variants"), list)
+            ):
                 recipes.append(data)
     return recipes
+
+
+def _recipe_variants(recipe: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
+    """配方的候选改法列表。``variants`` 按分支各备一组 edits；旧格式 ``edits`` 视为单组。"""
+    variants: List[List[Dict[str, Any]]] = []
+    for variant in recipe.get("variants") or []:
+        edits = variant.get("edits") if isinstance(variant, dict) else None
+        if isinstance(edits, list) and edits:
+            variants.append([e for e in edits if isinstance(e, dict)])
+    if isinstance(recipe.get("edits"), list) and recipe["edits"]:
+        variants.append([e for e in recipe["edits"] if isinstance(e, dict)])
+    return variants
 
 
 def _find_target_file(
@@ -72,13 +86,18 @@ def collect_recipe_edits(
 ) -> List[Dict[str, Any]]:
     """返回命中配方、且能在候选文件中精确定位 old_text 的 member_declaration edits。
 
-    - ``trigger_text``：路由文本（分析文本 + 候选文件路径），用于 match.require_all。
+    - ``trigger_text``：路由文本（分析文本 + 候选文件路径），用于 match.require_all /
+      match.require_any。
     - ``candidate_files``：本次代码上下文里的真实源文件绝对路径列表。
     - ``search_roots``：代码根目录；候选文件里找不到时按 ``root/file_suffix`` 精确定位。
-    - 只有 ``old_text`` 确实出现在目标文件里才产出对应 edit。
+    - 配方可声明多组 ``variants``（不同分支的原文不同），取第一组**全部** edit 都能
+      精确定位的变体；任一组都不能完整定位时跳过，不做部分落盘。
+    - 配方 ``fixed_in`` 里的提交已包含在当前检出时，说明上游已修，直接跳过。
     - 配方声明 ``exclusive: true`` 时，产出的 edit 带 ``exclusive`` 标记，
       调用方应只落盘配方 edit，丢弃大模型自行推理的其它改动。
     """
+    from knowledge_plane.api import upstream_fixed_commits
+
     text = str(trigger_text or "")
     files = [str(f) for f in (candidate_files or []) if str(f).strip()]
     roots = [str(r) for r in (search_roots or []) if str(r).strip()]
@@ -95,31 +114,42 @@ def collect_recipe_edits(
         require_all = match.get("require_all") or []
         if require_all and not all(str(tok) in text for tok in require_all):
             continue
+        require_any = match.get("require_any") or []
+        if require_any and not any(str(tok) in text for tok in require_any):
+            continue
+        if roots and upstream_fixed_commits(recipe, roots):
+            continue
         exclusive = bool(recipe.get("exclusive"))
-        for edit in recipe.get("edits") or []:
-            if not isinstance(edit, dict):
+        for edits in _recipe_variants(recipe):
+            located: List[Dict[str, Any]] = []
+            for edit in edits:
+                suffix = str(edit.get("file_suffix") or "").strip().replace("\\", "/")
+                old = str(edit.get("old_text") or "")
+                new = str(edit.get("new_text") or "")
+                if not suffix or not old or not new or old == new:
+                    located = []
+                    break
+                target = _find_target_file(suffix, old, files, roots)
+                if not target:
+                    located = []
+                    break
+                located.append({
+                    "file": target,
+                    "edit_type": "member_declaration",
+                    "old_text": old,
+                    "new_text": new,
+                    "reason": str(edit.get("reason") or "knowledge fix recipe"),
+                    "source": "knowledge_fix_recipe",
+                })
+            if not located:
                 continue
-            suffix = str(edit.get("file_suffix") or "").strip().replace("\\", "/")
-            old = str(edit.get("old_text") or "")
-            new = str(edit.get("new_text") or "")
-            if not suffix or not old or not new or old == new:
-                continue
-            target = _find_target_file(suffix, old, files, roots)
-            if not target:
-                continue
-            key = f"{target}::{old}"
-            if key in seen:
-                continue
-            seen.add(key)
-            item = {
-                "file": target,
-                "edit_type": "member_declaration",
-                "old_text": old,
-                "new_text": new,
-                "reason": str(edit.get("reason") or "knowledge fix recipe"),
-                "source": "knowledge_fix_recipe",
-            }
-            if exclusive:
-                item["exclusive"] = True
-            out.append(item)
+            for item in located:
+                key = f"{item['file']}::{item['old_text']}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                if exclusive:
+                    item["exclusive"] = True
+                out.append(item)
+            break
     return out

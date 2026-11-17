@@ -145,12 +145,67 @@ def _parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
     if not match:
         return {}, text
     metadata: Dict[str, Any] = {}
+    pending_key = ""
+    pending_value = ""
     for raw_line in match.group(1).splitlines():
+        # 跨行列表 ``key: [a, b,`` / ``  c]``：拼到右括号闭合再解析。
+        if pending_key:
+            pending_value += " " + raw_line.strip()
+            if pending_value.count("[") <= pending_value.count("]"):
+                metadata[pending_key] = _parse_scalar(pending_value)
+                pending_key, pending_value = "", ""
+            continue
         if not raw_line.strip() or raw_line.lstrip().startswith("#") or ":" not in raw_line:
             continue
         key, value = raw_line.split(":", 1)
+        value = value.strip()
+        if value.startswith("[") and value.count("[") > value.count("]"):
+            pending_key, pending_value = key.strip(), value
+            continue
         metadata[key.strip()] = _parse_scalar(value)
+    if pending_key:
+        metadata[pending_key] = _parse_scalar(pending_value + "]")
     return metadata, text[match.end() :]
+
+
+def _as_list(value: Any) -> List[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def _commit_in_checkout(commit: str, roots: Sequence[str]) -> bool:
+    """``commit`` 是否已包含在某个代码根（含其子模块）的当前检出里。"""
+    import subprocess
+
+    for root in roots:
+        candidates = [Path(root)]
+        try:
+            candidates.extend(p.parent for p in Path(root).glob("*/.git"))
+        except OSError:
+            pass
+        for repo in candidates:
+            try:
+                done = subprocess.run(
+                    ["git", "-C", str(repo), "merge-base", "--is-ancestor", commit, "HEAD"],
+                    capture_output=True,
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if done.returncode == 0:
+                return True
+    return False
+
+
+def upstream_fixed_commits(metadata: Dict[str, Any], code_roots: Sequence[str]) -> List[str]:
+    """返回 frontmatter ``fixed_in`` 中已包含在当前检出的提交。"""
+    roots = [str(r) for r in (code_roots or []) if str(r).strip()]
+    if not roots:
+        return []
+    return [c for c in _as_list(metadata.get("fixed_in")) if _commit_in_checkout(c, roots)]
 
 
 def _collect_query_text(
@@ -332,8 +387,13 @@ def retrieve_knowledge(
     pack_id: str = "",
     max_hits: int = _DEFAULT_MAX_HITS,
     max_chars: int = _DEFAULT_MAX_CHARS,
+    code_roots: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """路由到最相关的代码库 Pack，并返回可与现有 RAG 合并的命中。"""
+    """路由到最相关的代码库 Pack，并返回可与现有 RAG 合并的命中。
+
+    ``code_roots`` 给出时，文档 frontmatter ``fixed_in`` 里的提交若已包含在当前检出，
+    该文档降权并在摘录前注明"上游已修复"，避免对已修复分支重复推理和改码。
+    """
     roots = resolve_pack_dirs(pack_dirs)
     base: Dict[str, Any] = {
         "success": True,
@@ -380,9 +440,23 @@ def retrieve_knowledge(
         score, matched = _document_score(metadata, body, query_lower, terms)
         if score <= 0:
             continue
+        fixed_commits = upstream_fixed_commits(metadata, code_roots or [])
+        if fixed_commits:
+            score *= 0.3
         provenance = str(metadata.get("source_type") or "curated_playbook")
         pack_budget = manifest.get("prompt_budget") if isinstance(manifest.get("prompt_budget"), dict) else {}
         excerpt_budget = int(pack_budget.get("max_chars") or max_chars or _DEFAULT_MAX_CHARS)
+        excerpt = _excerpt(
+            body,
+            matched,
+            max_chars=excerpt_budget,
+            from_start=provenance == "curated_playbook",
+        )
+        if fixed_commits:
+            excerpt = (
+                f"（当前检出已包含上游修复提交 {', '.join(fixed_commits)}：先核对该修复是否生效，"
+                "不要按本文再次改码。）\n" + excerpt
+            )
         hits.append(
             {
                 "layer": str(metadata.get("kb_layer") or "code"),
@@ -394,12 +468,8 @@ def retrieve_knowledge(
                 "provenance": provenance,
                 "score": round(score, 3),
                 "matched_terms": matched,
-                "excerpt": _excerpt(
-                    body,
-                    matched,
-                    max_chars=excerpt_budget,
-                    from_start=provenance == "curated_playbook",
-                ),
+                "upstream_fixed": fixed_commits,
+                "excerpt": excerpt,
                 "metadata": metadata,
             }
         )

@@ -68,6 +68,30 @@ class TestMemoryRetriever(unittest.TestCase):
         StabilityMemorySystem.retrieve_patterns(mem, "sigsegv", n_results=1, record_usage=True)
         mem.meta_store.update_usage.assert_called_once_with("pattern_test", hit_inc=1)
 
+    def test_vector_filter_excludes_pack_chunks_and_env_sources(self):
+        """向量库只做案例召回：Pack 分片与部署方声明的来源都不进入相似检索。"""
+        from unittest.mock import patch
+
+        import rag.memory_retriever as mr
+
+        analyzer = MagicMock()
+        analyzer.match_rules.return_value = []
+        analyzer.retrieve_patterns.return_value = []
+        analyzer.get_fix_strategies.return_value = []
+        with patch.object(mr, "rag_stack_available", return_value=True), \
+                patch.object(mr, "get_ai_stability_analyzer_class", return_value=lambda **_: analyzer), \
+                patch.dict("os.environ", {mr.EXCLUDE_SOURCE_TYPES_ENV: "demo_basic, seed_concurrency"}):
+            mr.collect_memory_context(
+                parse_result={"frames": []},
+                resolved_stack={"frames": []},
+                code_context={},
+            )
+        filters = analyzer.retrieve_patterns.call_args.kwargs["filters"]
+        text = repr(filters)
+        for source in ("knowledge_pack_chunk", "demo_basic", "seed_concurrency"):
+            self.assertIn(source, text)
+        self.assertIn("$nin", text)
+
     def test_collect_minimal_inputs(self):
         out = collect_memory_context(
             parse_result={"frames": []},

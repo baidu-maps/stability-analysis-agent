@@ -876,6 +876,7 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                         pack_id=str(problem.get("knowledge_pack_id") or "") if isinstance(problem, dict) else "",
                         max_hits=int(problem.get("knowledge_max_hits") or 4) if isinstance(problem, dict) else 4,
                         max_chars=int(problem.get("knowledge_max_chars") or 4500) if isinstance(problem, dict) else 4500,
+                        code_roots=code_roots if isinstance(code_roots, list) else [],
                     )
                 else:
                     knowledge_retrieval = {

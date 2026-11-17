@@ -1,4 +1,9 @@
-"""将 Knowledge Pack 文档幂等写入现有 Stability Memory 向量库。"""
+"""将 Knowledge Pack 文档幂等写入现有 Stability Memory 向量库。
+
+已不推荐：Pack 文档由 ``knowledge_plane.retrieve_knowledge`` 直接检索进提示词，
+``rag.memory_retriever`` 召回向量案例时会排除 ``knowledge_pack_chunk``。保留本模块仅供
+没有直接检索入口的旧集成使用；新部署请让向量库只存历史案例。
+"""
 
 from __future__ import annotations
 

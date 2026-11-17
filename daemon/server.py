@@ -364,6 +364,7 @@ class RunState:
     finished_at: Optional[float] = None
     exit_code: Optional[int] = None
     error: Optional[str] = None
+    failure_detail: Optional[str] = None
     output_format: str = "markdown"
     report_dir: Optional[str] = None
     workspace_dir: Optional[str] = None
@@ -525,7 +526,7 @@ class RunManager:
                                created_at=float(item.get("created_at") or time.time()),
                                output_format=str(item.get("output_format") or "markdown"), request=request)
                 for name in (
-                    "started_at", "finished_at", "exit_code", "error", "report_dir", "workspace_dir",
+                    "started_at", "finished_at", "exit_code", "error", "failure_detail", "report_dir", "workspace_dir",
                     "workspace_manifest", "patch_path", "last_progress", "last_progress_percent",
                     "progress_history", "completion_reason", "runtime_state", "approval",
                     "runtime_trace", "pending_tool_approval",
@@ -1167,7 +1168,7 @@ def _report_failure_fields(run: "RunState") -> Dict[str, Any]:
     reason = str(run.completion_reason or "").strip()
     if not reason and isinstance(summary, dict):
         reason = str(summary.get("completion_reason") or "").strip()
-    failure_detail = _compose_failure_detail(
+    failure_detail = run.failure_detail or _compose_failure_detail(
         completion_reason=reason or None,
         stage_errors=stage_errors,
         fix_notes=fix_notes,
@@ -1567,6 +1568,25 @@ def _emit_stdout_line(run: RunState, stdout_acc: list[str], line: str) -> None:
     run.events.put(RunEvent(run.run_id, "stdout", {"line": text}))
 
 
+def _extract_cli_failure(text: str) -> Optional[Dict[str, str]]:
+    """从 CLI 输出中提取结构化失败信息。"""
+    for line in reversed(str(text or "").splitlines()):
+        raw = line.strip()
+        if not raw.startswith("{") or not raw.endswith("}"):
+            continue
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        error = str(payload.get("error") or "").strip()
+        message = str(payload.get("message") or "").strip()
+        if error or message:
+            return {"error": error, "message": message}
+    return None
+
+
 def _subprocess_env_for_run(run_id: Optional[str] = None) -> dict:
     """子进程环境：透传 Web UI 中禁用的 skill 列表给 CLI。"""
     from daemon.web_preferences import load_web_preferences
@@ -1615,6 +1635,7 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
             p.stdin.close()
 
         stdout_acc: list[str] = []
+        stderr_acc: list[str] = []
 
         def _pump_stdout(stream):
             try:
@@ -1630,6 +1651,7 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
                 for line in iter(stream.readline, ""):
                     if not line:
                         break
+                    stderr_acc.append(line)
                     _capture_report_dir_from_line(run, line)
                     _capture_progress(run, line.rstrip("\n"))
                     run.events.put(RunEvent(run.run_id, "stderr", {"line": line.rstrip("\n")}))
@@ -1660,7 +1682,12 @@ def _run_worker(run: RunState, req: RunRequest) -> None:
             pass
 
         output_text = "".join(stdout_acc)
-        reason = _extract_completion_reason(output_text)
+        diagnostic_text = output_text + "\n" + "".join(stderr_acc)
+        failure = _extract_cli_failure(diagnostic_text) if exit_code not in (None, 0) else None
+        if failure:
+            run.completion_reason = failure.get("error") or run.completion_reason
+            run.failure_detail = failure.get("message") or failure.get("error") or run.failure_detail
+        reason = _extract_completion_reason(diagnostic_text)
         if reason:
             run.completion_reason = reason
         report_summary = _load_run_summary(run)
@@ -2086,6 +2113,7 @@ def _run_public_dict(run: RunState) -> Dict[str, Any]:
         "finished_at": run.finished_at,
         "exit_code": run.exit_code,
         "error": run.error,
+        "failure_detail": run.failure_detail,
         "completion_reason": run.completion_reason,
         "stage": run.stage,
         "runtime_status": run.runtime_status,

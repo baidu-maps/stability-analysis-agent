@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """Unit tests for analysis acceleration services."""
 
+import json
 import os
 import tempfile
 import unittest
@@ -116,6 +117,35 @@ class TestFixRecipe(unittest.TestCase):
             self.assertEqual(len(edits), 1)
             self.assertEqual(edits[0]["file"], header)
             self.assertTrue(edits[0]["exclusive"])
+
+    def test_variants_pick_fully_located_group_only(self):
+        from knowledge_plane.fix_recipe import collect_recipe_edits
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "repo")
+            os.makedirs(os.path.join(root, "inc"))
+            with open(os.path.join(root, "inc", "Group.h"), "w", encoding="utf-8") as f:
+                f.write("class Group {\n    long m_count;\n    bool m_stop;\n};\n")
+            pack = os.path.join(tmp, "pack")
+            os.makedirs(pack)
+            recipe = {
+                "id": "g",
+                "match": {"require_any": ["Group"]},
+                "variants": [
+                    {"name": "old", "edits": [
+                        {"file_suffix": "inc/Group.h", "old_text": "int m_count;", "new_text": "X"},
+                        {"file_suffix": "inc/Group.h", "old_text": "bool m_stop;", "new_text": "Y"},
+                    ]},
+                    {"name": "new", "edits": [
+                        {"file_suffix": "inc/Group.h", "old_text": "long m_count;", "new_text": "Z"},
+                    ]},
+                ],
+            }
+            with open(os.path.join(pack, "g.fix.json"), "w", encoding="utf-8") as f:
+                json.dump(recipe, f)
+            edits = collect_recipe_edits("Group race", [], pack_dirs=[pack], search_roots=[root])
+            # 第一组只能定位一半，不得部分落盘；退到第二组。
+            self.assertEqual([e["new_text"] for e in edits], ["Z"])
 
 
 class TestCodeLocatorService(unittest.TestCase):

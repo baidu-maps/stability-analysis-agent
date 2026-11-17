@@ -25,11 +25,16 @@ from protocol.models import RunRequest
 
 
 class _FakeProcess:
-    def __init__(self, output: str = '{"status":"success"}\n', returncode: int = 0) -> None:
+    def __init__(
+        self,
+        output: str = '{"status":"success"}\n',
+        returncode: int = 0,
+        error_output: str = "",
+    ) -> None:
         import io
 
         self.stdout = io.StringIO(output)
-        self.stderr = io.StringIO("")
+        self.stderr = io.StringIO(error_output)
         self.stdin = None
         self._returncode = returncode
         self.terminated = False
@@ -292,6 +297,34 @@ class DaemonRunLifecycleTests(unittest.TestCase):
             error = str(state.get("error") or "")
             self.assertIn("分析未正常完成", error)
             self.assertNotIn("process exit", error)
+
+    def test_failed_run_uses_structured_stderr_error(self) -> None:
+        """A preparation failure in stderr is exposed with its code and message."""
+        error_output = (
+            '{"error":"package_hash_resolve_failed",'
+            '"message":"未找到对应的鸿蒙 SDK 构建产物"}\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            server, "DEFAULT_REPORT_DIR", Path(tmp)
+        ), mock.patch.object(
+            server.subprocess,
+            "Popen",
+            return_value=_FakeProcess(output="", returncode=1, error_output=error_output),
+        ):
+            status, created = self._request("POST", "/runs", {"crash_log": "/tmp/demo.crash"})
+            self.assertEqual(status, 200)
+            run_id = created["run_id"]
+            deadline = time.monotonic() + 3
+            state = {}
+            while time.monotonic() < deadline:
+                _, state = self._request("GET", f"/status/{run_id}")
+                if state.get("status") == "error":
+                    break
+                time.sleep(0.01)
+            self.assertEqual(state.get("status"), "error")
+            self.assertEqual(state.get("completion_reason"), "package_hash_resolve_failed")
+            self.assertEqual(state.get("failure_detail"), "未找到对应的鸿蒙 SDK 构建产物")
+            self.assertIn("未找到对应的鸿蒙 SDK 构建产物", state.get("error") or "")
 
     def test_skipped_resolve_is_error_with_completion_reason(self) -> None:
         """skipped_no_usable_resolve is a terminal error even if CLI exits 0."""

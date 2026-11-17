@@ -6,12 +6,22 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from rag.feature_extractor import build_pattern_query, extract_features, extract_module_list
 from rag.runtime import RAG_INSTALL_HINT, get_ai_stability_analyzer_class, rag_stack_available
 
 logger = logging.getLogger(__name__)
+
+# 部署方可用逗号分隔的 source_type 屏蔽向量库里不该参与召回的案例（如 demo/种子数据）。
+EXCLUDE_SOURCE_TYPES_ENV = "STABILITY_AGENT_VECTOR_EXCLUDE_SOURCE_TYPES"
+
+
+def _env_excluded_source_types() -> List[str]:
+    """读取环境变量里要排除的向量案例来源。"""
+    raw = os.environ.get(EXCLUDE_SOURCE_TYPES_ENV, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def render_memory_context(
@@ -167,22 +177,24 @@ def collect_memory_context(
         except Exception as e:
             logger.debug("Module knowledge routing skipped: %s", e)
 
-        if not include_domain_knowledge:
-            domain_exclusion = {
-                "source_type": {"$ne": "knowledge_pack_chunk"}
+        # 分工：Knowledge Pack 文档由 knowledge_plane 直接检索并进提示词；向量库只负责
+        # 历史案例相似召回。向量库里若残留 Pack 分片（旧版 ingest 写入），一律排除，
+        # 避免同一文档两路召回、重复占用预算。
+        excluded_types = ["knowledge_pack_chunk", *_env_excluded_source_types()]
+        source_exclusion = {"source_type": {"$nin": excluded_types}}
+        vector_filter = (
+            {"$and": [vector_filter, source_exclusion]}
+            if vector_filter
+            else source_exclusion
+        )
+        decision_trace.append(
+            {
+                "stage": "vector_source_filter",
+                "excluded_source_types": excluded_types,
             }
-            vector_filter = (
-                {"$and": [vector_filter, domain_exclusion]}
-                if vector_filter
-                else domain_exclusion
-            )
-            decision_trace.append(
-                {
-                    "stage": "domain_knowledge",
-                    "result": "disabled",
-                    "excluded_source_type": "knowledge_pack_chunk",
-                }
-            )
+        )
+        if not include_domain_knowledge:
+            decision_trace.append({"stage": "domain_knowledge", "result": "disabled"})
 
         # 规则与向量均参与统一融合；规则命中不再短路历史案例/Pack 向量召回。
         if high_conf_hits:
