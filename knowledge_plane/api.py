@@ -295,6 +295,34 @@ def _iter_pack_manifests(pack_dirs: Iterable[Path]) -> Iterable[Tuple[Path, Dict
                 yield manifest_path.parent, manifest
 
 
+def _group_packs(
+    pack_dirs: Iterable[Path],
+) -> List[Tuple[List[Tuple[Path, Dict[str, Any]]], Dict[str, Any]]]:
+    """按 ``id`` 合并分布在多个目录里的同名 Pack。
+
+    随包发布的 Pack 与运行时沉淀的 Pack 可以同 id 共存；合并后一起参与路由和检索。
+    展示名、预算等取第一个出现的清单，``match`` 各字段取并集。
+    """
+    groups: Dict[str, List[Tuple[Path, Dict[str, Any]]]] = {}
+    for pack_root, manifest in _iter_pack_manifests(pack_dirs):
+        members = groups.setdefault(str(manifest.get("id")), [])
+        if all(pack_root != root for root, _ in members):
+            members.append((pack_root, manifest))
+    result = []
+    for members in groups.values():
+        merged = dict(members[0][1])
+        match: Dict[str, List[Any]] = {}
+        for _, manifest in members:
+            raw = manifest.get("match") if isinstance(manifest.get("match"), dict) else {}
+            for field, values in raw.items():
+                items = [values] if isinstance(values, str) else list(values or [])
+                bucket = match.setdefault(field, [])
+                bucket.extend(item for item in items if item not in bucket)
+        merged["match"] = match
+        result.append((members, merged))
+    return result
+
+
 def _match_pack(manifest: Dict[str, Any], query_lower: str) -> Tuple[float, List[str]]:
     match = manifest.get("match") if isinstance(manifest.get("match"), dict) else {}
     score = 0.0
@@ -412,27 +440,31 @@ def retrieve_knowledge(
     query = _collect_query_text(parse_result, resolved_stack, code_context)
     query_lower = query.lower()
     candidates = []
-    for pack_root, manifest in _iter_pack_manifests(roots):
+    for members, manifest in _group_packs(roots):
         score, reasons = _match_pack(manifest, query_lower)
         if pack_id and str(manifest.get("id")) == pack_id:
             score += 100.0
             reasons.insert(0, f"forced:{pack_id}")
-        candidates.append((score, pack_root, manifest, reasons))
+        candidates.append((score, members, manifest, reasons))
     candidates.sort(key=lambda item: item[0], reverse=True)
     if not candidates or candidates[0][0] <= 0:
         base.update(skipped=True, skip_reason="no_matching_knowledge_pack")
         return base
 
-    route_score, pack_root, manifest, route_reason = candidates[0]
+    route_score, members, manifest, route_reason = candidates[0]
     terms = _normalized_terms(query)
     hits: List[Dict[str, Any]] = []
-    content_globs = manifest.get("content_globs") or ["**/*.md"]
-    if isinstance(content_globs, str):
-        content_globs = [content_globs]
-    paths = set()
-    for pattern in content_globs:
-        paths.update(pack_root.glob(str(pattern)))
-    for path in sorted(paths):
+    documents: Dict[str, Tuple[Path, Path]] = {}
+    for pack_root, member_manifest in members:
+        content_globs = member_manifest.get("content_globs") or ["**/*.md"]
+        if isinstance(content_globs, str):
+            content_globs = [content_globs]
+        for pattern in content_globs:
+            for path in pack_root.glob(str(pattern)):
+                # 同 id 多目录里相对路径相同的文档只取先出现的一份。
+                documents.setdefault(str(path.relative_to(pack_root)), (pack_root, path))
+    for rel_path in sorted(documents):
+        pack_root, path = documents[rel_path]
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -504,6 +536,7 @@ def retrieve_knowledge(
                 "pack_id": str(manifest.get("id")),
                 "score": route_score,
                 "reasons": route_reason,
+                "pack_roots": [str(root) for root, _ in members],
             },
             {
                 "stage": "knowledge_pack_retrieve",

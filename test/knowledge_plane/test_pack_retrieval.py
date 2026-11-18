@@ -63,6 +63,51 @@ RenderEngine::Draw must stop before the framebuffer and context are released.
         self.assertIn("Render thread lifecycle", result["knowledge_context"])
         self.assertIn("framebuffer", result["knowledge_context"])
 
+    def test_same_id_packs_in_two_dirs_are_merged(self):
+        with tempfile.TemporaryDirectory() as bundled_dir, tempfile.TemporaryDirectory() as runtime_dir:
+            self._create_pack(Path(bundled_dir))
+            runtime = Path(runtime_dir) / "demo"
+            (runtime / "auto").mkdir(parents=True)
+            (runtime / "pack.yaml").write_text(
+                json.dumps(
+                    {
+                        "id": "demo",
+                        "match": {"stack_hints": ["Texture::Release"]},
+                        "content_globs": ["auto/**/*.md"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (runtime / "auto" / "texture.md").write_text(
+                """---
+title: Texture release race
+kb_layer: crash
+confidence: medium
+symbols: [Texture::Release]
+---
+
+Texture::Release runs on the IO thread while the GL context is gone.
+""",
+                encoding="utf-8",
+            )
+            result = retrieve_knowledge(
+                parse_result={"signal": "SIGSEGV"},
+                resolved_stack={
+                    "resolved_frames": [
+                        {"function": "Texture::Release"},
+                        {"function": "RenderEngine::Draw"},
+                    ]
+                },
+                code_context={},
+                pack_dirs=[bundled_dir, runtime_dir],
+            )
+
+        self.assertEqual(result["pack_id"], "demo")
+        titles = {hit["title"] for hit in result["hits"]}
+        self.assertEqual(titles, {"Render thread lifecycle", "Texture release race"})
+        self.assertEqual(len(result["decision_trace"][0]["pack_roots"]), 2)
+        self.assertIn("Test Engine", result["knowledge_context"])
+
     def test_no_matching_pack_is_non_fatal(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
