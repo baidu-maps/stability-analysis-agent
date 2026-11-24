@@ -1473,8 +1473,9 @@ class Add2lineResolver:
     def _filter_cpp_native_output_frames(
         frames: List["ResolvedFrame"],
         crash_info: Optional[Dict[str, Any]] = None,
+        os_type: Optional[str] = None,
     ) -> Tuple[List["ResolvedFrame"], int]:
-        """02 输出：仅保留带 C++ native 符号的帧（丢弃 ObjC、无符号空帧等）。"""
+        """02 输出：默认仅保留 C++ native 符号；iOS/macOS 额外保留 ObjC selector。"""
         del crash_info  # 崩溃地址见 01，不在 02 重复占位
         kept: List[ResolvedFrame] = []
         dropped = 0
@@ -1485,7 +1486,7 @@ class Add2lineResolver:
                 "resolved_function": rf.resolved_function,
                 "module": rf.module,
             }
-            if should_keep_frame_for_cpp_stack_output(frame_dict):
+            if should_keep_frame_for_cpp_stack_output(frame_dict, os_type=os_type):
                 kept.append(rf)
             else:
                 dropped += 1
@@ -1557,14 +1558,16 @@ class Add2lineResolver:
             if has_symbol or has_source:
                 success_count += 1
 
-        resolved_frames, cpp_filtered = self._filter_cpp_native_output_frames(
-            resolved_frames, crash_info=crash_info
-        )
-        if cpp_filtered:
-            filtered_count += cpp_filtered
-            logger.info(
-                "log_symbolicated_passthrough 过滤非 C++/前端帧: %s", cpp_filtered
+            resolved_frames, cpp_filtered = self._filter_cpp_native_output_frames(
+                resolved_frames,
+                crash_info=crash_info,
+                os_type=os_type,
             )
+            if cpp_filtered:
+                filtered_count += cpp_filtered
+                logger.info(
+                    "log_symbolicated_passthrough 过滤非 C++/前端帧: %s", cpp_filtered
+                )
 
         resolved_threads = self._wrap_frames_as_resolved_threads(
             resolved_frames,
@@ -2542,7 +2545,9 @@ class Add2lineResolver:
                     errors.append(str(res["error"]))
 
             resolved_frames, cpp_filtered = self._filter_cpp_native_output_frames(
-                resolved_frames, crash_info=crash_data.get("crash_info") or {}
+                resolved_frames,
+                crash_info=crash_data.get("crash_info") or {},
+                os_type=(crash_data.get("meta_info") or {}).get("os_type"),
             )
             if cpp_filtered:
                 filtered_count += cpp_filtered

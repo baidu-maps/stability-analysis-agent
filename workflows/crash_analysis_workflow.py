@@ -4176,6 +4176,15 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         s = str(signature or "").strip()
         if not s:
             return ""
+        from tools._stack_symbol_utils import objc_selector_call_token, parse_objc_stack_symbol
+
+        objc_stack = parse_objc_stack_symbol(s)
+        if objc_stack:
+            return objc_selector_call_token(objc_stack[1]) or objc_stack[1]
+        # ObjC 源码签名：`- (void)initializeData`；勿把返回类型括号当成形参列表。
+        objc_sig = re.match(r"^[\-\+]\s*(?:\([^)]*\))?\s*([A-Za-z_]\w*)\b", s)
+        if objc_sig:
+            return objc_sig.group(1)
         paren_idx = s.find("(")
         head = s[:paren_idx].strip() if paren_idx > 0 else s
         head = BaseCrashAnalysisWorkflow._strip_template_args(head)
@@ -4234,13 +4243,16 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
         if not token:
             return None
         pat = re.compile(rf"(?:\b\w+\s*::\s*)?\b~?{re.escape(token)}\s*(?:\[[^\]]+\])?\s*\(")
+        objc_pat = re.compile(
+            rf"^[\-\+]\s*(?:\([^;\n{{}}]*?\))?\s*{re.escape(token)}\b"
+        )
         for i, ln in enumerate(snippet):
             s = str(ln or "").strip()
             if not s:
                 continue
             if ";" in s and "{" not in s:
                 continue
-            if pat.search(s):
+            if pat.search(s) or objc_pat.search(s):
                 return i
         return None
 

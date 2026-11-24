@@ -51,6 +51,36 @@ def _detect_harmony_native_stack(content: str) -> bool:
     return False
 
 
+def _detect_apple_ios_minimal_exception_stack(content: str) -> bool:
+    """
+    精简/转写的 Apple 崩溃片段：有 Exception Type + Crashed 线程栈，
+    可无 OS Version / Binary Images（客户粘贴、二次导出常见）。
+    """
+    if re.search(r"Hardware Model:\s*Mac", content, re.IGNORECASE):
+        return False
+    if re.search(r"^\s*OS Version:\s*macOS\b", content, re.MULTILINE | re.IGNORECASE) or re.search(
+        r"^\s*OS Version:\s*Mac OS X\b", content, re.MULTILINE | re.IGNORECASE
+    ):
+        return False
+    if not re.search(r"^\s*Exception Type:\s*EXC_", content, re.MULTILINE | re.IGNORECASE):
+        return False
+    has_crashed_thread = bool(
+        re.search(r"(?m)^Thread\s+\d+\s+Crashed:\s*$", content)
+        or re.search(r"^\s*Crashed Thread:\s*\d+", content, re.MULTILINE)
+    )
+    if not has_crashed_thread:
+        return False
+    # Apple 运行时 / ObjC 选择子特征，避免把其它平台 Exception 行误判成 iOS。
+    return bool(
+        re.search(
+            r"UIKitCore|UIKit\.framework|libsystem_|libdyld\.dylib|libobjc|"
+            r"CoreFoundation|\-\[[A-Za-z_]\w*\s+|^\s*\d+\s+\?\?\?",
+            content,
+            re.IGNORECASE | re.MULTILINE,
+        )
+    )
+
+
 def _detect_apple_ios_truncated_crash(content: str) -> bool:
     """
     截断/二次导出的 Apple 崩溃，或 ANR/主线程死锁类报告（可无 Exception/Crashed 行）。
@@ -62,6 +92,8 @@ def _detect_apple_ios_truncated_crash(content: str) -> bool:
         return False
     if re.search(r"Hardware Model:\s*Mac", content, re.IGNORECASE):
         return False
+    if _detect_apple_ios_minimal_exception_stack(content):
+        return True
     if "binary images:" not in cl:
         return False
     if not (

@@ -31,7 +31,8 @@ import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 # 缓存 schema 版本：结果结构/定位算法发生不兼容变化时自增，使旧缓存自然失效。
-CACHE_SCHEMA_VERSION = 1
+# v3：ObjC 图构建强一致重提取按 selector 抽取，避免把返回类型 void 当成函数名。
+CACHE_SCHEMA_VERSION = 3
 
 # Kill-switch 环境变量名。
 _DISABLE_ENV = "SA_DISABLE_CODE_LOCATION_CACHE"

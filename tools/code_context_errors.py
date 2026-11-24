@@ -16,8 +16,9 @@ _USER_MESSAGES: Dict[str, str] = {
         "请检查 --code-root 是否与符号化路径一致，或堆栈是否落在工程外（系统库/SDK）。"
     ),
     NO_EXTRACTABLE_CONTEXT: (
-        "未能从堆栈提取可分析的 C++ 源码。"
-        "请确认 addr2line/库目录正确，且栈顶为工程内符号（非仅 ObjC/系统库）。"
+        "未能从堆栈提取可分析的源码上下文。"
+        "请确认 addr2line/库目录正确，且栈顶为工程内符号"
+        "（Android/Harmony 需 C++；iOS/macOS 可含 ObjC，但仍会跳过纯系统库帧）。"
     ),
 }
 

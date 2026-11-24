@@ -32,6 +32,9 @@ from tools._lifecycle_contrast import (
 from tools._stack_symbol_utils import (
     _owner_class_token,
     cpp_owner_and_method,
+    objc_definition_line_matches_selector,
+    objc_selector_call_token,
+    parse_objc_stack_symbol,
     sanitize_stack_symbol,
     stack_symbol_aliases_crash_function,
 )
@@ -2375,6 +2378,20 @@ class CodeContentProvider:
         if not s:
             return ""
 
+        objc_info = parse_objc_stack_symbol(s)
+        if objc_info:
+            # 调用点/图节点用 selector 首段，避免残留 `]` 或完整 `-[Class ...]`。
+            return objc_selector_call_token(objc_info[1]) or objc_info[1]
+
+        # ObjC 方法签名（源码行/归一化后）：`- (void)initializeData` / `+ (id)foo:bar:`
+        # 必须在通用 `name(` 规则之前，否则会误把返回类型 `void` 当成函数名。
+        objc_sig = re.match(
+            r"^[\-\+]\s*(?:\([^;{}]*?\))?\s*([A-Za-z_]\w*)\b",
+            s,
+        )
+        if objc_sig:
+            return objc_sig.group(1)
+
         # 先处理 Itanium C++ mangled name（如 _Z13crash_nullptrv / _ZN11DataManager8add_dataEim）
         if s.startswith("_Z"):
             # 兜底：处理日志里常见的近似 mangled（如 _Z13crash_oobv）
@@ -2493,16 +2510,9 @@ class CodeContentProvider:
         """
         解析 ObjC 符号，返回 (class_name, selector)。
         例如：-[BMKBaseEngine updateCommonMemCacheWithKey:value:]
+        兼容 `-[Class sel] + 400` 偏移后缀。
         """
-        s = (resolved_function or "").strip()
-        m = re.match(r"^[\-\+]\[([A-Za-z_]\w*)\s+([^\]]+)\]$", s)
-        if not m:
-            return None
-        class_name = m.group(1).strip()
-        selector = m.group(2).strip()
-        if not class_name or not selector:
-            return None
-        return class_name, selector
+        return parse_objc_stack_symbol(resolved_function)
 
     @staticmethod
     def _is_cpp_native_symbol(resolved_function: str) -> bool:
@@ -2583,29 +2593,7 @@ class CodeContentProvider:
                         lines = f.readlines()
                     for i, line in enumerate(lines, 1):
                         stripped = line.strip()
-                        # ObjC 方法定义首行一般以 -/+ 开头
-                        if not stripped.startswith("-") and not stripped.startswith("+"):
-                            continue
-                        # 跳过头文件中的方法声明
-                        if stripped.endswith(";"):
-                            continue
-                        # 快速判定：必须含 selector 首段
-                        if sel_parts[0] not in stripped:
-                            continue
-                        # 兼容多行签名：在局部窗口内判定 selector 各段按序出现
-                        sig_window = " ".join(lines[i - 1 : min(len(lines), i + 6)]).replace("\n", " ")
-                        pos = 0
-                        ok = True
-                        for p in sel_parts:
-                            idx = sig_window.find(p, pos)
-                            if idx < 0:
-                                ok = False
-                                break
-                            pos = idx + len(p)
-                        if not ok:
-                            continue
-                        # 方法定义行还应含 ':'（多参）或 '('（无参方法签名）
-                        if (":" in sel and ":" not in stripped) and ("(" not in stripped):
+                        if not objc_definition_line_matches_selector(stripped, sel):
                             continue
                         self._function_def_cache[cache_key] = (file_path, i)
                         return (file_path, i)
@@ -2618,26 +2606,12 @@ class CodeContentProvider:
     ) -> Optional[Tuple[List[str], int, int, str]]:
         """按 selector 抽取 ObjC 方法定义代码块，返回 (snippet, start_line, end_line, signature)。"""
         sel = (selector or "").strip()
-        parts = [p.strip() for p in sel.split(":") if p.strip()]
-        if not parts:
+        if not sel:
             return None
         n = len(lines)
         for i in range(n):
             s = lines[i].strip()
-            if not (s.startswith("-") or s.startswith("+")):
-                continue
-            if s.endswith(";"):
-                continue
-            sig_window = " ".join(lines[i : min(n, i + 8)]).replace("\n", " ")
-            pos = 0
-            ok = True
-            for p in parts:
-                idx = sig_window.find(p, pos)
-                if idx < 0:
-                    ok = False
-                    break
-                pos = idx + len(p)
-            if not ok:
+            if not objc_definition_line_matches_selector(s, sel):
                 continue
 
             brace_line = -1
@@ -8368,29 +8342,74 @@ class CodeContentProvider:
                 anchor_line = int(
                     getattr(crash_summary, "crash_line_number", None)
                     or getattr(crash_func, "crash_line_number", None)
+                    or getattr(crash_func, "snippet_start_line", None)
                     or 0
                 )
                 if crash_lines and anchor_line > 0:
-                    target_name = self._extract_function_name_from_resolved(crash_func.signature or crash_func.name)
-                    refined = self._extract_full_function_code(
-                        crash_lines,
-                        max(0, anchor_line - 1),
-                        target_function_name=target_name or None,
-                    )
-                    if refined:
-                        refined_lines = [ln for ln in refined.splitlines()]
-                        while refined_lines and not refined_lines[-1].strip():
-                            refined_lines.pop()
-                        loc = self._locate_snippet_in_file(crash_lines, refined_lines, anchor_line)
-                        if loc:
-                            rs_line, re_line = loc
-                            crash_func = replace(
-                                crash_func,
-                                snippet=refined_lines,
-                                snippet_scope="full_function",
-                                snippet_start_line=rs_line,
-                                snippet_end_line=re_line,
+                    # 优先保留 ObjC selector：摘要里常是 `-[Class sel]`，签名行是 `- (ret)sel`。
+                    objc_info = parse_objc_stack_symbol(
+                        str(getattr(crash_summary, "function", "") or "")
+                    ) or parse_objc_stack_symbol(crash_func.signature or crash_func.name)
+                    objc_sel = ""
+                    if objc_info:
+                        objc_sel = objc_info[1]
+                    else:
+                        objc_sel = self._extract_function_name_from_resolved(
+                            crash_func.signature or crash_func.name
+                        )
+                    objc_block = None
+                    if objc_sel and str(crash_file).lower().endswith((".m", ".mm")):
+                        objc_block = self._extract_objc_method_block(crash_lines, objc_sel)
+                    if objc_block:
+                        refined_lines, rs_line, re_line, _method_sig = objc_block
+                        crash_func = replace(
+                            crash_func,
+                            snippet=refined_lines,
+                            snippet_scope="full_function",
+                            snippet_start_line=rs_line,
+                            snippet_end_line=re_line,
+                        )
+                    else:
+                        target_name = self._extract_function_name_from_resolved(
+                            crash_func.signature or crash_func.name
+                        )
+                        # 拒绝把 ObjC 返回类型（void/instancetype/BOOL…）当成重提取目标名。
+                        if target_name in {
+                            "void",
+                            "int",
+                            "long",
+                            "float",
+                            "double",
+                            "bool",
+                            "BOOL",
+                            "id",
+                            "instancetype",
+                            "NSInteger",
+                            "NSUInteger",
+                            "CGFloat",
+                        }:
+                            target_name = ""
+                        refined = self._extract_full_function_code(
+                            crash_lines,
+                            max(0, anchor_line - 1),
+                            target_function_name=target_name or None,
+                        )
+                        if refined:
+                            refined_lines = [ln for ln in refined.splitlines()]
+                            while refined_lines and not refined_lines[-1].strip():
+                                refined_lines.pop()
+                            loc = self._locate_snippet_in_file(
+                                crash_lines, refined_lines, anchor_line
                             )
+                            if loc:
+                                rs_line, re_line = loc
+                                crash_func = replace(
+                                    crash_func,
+                                    snippet=refined_lines,
+                                    snippet_scope="full_function",
+                                    snippet_start_line=rs_line,
+                                    snippet_end_line=re_line,
+                                )
             except Exception:
                 pass
 
@@ -10905,6 +10924,17 @@ class CodeContentProvider:
             candidate_pairs: List[Tuple[CrashFunction, Dict[str, Any], int]] = []
             symbol_only_rescue_attempts = 0
             max_symbol_only_rescues = int(getattr(self, "max_symbol_only_rescues", 5))
+            os_type_l = str(os_type or "").strip().lower()
+            # iOS/macOS 日志常以 ObjC selector 为崩溃点；其它平台仍按 native-only 跳过 ObjC，
+            # 避免 Android/Harmony 场景误扫 .m/.mm。
+            allow_objc_locate = os_type_l in {
+                "ios",
+                "iphoneos",
+                "ipados",
+                "macos",
+                "osx",
+                "darwin",
+            }
 
             for fi, candidate in enumerate(resolved_frames):
                 self._code_context_phase_check("crash_func_candidates")
@@ -10916,13 +10946,13 @@ class CodeContentProvider:
                 rfile = candidate.get("resolved_file", "") or ""
                 rline_raw = candidate.get("resolved_line", 0)
                 objc_info = self._parse_objc_symbol_class_selector(rf_or_raw)
-                # Native C++ 崩溃分析默认不提取 ObjC selector 的源码上下文，避免大量无效全仓扫描。
-                if objc_info:
+                # Native C++ 崩溃分析默认不提取 ObjC selector；iOS/macOS 放开。
+                if objc_info and not allow_objc_locate:
                     extraction_warnings.append(
                         f"帧[{fi}] ObjC selector 已按 native-only 策略跳过: {rf_or_raw}"
                     )
                     continue
-                if not self._is_cpp_native_symbol(rf_or_raw):
+                if (not objc_info) and (not self._is_cpp_native_symbol(rf_or_raw)):
                     extraction_warnings.append(
                         f"帧[{fi}] 非 C++ 符号已按 native-only 策略跳过: {rf_or_raw}"
                     )
@@ -10947,7 +10977,6 @@ class CodeContentProvider:
                     # 常见于「已符号化日志 + 未提供/不可用库目录」场景。
                     loc = None
                     rescue_reason_kind = "symbol_only_function_locate"
-                    # native-only 模式：禁用 ObjC 兜底定位，避免 selector 触发 code_root 大范围检索。
                     cpp_qualified = self._extract_cpp_qualified_parts(rf_or_raw)
                     simple_name = self._extract_function_name_from_resolved(rf_or_raw)
                     # 行号为 0 但文件已知：在该文件里找命名空间自由函数，构造函数仍走限定名。
@@ -10959,6 +10988,13 @@ class CodeContentProvider:
                                 loc = (mapped_file, named_line)
                                 rescue_reason_kind = "known_file_line_unknown"
                     symbol_only_rescue_attempts += 1
+                    if (not loc) and allow_objc_locate and objc_info:
+                        class_name, selector = objc_info
+                        loc = self._find_objc_method_definition_location(
+                            class_name, selector, code_roots_abs_strs
+                        )
+                        if loc:
+                            rescue_reason_kind = "objc_selector_locate"
                     if (not loc) and cpp_qualified:
                         loc = self._find_cpp_qualified_definition_location(rf_or_raw, code_roots_abs_strs)
                     # ObjC 符号不再退化到通用按 simple_name 全仓扫描，避免误命中到无关组件。

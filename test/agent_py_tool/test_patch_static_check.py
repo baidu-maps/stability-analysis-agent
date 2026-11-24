@@ -266,6 +266,22 @@ class PatchStaticCheckTest(unittest.TestCase):
         self.assertIn(("objc_bool_style", "bool"), rules)
         self.assertIn(("objc_bool_style", "true"), rules)
 
+    def test_objc_preexisting_false_not_flagged(self):
+        """文件里原本就有的 false 不算补丁新增。"""
+        original = (
+            '#import "BMKFileUtils.h"\n\n'
+            "void bmk_tick(void) {\n"
+            "    if (false == bmk_g_ready) { return; }\n"
+            "    bmk_g_count++;\n"
+            "}\n"
+        )
+        patched = original.replace(
+            "    bmk_g_count++;\n",
+            "    BOOL ok = YES;\n    if (ok) { bmk_g_count++; }\n",
+        )
+        report, _ = self._check(patched, original=original)
+        self.assertNotIn("objc_bool_style", {rule for rule, _symbol in self._rules(report)})
+
     def test_objc_bool_and_c_bool_are_allowed_in_their_files(self):
         """ObjC 用 BOOL 可通过；.c 和本来就写 bool 的 .m 不拦。"""
         patched = HANDLER_ORIGINAL.replace(

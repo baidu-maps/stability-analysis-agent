@@ -24,6 +24,7 @@ from tools.crash_parser.android import (
 )
 from tools.crash_parser.stack_lines import (
     _try_parse_windows_stack_line,
+    _try_parse_ios_glued_stack_line,
     _try_parse_ios_macos_stack_line,
     _try_parse_ios_pre_parsed_stack_line,
     _try_parse_ios_symbol_only_stack_line,
@@ -313,8 +314,11 @@ def extract_stack_frames(
                 logger.warning(f"解析已符号化 iOS 栈帧时出错: {e}")
             continue
 
-        # iOS / macOS .crash 风格栈（没有 #N 前缀）；无 0x 地址时再试纯符号行
+        # iOS / macOS .crash 风格栈（没有 #N 前缀）；
+        # 粘连格式须先于 symbol-only，避免把 Module0xADDR-[Class ...] 误拆成脏 module。
         ios_parsed = _try_parse_ios_macos_stack_line(line)
+        if not ios_parsed:
+            ios_parsed = _try_parse_ios_glued_stack_line(line)
         if not ios_parsed:
             ios_parsed = _try_parse_ios_symbol_only_stack_line(line)
         if ios_parsed:

@@ -789,9 +789,21 @@ class PatchStaticChecker:
             return
         if _C_BOOL_TYPE_RE.search(original_stripped):
             return
+        # 只拦补丁新增的字面量；文件里原本就有的 `false == ...` 不能当成新增。
+        from collections import Counter
+
+        original_counts = Counter(
+            m.group(0)
+            for pattern in (_C_BOOL_TYPE_RE, _C_TRUE_FALSE_RE)
+            for m in pattern.finditer(original_stripped)
+        )
+        seen_counts: Counter = Counter()
         for pattern in (_C_BOOL_TYPE_RE, _C_TRUE_FALSE_RE):
             for match in pattern.finditer(stripped):
                 token = match.group(0)
+                seen_counts[token] += 1
+                if seen_counts[token] <= original_counts.get(token, 0):
+                    continue
                 self.issues.append(_issue(
                     "objc_bool_style", path, text, match.start(), token,
                     f"`.m` / `.mm` 真假值应使用 BOOL / YES / NO，补丁新增了 `{token}`",

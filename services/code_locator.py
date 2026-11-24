@@ -1199,6 +1199,9 @@ class SymbolLocator:
         symbol = str(full_symbol or "").strip()
         if not symbol or not code_roots:
             return None
+        objc_hit = self._find_objc_method_definition_location(symbol, code_roots)
+        if objc_hit is not None:
+            return objc_hit
         # ctags 优先：Class::method 的方法名或简单名在 ctags 索引里可 O(1) 命中，
         # 避免落到 rg/os.walk 的全仓定义搜索（大仓场景定位源码的主要耗时来源）。
         # 索引为空（如非 universal-ctags）时返回 None，自动回退下方原有策略，无行为回退风险。
@@ -1746,6 +1749,11 @@ class SymbolLocator:
         """Extract simple function name from qualified name: Class::fn(...) -> fn"""
         if not full_function_name:
             return ""
+        from tools._stack_symbol_utils import objc_selector_call_token, parse_objc_stack_symbol
+
+        objc_info = parse_objc_stack_symbol(full_function_name)
+        if objc_info:
+            return objc_selector_call_token(objc_info[1]) or objc_info[1]
         s = full_function_name.strip()
         # Remove params
         paren_idx = s.find("(")
@@ -1765,6 +1773,64 @@ class SymbolLocator:
         if s.startswith("~"):
             return "~" + s[1:].lstrip("*&")
         return s.lstrip("*&~")
+
+    def _find_objc_method_definition_location(
+        self, full_symbol: str, code_roots: List[str]
+    ) -> Optional[Tuple[str, int]]:
+        """按 -[Class selector] / +[Class selector] 定位 ObjC 方法定义。"""
+        from tools._stack_symbol_utils import (
+            objc_definition_line_matches_selector,
+            parse_objc_stack_symbol,
+        )
+
+        parsed = parse_objc_stack_symbol(full_symbol)
+        if not parsed:
+            return None
+        class_name, selector = parsed
+        cache_key = f"__funcdef_objc__:{class_name}:{selector}"
+        cached = self._ctx._function_def_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        impl_ext = {".m", ".mm"}
+        header_ext = {".h"}
+        same_cls_impl: List[str] = []
+        all_impl: List[str] = []
+        same_cls_header: List[str] = []
+        all_header: List[str] = []
+        for code_root in code_roots or []:
+            if not os.path.isdir(code_root):
+                continue
+            for dirpath, dirnames, filenames in os.walk(code_root):
+                dirnames[:] = [d for d in dirnames if not self._ctx.should_skip_directory(d)]
+                for filename in filenames:
+                    ext = os.path.splitext(filename)[1].lower()
+                    if ext not in impl_ext and ext not in header_ext:
+                        continue
+                    file_path = os.path.join(dirpath, filename)
+                    if not self._ctx.is_file_readable(file_path):
+                        continue
+                    stem = os.path.splitext(filename)[0]
+                    same_cls = stem == class_name or stem.startswith(class_name)
+                    if ext in impl_ext:
+                        all_impl.append(file_path)
+                        if same_cls:
+                            same_cls_impl.append(file_path)
+                    else:
+                        all_header.append(file_path)
+                        if same_cls:
+                            same_cls_header.append(file_path)
+
+        for file_path in same_cls_impl + all_impl + same_cls_header + all_header:
+            content = self._ctx.read_file_cached(file_path)
+            if not content or selector.split(":", 1)[0] not in content:
+                continue
+            for idx, line in enumerate(content.split("\n"), 1):
+                if objc_definition_line_matches_selector(line, selector):
+                    hit = (file_path, idx)
+                    self._ctx._function_def_cache[cache_key] = hit
+                    return hit
+        return None
 
     @staticmethod
     def _strip_template_args(text: str) -> str:

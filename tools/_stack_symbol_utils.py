@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import re
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # iOS / 导出日志中常见的 C++ 限定名（可无括号）
 _CPP_QUALIFIED_SYMBOL_RE = re.compile(
@@ -173,8 +173,9 @@ def stack_has_same_named_trampoline(symbols: Sequence[str]) -> bool:
 
 def sanitize_stack_symbol(symbol: Optional[str]) -> Optional[str]:
     """
-    清洗堆栈符号中的 RTF/导出残留。
+    清洗堆栈符号中的 RTF/导出残留与 Apple 栈偏移后缀。
     例：demo_ns::DemoRoute::GetSegmentCount\\ -> demo_ns::DemoRoute::GetSegmentCount
+    例：-[Foo bar:] + 400 -> -[Foo bar:]
     """
     if symbol is None:
         return None
@@ -189,16 +190,71 @@ def sanitize_stack_symbol(symbol: Optional[str]) -> Optional[str]:
         s = s[:-1].rstrip()
     #  stray 花括号/反斜杠（如 _pthread_start}）
     s = re.sub(r"[\\{}]+$", "", s).strip()
+    # Apple 符号化栈常见偏移：` + 400` / ` + 0x190`
+    s = re.sub(r"\s*\+\s*(?:0x[0-9a-fA-F]+|\d+)\s*$", "", s).strip()
     return s if s else symbol
 
 
-def is_objc_stack_symbol(symbol: Optional[str]) -> bool:
-    """ObjC 方法符号：-[Class sel:] / +[Class sel:]"""
+def parse_objc_stack_symbol(symbol: Optional[str]) -> Optional[Tuple[str, str]]:
+    """
+    解析 ObjC 栈符号为 (class_name, selector)。
+    兼容 `-[Class sel] + 400` 偏移后缀。
+    """
     s = sanitize_stack_symbol(symbol) or ""
     s = s.strip()
     if not s:
+        return None
+    m = re.match(r"^[\-\+]\[([A-Za-z_]\w*)\s+([^\]]+)\]$", s)
+    if not m:
+        return None
+    class_name = m.group(1).strip()
+    selector = m.group(2).strip()
+    if not class_name or not selector:
+        return None
+    return class_name, selector
+
+
+def objc_selector_call_token(selector: Optional[str]) -> str:
+    """调用点检索用的 selector 首段（initializeData / initWithFrame）。"""
+    sel = (selector or "").strip()
+    if not sel:
+        return ""
+    return sel.split(":", 1)[0].strip()
+
+
+def objc_definition_line_matches_selector(line: str, selector: str) -> bool:
+    """
+    判断一行是否是给定 selector 的 ObjC 方法定义头。
+    避免把方法体里的 `[self initializeData]` 调用误当成定义。
+    """
+    s = (line or "").strip()
+    if not (s.startswith("-") or s.startswith("+")):
         return False
-    return bool(re.match(r"^[\-\+]\[[^\]]+\]$", s))
+    if s.endswith(";"):
+        return False
+    sel = (selector or "").strip()
+    if not sel:
+        return False
+    m = re.match(r"^[\-\+]\s*(?:\([^;{}]*?\))?\s*(.+)$", s)
+    if not m:
+        return False
+    rest = m.group(1).strip()
+    # 去掉行尾 `{` 方便比对签名
+    if rest.endswith("{"):
+        rest = rest[:-1].rstrip()
+    sel_parts = [p for p in sel.split(":") if p]
+    if not sel_parts:
+        return False
+    if ":" not in sel:
+        token = re.match(r"^([A-Za-z_]\w*)\b", rest)
+        return bool(token and token.group(1) == sel_parts[0] and ":" not in rest.split("{", 1)[0])
+    found = re.findall(r"([A-Za-z_]\w*)\s*:", rest)
+    return found[: len(sel_parts)] == sel_parts
+
+
+def is_objc_stack_symbol(symbol: Optional[str]) -> bool:
+    """ObjC 方法符号：-[Class sel:] / +[Class sel:]（可带 +offset）。"""
+    return parse_objc_stack_symbol(symbol) is not None
 
 
 def is_cpp_native_stack_symbol(resolved_function: Optional[str]) -> bool:
@@ -235,15 +291,23 @@ def frame_analysis_symbol(frame: Dict[str, Any]) -> str:
     return ""
 
 
-def should_keep_frame_for_cpp_stack_output(frame: Dict[str, Any]) -> bool:
+def should_keep_frame_for_cpp_stack_output(
+    frame: Dict[str, Any],
+    *,
+    os_type: Optional[str] = None,
+) -> bool:
     """
-    02 输出保留策略：仅保留带可读 C++ native 符号的帧。
+    02 输出保留策略：默认仅保留带可读 C++ native 符号的帧。
+    iOS/macOS 额外保留 ObjC selector（否则已符号化 ObjC 崩溃会被滤空，03 无法定位 .m/.mm）。
     无 function/resolved_function 的空帧（含仅地址的 AGXMetal 崩溃点）不写入 02，避免干扰 03。
     崩溃地址仍保留在 01 的 crash_info 中供摘要使用。
     """
     sym = frame_analysis_symbol(frame)
     if not sym:
         return False
+    os_l = (os_type or "").strip().lower()
+    if os_l in {"ios", "iphoneos", "ipados", "macos", "osx", "darwin"} and is_objc_stack_symbol(sym):
+        return True
     return is_cpp_native_stack_symbol(sym)
 
 

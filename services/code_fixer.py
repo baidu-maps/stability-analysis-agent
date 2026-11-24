@@ -86,6 +86,16 @@ def _extract_simple_function_name(signature: str) -> str:
     s = _normalize_signature_whitespace(signature)
     if not s:
         return ""
+    from tools._stack_symbol_utils import objc_selector_call_token, parse_objc_stack_symbol
+
+    objc_stack = parse_objc_stack_symbol(s)
+    if objc_stack:
+        return objc_selector_call_token(objc_stack[1]) or objc_stack[1]
+    # ObjC 源码签名：`- (void)initializeData` / `+ (id)foo:bar:`
+    # 必须先于通用 `name(` 规则，否则会误取返回类型 `void`。
+    objc_sig = re.match(r"^[\-\+]\s*(?:\([^)]*\))?\s*([A-Za-z_]\w*)\b", s)
+    if objc_sig:
+        return objc_sig.group(1)
     open_idx = _parameter_list_open_index(s)
     head = s[:open_idx].strip() if open_idx >= 0 else s
     head = _strip_template_args(head)
@@ -250,9 +260,15 @@ def _extracted_block_matches_signature(block: str, signature: str) -> bool:
         # 目标带 Class::，块签名因 NAMESPACE 宏 / 模板特化写成短名时，只要求函数名一致。
         if not header_name or header_name != func_name:
             return False
-    elif not re.search(
-        rf"(?:^|[\s:*&]){re.escape(func_name)}\s*(?:<[^>]*>)?\s*\(",
-        header,
+    elif not (
+        re.search(
+            rf"(?:^|[\s:*&]){re.escape(func_name)}\s*(?:<[^>]*>)?\s*\(",
+            header,
+        )
+        or re.search(
+            rf"^[\-\+]\s*(?:\([^)]*\))?\s*{re.escape(func_name)}\b",
+            header,
+        )
     ):
         return False
     if owner:
@@ -273,6 +289,14 @@ def _extract_owner_and_name(signature: str) -> Tuple[str, str]:
     text = _normalize_signature_whitespace(signature)
     if not text:
         return "", ""
+    from tools._stack_symbol_utils import objc_selector_call_token, parse_objc_stack_symbol
+
+    objc_stack = parse_objc_stack_symbol(text)
+    if objc_stack:
+        return objc_stack[0], objc_selector_call_token(objc_stack[1]) or objc_stack[1]
+    objc_sig = re.match(r"^[\-\+]\s*(?:\([^)]*\))?\s*([A-Za-z_]\w*)\b", text)
+    if objc_sig:
+        return "", objc_sig.group(1)
     open_idx = _parameter_list_open_index(text)
     head = text[:open_idx].rstrip() if open_idx >= 0 else text
     head = _strip_template_args(head).rstrip()
@@ -307,19 +331,25 @@ def edit_allowed_by_prompt_complete_body(
     if not isinstance(allowed, list):
         return None
     allowed_sigs = [str(item).strip() for item in allowed if str(item).strip()]
-    if not allowed_sigs:
-        return "提示词中没有完整函数体，已拒绝自动改码"
     for item in allowed_sigs:
         if signatures_match(item, signature):
             return None
-    # 分析后补进图里的完整函数体（如领域知识点名的析构）同样允许写入。
+    # 分析后补进图里的完整函数体（如领域知识点名的析构 / ObjC 方法）同样允许写入。
+    # 完整性元数据偶发把本已闭合的 ObjC 片段标成 incomplete 时，不能仅凭空列表拒写。
     for node in extract_candidate_nodes(code_context):
         node_sig = str(node.get("signature") or "")
         snippet = node.get("snippet")
-        if not signatures_match(node_sig, signature):
+        if not (
+            signatures_match(node_sig, signature)
+            or _extract_simple_function_name(node_sig) == _extract_simple_function_name(signature)
+        ):
             continue
         if isinstance(snippet, list) and len(snippet) >= 2:
-            return None
+            joined = "\n".join(str(x) for x in snippet)
+            if "{" in joined and "}" in joined:
+                return None
+    if not allowed_sigs:
+        return "提示词中没有完整函数体，已拒绝自动改码"
     return "目标函数未在提示词中给出完整函数体，已拒绝写入"
 
 
@@ -3148,6 +3178,11 @@ def _extract_block_signature(block: str) -> str:
     text = _strip_leading_attributes(str(block or "").strip())
     if not text:
         return ""
+    # ObjC：`+/- (ret)selector...` 的签名到 `{` 为止；不能把返回类型括号当成形参列表。
+    if re.match(r"^[\-\+]\s*", text):
+        brace = text.find("{")
+        head = text[:brace].rstrip() if brace >= 0 else text.split("\n", 1)[0].strip()
+        return _normalize_signature_whitespace(head)
     open_idx = _parameter_list_open_index(text)
     if open_idx >= 0:
         depth = 0
@@ -3355,6 +3390,20 @@ def _extract_replacement_from_analysis(
                     _extract_simple_function_name(block) == simple_name
                     or _source_defines_function(block, simple_name)
                 ):
+                    continue
+                usable = _usable_replacement(block)
+                if usable:
+                    return usable
+            # ObjC 无参方法：`- (void)initializeData {`（名字后没有 `(`）
+            objc_pattern = re.compile(
+                rf"^[\-\+]\s*(?:\([^;\n{{}}]*?\))?\s*{re.escape(simple_name)}\b",
+                re.M,
+            )
+            for m in objc_pattern.finditer(code):
+                block = _extract_function_block_from_code(code, m.start())
+                if not block:
+                    continue
+                if _extract_simple_function_name(block) != simple_name:
                     continue
                 usable = _usable_replacement(block)
                 if usable:
@@ -3971,7 +4020,14 @@ class CodeFixer:
                     r"\s*\{",
                     re.MULTILINE,
                 )
-                for m in func_pattern.finditer(code):
+                objc_func_pattern = re.compile(
+                    r"^[\-\+]\s*(?:\([^;\n{}]*?\))?\s*([A-Za-z_]\w*)\b[^{;]*\{",
+                    re.MULTILINE,
+                )
+                match_iters = list(func_pattern.finditer(code)) + list(
+                    objc_func_pattern.finditer(code)
+                )
+                for m in match_iters:
                     func_name = m.group(1)
                     # 排除控制语句
                     if func_name in ("if", "else", "for", "while", "switch", "do", "catch", "try"):
@@ -3994,6 +4050,8 @@ class CodeFixer:
                                 str(node.get("signature") or ""),
                                 func_name if "(" in func_name else f"{func_name}()",
                             )
+                            or _extract_simple_function_name(str(node.get("signature") or ""))
+                            == func_name
                         ),
                         None,
                     )

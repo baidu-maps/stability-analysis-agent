@@ -38,6 +38,11 @@ class TestStackSymbolUtils(unittest.TestCase):
         )
         self.assertFalse(is_cpp_native_stack_symbol("-[Foo bar:]"))
         self.assertTrue(is_objc_stack_symbol("-[Foo bar:]"))
+        self.assertTrue(is_objc_stack_symbol("-[Foo bar:] + 400"))
+        self.assertEqual(
+            sanitize_stack_symbol("-[Foo bar:] + 400"),
+            "-[Foo bar:]",
+        )
 
     def test_should_keep_frame_for_cpp_stack_output(self):
         self.assertFalse(

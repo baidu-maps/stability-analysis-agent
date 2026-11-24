@@ -89,6 +89,58 @@ def _try_parse_ios_macos_stack_line(line: str) -> Optional[Tuple[str, str, str, 
     return module, addr, rest.strip(), "0"
 
 
+def _split_ios_function_and_offset(rest: str) -> Tuple[str, str]:
+    """从地址后的剩余文本拆出 function / offset。"""
+    rest_st = (rest or "").strip()
+    if not rest_st:
+        return "", "0"
+    mx = re.search(r"\s+\+\s+(\d+)(\s*\*\(.+\))?\s*$", rest_st)
+    if mx:
+        func = rest_st[: mx.start()].strip()
+        return ("" if func == "0" else func), mx.group(1)
+    mx2 = re.match(r"^(.+?)\s+\+\s+(\d+)\s*$", rest_st)
+    if mx2:
+        func = mx2.group(1).strip()
+        return ("" if func == "0" else func), mx2.group(2)
+    return ("" if rest_st == "0" else rest_st), "0"
+
+
+def _try_parse_ios_glued_stack_line(line: str) -> Optional[Tuple[str, str, str, str]]:
+    """
+    解析模块与 0x 地址粘连、或地址与符号粘连的 Apple 栈行。
+
+    例如：
+    - ``7 ZiroomerProject0x104b30a90-[BMKAnnotationContainer initializeData] + 400``
+    - ``5 libdyld.dylib0x1a05ce5f4``
+    - ``1 libsystem_platform.dylib 0x1ec151290_platform_handle_signal``
+    - ``0 ???0x0000000000000001 0 + 1``
+
+    标准「模块 地址 符号」格式请走 ``_try_parse_ios_macos_stack_line``。
+    """
+    m = re.match(r"^\s*\d+\s+(.+)$", line)
+    if not m:
+        return None
+    body = m.group(1).strip()
+    am = re.search(r"(0x[0-9a-fA-F]+)", body)
+    if not am:
+        return None
+    addr = am.group(1)
+    before = body[: am.start()]
+    after = body[am.end() :]
+    module = before.rstrip()
+    if not module:
+        return None
+
+    had_space_before = bool(before) and before[-1].isspace()
+    had_space_after = bool(after) and after[0].isspace()
+    # 模块、地址、符号三者均有空格分隔时，交给标准解析器，避免抢匹配。
+    if had_space_before and had_space_after:
+        return None
+
+    function, offset = _split_ios_function_and_offset(after)
+    return module, addr, function, offset
+
+
 # 无指令地址、仅「序号 模块  符号 + 偏移」的符号化栈（导出/裁剪后常见）
 _IOS_STACK_SYMBOL_ONLY_RE = re.compile(r"^\s*\d+\s+(\S+)\s+(.+)$")
 
