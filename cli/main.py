@@ -4690,6 +4690,15 @@ def _write_cli_report(
             lifecycle_evidence = result.get("lifecycle_evidence")
             if isinstance(lifecycle_evidence, dict) and lifecycle_evidence.get("findings"):
                 _write_json(report_dir / "04b3_lifecycle_evidence.json", lifecycle_evidence)
+        # Gate B：结论完备性（可开跑 ≠ 可下结论）
+        if scope in {"full", "gen_prompt_only"}:
+            readiness = result.get("conclusion_readiness")
+            if not isinstance(readiness, dict):
+                meta = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+                nested = meta.get("conclusion_readiness")
+                readiness = nested if isinstance(nested, dict) else None
+            if isinstance(readiness, dict) and readiness:
+                _write_json(report_dir / "04i_conclusion_readiness.json", readiness)
         if scope in {"full", "gen_prompt_only"}:
             memory_payload = result.get("memory_retrieval")
             if not isinstance(memory_payload, dict):
@@ -5671,13 +5680,33 @@ def _print_tty_markdown_brief_summary(
             )
         print(_yellow("【源码】未获取到可用代码上下文"))
         print(_yellow(f"  {code_tip}"))
+    elif result_meta.get("pipeline_skip_reason") == "conclusion_not_ready" and scope_norm in {
+        "full",
+        "gen_prompt_only",
+    }:
+        ready_tip = str(result_meta.get("pipeline_skip_user_message") or "").strip()
+        if not ready_tip:
+            readiness = result.get("conclusion_readiness")
+            if isinstance(readiness, dict):
+                ready_tip = str(readiness.get("user_message") or "").strip()
+        print(_yellow("【结论完备性】证据不足，已停止大模型分析"))
+        if ready_tip:
+            for line in ready_tip.splitlines():
+                text = str(line or "").strip()
+                if text:
+                    print(_yellow(f"  {text}"))
     elif scope_norm in {"full", "gen_prompt_only"}:
         cc_msg = code_context_failure_message(result.get("code_context"))
         if cc_msg:
             print(_yellow("【源码】未定位到崩溃代码"))
             print(_yellow(f"  {cc_msg}"))
 
-    _skip_reasons = ("no_usable_parse", "no_usable_resolve", "no_usable_code")
+    _skip_reasons = (
+        "no_usable_parse",
+        "no_usable_resolve",
+        "no_usable_code",
+        "conclusion_not_ready",
+    )
     if (
         result_meta.get("llm_skipped")
         and scope_norm in {"full", "gen_prompt_only"}
@@ -5737,8 +5766,8 @@ def _print_tty_markdown_brief_summary(
             reason = str(result_meta.get("pipeline_skip_reason") or "")
             if reason == "no_usable_parse":
                 label = "崩溃日志解析结果"
-            elif reason in ("no_usable_resolve", "no_usable_code"):
-                label = "阶段报告（01～04b）"
+            elif reason in ("no_usable_resolve", "no_usable_code", "conclusion_not_ready"):
+                label = "阶段报告（01～04b / 结论完备性）"
             else:
                 label = "可复用提示词"
             print(f"【产物】{label}：")
@@ -5746,8 +5775,8 @@ def _print_tty_markdown_brief_summary(
             reason = str(result_meta.get("pipeline_skip_reason") or "")
             if reason == "no_usable_parse":
                 label = "崩溃日志解析结果"
-            elif reason in ("no_usable_resolve", "no_usable_code"):
-                label = "阶段报告（01～04b）"
+            elif reason in ("no_usable_resolve", "no_usable_code", "conclusion_not_ready"):
+                label = "阶段报告（01～04b / 结论完备性）"
             else:
                 label = "分析报告"
             print(f"【产物】{label}：")
@@ -5764,6 +5793,8 @@ def _print_tty_markdown_brief_summary(
                 print(_yellow("【改码】已跳过（02 无可用符号）"))
             elif reason == "no_usable_code":
                 print(_yellow("【改码】已跳过（04b 无可用源码）"))
+            elif reason == "conclusion_not_ready":
+                print(_yellow("【改码】已跳过（结论完备性未通过）"))
             else:
                 print(_yellow("【改码】已跳过（04b 无可用源码）"))
         elif not isinstance(applied_fix_result, dict):
@@ -7032,13 +7063,15 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
             bypass_repair_gate=bool(getattr(args, "bypass_repair_gate", True)),
         ):
             print("[crash-replay] 上次改码未覆盖必改函数，重新落盘", file=sys.stderr, flush=True)
+            if isinstance(result, dict) and problem.get("_llm_router_state") is not None:
+                result["_llm_router_state"] = problem.get("_llm_router_state")
             repair_out = runtime.run_repair_and_verify(
                 result=result,
                 code_roots=code_roots,
                 report_dir=report_dir,
                 run_id=str(request_record.get("run_id") or ""),
                 verification_config=verification_config if isinstance(verification_config, dict) else None,
-                llm_adapter=llm_adapter,
+                llm_adapter=problem.get("_active_llm_adapter") or llm_adapter,
                 backup_original_sources=bool(args.backup_original_sources),
                 uaf_nullptr_guard_policy=_effective_uaf_nullptr_guard_policy,
                 request_record=request_record,
@@ -7072,13 +7105,15 @@ def _execute_analysis_single(args: argparse.Namespace) -> int:
         scope=scope,
         bypass_repair_gate=bool(getattr(args, "bypass_repair_gate", True)),
     ):
+        if isinstance(result, dict) and problem.get("_llm_router_state") is not None:
+            result["_llm_router_state"] = problem.get("_llm_router_state")
         repair_out = runtime.run_repair_and_verify(
             result=result,
             code_roots=code_roots,
             report_dir=report_dir,
             run_id=str(request_record.get("run_id") or ""),
             verification_config=verification_config if isinstance(verification_config, dict) else None,
-            llm_adapter=llm_adapter,
+            llm_adapter=problem.get("_active_llm_adapter") or llm_adapter,
             backup_original_sources=bool(args.backup_original_sources),
             uaf_nullptr_guard_policy=_effective_uaf_nullptr_guard_policy,
             request_record=request_record,

@@ -169,7 +169,11 @@ def _report_location_failed(report_dir: Path) -> bool:
     """定位没有可用源码时，这次运行不能复用。"""
     summary = _load_json(report_dir / "00_run_summary.json") or {}
     reason = str(summary.get("completion_reason") or "").strip()
-    if reason == "skipped_no_usable_code" or reason.startswith("skipped_no_usable_code"):
+    if reason in {
+        "skipped_no_usable_code",
+        "skipped_conclusion_not_ready",
+        "conclusion_not_ready",
+    } or reason.startswith("skipped_no_usable_code"):
         return True
     code = _load_json(report_dir / "04b_code_content_provider.json")
     if not isinstance(code, dict):

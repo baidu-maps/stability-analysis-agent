@@ -86,10 +86,26 @@ def gateway_failure_from_response(response: Any) -> str:
     return gateway_error_text(str(getattr(response, "content", "") or ""))
 
 
+_COOLING_MARKERS = (
+    "refusal brake",
+    "cooling down",
+    "风控",
+)
+
+
+def should_failover_model_immediately(cause: str) -> bool:
+    """风控冷却类失败应立刻换 models 列表中的下一个模型，不要空转 max_tokens。"""
+    text = str(cause or "")
+    lowered = text.lower()
+    return any(marker in text or marker in lowered for marker in _COOLING_MARKERS)
+
+
 def should_retry_same_model(cause: str, retries_left: int) -> bool:
-    """过载、超时和 5xx 先在当前模型上再试一次。"""
+    """过载、超时和 5xx 先在当前模型上再试一次；冷却类失败除外。"""
     from tool_system.llm.llm_router import classify_llm_failure
 
+    if should_failover_model_immediately(cause):
+        return False
     return int(retries_left or 0) > 0 and classify_llm_failure(cause) == "retryable"
 
 
@@ -412,6 +428,9 @@ def call_analyze_llm_with_retries(
                     max_tokens if max_tokens is not None else "default",
                     exc,
                 )
+                # 冷却/风控：立刻离开 max_tokens 阶梯，按 models 列表换模型。
+                if should_failover_model_immediately(str(exc)):
+                    break
         if response_text_chars(best_response) > response_text_chars(llm_response):
             llm_response = best_response
         duration_ms = int(round((time.perf_counter() - call_started) * 1000))
@@ -472,6 +491,8 @@ def call_analyze_llm_with_retries(
                 if next_endpoint is None:
                     break
                 _apply_router_endpoint(context, next_endpoint)
+                if isinstance(problem, dict):
+                    problem["_active_llm_adapter"] = getattr(context, "llm", None)
                 announce_llm_failover(previous_model, next_endpoint.model, cause)
                 logger.warning(
                     "LLM failover to provider=%s model=%s",

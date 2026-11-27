@@ -1121,6 +1121,11 @@ def _compose_failure_detail(
     parts: List[str] = []
     if reason == "safety_check_failed":
         parts.append("改码阶段被服务端安全校验拒绝，已回滚全部改动")
+    elif reason in {"skipped_conclusion_not_ready", "conclusion_not_ready"}:
+        parts.append(
+            "现有崩溃证据不足以安全下结论，已停止大模型分析与自动改码；"
+            "请按结论完备性缺口补齐材料后重试"
+        )
     elif reason.startswith("skipped_"):
         parts.append(f"分析提前终止（completion_reason={reason}）")
     elif reason:

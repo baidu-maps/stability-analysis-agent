@@ -184,6 +184,18 @@ class ModelListFailoverTest(unittest.TestCase):
             "retryable",
         )
 
+    def test_cooling_skips_same_model_retry_for_immediate_failover(self):
+        """冷却类失败应直接换 models，而不是同模型空转 max_tokens。"""
+        from services.analyze_llm import (
+            should_failover_model_immediately,
+            should_retry_same_model,
+        )
+
+        cause = "LLM call failed: Error code: 500 - refusal brake: session cooling down"
+        self.assertTrue(should_failover_model_immediately(cause))
+        self.assertFalse(should_retry_same_model(cause, retries_left=1))
+        self.assertTrue(should_retry_same_model("Error code: 429 - rate limit", retries_left=1))
+
 
 class RoutingPolicyTest(unittest.TestCase):
     def test_force_profile(self):

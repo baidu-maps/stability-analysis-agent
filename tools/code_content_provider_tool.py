@@ -439,6 +439,7 @@ class CodeContentProvider:
         # 默认排除的目录（常见的不需要搜索的目录）
         default_exclude_dirs = [
             'test', 'tests', 'testing', 'test_utils',
+            'demo', 'sdkdemo', 'enginetest', 'apptest', 'systemtest', 'unittest',
             'third_party', 'third-party', 'thirdparty', 'vendor', 'external',
             'build', 'builds', 'out', 'output', 'bin', 'obj',
             'generated', 'gen', 'generated_files',

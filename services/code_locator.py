@@ -109,6 +109,7 @@ class LocatorConfig:
     }))
     exclude_dirs: frozenset = field(default_factory=lambda: frozenset({
         'test', 'tests', 'testing', 'test_utils',
+        'demo', 'sdkdemo', 'enginetest', 'apptest', 'systemtest', 'unittest',
         'third_party', 'third-party', 'thirdparty', 'vendor', 'external',
         'build', 'builds', 'out', 'output', 'bin', 'obj',
         'generated', 'gen', 'generated_files',
@@ -1092,12 +1093,21 @@ class SymbolLocator:
         score = 0
         if any(
             token in path
-            for token in ("/demo/", "/test/", "/apptest/", "/unittest/", "/systemtest/")
+            for token in (
+                "/demo/",
+                "/sdkdemo/",
+                "/enginetest/",
+                "/test/",
+                "/tests/",
+                "/apptest/",
+                "/unittest/",
+                "/systemtest/",
+            )
         ):
             score -= 120
         if "/support/" in path:
             score -= 150
-        if any(token in path for token in ("/src/app/", "/src/")):
+        if any(token in path for token in ("/src/app/", "/src/", "/platform/")):
             score += 80
         if "/inc/" in path or "/include/" in path:
             score += 40
@@ -1205,10 +1215,11 @@ class SymbolLocator:
         # ctags 优先：Class::method 的方法名或简单名在 ctags 索引里可 O(1) 命中，
         # 避免落到 rg/os.walk 的全仓定义搜索（大仓场景定位源码的主要耗时来源）。
         # 索引为空（如非 universal-ctags）时返回 None，自动回退下方原有策略，无行为回退风险。
+        # 限定名命中必须通过类名校验，避免把接口桩/其它类同名方法当成目标。
         self._ctx.ensure_ctags_index(code_roots)
         ctags = getattr(self._ctx, "_ctags_index", None)
+        parsed_scope = self.parse_qualified_member_symbol(symbol)
         if ctags is not None and ctags.is_ready():
-            parsed_scope = self.parse_qualified_member_symbol(symbol)
             if parsed_scope and parsed_scope.get("method"):
                 probe = str(parsed_scope.get("method") or "")
             else:
@@ -1216,7 +1227,23 @@ class SymbolLocator:
             if probe:
                 ctags_hit = ctags.lookup(probe, code_roots)
                 if ctags_hit is not None:
-                    return ctags_hit
+                    if not parsed_scope:
+                        return ctags_hit
+                    hit_file, hit_line = ctags_hit
+                    line_text = ""
+                    try:
+                        content = self._ctx.read_file_cached(hit_file) or ""
+                        lines = content.splitlines()
+                        if 1 <= int(hit_line) <= len(lines):
+                            line_text = lines[int(hit_line) - 1]
+                    except Exception:
+                        line_text = ""
+                    if self.qualified_symbol_matches_line(
+                        symbol,
+                        line_text,
+                        function_signature="",
+                    ):
+                        return ctags_hit
         template_parsed = self.parse_template_qualified_symbol(symbol)
         if template_parsed:
             located = self._find_template_member_definition_location(

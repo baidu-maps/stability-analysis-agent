@@ -597,7 +597,8 @@ class CodeContextRequestResolver:
     def _plain_type_name(symbol: str) -> str:
         """去掉命名空间和模板参数，得到类名本身。"""
         raw = str(symbol or "").strip().split("(", 1)[0].strip()
-        raw = raw.split("::")[-1]
+        parts = [part.strip() for part in raw.split("::") if part.strip()]
+        raw = parts[-1] if parts else raw
         return raw.split("<", 1)[0].strip()
 
     @classmethod

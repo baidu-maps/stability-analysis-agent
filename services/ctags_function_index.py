@@ -27,7 +27,67 @@ _DEFAULT_EXCLUDE = {
     "third-party",
     "node_modules",
     ".crash_agent",
+    "demo",
+    "sdkdemo",
+    "enginetest",
+    "apptest",
+    "systemtest",
+    "unittest",
+    "test",
+    "tests",
 }
+
+
+def _definition_path_score(file_path: str) -> int:
+    """给定义候选取分：生产 .cpp 优先，demo/测试/头文件空桩降权。"""
+    path = str(file_path or "").replace("\\", "/").lower()
+    score = 0
+    if any(
+        token in path
+        for token in (
+            "/demo/",
+            "/sdkdemo/",
+            "/enginetest/",
+            "/apptest/",
+            "/unittest/",
+            "/systemtest/",
+            "/test/",
+            "/tests/",
+        )
+    ):
+        score -= 120
+    if "/support/" in path:
+        score -= 150
+    if any(token in path for token in ("/src/app/", "/src/", "/platform/")):
+        score += 80
+    if "/inc/" in path or "/include/" in path:
+        score += 40
+    if path.endswith((".cpp", ".cc", ".cxx", ".mm", ".m", ".java", ".kt")):
+        score += 60
+    elif path.endswith((".h", ".hpp", ".hh", ".hxx")):
+        score -= 40
+    return score
+
+
+def _trivial_stub_line_penalty(file_path: str, line_no: int) -> int:
+    """单行 return V_NULL/nullptr 的接口桩额外降权。"""
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
+            for index, line in enumerate(handle, 1):
+                if index != int(line_no):
+                    continue
+                stripped = line.strip()
+                if not stripped:
+                    return 0
+                if any(
+                    marker in stripped
+                    for marker in ("return V_NULL", "return nullptr", "return NULL", "return 0;")
+                ) and ("{" in stripped and "}" in stripped):
+                    return -200
+                return 0
+    except OSError:
+        return 0
+    return 0
 _SUPPORTED_SOURCE_EXTENSIONS = {
     ".c",
     ".cpp",
@@ -550,7 +610,13 @@ class CtagsFunctionIndex:
             filtered = candidates
         if not filtered:
             return None
-        filtered.sort(key=lambda item: (len(item[0]), item[0]))
+
+        def _rank(item: Tuple[str, int]) -> Tuple[int, int, str]:
+            path, line_no = item
+            score = _definition_path_score(path) + _trivial_stub_line_penalty(path, line_no)
+            return (-score, len(path), path)
+
+        filtered.sort(key=_rank)
         return filtered[0]
 
 

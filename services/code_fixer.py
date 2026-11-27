@@ -17,6 +17,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -2836,6 +2837,53 @@ def _function_bodies_for_repair(
     return sections
 
 
+def _chat_with_model_failover(
+    llm: Any,
+    messages: List[Dict[str, str]],
+    *,
+    router_state: Any = None,
+    call_kwargs: Optional[Dict[str, Any]] = None,
+) -> Tuple[Any, Any]:
+    """调用模型；遇 cooling/风控时按 router models 列表切换。"""
+    from services.analyze_llm import (
+        active_model_name,
+        announce_llm_failover,
+        should_failover_model_immediately,
+    )
+
+    kwargs = dict(call_kwargs or {})
+    current = llm
+    max_attempts = 1
+    if router_state is not None and getattr(router_state, "failover_enabled", False):
+        max_attempts = max(1, len(getattr(router_state, "pool", []) or []) or 1)
+    last_exc: Optional[Exception] = None
+    for _ in range(max_attempts):
+        try:
+            return current.chat(messages, **kwargs), current
+        except Exception as exc:
+            last_exc = exc
+            if router_state is None or not should_failover_model_immediately(str(exc)):
+                raise
+            from tool_system.llm.llm_adapter import LLMAdapterFactory
+            from tool_system.llm.llm_router import build_llm_config_for_endpoint, failover_next
+
+            previous = active_model_name(SimpleNamespace(llm=current), router_state)
+            next_endpoint = failover_next(router_state, cause=str(exc))
+            if next_endpoint is None:
+                raise
+            config = build_llm_config_for_endpoint(next_endpoint, engine="direct")
+            current = LLMAdapterFactory.create(config.to_dict())
+            announce_llm_failover(previous, next_endpoint.model, str(exc))
+            logger.warning(
+                "[CodeFixer] LLM failover to provider=%s model=%s",
+                next_endpoint.provider_key,
+                next_endpoint.model,
+            )
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("llm_chat_failed")
+
+
 def _complete_missing_repair_code(
     llm: Any,
     analysis_text: str,
@@ -2843,6 +2891,7 @@ def _complete_missing_repair_code(
     context_session: Optional[Dict[str, Any]],
     code_roots: List[str],
     code_context: Optional[Dict[str, Any]] = None,
+    router_state: Any = None,
 ) -> str:
     """分析没有可落盘补丁时，用已定位的完整函数再请求一次修复代码。"""
     if llm is None or not hasattr(llm, "chat"):
@@ -2887,7 +2936,12 @@ def _complete_missing_repair_code(
         # 只要求输出函数，思考型模型默认思考量会耗尽输出预算导致正文为空。
         call_kwargs["effort"] = "low"
     try:
-        response = llm.chat([{"role": "user", "content": prompt}], **call_kwargs)
+        response, _used_llm = _chat_with_model_failover(
+            llm,
+            [{"role": "user", "content": prompt}],
+            router_state=router_state,
+            call_kwargs=call_kwargs,
+        )
     except Exception as exc:
         logger.warning("[CodeFixer] 补全修复代码失败: %s", exc)
         return ""
@@ -4155,6 +4209,7 @@ class CodeFixer:
             logger.info("[CodeFixer] 从已读源码补齐候选函数 %s 个", len(promoted))
         _refresh_located_function_snippets(code_context)
         candidate_nodes = extract_candidate_nodes(code_context)
+        router_state = result.get("_llm_router_state") if isinstance(result, dict) else None
         if not candidate_nodes:
             completed = _complete_missing_repair_code(
                 self._llm,
@@ -4162,6 +4217,7 @@ class CodeFixer:
                 context_session=session_dict,
                 code_roots=list(code_roots or []),
                 code_context=code_context,
+                router_state=router_state,
             )
             if completed:
                 analysis_text = analysis_text.rstrip() + "\n\n" + completed
@@ -4197,6 +4253,7 @@ class CodeFixer:
                 context_session=session_dict,
                 code_roots=list(code_roots or []),
                 code_context=code_context,
+                router_state=router_state,
             )
             if not completed:
                 return False

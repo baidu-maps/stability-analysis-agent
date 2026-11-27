@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.7.8] - 2026-11-27
+
+### Fixed
+
+- 风控冷却（`refusal brake` / `cooling down`）立刻按 `models` 列表换模型，不再空转 `max_tokens` 同模型重试；改码补全同样跟随切换。
+- 源码定位：ctags 按路径打分，优先生产 `.cpp`，降权 `demo`/接口 `V_NULL` 桩；限定名命中需校验 `Class::method`；检索排除 `demo`/`sdkdemo`/`enginetest`。
+
+### Added
+
+- Gate B 结论完备性检查（`conclusion_readiness`）：材料不足时停止分析并给出补材建议。
+
 ## [1.7.7] - 2026-11-27
 
 ### Fixed

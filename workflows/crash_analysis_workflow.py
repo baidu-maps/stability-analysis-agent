@@ -239,6 +239,53 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
             },
         }
 
+    def _return_skipped_conclusion_not_ready(
+        self,
+        parse_result: Dict[str, Any],
+        resolved_stack: Dict[str, Any],
+        code_context: Dict[str, Any],
+        scope: str,
+        problem: Dict[str, Any],
+        readiness: Dict[str, Any],
+        *,
+        crash_diagnosis: Optional[Dict[str, Any]] = None,
+        memory_context: str = "",
+        memory_retrieval: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Gate B 未通过：证据不足以安全下结论，跳过 LLM/改码。"""
+        from services.conclusion_readiness import pipeline_skip_metadata_conclusion
+
+        skip_meta = pipeline_skip_metadata_conclusion(readiness)
+        if scope == "gen_prompt_only":
+            note = "skipped_conclusion_not_ready，未生成 05 提示词"
+        else:
+            note = "skipped_conclusion_not_ready，未执行 AI 分析/改码"
+        return {
+            "status": "success",
+            "platform": self.platform,
+            "workflow": self.definition.name,
+            "parse_result": parse_result,
+            "resolved_stack": resolved_stack,
+            "code_context": code_context,
+            "crash_diagnosis": crash_diagnosis or {},
+            "analysis": None,
+            "final_tip": None,
+            "note": note,
+            "rule_hits": [],
+            "pattern_hits": [],
+            "evidence_map": {},
+            "strategy_hits": [],
+            "decision_trace": [],
+            "vector_used": False,
+            "memory_context": memory_context or "",
+            "memory_retrieval": memory_retrieval or {},
+            "conclusion_readiness": readiness,
+            "metadata": {
+                "problem_type": self.definition.problem_type,
+                **skip_meta,
+            },
+        }
+
     def _return_skipped_no_usable_resolve(
         self,
         parse_result: Dict[str, Any],
@@ -950,6 +997,41 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 memory_retrieval["decision_trace"] = decision_trace
 
             # === 确定性结论已并入 04a.prompt_section_zh，此处不再旁路重复注入 ===
+
+            # Gate B：结论完备性（可开跑 ≠ 可下结论）。不满足则停止 LLM，避免缺口上编故事。
+            if scope in {"full", "gen_prompt_only"}:
+                from services.conclusion_readiness import evaluate_conclusion_readiness
+
+                readiness = evaluate_conclusion_readiness(
+                    parse_result=parse_result,
+                    code_context=code_context,
+                    scope=scope,
+                )
+                if not readiness.get("ready"):
+                    logger.info(
+                        "[%s] conclusion readiness failed; stopping before LLM (scope=%s, gaps=%s)",
+                        self.definition.name,
+                        scope,
+                        [g.get("id") for g in (readiness.get("gaps") or []) if isinstance(g, dict)],
+                    )
+                    print(
+                        "[conclusion-readiness] 未通过，已停止大模型分析",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return self._return_skipped_conclusion_not_ready(
+                        parse_result,
+                        resolved,
+                        code_context,
+                        scope,
+                        problem,
+                        readiness,
+                        crash_diagnosis=crash_diagnosis,
+                        memory_context=memory_context,
+                        memory_retrieval=memory_retrieval
+                        if isinstance(memory_retrieval, dict)
+                        else {},
+                    )
 
             evidence_store = getattr(context, "evidence", None)
             if evidence_store is not None:
@@ -2177,6 +2259,17 @@ class BaseCrashAnalysisWorkflow(BaseWorkflow):
                 "## Evidence Contract（必须遵守）",
                 "- 将结论逐项标注为「日志事实」「符号事实」「源码事实」或「推断」，禁止混写。",
                 "- 日志没有明确 signal 字段时，不得宣称信号为 SIGABRT；Abort 字样也不能替代 signal 证据。",
+            ]
+        )
+        try:
+            from services.conclusion_readiness import prompt_os_constraint_lines
+
+            for os_line in prompt_os_constraint_lines(parse_result, code_context):
+                lines.append(os_line)
+        except Exception as os_exc:
+            logger.debug("os version prompt constraint skipped: %s", os_exc)
+        lines.extend(
+            [
                 "- 宣称数据竞态时，必须列出读线程、写线程、共享对象，以及两侧锁覆盖；若读写受同一 mutex",
                 "  完整保护，不得强制提出竞态修复。",
                 "- 栈顶若为容器拷贝（如 Copy / operator= / 按值返回容器），共享对象优先视为被拷贝的容器",
