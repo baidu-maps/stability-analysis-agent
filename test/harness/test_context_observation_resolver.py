@@ -59,6 +59,27 @@ class ContextObservationResolverTests(unittest.TestCase):
         ).resolve({"type": "memory_pattern", "symbol": "NullPtr"})
         self.assertTrue(out["success"])
 
+    def test_memory_pattern_queries_knowledge_packs_without_artifacts(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from services.context_observation_resolver import MemoryPatternResolver
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pack = Path(tmp) / "demo"
+            pack.mkdir()
+            (pack / "pack.yaml").write_text(json.dumps({"id": "demo", "match": {"stack_hints": ["CFoo::Run"]}}))
+            (pack / "foo.md").write_text(
+                "---\ntitle: Foo race\nsymbols: [CFoo::Run]\n---\n\nCFoo::Run races with Stop.\n"
+            )
+            out = MemoryPatternResolver(
+                prepare={},
+                problem={"knowledge_pack_dirs": [str(pack.parent)]},
+            ).resolve({"type": "memory_pattern", "symbol": "CFoo::Run"})
+        self.assertTrue(out["success"])
+        self.assertIn("Foo race", "\n".join(out["snippet"]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,15 +28,20 @@ def _split_paths(value: str) -> List[Path]:
     ]
 
 
-def resolve_pack_dirs(explicit_dirs: Optional[Sequence[str]] = None) -> List[Path]:
-    """返回 Pack 搜索目录；显式配置优先，并追加环境变量目录。"""
+def resolve_pack_dirs(
+    explicit_dirs: Optional[Sequence[str]] = None,
+    *,
+    include_env: bool = True,
+) -> List[Path]:
+    """返回 Pack 搜索目录；显式配置优先，并追加环境变量目录（``include_env=False`` 时不追加）。"""
     paths: List[Path] = []
     for item in explicit_dirs or []:
         if str(item).strip():
             paths.append(Path(item).expanduser().resolve())
-    paths.extend(
-        _split_paths(os.environ.get("STABILITY_AGENT_KNOWLEDGE_PACK_DIRS", ""))
-    )
+    if include_env:
+        paths.extend(
+            _split_paths(os.environ.get("STABILITY_AGENT_KNOWLEDGE_PACK_DIRS", ""))
+        )
     seen = set()
     result: List[Path] = []
     for path in paths:
@@ -406,6 +411,53 @@ def _excerpt(
     return excerpt
 
 
+CANDIDATE_DIRS_ENV = "STABILITY_AGENT_KNOWLEDGE_CANDIDATE_DIRS"
+USAGE_STATS_ENV = "STABILITY_AGENT_KNOWLEDGE_STATS"
+_INACTIVE_STATUSES = {"demoted", "retired"}
+
+
+def _load_usage_stats() -> Dict[str, Dict[str, Any]]:
+    """读取 ``memory_id -> {hits, adopted, rejected}`` 统计；未配置或损坏时返回空。"""
+    path = os.environ.get(USAGE_STATS_ENV, "").strip()
+    if not path:
+        return {}
+    try:
+        data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _usage_factor(stats: Dict[str, Any]) -> float:
+    """采纳多的文档小幅加权，拒绝多于采纳的降权；只做同分附近的调整。"""
+    adopted = int(stats.get("adopted") or 0)
+    rejected = int(stats.get("rejected") or 0)
+    factor = 1.0 + 0.05 * min(adopted, 6)
+    if rejected > adopted:
+        factor *= 0.6
+    return factor
+
+
+def _related_members(
+    groups: Sequence[Tuple[List[Tuple[Path, Dict[str, Any]]], Dict[str, Any]]],
+    manifest: Dict[str, Any],
+) -> List[Tuple[str, Path, Dict[str, Any]]]:
+    """主包加 ``related_packs`` 关联包（双向）的全部目录，带各自的 pack id。
+
+    主仓库与子模块常编进同一个 so，路由只能选中一个包时，子模块知识会丢；关联包一起检索。
+    """
+    top_id = str(manifest.get("id"))
+    related = set(_as_list(manifest.get("related_packs")))
+    result: List[Tuple[str, Path, Dict[str, Any]]] = []
+    for members, merged in groups:
+        pack = str(merged.get("id"))
+        if pack == top_id or pack in related or top_id in _as_list(merged.get("related_packs")):
+            ordered = 0 if pack == top_id else 1
+            result.extend((pack, root, item, ordered) for root, item in members)
+    result.sort(key=lambda item: item[3])
+    return [(pack, root, item) for pack, root, item, _ in result]
+
+
 def retrieve_knowledge(
     *,
     parse_result: Dict[str, Any],
@@ -416,13 +468,19 @@ def retrieve_knowledge(
     max_hits: int = _DEFAULT_MAX_HITS,
     max_chars: int = _DEFAULT_MAX_CHARS,
     code_roots: Optional[Sequence[str]] = None,
+    query_terms: Optional[Sequence[str]] = None,
+    include_env_dirs: bool = True,
+    candidate_fallback: bool = True,
 ) -> Dict[str, Any]:
     """路由到最相关的代码库 Pack，并返回可与现有 RAG 合并的命中。
 
     ``code_roots`` 给出时，文档 frontmatter ``fixed_in`` 里的提交若已包含在当前检出，
     该文档降权并在摘录前注明"上游已修复"，避免对已修复分支重复推理和改码。
+    ``query_terms`` 追加到检索词（推理中按函数名再查一次时用）。
+    frontmatter ``status`` 为 demoted / retired 的文档不参与。主包没有命中时，
+    若配置了 ``STABILITY_AGENT_KNOWLEDGE_CANDIDATE_DIRS``，再到候选池查一次并标为“未准入候选”。
     """
-    roots = resolve_pack_dirs(pack_dirs)
+    roots = resolve_pack_dirs(pack_dirs, include_env=include_env_dirs)
     base: Dict[str, Any] = {
         "success": True,
         "skipped": False,
@@ -433,14 +491,22 @@ def retrieve_knowledge(
         "knowledge_context": "",
         "decision_trace": [],
     }
+    fallback_kwargs = dict(
+        parse_result=parse_result, resolved_stack=resolved_stack, code_context=code_context,
+        pack_id=pack_id, max_hits=max_hits, max_chars=max_chars, code_roots=code_roots,
+        query_terms=query_terms,
+    )
     if not roots:
         base.update(skipped=True, skip_reason="knowledge_pack_dirs_not_configured")
-        return base
+        return _candidate_fallback(base, fallback_kwargs) if candidate_fallback else base
 
     query = _collect_query_text(parse_result, resolved_stack, code_context)
+    if query_terms:
+        query = "\n".join([query, *[str(t) for t in query_terms if str(t).strip()]])
     query_lower = query.lower()
+    groups = _group_packs(roots)
     candidates = []
-    for members, manifest in _group_packs(roots):
+    for members, manifest in groups:
         score, reasons = _match_pack(manifest, query_lower)
         if pack_id and str(manifest.get("id")) == pack_id:
             score += 100.0
@@ -449,29 +515,36 @@ def retrieve_knowledge(
     candidates.sort(key=lambda item: item[0], reverse=True)
     if not candidates or candidates[0][0] <= 0:
         base.update(skipped=True, skip_reason="no_matching_knowledge_pack")
-        return base
+        return _candidate_fallback(base, fallback_kwargs) if candidate_fallback else base
 
-    route_score, members, manifest, route_reason = candidates[0]
+    route_score, _members, manifest, route_reason = candidates[0]
+    members = _related_members(groups, manifest)
+    usage = _load_usage_stats()
     terms = _normalized_terms(query)
     hits: List[Dict[str, Any]] = []
-    documents: Dict[str, Tuple[Path, Path]] = {}
-    for pack_root, member_manifest in members:
+    documents: Dict[Tuple[str, str], Tuple[Path, Path]] = {}
+    for member_pack, pack_root, member_manifest in members:
         content_globs = member_manifest.get("content_globs") or ["**/*.md"]
         if isinstance(content_globs, str):
             content_globs = [content_globs]
         for pattern in content_globs:
             for path in pack_root.glob(str(pattern)):
                 # 同 id 多目录里相对路径相同的文档只取先出现的一份。
-                documents.setdefault(str(path.relative_to(pack_root)), (pack_root, path))
-    for rel_path in sorted(documents):
-        pack_root, path = documents[rel_path]
+                key = (member_pack, str(path.relative_to(pack_root)))
+                documents.setdefault(key, (pack_root, path))
+    for key in sorted(documents):
+        member_pack, rel_path = key
+        pack_root, path = documents[key]
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         metadata, body = _parse_frontmatter(text)
+        if str(metadata.get("status") or "").lower() in _INACTIVE_STATUSES:
+            continue
         score, matched = _document_score(metadata, body, query_lower, terms)
         if score <= 0:
             continue
+        score *= _usage_factor(usage.get(f"{member_pack}/{rel_path}") or {})
         fixed_commits = upstream_fixed_commits(metadata, code_roots or [])
         if fixed_commits:
             score *= 0.3
@@ -493,8 +566,9 @@ def retrieve_knowledge(
             {
                 "layer": str(metadata.get("kb_layer") or "code"),
                 "backend": "pack_document",
-                "pack_id": str(manifest.get("id")),
-                "path": str(path.relative_to(pack_root)),
+                "pack_id": member_pack,
+                "memory_id": f"{member_pack}/{rel_path}",
+                "path": rel_path,
                 "title": str(metadata.get("title") or path.stem),
                 "confidence": str(metadata.get("confidence") or "medium"),
                 "provenance": provenance,
@@ -536,7 +610,7 @@ def retrieve_knowledge(
                 "pack_id": str(manifest.get("id")),
                 "score": route_score,
                 "reasons": route_reason,
-                "pack_roots": [str(root) for root, _ in members],
+                "pack_roots": [str(root) for _, root, _ in members],
             },
             {
                 "stage": "knowledge_pack_retrieve",
@@ -546,4 +620,27 @@ def retrieve_knowledge(
             },
         ],
     )
+    if not selected and candidate_fallback:
+        return _candidate_fallback(base, fallback_kwargs)
     return base
+
+
+def _candidate_fallback(base: Dict[str, Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """记忆没命中时到候选池再查一次；命中标为“未准入候选”，置信度降为 low。"""
+    dirs = [str(p) for p in _split_paths(os.environ.get(CANDIDATE_DIRS_ENV, ""))]
+    if not dirs:
+        return base
+    found = retrieve_knowledge(pack_dirs=dirs, include_env_dirs=False, candidate_fallback=False, **kwargs)
+    if not found.get("hits"):
+        return base
+    for hit in found["hits"]:
+        hit["provenance"] = "candidate"
+        hit["confidence"] = "low"
+        hit["title"] = f"（未准入候选）{hit['title']}"
+    lines = ["候选知识（尚未准入记忆，仅供参考，结论需结合本次代码核实）:"]
+    for hit in found["hits"]:
+        lines.append(f"- {hit['title']}（{hit['path']}）\n  {hit['excerpt']}")
+    found["knowledge_context"] = "\n".join(lines)
+    found["candidate_fallback"] = True
+    found["decision_trace"] = list(base.get("decision_trace") or []) + list(found.get("decision_trace") or [])
+    return found

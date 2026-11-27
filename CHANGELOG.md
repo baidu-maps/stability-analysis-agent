@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.7.6] - 2026-11-27
+
+### Added
+
+- 知识检索支持 `related_packs` 关联包、候选池 fallback、记忆使用统计和 `query_terms`；推理中的 `memory_pattern` 可主动查询知识包，且不改变 `round_0` 提示词组装。
+- 新增候选 fallback、关联包、非活跃状态和使用统计排序单测。
+
 ## [1.6.6] - 2026-10-22
 
 ### Changed

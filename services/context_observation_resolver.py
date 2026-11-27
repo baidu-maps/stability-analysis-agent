@@ -1,6 +1,8 @@
 """Resolvers for observation, memory, and trace context requests."""
 from __future__ import annotations
 
+import os
+import re
 from typing import Any, Callable, Dict, List, Optional
 
 from services.context_engine import CallableContextResolver, ContextResolverRegistry
@@ -18,7 +20,14 @@ def _snippet_lines(text: str, *, limit: int = 6000) -> List[str]:
     return (joined[: limit - len(marker)] + marker).splitlines()
 
 
+def _query_terms(symbol: str) -> List[str]:
+    """把查询串拆成检索词：空白、逗号、分号分隔。"""
+    return [part for part in re.split(r"[\s,;，；]+", symbol) if part.strip()]
+
+
 class MemoryPatternResolver:
+    """按查询词查记忆：先查代码库知识包（含关联包与候选池），再查相似历史案例。"""
+
     request_type = "memory_pattern"
 
     def __init__(
@@ -26,9 +35,39 @@ class MemoryPatternResolver:
         *,
         prepare: Dict[str, Any],
         problem: Optional[Dict[str, Any]],
+        code_roots: Optional[List[str]] = None,
     ):
         self.prepare = prepare if isinstance(prepare, dict) else {}
         self.problem = problem if isinstance(problem, dict) else {}
+        self.code_roots = list(code_roots or [])
+
+    def _knowledge_text(self, symbol: str) -> str:
+        """按查询词检索知识包；未配置或无命中时返回空串。"""
+        if self.problem.get("enable_domain_knowledge") is False:
+            return ""
+        try:
+            from knowledge_plane import retrieve_knowledge
+        except ImportError:
+            return ""
+        dirs = self.problem.get("knowledge_pack_dirs") or []
+        if isinstance(dirs, str):
+            dirs = [item for item in dirs.split(os.pathsep) if item.strip()]
+        terms = _query_terms(symbol)
+        try:
+            found = retrieve_knowledge(
+                parse_result={},
+                resolved_stack={"resolved_frames": [{"function": term} for term in terms]},
+                code_context={},
+                pack_dirs=list(dirs),
+                pack_id=str(self.problem.get("knowledge_pack_id") or ""),
+                max_hits=3,
+                max_chars=int(self.problem.get("knowledge_max_chars") or 4500),
+                code_roots=self.code_roots,
+                query_terms=terms,
+            )
+        except Exception:
+            return ""
+        return str(found.get("knowledge_context") or "").strip()
 
     def resolve(self, request: Dict[str, Any]) -> Dict[str, Any]:
         symbol = str(request.get("symbol") or "").strip()
@@ -38,6 +77,7 @@ class MemoryPatternResolver:
                 "success": False,
                 "error": "memory_pattern requires symbol query",
             }
+        knowledge = self._knowledge_text(symbol)
         parse_result = self.prepare.get("parse_result") or self.problem.get("parse_result")
         resolved_stack = (
             self.prepare.get("resolved_stack")
@@ -46,6 +86,8 @@ class MemoryPatternResolver:
         )
         code_context = self.prepare.get("code_context") or self.problem.get("code_context") or {}
         if not isinstance(parse_result, dict) or not isinstance(resolved_stack, dict):
+            if knowledge:
+                return {"request": dict(request), "success": True, "snippet": _snippet_lines(knowledge)}
             return {
                 "request": dict(request),
                 "success": False,
@@ -66,6 +108,8 @@ class MemoryPatternResolver:
                 crash_log_content=str(self.problem.get("crash_log") or ""),
             )
             if payload.get("skipped"):
+                if knowledge:
+                    return {"request": dict(request), "success": True, "snippet": _snippet_lines(knowledge)}
                 return {
                     "request": dict(request),
                     "success": False,
@@ -75,6 +119,7 @@ class MemoryPatternResolver:
             text = str(payload.get("memory_context") or "").strip()
             if symbol.lower() not in text.lower() and text:
                 text = f"Query: {symbol}\n\n{text}"
+            text = "\n\n".join(part for part in (knowledge, text) if part)
             if not text:
                 return {
                     "request": dict(request),
@@ -191,6 +236,7 @@ def build_observation_resolvers(
     problem: Optional[Dict[str, Any]],
     context: Any = None,
     trace: Any = None,
+    code_roots: Optional[List[str]] = None,
 ) -> List[CallableContextResolver]:
     verification = {}
     if isinstance(problem, dict):
@@ -199,7 +245,7 @@ def build_observation_resolvers(
             verification = ver
     observation_store = getattr(context, "observations", None) if context is not None else None
     resolvers = [
-        MemoryPatternResolver(prepare=prepare, problem=problem),
+        MemoryPatternResolver(prepare=prepare, problem=problem, code_roots=code_roots),
         VerificationLogResolver(observation_store=observation_store, verification=verification),
         TraceSnippetResolver(trace=trace),
     ]
@@ -230,6 +276,7 @@ def build_context_resolver_registry(
         problem=problem,
         context=context,
         trace=trace,
+        code_roots=roots,
     ):
         registry.register(resolver)
     return registry
