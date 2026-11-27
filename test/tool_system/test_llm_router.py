@@ -178,6 +178,12 @@ class ModelListFailoverTest(unittest.TestCase):
         long_text = "分析结论正常。" * 40
         self.assertEqual(gateway_error_text(long_text), "")
 
+    def test_risk_control_cooldown_is_retryable(self):
+        self.assertEqual(
+            classify_llm_failure("refusal brake: session cooling down"),
+            "retryable",
+        )
+
 
 class RoutingPolicyTest(unittest.TestCase):
     def test_force_profile(self):

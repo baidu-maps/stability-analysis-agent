@@ -44,6 +44,9 @@ _RETRYABLE_PHRASES = (
     "connection refused",
     "temporarily unavailable",
     "remote end closed",
+    "refusal brake",
+    "cooling down",
+    "风控",
 )
 _GATEWAY_BODY_MARKERS = (
     "负载过高",

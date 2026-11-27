@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [1.7.7] - 2026-11-27
+
+### Fixed
+
+- Crash Agent 的模型失败分类识别 `refusal brake`、`cooling down` 和风控文案，按配置的 `models` 顺序切换，不再把风控冷却当作普通失败。
+
 ## [1.7.6] - 2026-11-27
 
 ### Added
